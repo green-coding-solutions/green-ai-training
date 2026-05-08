@@ -75,3 +75,9 @@ Refer to the [GMT documentation](https://docs.green-coding.io) for installation 
 - **Composability** — scenarios are independent and can be combined if needed
 - **Normalization** — all scenarios report work units so energy measurements are comparable across hardware
 - **Reproducibility** — all services are local; no external network dependencies unless explicitely intended
+
+
+# Funding Notice
+
+The work for this repository was funded by the [BRAID - Sustainable AI futures](https://www.bathspa.ac.uk/news-and-events/news/ai-research-grant/)
+grant.
