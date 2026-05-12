@@ -17,40 +17,16 @@ constructs and mapped back to source-level operations.
 The benchmarks are designed for the the [Green Metrics Tool (GMT)](https://www.green-coding.io/projects/green-metrics-tool/)
 but when extracted from their *YAML* files can be run in any linux environment.
 
-## Repository layout
+## Purpose and gains
 
-```
-green-ai-training/
-├── python/          # Python bottom-up benchmark scenarios
-└── system/          # System-level benchmark scenarios
-```
+The basic energy information about progamming language primitives as well as infrastructure decisions shall
+aid human and AI developers in creating more energy efficient code.
 
-## python/
+Please read details in [CONCEPT.md](/CONCEPT.md)
 
-Contains a shared benchmark harness and ten independent GMT usage scenarios, each targeting a single operation type:
+## Repository Layout
 
-| Scenario | What it measures |
-|---|---|
-| `idle` | Baseline energy while sleeping |
-| `empty-loop` | Loop overhead with no body |
-| `integer-arithmetic` | Arithmetic-heavy computation |
-| `memory-sequential` | Sequential read/write over buffers |
-| `dict-lookup` | Hash table lookups |
-| `json-roundtrip` | JSON encode/decode |
-| `sort` | In-memory sort |
-| `subprocess-spawn` | Process creation overhead |
-| `http-requests` | Local HTTP request/response cycle |
-| `page-assets` | Web asset transfer (HTML + images) |
-
-Each scenario:
-- Runs inside a Docker container with defined CPU/memory limits
-- Scales across multiple input sizes to reveal complexity trends
-- Emits work units via `custom_metrics` for energy-per-unit normalization
-- Includes cooldown sleeps between steps for thermal stabilization
-
-See [`python/README.md`](python/README.md) for details on the harness files.
-
-## system/
+### system/
 
 System-level scenarios that benchmark CPU, memory, disk, network, idle time, wakeups, and syscalls at the OS layer.
 
@@ -58,6 +34,13 @@ System-level scenarios that benchmark CPU, memory, disk, network, idle time, wak
 |---|---|
 | `usage_scenario.yml` | Standard container environment |
 | `usage_scenario_vm.yml` | Kata container / VM environment |
+
+
+### Rest TBD
+
+## Results
+
+The results are online in the [Green Metrics Tool Cluster Dashboard](https://metrics.green-coding.io/runs.html?&uri=green-ai-training&show_archived=false&show_other_users=true)
 
 ## Running a scenario
 
@@ -77,7 +60,7 @@ Refer to the [GMT documentation](https://docs.green-coding.io) for installation 
 - **Reproducibility** — all services are local; no external network dependencies unless explicitely intended
 
 
-# Funding Notice
+## Funding Notice
 
 The work for this repository was funded by the [BRAID - Sustainable AI futures](https://www.bathspa.ac.uk/news-and-events/news/ai-research-grant/)
 grant.
