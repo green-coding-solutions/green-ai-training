@@ -2,15 +2,12 @@
 import sys
 import requests
 
-BASE_URL = "http://192.168.178.21:5000/v2/greencoding/gcb_playwright/blobs/sha256:"
-
 def main():
     if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <sha256-hash>")
+        print(f"Usage: {sys.argv[0]} <url>")
         sys.exit(1)
 
-    sha = sys.argv[1]
-    url = BASE_URL + sha
+    url = sys.argv[1]
 
     r = requests.get(url, stream=True)
     r.raise_for_status()
