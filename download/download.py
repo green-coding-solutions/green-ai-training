@@ -12,7 +12,7 @@ def main():
     r = requests.get(url, stream=True)
     r.raise_for_status()
 
-    out_path = "/tmp/myfile"
+    out_path = "/dev/null"
     with open(out_path, "wb") as f:
         for chunk in r.iter_content(chunk_size=8192):
             if chunk:
