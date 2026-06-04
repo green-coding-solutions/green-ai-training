@@ -7,7 +7,6 @@ This includes:
 - Programming language primitives like variable assignments, loops, incrementation etc
 - Typical code functionality like executing network requests, loading libraries, etc.
 - Specific language building blocks like memory cost for DOM nodes, rendering and download cost of images in a web-page etc.
-- Infrastructure building blocks like the cost of overhead from VMs vs. native level (Docker)
 - System level building blocks like the cost of running a full additional core, idling a system, running unthrottled downloads etc.
 
 In summary scenarios isolate primitive workloads so that measured energy can be attributed to specific code
@@ -24,19 +23,6 @@ aid human and AI developers in creating more energy efficient code.
 
 Please read details in [CONCEPT.md](/CONCEPT.md)
 
-## Repository Layout
-
-### system/
-
-System-level scenarios that benchmark CPU, memory, disk, network, idle time, wakeups, and syscalls at the OS layer.
-
-| File | Target |
-|---|---|
-| `usage_scenario.yml` | Standard container environment |
-| `usage_scenario_vm.yml` | Kata container / VM environment |
-
-
-### Rest TBD
 
 ## Results
 
