@@ -1,0 +1,51 @@
+---
+name: Browser CSS Animation Energy Cost
+author: arne@green-coding.io
+description: |
+  Measures the energy cost of running 100 CSS @keyframes translateX animations
+  for 55 seconds in a headless Firefox browser. A parallel requestAnimationFrame
+  counter measures actual frames rendered. Compare with usage_scenario-js.yml
+  to quantify the energy difference between compositor-offloaded CSS animations
+  and main-thread JS-driven animations.
+
+custom_metrics:
+  animation_frames:
+    unit: Frames rendered
+    sci: True
+
+compose-file: !include-gmt-helper gmt-playwright.yml
+
+services:
+  gcb-browser-nginx:
+    image: nginx:alpine
+    folder-destination: /usr/share/nginx/html
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/benchmarks/browser/animation/css-animation.html"]
+      start_period: 5s
+      start_interval: 1s
+
+  gmt-playwright-nodejs:
+    depends_on:
+      gcb-browser-nginx:
+        condition: service_healthy
+
+flow:
+
+  - name: Navigate to animation page
+    container: gmt-playwright-nodejs
+    commands:
+      - type: playwright
+        command: |
+          await page.goto("http://gcb-browser-nginx/benchmarks/browser/animation/css-animation.html", { waitUntil: "networkidle" });
+
+  - name: Run animation for 20 seconds
+    container: gmt-playwright-nodejs
+    commands:
+      - type: console
+        command: sleep 20
+        note: Wait for animations to run (console sleep avoids the 60s playwright IPC timeout)
+      - type: playwright
+        command: |
+          const count = await page.evaluate(() => window.frameCount);
+          logNote("animation_frames=" + String(count));
+        note: Read rAF counter and emit GMT custom metric via logNote
