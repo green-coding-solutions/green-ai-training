@@ -2,7 +2,7 @@ import time
 import urllib.request
 import sys
 
-URL = "https://codetactics.de"
+URL = "https://www.codetactics.de/"
 
 for _ in range(10):
     with urllib.request.urlopen(URL) as response:
