@@ -5,9 +5,6 @@ Scope: composable, bottom-up benchmark scenarios for Green Metrics Tool.
 ## Scenario Layout
 
 - `usage_scenario-*.yml`: one primitive benchmark per file.
-- `benchmark.py`: shared benchmark harness used by most scenarios.
-- `benchmark_server.py`: local HTTP server for request and asset benchmarks.
-- `Dockerfile`: shared runtime image for all scenarios in this directory.
 
 ## Agent Notes
 
