@@ -27,4 +27,4 @@ def classify(x):
 for x in data:
     classify(x)
 
-print(f"{int(time.time() * 1e9)} classifications={N}")
+print(f"{time.time_ns()} classifications={N}")

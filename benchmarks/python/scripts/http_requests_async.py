@@ -1,3 +1,4 @@
+import time
 import asyncio
 import sys
 import aiohttp
@@ -15,5 +16,6 @@ async def main():
     async with aiohttp.ClientSession() as session:
         for _ in range(10):
             await fetch(session)
+        print(f"{time.time_ns()} http_requests=10")
 
 asyncio.run(main())
