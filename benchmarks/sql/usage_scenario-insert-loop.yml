@@ -1,0 +1,98 @@
+---
+name: PostgreSQL INSERT loop Benchmark
+author: arne@green-coding.io
+description: >
+  Measures the energy cost of inserting rows into PostgreSQL one row at a time
+  using a Python for-loop with individual execute() calls per row.
+
+  This is the naive baseline: each row is sent as a separate protocol round-trip
+  within a single transaction. All rows in a batch are committed together, so
+  commit overhead is not the variable under test — only the per-row
+  serialisation and execute overhead.
+
+  Run alongside usage_scenario-insert-executemany.yml and
+  usage_scenario-insert-copy.yml and compare rows_inserted per joule across all
+  three scenarios.
+
+custom_metrics:
+  rows_inserted:
+    unit: rows
+    sci: True
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB:       benchmark_db
+      POSTGRES_USER:     bench
+      POSTGRES_PASSWORD: bench123
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "psql -U bench -d benchmark_db -c 'SELECT 1 FROM products LIMIT 1' > /dev/null 2>&1"]
+      interval:     10s
+      timeout:       5s
+      retries:       30
+      start_period: 120s
+
+  benchmark:
+    image: python:3.12-slim
+    volumes:
+      - ./benchmark.py:/opt/bench/benchmark.py:ro
+      - ./requirements.txt:/opt/bench/requirements.txt:ro
+    environment:
+      PG_HOST:     postgres
+      PG_PORT:     "5432"
+      PG_DB:       benchmark_db
+      PG_USER:     bench
+      PG_PASSWORD: bench123
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+flow:
+
+  - name: Install Python dependencies
+    container: benchmark
+    hidden: true
+    commands:
+      - type: console
+        command: pip install -r /opt/bench/requirements.txt -q
+        note: Install psycopg[binary]
+
+  - name: INSERT batch - 100 rows
+    container: benchmark
+    commands:
+      - type: console
+        command: python -B /opt/bench/benchmark.py --mode insert-loop --size 100 --repetitions 100
+        note: INSERT 100 rows/batch via loop, 100 repetitions
+
+  - name: Cooldown 1
+    container: benchmark
+    hidden: true
+    commands:
+      - type: console
+        command: sleep 10
+        note: Cooldown between steps
+
+  - name: INSERT batch - 1000 rows
+    container: benchmark
+    commands:
+      - type: console
+        command: python -B /opt/bench/benchmark.py --mode insert-loop --size 1000 --repetitions 100
+        note: INSERT 1000 rows/batch via loop, 100 repetitions
+
+  - name: Cooldown 2
+    container: benchmark
+    hidden: true
+    commands:
+      - type: console
+        command: sleep 10
+        note: Cooldown between steps
+
+  - name: INSERT batch - 5000 rows
+    container: benchmark
+    commands:
+      - type: console
+        command: python -B /opt/bench/benchmark.py --mode insert-loop --size 5000 --repetitions 100
+        note: INSERT 5000 rows/batch via loop, 100 repetitions

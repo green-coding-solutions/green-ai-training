@@ -1,0 +1,53 @@
+---
+# Local development / smoke-test compose file.
+# For Green Metrics Tool runs use the usage_scenario-*.yml files instead.
+#
+# Usage:
+#   docker compose up postgres          # wait for healthcheck to pass (~60-120 s)
+#   docker compose run --rm benchmark \
+#       python /opt/bench/benchmark.py --mode select-star-products --size 1000
+#
+# Or run all four modes back-to-back:
+#   docker compose up --abort-on-container-exit
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB:       benchmark_db
+      POSTGRES_USER:     bench
+      POSTGRES_PASSWORD: bench123
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      # Wait until the tables exist and contain rows – the init script runs
+      # before postgres opens for business, but the start_period gives extra
+      # headroom for large-data-generation runs.
+      test: >
+        CMD-SHELL psql -U bench -d benchmark_db
+          -c "SELECT 1 FROM products LIMIT 1"
+          > /dev/null 2>&1
+      interval:     10s
+      timeout:       5s
+      retries:       30
+      start_period: 120s
+
+  benchmark:
+    image: python:3.12-slim
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./benchmark.py:/opt/bench/benchmark.py:ro
+      - ./requirements.txt:/opt/bench/requirements.txt:ro
+    working_dir: /opt/bench
+    environment:
+      PG_HOST:     postgres
+      PG_PORT:     "5432"
+      PG_DB:       benchmark_db
+      PG_USER:     bench
+      PG_PASSWORD: bench123
+    entrypoint: ['tail', '-f', '/dev/null']

@@ -1,0 +1,132 @@
+---
+name: PostgreSQL SELECT * Benchmark
+author: arne@green-coding.io
+description: >
+  Measures the energy cost of fetching result sets from PostgreSQL using
+  SELECT * (all columns) on a wide 52-column products table and on a JOIN
+  between the orders and order_items tables.
+
+  The products table contains substantial TEXT columns (descriptions,
+  specifications, localised content) that inflate every row to ~1.5 KB of
+  payload. The benchmark always fetches the full row across the wire,
+  regardless of how many fields the caller actually needs.
+
+  Run alongside usage_scenario-select-named.yml and compare
+  queries_executed per joule to quantify the SELECT * overhead.
+
+custom_metrics:
+  queries_executed:
+    unit: queries
+    sci: True
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB:       benchmark_db
+      POSTGRES_USER:     bench
+      POSTGRES_PASSWORD: bench123
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "psql -U bench -d benchmark_db -c 'SELECT 1 FROM products LIMIT 1' > /dev/null 2>&1"]
+      interval:     10s
+      timeout:       5s
+      retries:       30
+      start_period: 120s
+
+  benchmark:
+    image: python:3.12-slim
+    volumes:
+      - ./benchmark.py:/opt/bench/benchmark.py:ro
+      - ./requirements.txt:/opt/bench/requirements.txt:ro
+    environment:
+      PG_HOST:     postgres
+      PG_PORT:     "5432"
+      PG_DB:       benchmark_db
+      PG_USER:     bench
+      PG_PASSWORD: bench123
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+flow:
+
+  - name: Install Python dependencies
+    container: benchmark
+    hidden: true
+    commands:
+      - type: console
+        command: pip install -r /opt/bench/requirements.txt -q
+        note: Install psycopg[binary]
+
+  # ── Single-table: products ────────────────────────────────────────────────
+
+  - name: SELECT (star) products - 500 rows
+    container: benchmark
+    commands:
+      - type: console
+        command: python -B /opt/bench/benchmark.py --mode select-star-products --size 500 --repetitions 1000
+        note: SELECT * FROM products LIMIT 500, 1000 repetitions
+
+  - name: Cooldown 1
+    container: benchmark
+    hidden: true
+    commands:
+      - type: console
+        command: sleep 10
+        note: Cooldown between steps
+
+  - name: SELECT (star) products - 2500 rows
+    container: benchmark
+    commands:
+      - type: console
+        command: python -B /opt/bench/benchmark.py --mode select-star-products --size 2500 --repetitions 1000
+        note: SELECT * FROM products LIMIT 2500, 1000 repetitions
+
+  - name: Cooldown 2
+    container: benchmark
+    hidden: true
+    commands:
+      - type: console
+        command: sleep 10
+        note: Cooldown between steps
+
+  - name: SELECT (star) products - 10000 rows
+    container: benchmark
+    commands:
+      - type: console
+        command: python -B /opt/bench/benchmark.py --mode select-star-products --size 10000 --repetitions 1000
+        note: SELECT * FROM products LIMIT 10000, 1000 repetitions
+
+  - name: Cooldown 3
+    container: benchmark
+    hidden: true
+    commands:
+      - type: console
+        command: sleep 10
+        note: Cooldown between steps
+
+  # ── JOIN: orders × order_items ────────────────────────────────────────────
+
+  - name: SELECT (star) join - 200 rows
+    container: benchmark
+    commands:
+      - type: console
+        command: python -B /opt/bench/benchmark.py --mode select-star-join --size 200 --repetitions 1000
+        note: SELECT * FROM orders JOIN order_items LIMIT 200, 1000 repetitions
+
+  - name: Cooldown 4
+    container: benchmark
+    hidden: true
+    commands:
+      - type: console
+        command: sleep 10
+        note: Cooldown between steps
+
+  - name: SELECT (star) join - 1000 rows
+    container: benchmark
+    commands:
+      - type: console
+        command: python -B /opt/bench/benchmark.py --mode select-star-join --size 1000 --repetitions 1000
+        note: SELECT * FROM orders JOIN order_items LIMIT 1000, 1000 repetitions
