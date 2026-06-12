@@ -98,6 +98,15 @@ Structured Data in JSON format is available through the individual run endpoints
 
 - Example for [Bash Quoting - Double](https://metrics.green-coding.io/stats.html?id=26bae94a-54ca-423b-9890-0fd29ca51a15): https://api.green-coding.io/v1/phase_stats/single/26bae94a-54ca-423b-9890-0fd29ca51a15
 
+### Badge Linking
+
+If you want to cite some benchmarks for the training data used here you can also badge-link the results.
+
+- Example for [Bash Quoting - Double](https://metrics.green-coding.io/stats.html?id=26bae94a-54ca-423b-9890-0fd29ca51a15) CPU Package Energy:
+                    <img src="https://api.green-coding.io/v1/badge/single/26bae94a-54ca-423b-9890-0fd29ca51a15?metric=cpu_energy_rapl_msr_component" loading="lazy" onerror="this.parentNode.parentNode.remove(); console.log('Could not render cpu_energy_rapl_msr_component badge - Likely due to non public visibility of the run.')">
+
+You can find the badges under the "Badges" tab to copy & paste.
+
 ## Running a scenario
 
 Scenarios are executed via the Green Metrics Tool CLI. Example for a single Python scenario:
