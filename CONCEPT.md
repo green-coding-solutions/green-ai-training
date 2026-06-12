@@ -141,7 +141,7 @@ At low/moderate utilization (common in real systems): * energy overhead can be *
 So one can see that an LLM can not only provide background information why a technology should be theoretically
 be less energy consuming, but also can give ballpark numbers why that is the case.
 
-The data actually corresponds to our internal measurements [TODO]
+The data actually corresponds to our internal measurements on [Docker vs. VMs](https://metrics.green-coding.io/compare.html?ids=68fb8502-4a61-40b8-a5cd-14bb7affda4b,e9289785-98bf-4e81-8069-b494fdaa00ba,98265e98-8126-4f72-8f1b-bc7ecd1892c5,cd83a76e-fa24-4317-a107-50e84d5a5cc7,0ddc51b2-e75b-45c7-9b73-34611063d8e6,d4d4441b-b1a8-426b-8ce9-c6636640853f,d1c4f8b0-0093-40b6-a27e-47f9056f0569&force_mode=usage_scenarios)
 
 #### Image Rendering Example
 However for image rendering, a more niche topic, the results are vague and unhelpful:
