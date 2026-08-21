@@ -168,4 +168,4 @@ You cna find those including their **planned prompts** as well as **expected out
 ## Funding Notice
 
 The work for this repository was funded by the [BRAID - Sustainable AI futures](https://www.bathspa.ac.uk/news-and-events/news/ai-research-grant/)
-grant.
+grant - UKRI grant number UKRI569.
