@@ -244,3 +244,10 @@ for instance executed in a FaaS with 10.000 invocations a day this would save x 
 be x mWh. This should be so the user can decide if the costs really outweigh the change overhead done
 by for instance an LLM model
 
+
+# Alternative Approaches
+
+During research of this project we also found alternative approaches that are worth highlighting:
+
+- [A Generative AI Tool for Constructing Web Frontend with Integration of Quality Feedback Loop](https://dl.acm.org/doi/full/10.1145/3816713.3818803)
+    - Instead of only telling the AI model to make code adhere to Green Coding principles this coding harness also checks if the code is actually compliant by running non-AI checks after (heurisitics, pattern matching etc.) - A really nice addition, but neglected in this research project as purely an engineering challenge and not a research one.
