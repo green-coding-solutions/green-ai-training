@@ -13,7 +13,7 @@ import mlx.core as mx
 #    - Good Takes around 1:22 to complete in Ollama and 1:04 in PyTorch
 # unsloth/Qwen2.5-Coder-7B-Instruct-bnb-4bit better?
 
-def generate_output(model_name, prompt):
+def generate_output(model_name, prompt, lora_adapter_folder):
     # Load the model
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_name,
@@ -21,8 +21,12 @@ def generate_output(model_name, prompt):
         load_in_4bit=True,
     )
 
+    if lora_adapter_folder:
+        model.load_adapter(lora_adapter_folder)
+
     # Optimize the model for inference
     FastLanguageModel.for_inference(model)
+
 
     if tokenizer.chat_template:
         print('Using chat template: ', tokenizer.chat_template)
@@ -66,6 +70,8 @@ def main():
     prompt_group.add_argument("--prompt", help="Prompt to send to the model.")
     prompt_group.add_argument("--prompt-file", help="Path to a file containing the prompt.")
 
+    parser.add_argument("--lora-adapter", help="Add additional LoRA adapter from directory")
+
     args = parser.parse_args()
 
     if args.prompt is not None:
@@ -76,7 +82,7 @@ def main():
 
     print(f"Loading model: {args.model}")
 
-    output = generate_output(args.model, prompt)
+    output = generate_output(args.model, prompt, args.lora_adapter)
 
     print(output)
 
