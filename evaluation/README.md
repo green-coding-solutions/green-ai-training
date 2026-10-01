@@ -7,7 +7,7 @@ It needs it's own `venv` and own folder as we install different `pip` package ve
 ## Installation
 
 ```bash
-python3.14 -m venv venv
+python3.12 -m venv venv
 pip install -r requirements.txt
 ```
 

@@ -140,7 +140,10 @@ You cna find those including their **planned prompts** as well as **expected out
     - **Expected output**: Optimized code with annotations or additional output file that states expected energy and carbon savings
 
 
-# TODOS
+## AI Model Training
+
+If you read this repository in 2026, please use Python3.12 throughout the entire training as there are [open bugs](https://github.com/huggingface/datasets/issues/8373)
+which currently make it unusable in Python3.14 and likely also Python3.13.
 
 - AI Model Training ⭕️
 - AI Model evaluation ⭕️
