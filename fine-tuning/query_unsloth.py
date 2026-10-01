@@ -1,8 +1,15 @@
-import argparse
+import os
 
-from unsloth import FastLanguageModel
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["UNSLOTH_DISABLE_STATISTICS"] = "1"   # skips a telemetry README fetch
+os.environ["UNSLOTH_DISABLE_UPDATE_CHECK"] = "1"
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+
+import argparse
 import torch
+from unsloth import FastLanguageModel
 from peft import PeftModel
+
 
 # unsloth/Qwen2.5-Coder-0.5B-Instruct any good?
 #    - Quick. Takes 0:16
@@ -13,13 +20,12 @@ from peft import PeftModel
 #    - Good Takes around 1:22 to complete in Ollama and 1:04 in PyTorch
 # unsloth/Qwen2.5-Coder-7B-Instruct-bnb-4bit better?
 
-def generate_output(model_name, prompt, lora_adapter_folder):
+def generate_output(model_name_or_lora_folder, prompt, verbose):
     # Load the model
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=model_name,
+        model_name=model_name_or_lora_folder,
         max_seq_length=4096,
         load_in_4bit=True,
-        adapter_name=lora_adapter_folder,
     )
 
     # Optimize the model for inference
@@ -27,7 +33,8 @@ def generate_output(model_name, prompt, lora_adapter_folder):
 
 
     if tokenizer.chat_template:
-        print('Using chat template: ', tokenizer.chat_template)
+        if verbose:
+            print('Using chat template: ', tokenizer.chat_template)
 
         messages = [{"role": "user","content": prompt}]
         inputs = tokenizer.apply_chat_template(
@@ -62,27 +69,36 @@ def generate_output(model_name, prompt, lora_adapter_folder):
 def main():
     parser = argparse.ArgumentParser(description="Run inference with an Unsloth language model.")
 
-    parser.add_argument("--model", help=f"Model name/path (e.g.: unsloth/Qwen2.5-Coder-7B-Instruct)", required=True)
+    parser.add_argument("--model", help=f"Model name/path (e.g.: unsloth/Qwen2.5-Coder-7B-Instruct) or LoRA adapater folder", required=True)
+    parser.add_argument('--verbose', help="Show debug output", action="store_true")
 
     prompt_group = parser.add_mutually_exclusive_group(required=True)
-    prompt_group.add_argument("--prompt", help="Prompt to send to the model.")
+    prompt_group.add_argument(
+        "--prompt",
+        action="append",
+        help="One or more prompts to send to the model. "
+             "Each prompt is executed in a fresh context.",
+    )
     prompt_group.add_argument("--prompt-file", help="Path to a file containing the prompt.")
-
-    parser.add_argument("--lora-adapter", help="Add additional LoRA adapter from directory")
 
     args = parser.parse_args()
 
     if args.prompt is not None:
-        prompt = args.prompt
+        prompts = args.prompt
     else:
         with open(args.prompt_file, "r", encoding="utf-8") as f:
-            prompt = f.read()
+            prompts = [f.read()]
 
     print(f"Loading model: {args.model}")
 
-    output = generate_output(args.model, prompt, args.lora_adapter)
+    for prompt in prompts:
+        print("\n" + "=" * 80)
+        print(f"Prompt: {prompt}")
+        print("=" * 80)
 
-    print(output)
+        output = generate_output(args.model, prompt, args.verbose)
+
+        print(output)
 
 if __name__ == "__main__":
     main()
