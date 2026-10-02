@@ -26,7 +26,7 @@ The main user should then create a git that is non readable or writeable to the 
 ```bash
 HF_ALLOW_CODE_EVAL=1 lm_eval \
   --model hf \
-  --model_args "pretrained=Qwen/Qwen2.5-7B-Instruct,peft=/Users/code-runner/Public/Sites/green-coding/green-ai-training/fine-tuning/lora-adapter" \
+  --model_args "pretrained=../fine-tuning/fused-model" \
   --tasks mbpp_plus \
   --batch_size 1 \
   --output_path results/base \
@@ -34,3 +34,7 @@ HF_ALLOW_CODE_EVAL=1 lm_eval \
   --confirm_run_unsafe_code \
   --device mps
 ```
+
+In case you have not fused the model try:
+
+- `--model_args "pretrained=unsloth/Qwen2.5-Coder-7B-Instruct,peft=../fine-tuning/lora-adapter" \`
