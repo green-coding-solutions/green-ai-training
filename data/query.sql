@@ -1,7 +1,3 @@
--- This query is to export the data from a running GMT instance
--- GMT is the tool used to measure this data - https://github.com/green-coding-solutions/green-metrics-tool
--- ⚙️ Detailed machine specs and configuration like CPU Cores, Memory, TurboBoost etc. are always up to date on the (ℹ︎) icon in the [Cluster Machine Listing](https://metrics.green-coding.io/cluster-status.html)
-
 WITH task_runs AS (
     SELECT
         sw.id          AS software_id,
