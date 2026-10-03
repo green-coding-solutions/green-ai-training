@@ -13,7 +13,7 @@ pip install -r requirements.txt
 ## Run
 
 ```bash
-python3 train_unsloth.py --model 'unsloth/Qwen2.5-Coder-0.5B-Instruct' --dataset training_data.json
+python3 train_unsloth.py --model 'unsloth/Qwen2.5-Coder-7B-Instruct' --dataset ../data/green-coding-talk-questions.csv
 ```
 
 
