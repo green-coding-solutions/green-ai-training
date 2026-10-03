@@ -120,7 +120,7 @@ def main():
     parser.add_argument("--dataset", help=f"Dataset to use for fine-tuning of model", required=True)
     parser.add_argument("--output", help=f"Output directory for LoRA adapter", default="./lora-adapter")
     parser.add_argument("--split-and-evaluate", help=f"Split Dataset in Training and Evaluation and evaluate", action="store_true")
-    parser.add_argument("--target-modules", help="Comma-separated LoRA target modules (gate_proj,up_proj,down_proj are typically 'knowledge' and 'q_proj,k_proj,v_proj,o_proj behaviour and capabilities)", default="gate_proj,up_proj,down_proj")
+    parser.add_argument("--target-modules", help="Comma-separated LoRA target modules (gate_proj,up_proj,down_proj are typically 'knowledge' and 'q_proj,k_proj,v_proj,o_proj 'behaviour and capabilities')", default="gate_proj,up_proj,down_proj")
 
     args = parser.parse_args()
 
