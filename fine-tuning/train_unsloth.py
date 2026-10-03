@@ -21,7 +21,7 @@ from trl import SFTTrainer, SFTConfig
 #    - Good Takes around 1:22 to complete in Ollama and 1:04 in PyTorch
 # unsloth/Qwen2.5-Coder-7B-Instruct-bnb-4bit better?
 
-def train_model(model_name, dataset_path, output_dir, split_and_evaluate):
+def train_model(model_name, target_modules, dataset_path, output_dir, split_and_evaluate):
 
     # Load the model
     model, tokenizer = FastLanguageModel.from_pretrained(
@@ -36,19 +36,7 @@ def train_model(model_name, dataset_path, output_dir, split_and_evaluate):
         r=16,
         lora_alpha=16,
         lora_dropout=0,
-        target_modules=[
-            # These modules are typically associated with "behaviours" or "capabilities"
-            # Include them if you want to train the model to act differently or learn some new mode
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            # These modules are typically associated with the "stored facts"
-            # Use these if you want it to train knowledge
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],
+        target_modules=target_modules,
         bias="none",
         use_gradient_checkpointing="unsloth",
         random_state=3407,
@@ -132,12 +120,17 @@ def main():
     parser.add_argument("--dataset", help=f"Dataset to use for fine-tuning of model", required=True)
     parser.add_argument("--output", help=f"Output directory for LoRA adapter", default="./lora-adapter")
     parser.add_argument("--split-and-evaluate", help=f"Split Dataset in Training and Evaluation and evaluate", action="store_true")
+    parser.add_argument("--target-modules", help="Comma-separated LoRA target modules (gate_proj,up_proj,down_proj are typically 'knowledge' and 'q_proj,k_proj,v_proj,o_proj behaviour and capabilities)", default="gate_proj,up_proj,down_proj")
 
     args = parser.parse_args()
 
-    print(f"Loading model: {args.model}")
+    target_modules = [module.strip() for module in args.target_modules.split(",") if module.strip()]
 
-    train_model(args.model, args.dataset, args.output, args.split_and_evaluate)
+
+    print(f"Loading model: {args.model}")
+    print(f"Target modules: {target_modules}")
+
+    train_model(args.model, args.target_modules, args.dataset, args.output, args.split_and_evaluate)
 
 if __name__ == "__main__":
     main()
