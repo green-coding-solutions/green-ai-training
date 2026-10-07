@@ -1,0 +1,48 @@
+---
+name: Container Image - Optimized Dockerfile
+author: arne@green-coding.io
+description: >
+  Builds the same app with Dockerfile.optimized: slim base, only runtime dependencies, dependency layer before the source, no pip cache.
+  The image build runs in the GMT [INSTALLATION] phase, so compare that phase for build energy
+  (run without --dev-cache-build). The runtime flow reports the container filesystem size and serves
+  2000 health requests as a control: the app itself is identical in both variants.
+
+custom_metrics:
+  http_requests:
+    unit: HTTP requests
+    sci: True
+  image_size_mb:
+    unit: MB container filesystem
+
+services:
+  gcb-container-image-app:
+    image: gcb_container_image_optimized
+    build:
+      context: ../../../test-cases/infra/container-image
+      dockerfile: ../../../benchmarks/infra/container-image/Dockerfile.optimized
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      start_period: 5s
+      start_interval: 1s
+
+  gcb-container-image-client:
+    image: python:3.13-slim
+    depends_on:
+      gcb-container-image-app:
+        condition: service_healthy
+
+flow:
+  - name: Report filesystem size
+    container: gcb-container-image-app
+    hidden: true
+    commands:
+      - type: console
+        command: echo $(date +%s%N) image_size_mb=$(du -sxm / 2>/dev/null | cut -f1)
+        shell: sh
+        note: du -x stays on the container root filesystem, the mounted repo is not counted
+
+  - name: Serve 2000 requests
+    container: gcb-container-image-client
+    commands:
+      - type: console
+        command: python -B /tmp/repo/benchmarks/infra/container-image/request-health.py --host gcb-container-image-app --requests 2000

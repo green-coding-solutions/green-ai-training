@@ -45,3 +45,7 @@ All scenarios emit work units through `custom_metrics` so a run can be normalize
 | `usage_scenario-pytorch-no-grad.yml` | PyTorch inference **with** `torch.no_grad()` (10k and 100k passes) | `inferences` |
 | `usage_scenario-quantize-numpy.yml` | 1-bit sigma-delta quantization — pure Python loop over NumPy array | `samples` |
 | `usage_scenario-quantize-numba.yml` | Same quantization loop compiled to native code with Numba `@njit` | `samples` |
+| `usage_scenario-efficient-algorithm-nested.yml` | Match 20k payments to 20k invoices with a nested loop (O(n·m)) | `payments_matched` |
+| `usage_scenario-efficient-algorithm-dict.yml` | Same matching with a set index built once (O(n + m)) | `payments_matched` |
+| `usage_scenario-builtin-functions-loops.yml` | Sum, max, frost check and per-station counts with hand-written loops and a full sort | `readings_processed` |
+| `usage_scenario-builtin-functions-builtins.yml` | Same with `sum()`, `max()`, `any()`, `Counter` and `most_common(1)` | `readings_processed` |
