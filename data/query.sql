@@ -45,6 +45,7 @@ LEFT JOIN phase_stats p ON p.run_id = tr.run_id
         (p.metric LIKE 'psu_energy_%' AND p.metric LIKE '%_machine')      -- Machine energy
         OR (p.metric LIKE 'cpu_energy_%' AND p.metric LIKE '%_component') -- CPU energy
         OR p.metric = 'phase_time_syscall_system'                        -- CPU duration
+        OR (p.metric LIKE 'custom_%' and p.metric not like '%_sci_global')
     )
 GROUP BY
     tr.software_id, tr.software_name,
@@ -52,5 +53,3 @@ GROUP BY
     tr.phase, tr.machine_id, tr.machine_name, tr.created_at,
     tr.run_id, tr.run_created_at, p.metric, p.unit, p.type
 ORDER BY tr.software_name, tr.task_id, p.metric;
-
-
