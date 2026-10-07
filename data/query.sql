@@ -29,16 +29,7 @@ WITH task_runs AS (
         ORDER BY r.created_at DESC
         LIMIT 1
     ) r ON TRUE
-    WHERE sw.name = ANY(ARRAY[
-        'Browser Animation Rendering Cost (CSS vs JS)',
-        'brotli',
-        'bzip2',
-        'gzip',
-        'zstd',
-        'Image Format Encoding Cost',
-        'Image Format Rendering Cost (Headful Browser)',
-        'Python'
-    ])
+    WHERE st.uri = 'https://github.com/green-coding-solutions/green-ai-training' OR (st.uri = 'https://github.com/green-coding-solutions/SEBOM' and st.filename LIKE 'compression/usage_scenario%' )
 )
 SELECT
     tr.software_id, tr.software_name,
