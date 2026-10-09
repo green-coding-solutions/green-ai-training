@@ -6,35 +6,33 @@ os.environ["UNSLOTH_DISABLE_UPDATE_CHECK"] = "1"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
 import argparse
-from unsloth import FastLanguageModel
+from unsloth import FastLanguageModel, is_bfloat16_supported
+from unsloth.chat_templates import train_on_responses_only
 import torch
 from datasets import load_dataset
 from trl import SFTTrainer, SFTConfig
 
-
-# unsloth/Qwen2.5-Coder-0.5B-Instruct any good?
-#    - Quick. Takes 0:16
-#    - But no optimization actually applied 😢
-# distilbert/distilbert-base-uncased can do more than 1/0 ?
-
-# unsloth/Qwen2.5-Coder-7B-Instruct better?
-#    - Good Takes around 1:22 to complete in Ollama and 1:04 in PyTorch
-# unsloth/Qwen2.5-Coder-7B-Instruct-bnb-4bit better?
-
-def train_model(model_name, target_modules, dataset_path, output_dir, split_and_evaluate):
+def train_model(model_name, target_modules, dataset_path, output_dir, split_and_evaluate,
+                eval_dataset_path=None, epochs=3, learning_rate=2e-4, rank=16, max_seq_length=2048, quantize_4bit=False):
 
     # Load the model
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_name,
-        max_seq_length=4096,
-        load_in_4bit=True,
+        max_seq_length=max_seq_length,
+
+        # Setting load_in_4bit = False and load_in_16bit=True can help with training speed if the model is not in 4bit.
+        # We have seen 15-25% improvement unsloth/Qwen2.5-Coder-7B-Instruct which has BF16 tensors
+        # => Always both parameter have to be set with each value inverse to the other!
+        # Using 4-bit might use less memory, but can degrade the model if not already in 4bit
+        load_in_4bit=bool(quantize_4bit),
+        load_in_16bit=not bool(quantize_4bit),
     )
 
     # Add LoRA adapters.
     model = FastLanguageModel.get_peft_model(
         model,
-        r=16,
-        lora_alpha=16,
+        r=rank,
+        lora_alpha=rank,
         lora_dropout=0,
         target_modules=target_modules,
         bias="none",
@@ -51,7 +49,10 @@ def train_model(model_name, target_modules, dataset_path, output_dir, split_and_
     train_dataset = dataset
     eval_dataset = None
 
-    if split_and_evaluate:
+    if eval_dataset_path:
+        # ../dataset/out/eval.jsonl is a fixed held-out split, no need to cut the train set
+        eval_dataset = load_dataset("json", data_files=eval_dataset_path, split="train")
+    elif split_and_evaluate:
         dataset = dataset.train_test_split(
             test_size=0.1,
             seed=3407,
@@ -60,7 +61,8 @@ def train_model(model_name, target_modules, dataset_path, output_dir, split_and_
         eval_dataset = dataset["test"]
 
     def format_example(example):
-        messages = [
+        # ../dataset/out/*.jsonl uses a "messages" list (multi-turn, optional system prompt)
+        messages = example.get("messages") or [
             {
                 "role": "user",
                 "content": example["prompt"],
@@ -88,24 +90,33 @@ def train_model(model_name, target_modules, dataset_path, output_dir, split_and_
         tokenizer=tokenizer,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        dataset_text_field="text",
-        max_seq_length=4096,
         args=SFTConfig(
             output_dir=output_dir,
+            dataset_text_field="text",
+            max_length=max_seq_length,
             per_device_train_batch_size=2,
             gradient_accumulation_steps=4,
-            num_train_epochs=10,
-            learning_rate=2e-4,
-            logging_steps=10,
-            save_steps=100,
-            fp16=True,
+            num_train_epochs=epochs,
+            learning_rate=learning_rate,
+            lr_scheduler_type="cosine",
+            warmup_steps=0.1,  # < 1 means fraction of total steps
+            weight_decay=0.01,
+            logging_steps=1,
+            save_strategy="epoch",
+            save_total_limit=2,
+            bf16=is_bfloat16_supported(),
+            fp16=not is_bfloat16_supported(),
             optim="adamw_8bit",
+            seed=3407,
             report_to="none",
-            # Validation loss - Works only if eval_dataset != None
-            eval_strategy="steps",
-            eval_steps=50,
+            # Small datasets have few steps per epoch, so evaluate once per epoch
+            eval_strategy="epoch" if eval_dataset is not None else "no",
         ),
     )
+
+    # Loss only on the assistant turns. Otherwise the model also learns to reproduce the user
+    # prompts and the system prompt. Instruction/response markers are detected from the chat template.
+    trainer = train_on_responses_only(trainer)
 
     trainer.train()
 
@@ -120,7 +131,13 @@ def main():
     parser.add_argument("--dataset", help=f"Dataset to use for fine-tuning of model", required=True)
     parser.add_argument("--output", help=f"Output directory for LoRA adapter", default="./lora-adapter")
     parser.add_argument("--split-and-evaluate", help=f"Split Dataset in Training and Evaluation and evaluate", action="store_true")
-    parser.add_argument("--target-modules", help="Comma-separated LoRA target modules (gate_proj,up_proj,down_proj are typically 'knowledge' and 'q_proj,k_proj,v_proj,o_proj 'behaviour and capabilities')", default="gate_proj,up_proj,down_proj")
+    parser.add_argument("--eval-dataset", help="Separate evaluation dataset (e.g. ../dataset/out/eval.jsonl), replaces --split-and-evaluate", default=None)
+    parser.add_argument("--epochs", help="Number of training epochs", type=float, default=3)
+    parser.add_argument("--learning-rate", help="Learning rate", type=float, default=2e-4)
+    parser.add_argument("--rank", help="LoRA rank (lora_alpha is set to the same value)", type=int, default=16)
+    parser.add_argument("--max-seq-length", help="Maximum tokens per conversation, longer ones are truncated", type=int, default=2048)
+    parser.add_argument("--target-modules", help="Comma-separated LoRA target modules (gate_proj,up_proj,down_proj are typically 'knowledge' and 'q_proj,k_proj,v_proj,o_proj 'behaviour and capabilities')", default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
+    parser.add_argument("--quantize-4bit", help="Force 4-bit quantization. Helpful if you have limited memory. Might reduce training speed and model accuracy in not already 4-bit models.")
 
     args = parser.parse_args()
 
@@ -130,7 +147,8 @@ def main():
     print(f"Loading model: {args.model}")
     print(f"Target modules: {target_modules}")
 
-    train_model(args.model, args.target_modules, args.dataset, args.output, args.split_and_evaluate)
+    train_model(args.model, target_modules, args.dataset, args.output, args.split_and_evaluate,
+                args.eval_dataset, args.epochs, args.learning_rate, args.rank, args.max_seq_length, args.quantize_4bit)
 
 if __name__ == "__main__":
     main()
