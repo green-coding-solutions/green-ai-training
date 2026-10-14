@@ -1,0 +1,51 @@
+id: gen-1-00386-generation
+category: generation
+language: java
+patterns:
+- set-membership
+messages:
+- role: user
+  content: |
+    java method to drop known flaky tests from the failed test list in our CI report. flaky.txt has ~15k names, one per line
+- role: assistant
+  content: |
+    ```java
+    import java.io.IOException;
+    import java.nio.file.Files;
+    import java.nio.file.Path;
+    import java.util.HashSet;
+    import java.util.List;
+    import java.util.Set;
+
+    public final class FlakyFilter {
+        private FlakyFilter() {}
+
+        /** Reads one test name per line. Blank lines and lines starting with # are ignored. */
+        public static Set<String> loadFlaky(Path file) throws IOException {
+            Set<String> flaky = new HashSet<>();
+            for (String line : Files.readAllLines(file)) {
+                String name = line.strip();
+                if (!name.isEmpty() && !name.startsWith("#")) {
+                    flaky.add(name);
+                }
+            }
+            return flaky;
+        }
+
+        /** Keeps the order of the report. Returns only failures that are not known flaky. */
+        public static List<String> realFailures(List<String> failed, Set<String> flaky) {
+            return failed.stream()
+                    .filter(test -> !flaky.contains(test))
+                    .toList();
+        }
+    }
+    ```
+
+    Load the set once per CI run and pass it in, for example `realFailures(failed, FlakyFilter.loadFlaky(Path.of("flaky.txt")))`.
+
+    **Green Notes**
+    - **`HashSet` for the flaky names** (reduces E): every failed test needs a membership check against ~15k names. A `List.contains` would scan the list each time. The set makes each check one hash lookup, so the work grows with the number of failures, not failures times list size.
+    - **Set built once, reused** (reduces E): the set is built in a single pass and passed in. Do not rebuild it per test or per report.
+    - *Not applied:* if the flaky list had only a few dozen names, or you checked only one test, a plain `List.contains` would be fine. Building the set costs a full pass over the list, which only pays off with repeated lookups.
+verify:
+  static_only: Java; needs a JDK (16+ for Stream.toList), not run in the Python/JS harness

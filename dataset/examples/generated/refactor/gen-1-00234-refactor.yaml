@@ -1,0 +1,150 @@
+id: gen-1-00234-refactor
+category: refactor
+language: python
+patterns:
+- select-columns
+- regex-precompile
+facts:
+- F-PG-SELECT
+- F-REGEX
+messages:
+- role: user
+  content: |
+    We run a small ticket triage service. Every few minutes a worker picks up new open support tickets and classifies them (billing / bug / other) with a scikit-learn pipeline. It's CPU-only and runs all day on one VM, so I'd like to cut the cost of the whole job. Requirements:
+
+    - the labels and the order of the results must stay exactly the same
+    - the model gets texts in batches, so keep that
+    - no new dependencies
+
+    ```python
+    import re
+    import sqlite3
+
+
+    def clean_text(text):
+        text = re.sub(r'<[^>]+>', ' ', text)
+        text = re.sub(r'https?://\S+', ' <url> ', text)
+        text = re.sub(r'\b[\w.+-]+@[\w-]+\.[\w.]+\b', ' <email> ', text)
+        text = re.sub(r'\d{4,}', ' <num> ', text)
+        text = re.sub(r'\s+', ' ', text)
+        return text.strip().lower()
+
+
+    def classify_new_tickets(conn, model, since_id, batch_size=64):
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM support_tickets WHERE id > ? AND status = 'open' ORDER BY id",
+            (since_id,),
+        ).fetchall()
+
+        results = []
+        for i in range(0, len(rows), batch_size):
+            batch = rows[i:i + batch_size]
+            texts = [clean_text(r["subject"] + " " + r["body"]) for r in batch]
+            labels = model.predict(texts)
+            for r, label in zip(batch, labels):
+                results.append({"id": r["id"], "label": label})
+        return results
+    ```
+
+    The support_tickets table has about 30 columns, including raw_html, attachments and an embedding blob.
+- role: assistant
+  content: |
+    ```python
+    import re
+
+    _TAG_RE = re.compile(r'<[^>]+>')
+    _URL_RE = re.compile(r'https?://\S+')
+    _EMAIL_RE = re.compile(r'\b[\w.+-]+@[\w-]+\.[\w.]+\b')
+    _LONG_NUM_RE = re.compile(r'\d{4,}')
+    _SPACE_RE = re.compile(r'\s+')
+
+
+    def clean_text(text):
+        text = _TAG_RE.sub(' ', text)
+        text = _URL_RE.sub(' <url> ', text)
+        text = _EMAIL_RE.sub(' <email> ', text)
+        text = _LONG_NUM_RE.sub(' <num> ', text)
+        text = _SPACE_RE.sub(' ', text)
+        return text.strip().lower()
+
+
+    def classify_new_tickets(conn, model, since_id, batch_size=64):
+        cur = conn.execute(
+            "SELECT id, subject, body FROM support_tickets "
+            "WHERE id > ? AND status = 'open' ORDER BY id",
+            (since_id,),
+        )
+
+        results = []
+        while True:
+            batch = cur.fetchmany(batch_size)
+            if not batch:
+                break
+            texts = [clean_text(subject + " " + body) for _, subject, body in batch]
+            labels = model.predict(texts)
+            results.extend(
+                {"id": row[0], "label": label} for row, label in zip(batch, labels)
+            )
+        return results
+    ```
+
+    **Green Notes**
+    - **Select only the needed columns** (reduces E, network): the model only reads `id`, `subject` and `body`, but `SELECT *` also pulled `raw_html`, `attachments` and the embedding blob for every ticket, then threw them away. In Green Metrics Tool PostgreSQL micro-benchmarks, reading 2,500 rows from a 52-column table with large text columns used about 7× less CPU energy when only 10 columns were named ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=b7203ffe-39ae-4e84-bf85-998c9389ea46,4702c2ee-13d5-4d70-bcfe-31e193104a8e)). Your table and database are different, so measure it, but the saving grows with the size of the columns you skip. This is the biggest change here.
+    - **Rows are fetched per batch** (reduces E, memory): `fetchmany(batch_size)` replaces `fetchall()`, so only one batch is held in memory. The batches, labels and result order are the same as before.
+    - **Regexes compiled once at module level** (reduces E): this is a small win. Python's `re` caches compiled patterns, so the old `re.sub` calls did not recompile every time. In Green Metrics Tool micro-benchmarks a precompiled pattern used about 18% less CPU energy than inline `re.match` over 1,000,000 matches ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=3827c15a-4295-44a4-8025-a07e8653ab7e,b7a9f0bd-c9e0-4b95-9bda-e8a96f38020c,f3e0434d-744b-41a0-a0cc-9bf00d80500d)). It is still a cheap change in code that cleans every ticket.
+    - **No more `conn.row_factory` change:** the old code switched the caller's connection to `sqlite3.Row` as a side effect. Rows are now plain tuples, so the connection is left as it was.
+
+    *Not applied:* caching `clean_text` results. Tickets are mostly unique texts, so a cache would add memory and overhead without many hits.
+verify:
+  equivalence:
+    driver: |-
+      import random
+      import sqlite3
+
+      random.seed(3)
+      conn = sqlite3.connect(":memory:")
+      conn.execute(
+          "CREATE TABLE support_tickets ("
+          "id INTEGER PRIMARY KEY, customer_id INTEGER, subject TEXT, body TEXT, "
+          "raw_html TEXT, attachments BLOB, embedding BLOB, status TEXT, created_at TEXT)"
+      )
+      words = ["refund", "invoice", "crash", "error", "login", "thanks", "order", "card"]
+      extras = [
+          "<p>see https://example.com/a?b=1</p>",
+          "mail me at jane.doe@mail.example.org",
+          "ref 123456789",
+          "   spaced    out   ",
+          "",
+      ]
+      for i in range(1, 301):
+          subject = " ".join(random.choice(words) for _ in range(3)).title()
+          body = " ".join(
+              random.choice(words + extras) for _ in range(random.randint(3, 12))
+          )
+          status = "open" if i % 3 else "closed"
+          conn.execute(
+              "INSERT INTO support_tickets VALUES (?,?,?,?,?,?,?,?,?)",
+              (i, i % 17, subject, body, "<html>" + body + "</html>",
+               b"x" * 50, b"y" * 50, status, "2026-10-01"),
+          )
+
+
+      class FakeModel:
+          def predict(self, texts):
+              out = []
+              for t in texts:
+                  if "refund" in t or "invoice" in t:
+                      out.append("billing")
+                  elif "crash" in t or "error" in t:
+                      out.append("bug")
+                  else:
+                      out.append("other")
+              return out
+
+
+      res = classify_new_tickets(conn, FakeModel(), 20, batch_size=7)
+      print(len(res))
+      print(res[:10])
+      print(res[-5:])
+      print(clean_text("<b>Hi</b> visit https://x.io/p now, mail a.b@c.de or call 0123456   please"))

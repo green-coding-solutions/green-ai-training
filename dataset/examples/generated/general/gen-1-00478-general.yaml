@@ -1,0 +1,70 @@
+id: gen-1-00478-general
+category: general
+language: sql
+patterns:
+- none
+messages:
+- role: user
+  content: |
+    I log predictions from our classifier in a table and I want one query that compares model versions. Tables:
+
+    ```sql
+    CREATE TABLE predictions (
+      id INTEGER PRIMARY KEY,
+      model_version TEXT NOT NULL,
+      item_id INTEGER NOT NULL,
+      predicted_label TEXT,
+      confidence REAL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE labels (
+      item_id INTEGER PRIMARY KEY,
+      true_label TEXT NOT NULL
+    );
+    ```
+
+    Requirements:
+    - one row per model_version
+    - an item can be predicted several times by the same version (retries), so only the latest prediction per item and version should count
+    - only items that have a human label
+    - columns: number of scored items, number correct, accuracy, and the average confidence of the wrong predictions
+    - best accuracy first
+
+    I need it to run on SQLite for local tests, and later on Postgres.
+- role: assistant
+  content: |-
+    Use a window function to pick the latest prediction per version and item, then join the labels and aggregate:
+
+    ```sql
+    WITH latest AS (
+      SELECT
+        p.*,
+        ROW_NUMBER() OVER (
+          PARTITION BY p.model_version, p.item_id
+          ORDER BY p.created_at DESC, p.id DESC
+        ) AS rn
+      FROM predictions p
+    )
+    SELECT
+      l.model_version,
+      COUNT(*) AS n_scored,
+      SUM(CASE WHEN l.predicted_label = t.true_label THEN 1 ELSE 0 END) AS n_correct,
+      ROUND(1.0 * SUM(CASE WHEN l.predicted_label = t.true_label THEN 1 ELSE 0 END) / COUNT(*), 4) AS accuracy,
+      AVG(CASE WHEN l.predicted_label <> t.true_label THEN l.confidence END) AS avg_conf_wrong
+    FROM latest l
+    JOIN labels t ON t.item_id = l.item_id
+    WHERE l.rn = 1
+    GROUP BY l.model_version
+    ORDER BY accuracy DESC, l.model_version;
+    ```
+
+    How it works:
+
+    - `ROW_NUMBER()` with `ORDER BY created_at DESC, id DESC` keeps exactly one row per version and item. The `id` tie-breaker makes the result stable if two retries share a timestamp.
+    - The inner join drops items without a human label, as you asked.
+    - `1.0 * ...` forces decimal division. Without it, SQLite and Postgres both do integer division and give 0 or 1.
+    - `AVG` ignores NULLs, so the `CASE` without `ELSE` averages only the wrong predictions. It returns NULL for a version with no wrong predictions.
+    - A NULL `predicted_label` counts in `n_scored`, but it is never "correct" and never "wrong". The comparison is NULL in both cases. If you want NULL predictions to count as wrong, use `l.predicted_label IS NOT t.true_label` in SQLite, or `IS DISTINCT FROM` in Postgres.
+
+    The query runs unchanged on both databases. Keep `created_at` as an ISO 8601 string or a real timestamp so the ordering is correct. Versions with few scored items can show a very high or low accuracy, so check `n_scored` before comparing them.

@@ -1,0 +1,85 @@
+id: gen-1-00005-refactor
+category: refactor
+language: java
+patterns:
+- string-join
+messages:
+- role: user
+  content: |
+    diff only please. CLI that lists files under a dir, gets slow on big trees (few hundred k files).
+
+    ```java
+    import java.io.IOException;
+    import java.nio.file.*;
+    import java.nio.file.attribute.BasicFileAttributes;
+    import java.util.*;
+
+    public class DiskReport {
+        private static final String SEP = " | ";
+
+        record FileInfo(String path, long size, String modified) {}
+
+        public static void main(String[] args) throws IOException {
+            Path root = Paths.get(args.length > 0 ? args[0] : ".");
+            boolean lng = args.length > 1 && args[1].equals("--long");
+            List<FileInfo> files = scan(root);
+            files.sort(Comparator.comparingLong(FileInfo::size).reversed());
+            System.out.print(render(files, lng));
+        }
+
+        static List<FileInfo> scan(Path root) throws IOException {
+            List<FileInfo> result = new ArrayList<>();
+            Files.walkFileTree(root, new SimpleFileVisitor<Path>() {
+                @Override
+                public FileVisitResult visitFile(Path p, BasicFileAttributes a) {
+                    result.add(new FileInfo(p.toString(), a.size(), a.lastModifiedTime().toString()));
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+            return result;
+        }
+
+        static String render(List<FileInfo> files, boolean lng) {
+            String out = "";
+            out += "path" + SEP + "bytes" + (lng ? SEP + "modified" : "") + "\n";
+            for (FileInfo f : files) {
+                out += f.path();
+                out += SEP;
+                out += f.size();
+                if (lng) {
+                    out += SEP + f.modified();
+                }
+                out += "\n";
+            }
+            out += "total: " + files.size() + " files\n";
+            return out;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    Only `render` changes:
+
+    ```java
+    static String render(List<FileInfo> files, boolean lng) {
+        StringBuilder out = new StringBuilder(files.size() * 64 + 64);
+        out.append("path").append(SEP).append("bytes");
+        if (lng) out.append(SEP).append("modified");
+        out.append('\n');
+        for (FileInfo f : files) {
+            out.append(f.path()).append(SEP).append(f.size());
+            if (lng) out.append(SEP).append(f.modified());
+            out.append('\n');
+        }
+        out.append("total: ").append(files.size()).append(" files\n");
+        return out.toString();
+    }
+    ```
+
+    **Green Notes**
+    - **`StringBuilder` instead of `+=` in a loop** (reduces E): `String` is immutable, so each `out += ...` copies the whole string built so far. With n files that is O(n²) bytes copied and a lot of short-lived garbage. The builder appends in amortized O(1), so total work is O(n).
+    - **Pre-sized buffer**: the capacity is a rough guess (about 64 chars per line). It only avoids a few regrows, and a wrong guess costs nothing in correctness.
+    - **Same output**: the header, the rows, the optional `modified` column and the trailing `total:` line are byte-for-byte as before. Only `render` changed. `main` and `scan` stay as they are.
+    - *Not applied:* streaming straight to `System.out` or a `BufferedWriter`. It would avoid holding the whole report in memory, but it changes `render`'s signature and callers. It is worth it only if the report gets very large.
+verify:
+  static_only: Java is not in the python/javascript runner; the change is a mechanical StringBuilder rewrite of one method

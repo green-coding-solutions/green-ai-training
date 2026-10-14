@@ -1,0 +1,56 @@
+id: gen-1-00405-generation
+category: generation
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    hello, I need python function for our shop. we have small pytorch model who say if a product review is spam, the class is ReviewNet in reviewnet.py and weigths are in reviews.pt (state_dict). we also have tokenizer.py with encode(text) that give back list of ints. max length is 128 and pad id is 0. model output is one logit for every review.
+
+    I want function spam_scores(reviews) who take list of strings and give back list of floats between 0 and 1, same order. we run it on CPU when new reviews come in, sometimes few hundreds at once. thank you!
+- role: assistant
+  content: |-
+    This loads the model once, runs it in batches and keeps autograd off:
+
+    ```python
+    import torch
+
+    from reviewnet import ReviewNet
+    from tokenizer import encode
+
+    MAX_LEN = 128
+    PAD_ID = 0
+
+    _model = ReviewNet()
+    _model.load_state_dict(torch.load("reviews.pt", map_location="cpu", weights_only=True))
+    _model.eval()
+
+
+    def _pad(batch_ids):
+        out = torch.full((len(batch_ids), MAX_LEN), PAD_ID, dtype=torch.long)
+        for i, ids in enumerate(batch_ids):
+            ids = ids[:MAX_LEN]
+            out[i, : len(ids)] = torch.tensor(ids, dtype=torch.long)
+        return out
+
+
+    def spam_scores(reviews, batch_size=64):
+        scores = []
+        with torch.inference_mode():
+            for start in range(0, len(reviews), batch_size):
+                chunk = reviews[start : start + batch_size]
+                x = _pad([encode(text) for text in chunk])
+                logits = _model(x)  # shape (batch, 1)
+                scores.extend(torch.sigmoid(logits).squeeze(-1).tolist())
+        return scores
+    ```
+
+    I assumed the model returns logits with shape `(batch, 1)`. If it already applies a sigmoid, remove `torch.sigmoid`.
+
+    **Green Notes**
+    - **`torch.inference_mode()` for prediction** (reduces E): no autograd graph is built, so no intermediate values are stored for a backward pass that never happens. In Green Metrics Tool micro-benchmarks, 100,000 PyTorch CPU inferences used about 14% less CPU energy with `torch.no_grad()` than without ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=42de8e68-4536-43f4-a9bd-427ec42affd1,7e6a3886-425a-4992-9f14-180bede2d841)). `inference_mode` is the stricter version of it, and the saving comes from the same source.
+    - **`_model.eval()`** is needed for correct scores, not for energy. It switches off dropout and uses the stored batch-norm statistics.
+    - **Model loaded once at import time, reviews run in batches of 64** (reduces E): the weights are not reloaded per call, and one forward pass serves many reviews. This fits here because the reviews arrive as a list and nobody waits for a single answer. For one review at a time, use `batch_size=1`.

@@ -1,0 +1,170 @@
+id: gen-1-00086-generation
+category: generation
+language: typescript
+patterns:
+- dom-size
+messages:
+- role: user
+  content: |
+    I'm building a small results viewer for our molecular dynamics runs. Each run writes a trajectory summary with about 250,000 rows. Every row has `step`, `time_ps`, `temperature_k`, `pressure_bar` and `potential_kj`. We load the whole thing in the browser as an array of objects, and people need to scroll through it and jump to a given step.
+
+    Requirements:
+    - TypeScript, no framework, no dependencies
+    - Column headers always visible
+    - A `scrollToRow(index)` method so the "go to step" input can jump
+    - Numbers shown with a fixed number of decimals per column
+    - Should work in current Chrome and Firefox
+
+    Can you write the table component?
+- role: assistant
+  content: |
+    The table only puts the rows that are visible (plus a few extra) into the DOM. A spacer element gives the scrollbar the full height. All rows have the same height, so the visible range is a simple division.
+
+    ```ts
+    export interface Column<T> {
+      key: keyof T & string;
+      label: string;
+      width: number; // px
+      format?: (value: T[keyof T]) => string;
+    }
+
+    export class VirtualTable<T> {
+      private readonly viewport = document.createElement("div");
+      private readonly spacer = document.createElement("div");
+      private readonly body = document.createElement("div");
+      private first = -1;
+      private last = -1;
+      private frame = 0;
+      private readonly resizeObserver: ResizeObserver;
+
+      constructor(
+        host: HTMLElement,
+        private readonly columns: readonly Column<T>[],
+        private readonly rows: readonly T[],
+        private readonly rowHeight = 28,
+        private readonly overscan = 8,
+      ) {
+        const totalWidth = columns.reduce((sum, c) => sum + c.width, 0);
+
+        const header = document.createElement("div");
+        header.setAttribute("role", "row");
+        header.style.cssText = `display:flex;width:${totalWidth}px;height:${rowHeight}px;font-weight:600`;
+        for (const col of columns) header.append(this.makeCell(col.label, col.width));
+
+        this.viewport.style.cssText = "position:relative;overflow:auto;height:100%";
+        this.spacer.style.cssText = `height:${rows.length * rowHeight}px;width:${totalWidth}px`;
+        this.body.style.cssText = `position:absolute;top:0;left:0;width:${totalWidth}px;will-change:transform`;
+        this.viewport.append(this.spacer, this.body);
+
+        const table = document.createElement("div");
+        table.setAttribute("role", "table");
+        table.setAttribute("aria-rowcount", String(rows.length));
+        table.style.cssText = "display:flex;flex-direction:column;height:100%";
+        table.append(header, this.viewport);
+        host.replaceChildren(table);
+
+        // Batch scroll events into one render per frame.
+        this.viewport.addEventListener("scroll", () => this.schedule(), { passive: true });
+        this.resizeObserver = new ResizeObserver(() => this.schedule());
+        this.resizeObserver.observe(this.viewport);
+        this.render();
+      }
+
+      scrollToRow(index: number): void {
+        const i = Math.min(Math.max(index, 0), this.rows.length - 1);
+        this.viewport.scrollTop = i * this.rowHeight;
+      }
+
+      destroy(): void {
+        cancelAnimationFrame(this.frame);
+        this.resizeObserver.disconnect();
+      }
+
+      private schedule(): void {
+        if (this.frame) return;
+        this.frame = requestAnimationFrame(() => {
+          this.frame = 0;
+          this.render();
+        });
+      }
+
+      private render(): void {
+        const { scrollTop, clientHeight } = this.viewport;
+        const first = Math.max(0, Math.floor(scrollTop / this.rowHeight) - this.overscan);
+        const last = Math.min(
+          this.rows.length,
+          Math.ceil((scrollTop + clientHeight) / this.rowHeight) + this.overscan,
+        );
+        if (first === this.first && last === this.last) return;
+        this.first = first;
+        this.last = last;
+
+        const fragment = document.createDocumentFragment();
+        for (let i = first; i < last; i++) {
+          const row = document.createElement("div");
+          row.setAttribute("role", "row");
+          row.setAttribute("aria-rowindex", String(i + 1));
+          row.style.cssText = `display:flex;height:${this.rowHeight}px`;
+          const data = this.rows[i];
+          for (const col of this.columns) {
+            const value = data[col.key];
+            row.append(this.makeCell(col.format ? col.format(value) : String(value), col.width));
+          }
+          fragment.append(row);
+        }
+        this.body.style.transform = `translateY(${first * this.rowHeight}px)`;
+        this.body.replaceChildren(fragment);
+      }
+
+      private makeCell(text: string, width: number): HTMLDivElement {
+        const cell = document.createElement("div");
+        cell.setAttribute("role", "cell");
+        cell.style.cssText = `width:${width}px;flex:none;padding:0 8px;box-sizing:border-box;line-height:${this.rowHeight}px;text-align:right;white-space:nowrap`;
+        cell.textContent = text;
+        return cell;
+      }
+    }
+    ```
+
+    Usage:
+
+    ```ts
+    interface Sample {
+      step: number;
+      time_ps: number;
+      temperature_k: number;
+      pressure_bar: number;
+      potential_kj: number;
+    }
+
+    const fixed = (digits: number) => (v: unknown) => (v as number).toFixed(digits);
+
+    const table = new VirtualTable<Sample>(
+      document.getElementById("results")!, // needs a fixed height, e.g. height: 70vh
+      [
+        { key: "step", label: "Step", width: 100 },
+        { key: "time_ps", label: "Time (ps)", width: 120, format: fixed(3) },
+        { key: "temperature_k", label: "T (K)", width: 110, format: fixed(2) },
+        { key: "pressure_bar", label: "P (bar)", width: 120, format: fixed(1) },
+        { key: "potential_kj", label: "Epot (kJ/mol)", width: 150, format: fixed(2) },
+      ],
+      samples,
+    );
+
+    document.getElementById("goto")!.addEventListener("change", (e) => {
+      const step = Number((e.target as HTMLInputElement).value);
+      table.scrollToRow(samples.findIndex((s) => s.step >= step));
+    });
+    ```
+
+    Two things to know:
+    - The container needs a fixed height, otherwise the viewport has nothing to scroll in.
+    - Ctrl+F only finds rows that are currently in the DOM. If people need to search, add a search box that filters `rows` or calls `scrollToRow`.
+
+    **Green Notes**
+    - **Avoid excessive DOM size** (reduces client E): the page keeps a few dozen rows in the DOM instead of 250,000 × 5 cells. Load time, memory, style recalculation and layout all stay roughly constant, no matter how long the run is.
+      https://patterns.greensoftware.foundation/development/web-performance/avoid-excessive-dom-size
+    - **One render per animation frame, passive scroll listener** (reduces client E): fast scrolling does not rebuild rows more often than the screen can show them.
+    - *Not applied:* pagination. It would also cut the DOM, but you asked for continuous scrolling and jump-to-step. For tables under a few hundred rows, plain `<table>` markup is simpler and enough.
+verify:
+  static_only: needs a browser DOM and the TypeScript compiler

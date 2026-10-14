@@ -1,0 +1,80 @@
+id: gen-1-00324-generation
+category: generation
+language: python
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    Need two functions for our remote solver workers: `send_field(wfile, arr)` and `recv_field(rfile)`. They move a 2D/3D float32/float64 numpy field (temperature grids, ~200 MB, smooth with big zero regions) from the worker to the aggregator over a TCP socket file object (`sock.makefile('wb')` / `'rb'`). The link is the site-to-site VPN, about 50 Mbit. One field per call, dtype and shape must survive the round trip. Just the code, no walkthrough.
+- role: assistant
+  content: |
+    ```python
+    import json
+    import struct
+    import zlib
+
+    import numpy as np
+
+
+    def _read_exact(f, n):
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = f.read(n - len(buf))
+            if not chunk:
+                raise EOFError("stream closed mid-frame")
+            buf += chunk
+        return bytes(buf)
+
+
+    def send_field(wfile, arr, level=1):
+        arr = np.ascontiguousarray(arr)
+        # Byte shuffle: group byte 0 of every value, then byte 1, ...
+        # Smooth floats then have long runs of similar bytes and deflate fast.
+        shuffled = arr.reshape(-1).view(np.uint8).reshape(-1, arr.itemsize).T
+        payload = zlib.compress(shuffled.tobytes(), level)
+        header = json.dumps({"dtype": arr.dtype.str, "shape": arr.shape}).encode()
+        wfile.write(struct.pack("!IQ", len(header), len(payload)))
+        wfile.write(header)
+        wfile.write(payload)
+        wfile.flush()
+
+
+    def recv_field(rfile):
+        hlen, plen = struct.unpack("!IQ", _read_exact(rfile, 12))
+        header = json.loads(_read_exact(rfile, hlen))
+        raw = zlib.decompress(_read_exact(rfile, plen))
+        dtype = np.dtype(header["dtype"])
+        shape = tuple(header["shape"])
+        n = int(np.prod(shape))
+        shuffled = np.frombuffer(raw, dtype=np.uint8).reshape(dtype.itemsize, n)
+        return np.ascontiguousarray(shuffled.T).reshape(-1).view(dtype).reshape(shape)
+    ```
+
+    **Green Notes**
+    - **Compress transmitted data** (reduces network): the field crosses a slow WAN link, so fewer bytes on the wire is the main saving. The zero regions and smooth areas compress well, especially after the byte shuffle.
+      https://patterns.greensoftware.foundation/development/data-handling/compress-transmitted-data
+    - **Fast codec, level 1** (reduces E): this data is compressed on every call, so compression CPU adds up. In Green Metrics Tool micro-benchmarks on a text corpus, zstd at its default level used about 4× less energy than gzip at its default level ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=2584305c-7a1e-47e2-b6cc-26276962035e,addc5f5e-55da-47f8-956d-240d06304e4e,fb08d3c3-ba41-4f0f-85fd-0b6c34e6c39b,f1479db0-c453-4aaa-9116-e137621fad07,7b3bb87d-3b43-4f82-be99-0327405205b8,905bd408-6b31-4237-a4da-14b8fad90613,7f213a20-8028-4080-9583-6e465c217bb5,8e93a8d2-60b0-4831-905b-764b68257bc7)). If the `zstandard` package is available, it is a good drop-in. That figure is for text, so measure on your own fields.
+    - *Not applied:* compression on a fast local link, or for noisy data such as raw random fields. There it only burns CPU. Pass the data through uncompressed in that case.
+verify:
+  test: |-
+    import io
+    rng = np.random.default_rng(0)
+    smooth = np.zeros((64, 64, 8), dtype=np.float32)
+    smooth[16:48, 16:48, :] = np.linspace(0, 1, 32, dtype=np.float32)[None, :, None]
+    for a in (smooth,
+              rng.standard_normal((30, 40)).astype(np.float64),
+              np.asfortranarray(rng.standard_normal((5, 7)).astype(np.float32)),
+              np.arange(12, dtype=">f8").reshape(3, 4)):
+        buf = io.BytesIO()
+        send_field(buf, a)
+        buf.seek(0)
+        out = recv_field(buf)
+        assert out.shape == a.shape
+        assert out.dtype == a.dtype
+        assert np.array_equal(out, a)
+    buf = io.BytesIO()
+    send_field(buf, smooth)
+    assert len(buf.getvalue()) < smooth.nbytes // 4

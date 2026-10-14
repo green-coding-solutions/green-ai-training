@@ -1,0 +1,73 @@
+id: gen-1-00002-review
+category: review
+language: bash
+patterns:
+- bash-builtins
+messages:
+- role: user
+  content: |
+    review? 40k runs per parameter sweep
+
+    ```bash
+    #!/bin/bash
+    # summarize simulation runs
+    OUT=summary.tsv
+    : > $OUT
+
+    for f in $(ls results/run_*.csv); do
+      id=$(basename $f .csv | sed 's/run_//')
+      n=$(wc -l < $f)
+      last=$(tail -n 1 $f | cut -d, -f3)
+      steps=$(expr $n - 1)
+      if [ $(echo "$last < 0.001" | bc -l) -eq 1 ]; then
+        status=converged
+      else
+        status=running
+      fi
+      echo -e "$id\t$steps\t$last\t$status" >> $OUT
+    done
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (scientific post-processing, loops over every run file)
+
+    #### [Bug] `for f in $(ls ...)` and unquoted variables
+    - **Where:** the `for` line and every `$f`, `$OUT`
+    - **Issue:** word splitting breaks on file names with spaces. If no file matches, `ls` fails and the loop gets a literal error string.
+    - **Fix:** use a glob, skip the no-match case, and quote the variables.
+
+    #### [High] About eight forked processes per file
+    - **Where:** loop body (`basename`, `sed`, `wc`, `tail`, `cut`, `expr`, `echo | bc`, plus `ls` once)
+    - **Issue:** each `$(...)` forks a subshell, and most of them start an external program. At 40k files that is hundreds of thousands of process starts. The actual work is trivial.
+    - **Fix:**
+      - File id: parameter expansion (`${f##*/run_}`, `${id%.csv}`) replaces `basename` and `sed`.
+      - Step count: `expr` is not needed once awk counts the lines.
+      - Float compare: one `awk` call replaces `wc`, `tail`, `cut`, `echo` and `bc`. Bash has no float arithmetic, so one small external call is the right tool here.
+    - **Impact:** reduces E per file from many process starts to one. The saving grows with the number of runs.
+
+    #### [Low] `echo -e` and appending to the file on every iteration
+    - **Where:** last line of the loop
+    - **Issue:** `echo -e` is not portable. `>> $OUT` reopens the file for every row.
+    - **Fix:** `printf` and a single redirect on the loop.
+
+    ```bash
+    #!/bin/bash
+    # summarize simulation runs
+    OUT=summary.tsv
+
+    for f in results/run_*.csv; do
+      [ -e "$f" ] || continue
+      id=${f##*/run_}
+      id=${id%.csv}
+      read -r steps last status <<< "$(awk -F, 'END { printf "%d %s %s", NR - 1, $3, ($3 < 0.001 ? "converged" : "running") }' "$f")"
+      printf '%s\t%s\t%s\t%s\n' "$id" "$steps" "$last" "$status"
+    done > "$OUT"
+    ```
+
+    Differences to know:
+    - `awk` counts records, `wc -l` counts newlines. They differ only if a file lacks a trailing newline.
+    - Files are processed in glob order, which is the same sorted order `ls` gave.
+
+    **Already good:** the output is built in one pass and the convergence check is simple.
+verify:
+  static_only: bash script that needs a results directory with csv files; no bash equivalence driver

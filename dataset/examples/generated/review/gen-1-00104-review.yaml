@@ -1,0 +1,125 @@
+id: gen-1-00104-review
+category: review
+language: python
+patterns:
+- compress-stored
+- context-tradeoff
+messages:
+- role: user
+  content: |
+    Hi, I'm new to this. I wrote the storage part of our image classifier service. I added compression everywhere because I thought it saves disk and is better. It works but something feels off, can you look?
+
+    ```python
+    import gzip
+    import json
+    import os
+
+    import numpy as np
+
+    SCRATCH = "/tmp/infer_scratch"
+    ARCHIVE = "/data/archive"
+
+
+    def save_batch_logits(batch_id, logits):
+        # the postprocess worker picks this up a few seconds later
+        os.makedirs(SCRATCH, exist_ok=True)
+        path = os.path.join(SCRATCH, f"{batch_id}.npz")
+        np.savez_compressed(path, logits=logits)
+        return path
+
+
+    def load_batch_logits(path):
+        with np.load(path) as f:
+            return f["logits"]
+
+
+    def archive_request(req_id, image_bytes, prediction):
+        # image_bytes is the JPEG the user uploaded
+        os.makedirs(ARCHIVE, exist_ok=True)
+        with gzip.open(os.path.join(ARCHIVE, f"{req_id}.jpg.gz"), "wb", compresslevel=9) as f:
+            f.write(image_bytes)
+        with gzip.open(os.path.join(ARCHIVE, f"{req_id}.json.gz"), "wt", compresslevel=9) as f:
+            json.dump(prediction, f)
+    ```
+- role: assistant
+  content: |
+    **Workload:** machine learning inference (web service, per-request and per-batch storage)
+
+    #### [Bug] Scratch files are never deleted
+    - **Where:** `load_batch_logits`
+    - **Issue:** every batch leaves a file in `/tmp/infer_scratch`. The disk fills up over time.
+    - **Fix:** remove the file once the postprocess worker has read it.
+    - **Impact:** avoids unbounded storage growth.
+
+    #### [High] Compressing data that lives only a few seconds
+    - **Where:** `np.savez_compressed` in `save_batch_logits`
+    - **Issue:** the logits are read again seconds later and then thrown away. Compression and decompression cost CPU on every batch and save nothing worth keeping.
+    - **Fix:** use plain `np.save`.
+    - **Impact:** reduces E on every batch. Compression only pays off when data is stored for a long time.
+
+    #### [Medium] gzip on a JPEG
+    - **Where:** `{req_id}.jpg.gz`
+    - **Issue:** JPEG is already compressed, so gzip finds almost nothing to remove. You pay the compression CPU on every request and the file stays about the same size. Level 9 is the most expensive setting.
+    - **Fix:** write the bytes as they are.
+    - **Impact:** reduces E per request, no change in disk use.
+
+    #### [Low] Level 9 on a tiny JSON file
+    - **Where:** `{req_id}.json.gz`
+    - **Issue:** one prediction is probably a few hundred bytes. Gzip header overhead eats much of the gain, and level 9 costs more CPU than a moderate level for very little extra size reduction.
+    - **Fix:** write plain JSON. If you keep predictions for months, collect them into one daily JSONL file and compress that once with a moderate level (3 to 6).
+    - **Impact:** small per request, but it adds up on a busy endpoint.
+
+    ```python
+    import gzip
+    import json
+    import os
+
+    import numpy as np
+
+    SCRATCH = "/tmp/infer_scratch"
+    ARCHIVE = "/data/archive"
+
+
+    def save_batch_logits(batch_id, logits):
+        # the postprocess worker picks this up a few seconds later
+        os.makedirs(SCRATCH, exist_ok=True)
+        path = os.path.join(SCRATCH, f"{batch_id}.npy")
+        np.save(path, logits)
+        return path
+
+
+    def load_batch_logits(path):
+        logits = np.load(path)
+        os.remove(path)  # scratch file is single-use
+        return logits
+
+
+    def archive_request(req_id, image_bytes, prediction):
+        # image_bytes is the JPEG the user uploaded, already compressed
+        os.makedirs(ARCHIVE, exist_ok=True)
+        with open(os.path.join(ARCHIVE, f"{req_id}.jpg"), "wb") as f:
+            f.write(image_bytes)
+        with open(os.path.join(ARCHIVE, f"{req_id}.json"), "w") as f:
+            json.dump(prediction, f)
+    ```
+
+    Behavior change: `load_batch_logits` now deletes the file, so it can be called only once per path. File names change from `.npz`, `.jpg.gz` and `.json.gz` to `.npy`, `.jpg` and `.json`, so check that nothing else reads the old names.
+
+    **Already good:** `os.makedirs(..., exist_ok=True)` is safe to call repeatedly, and keeping the uploaded image next to its prediction makes later debugging easy.
+verify:
+  test: |-
+    import tempfile
+    _d = tempfile.mkdtemp()
+    SCRATCH = os.path.join(_d, "scratch")
+    ARCHIVE = os.path.join(_d, "archive")
+    _logits = np.arange(12, dtype=np.float32).reshape(3, 4)
+    _p = save_batch_logits("b1", _logits)
+    assert os.path.exists(_p)
+    _out = load_batch_logits(_p)
+    assert np.array_equal(_out, _logits)
+    assert not os.path.exists(_p)
+    archive_request("r1", b"\xff\xd8\xff\xe0jpegdata", {"label": "cat", "score": 0.93})
+    with open(os.path.join(ARCHIVE, "r1.jpg"), "rb") as _f:
+        assert _f.read() == b"\xff\xd8\xff\xe0jpegdata"
+    with open(os.path.join(ARCHIVE, "r1.json")) as _f:
+        assert json.load(_f) == {"label": "cat", "score": 0.93}

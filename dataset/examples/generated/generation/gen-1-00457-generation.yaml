@@ -1,0 +1,52 @@
+id: gen-1-00457-generation
+category: generation
+language: javascript
+patterns:
+- simple-conditions
+facts:
+- F-COND
+messages:
+- role: user
+  content: |
+    Node gateway, BLE sensor frames arrive as Buffers, byte 0 is the type:
+    0x01 temperature (int16 BE at offset 1, 0.01 °C), 0x02 humidity (uint16 BE at offset 1, 0.01 %), 0x03 battery (uint8 %), 0x10 heartbeat (no payload), 0x7f error (uint8 code).
+    Need `decodeFrame(buf)` -> `{ kind, value }`, or `null` for unknown or truncated frames. It runs for every frame on the radio, so keep it lean. Just the code, no walkthrough.
+- role: assistant
+  content: |
+    ```javascript
+    // type byte -> [minimum frame length, decoder]
+    const DECODERS = new Map([
+      [0x01, [3, (b) => ({ kind: 'temperature', value: b.readInt16BE(1) / 100 })]],
+      [0x02, [3, (b) => ({ kind: 'humidity', value: b.readUInt16BE(1) / 100 })]],
+      [0x03, [2, (b) => ({ kind: 'battery', value: b.readUInt8(1) })]],
+      [0x10, [1, () => ({ kind: 'heartbeat', value: null })]],
+      [0x7f, [2, (b) => ({ kind: 'error', value: b.readUInt8(1) })]],
+    ]);
+
+    function decodeFrame(buf) {
+      if (buf.length === 0) return null;
+      const entry = DECODERS.get(buf[0]);
+      if (entry === undefined || buf.length < entry[0]) return null;
+      return entry[1](buf);
+    }
+
+    module.exports = { decodeFrame };
+    ```
+
+    **Green Notes**
+    - **Table dispatch on the type byte** (reduces E): one `Map` lookup with a plain equality key replaces a chain of `if`/`switch` tests and range checks, so every frame costs the same. In Green Metrics Tool micro-benchmarks (Python, 10,000,000 classifications), simple equality branches used about 16% less CPU energy than complex range/modulo conditions ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=123676d7-2121-4b9d-b78e-e065836fc608,a7780e2a-2934-4d26-b2a9-2cda7848adc1)). That was Python, so treat it as a direction, not a Node figure.
+    - **Length check before the read** (correctness): truncated frames return `null` instead of throwing a `RangeError` in the hot path.
+    - *Not applied:* no `switch` rewrite and no extra layers. With five types the table is already as simple as it gets.
+verify:
+  green_block: 0
+  test: |-
+    const assert = require('assert');
+    assert.deepStrictEqual(decodeFrame(Buffer.from([0x01, 0x09, 0xc4])), { kind: 'temperature', value: 25 });
+    assert.deepStrictEqual(decodeFrame(Buffer.from([0x01, 0xff, 0x9c])), { kind: 'temperature', value: -1 });
+    assert.deepStrictEqual(decodeFrame(Buffer.from([0x02, 0x13, 0x88])), { kind: 'humidity', value: 50 });
+    assert.deepStrictEqual(decodeFrame(Buffer.from([0x03, 87])), { kind: 'battery', value: 87 });
+    assert.deepStrictEqual(decodeFrame(Buffer.from([0x10])), { kind: 'heartbeat', value: null });
+    assert.deepStrictEqual(decodeFrame(Buffer.from([0x7f, 4])), { kind: 'error', value: 4 });
+    assert.strictEqual(decodeFrame(Buffer.from([0x55, 1, 2])), null);
+    assert.strictEqual(decodeFrame(Buffer.from([0x01, 0x09])), null);
+    assert.strictEqual(decodeFrame(Buffer.alloc(0)), null);

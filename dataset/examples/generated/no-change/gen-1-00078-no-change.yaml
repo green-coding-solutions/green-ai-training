@@ -1,0 +1,79 @@
+id: gen-1-00078-no-change
+category: no-change
+language: yaml
+patterns:
+- minimize-environments
+- context-tradeoff
+messages:
+- role: user
+  content: |
+    We run a nightly ETL for our ad-reporting warehouse and I'd like a second opinion on the CI/CD setup before we sign it off. Requirements: PRs must be validated against a real Postgres, the main branch must deploy the pipeline image to prod, and we don't want leftover infrastructure. Here is the workflow:
+
+    ```yaml
+    name: etl-ci
+
+    on:
+      pull_request:
+        paths: ["etl/**", "sql/**", "Dockerfile"]
+      push:
+        branches: [main]
+
+    concurrency:
+      group: etl-${{ github.ref }}
+      cancel-in-progress: true
+
+    jobs:
+      test:
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        services:
+          postgres:
+            image: postgres:16-alpine
+            env:
+              POSTGRES_PASSWORD: test
+            ports: ["5432:5432"]
+            options: >-
+              --health-cmd pg_isready
+              --health-interval 5s
+              --health-retries 10
+        steps:
+          - uses: actions/checkout@v4
+          - uses: actions/setup-python@v5
+            with:
+              python-version: "3.12"
+              cache: pip
+          - run: pip install -r requirements.txt
+          - run: pytest etl/tests -q
+            env:
+              DATABASE_URL: postgresql://postgres:test@localhost:5432/postgres
+
+      deploy:
+        if: github.ref == 'refs/heads/main'
+        needs: test
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+          - run: docker build -t registry.example.com/etl:${{ github.sha }} .
+          - run: docker push registry.example.com/etl:${{ github.sha }}
+          - run: ./scripts/update_cronjob.sh ${{ github.sha }}
+    ```
+
+    Is there anything we should change, e.g. should we add a shared staging environment for the pipeline?
+- role: assistant
+  content: |-
+    No changes needed. This setup already follows the "minimize deployed environments" idea, and adding a staging environment would make it worse.
+
+    - **Tests use an ephemeral database.** The Postgres service container lives only for the length of the `test` job. When the job ends, it is gone. Nothing stays running between PRs.
+    - **No always-on non-prod infrastructure.** There is no staging cluster, no preview database and no review stack to forget about or tear down.
+    - **Deploy only updates a cron job.** The nightly ETL runs once a day, so a shared staging copy would sit idle almost all the time. The runner in CI gives you the same validation for free.
+    - **Wasted runs are avoided.** `paths` filters skip PRs that don't touch the pipeline, `concurrency` with `cancel-in-progress` stops superseded runs, and `timeout-minutes` caps stuck jobs. Pip caching saves repeated downloads.
+
+    A staging environment would only be worth it if you need to test things the CI container cannot reproduce, for example a cloud-specific warehouse, large production-like data volumes, or a long-running integration with an external system. If that happens, make it temporary: create it for the test run and destroy it afterwards, instead of keeping it up all year.
+
+    One small point, not about energy: `deploy` runs a second `checkout`. That is fine. Keep it, so the job stays self-contained.
+
+    **Green Notes**
+    - **Minimize deployed environments** (reduces E and M): already met. Ephemeral service container, nothing idle between runs.
+    - *Not applied:* a shared staging environment. For a once-a-day batch job it would hold hardware and power for almost no use.
+
+    https://patterns.greensoftware.foundation/development/minimizing-deployed-environments

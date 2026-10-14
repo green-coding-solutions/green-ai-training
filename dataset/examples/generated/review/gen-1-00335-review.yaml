@@ -1,0 +1,109 @@
+id: gen-1-00335-review
+category: review
+language: javascript
+patterns:
+- regex-precompile
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```javascript
+    const fs = require('fs');
+
+    // channels we plot from the MD run logs
+    const CHANNELS = ['temp_K', 'pressure_Pa', 'energy_eV'];
+
+    function extractValue(line, name) {
+      const re = new RegExp('\\b' + name + '\\s*=\\s*([-+]?\\d*\\.?\\d+(?:[eE][-+]?\\d+)?)');
+      const m = re.exec(line);
+      return m ? parseFloat(m[1]) : null;
+    }
+
+    function loadRun(path) {
+      const lines = fs.readFileSync(path, 'utf8').split('\n');
+      const series = {};
+      for (const name of CHANNELS) series[name] = [];
+
+      for (const line of lines) {
+        if (!line.startsWith('STEP')) continue;
+        for (const name of CHANNELS) {
+          const v = extractValue(line, name);
+          if (v !== null) series[name].push(v);
+        }
+      }
+      return series;
+    }
+
+    module.exports = { loadRun };
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (scientific data loading)
+
+    #### [Bug] Channel series can drift out of sync
+    - **Where:** `if (v !== null) series[name].push(v);`
+    - **Issue:** if a channel is missing on one `STEP` line, only that series gets shorter. Index `i` then means different time steps in different channels, and your plots silently misalign.
+    - **Fix:** push `NaN` for a missing value, so every series has one entry per step.
+
+    #### [High] A new RegExp is built for every line and channel
+    - **Where:** `extractValue`
+    - **Issue:** the pattern depends only on the channel name, but the string is concatenated and compiled again for each channel on each `STEP` line. With millions of lines, that is millions of identical compilations.
+    - **Fix:** compile one regex per channel once, at module load, and reuse it. The regexes have no `g` flag, so they hold no state between calls.
+    - **Impact:** reduces E per line, because the compile step is removed from the per-line loop. The matching work stays the same.
+
+    #### [Low] Channel name is not escaped
+    - **Where:** `'\\b' + name + ...`
+    - **Issue:** a name like `E.pot` would use `.` as a wildcard and could match the wrong key.
+    - **Fix:** escape the name when you build the pattern.
+
+    ```javascript
+    const fs = require('fs');
+
+    // channels we plot from the MD run logs
+    const CHANNELS = ['temp_K', 'pressure_Pa', 'energy_eV'];
+    const NUMBER = '([-+]?\\d*\\.?\\d+(?:[eE][-+]?\\d+)?)';
+
+    const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    // compiled once per channel, reused for every line
+    const CHANNEL_PATTERNS = CHANNELS.map((name) => ({
+      name,
+      re: new RegExp('\\b' + escapeRegExp(name) + '\\s*=\\s*' + NUMBER),
+    }));
+
+    function loadRun(path) {
+      const lines = fs.readFileSync(path, 'utf8').split('\n');
+      const series = {};
+      for (const name of CHANNELS) series[name] = [];
+
+      for (const line of lines) {
+        if (!line.startsWith('STEP')) continue;
+        for (const { name, re } of CHANNEL_PATTERNS) {
+          const m = re.exec(line);
+          series[name].push(m ? parseFloat(m[1]) : NaN);
+        }
+      }
+      return series;
+    }
+
+    module.exports = { loadRun };
+    ```
+
+    **Already good:** the cheap `startsWith('STEP')` check skips non-data lines before any regex runs.
+verify:
+  green_block: 0
+  equivalence:
+    driver: |-
+      const _fs2 = require('fs');
+      const _os2 = require('os');
+      const _path2 = require('path');
+      const _p = _path2.join(_os2.tmpdir(), 'md_run_' + process.pid + '.log');
+      const _out = ['# header line', 'INFO start'];
+      for (let i = 0; i < 200; i++) {
+        _out.push('STEP ' + i + ' temp_K=' + (300 + i * 0.5).toFixed(2) + ' pressure_Pa=' + (100000 + i * 10) + ' energy_eV=-' + (12.5 + i / 100).toFixed(3) + 'e0');
+      }
+      _out.push('DONE');
+      _fs2.writeFileSync(_p, _out.join('\n'));
+      console.log(JSON.stringify(loadRun(_p)));
+      _fs2.unlinkSync(_p);

@@ -1,0 +1,109 @@
+id: gen-1-00288-review
+category: review
+language: html
+patterns:
+- modern-image-formats
+- lazy-load-images
+facts:
+- F-IMGENC
+- F-IMGRENDER
+messages:
+- role: user
+  content: |
+    Our CLI `logship` has a script that renders the release notes page from a template and publishes it to the docs site. Review the template, diff only please.
+
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <title>logship {{version}} – release notes</title>
+      <link rel="stylesheet" href="style.css">
+    </head>
+    <body>
+      <header>
+        <a href="/"><img src="img/logo.png" alt="logship" class="logo"></a>
+        <nav><a href="/docs">Docs</a> <a href="/releases">Releases</a></nav>
+      </header>
+      <main>
+        <img src="img/hero-terminal.png" alt="logship tail running in a terminal" loading="lazy" class="hero">
+        <h1>logship {{version}}</h1>
+        <p>{{summary}}</p>
+
+        <section>
+          <h2>Live tail</h2>
+          <p>{{tail_text}}</p>
+          <img src="img/tail-2400.png" alt="Live tail with highlighted errors" style="width:100%;max-width:800px">
+        </section>
+
+        <section>
+          <h2>Filters</h2>
+          <p>{{filters_text}}</p>
+          <img src="img/filters-2400.png" alt="Filter expression editor" style="width:100%;max-width:800px">
+        </section>
+
+        <section>
+          <h2>Contributors</h2>
+          <img src="img/contributors.jpg" alt="Contributors at the 2.4 sprint" width="800" height="450" loading="lazy">
+        </section>
+      </main>
+    </body>
+    </html>
+    ```
+
+    `logo.png` is 512x512 and shown at 32px via CSS. The `*-2400.png` screenshots are 2400px wide. `hero-terminal.png` is 1600x900.
+- role: assistant
+  content: |
+    **Workload:** web (static docs page, built by a script)
+
+    #### [High] Large PNG screenshots in an 800px slot
+    - **Where:** `tail-2400.png`, `filters-2400.png`, `hero-terminal.png`
+    - **Issue:** every visitor downloads 2400px PNGs to fill at most 800 CSS pixels. There is no `srcset`, so phones and laptops get the same big file. There is no modern format either.
+    - **Fix:** let the publish script write AVIF and WebP at 800 and 1600 px next to the PNG, and use `<picture>`. Keep the PNG as fallback. Encode once at publish time and skip images whose source did not change. Don't encode per request. In Green Metrics Tool micro-benchmarks, AVIF encoding cost about 7× JPG, and decoding cost about 19% more CPU than JPG in the browser ([measurements](https://metrics.green-coding.io/stats.html?id=81a932bc-04da-443b-93cf-d4d8468de247), [measurements](https://metrics.green-coding.io/stats.html?id=b31ca361-1745-4fac-8e6b-a97ec99bf476)). The gain comes from the smaller transfer, so build once and serve many times.
+    - **Impact:** reduces network bytes for every visit (reduces E). The gain is largest on mobile.
+    - **Pattern:** https://patterns.greensoftware.foundation/development/media-and-code-efficiency/serve-images-in-modern-formats
+
+    #### [Medium] Above-the-fold hero is lazy-loaded
+    - **Where:** `hero-terminal.png` with `loading="lazy"`
+    - **Issue:** the hero is the first thing on screen. Lazy loading delays it until layout is known. The two screenshots further down are the right place for lazy loading.
+    - **Fix:** remove `loading="lazy"` from the hero. Add `fetchpriority="high"` and keep lazy on the others.
+
+    #### [Medium] 512px logo shown at 32px
+    - **Where:** `img/logo.png`
+    - **Issue:** a full-size PNG for a 32px slot.
+    - **Fix:** use an SVG logo if you have one. Otherwise export a 64px version (2x for sharp screens).
+
+    #### [Low] No intrinsic size on the screenshots
+    - **Where:** `tail-2400.png`, `filters-2400.png`
+    - **Issue:** the browser can't reserve space, so the layout jumps when they load.
+    - **Fix:** add `width` and `height`.
+
+    ```html
+    <header>
+    -  <a href="/"><img src="img/logo.png" alt="logship" class="logo"></a>
+    +  <a href="/"><img src="img/logo.svg" alt="logship" class="logo" width="32" height="32"></a>
+       <nav><a href="/docs">Docs</a> <a href="/releases">Releases</a></nav>
+    </header>
+    <main>
+    -  <img src="img/hero-terminal.png" alt="logship tail running in a terminal" loading="lazy" class="hero">
+    +  <picture>
+    +    <source type="image/avif" srcset="img/hero-terminal-800.avif 800w, img/hero-terminal-1600.avif 1600w" sizes="(min-width: 860px) 800px, 100vw">
+    +    <source type="image/webp" srcset="img/hero-terminal-800.webp 800w, img/hero-terminal-1600.webp 1600w" sizes="(min-width: 860px) 800px, 100vw">
+    +    <img src="img/hero-terminal-1600.png" alt="logship tail running in a terminal" class="hero" width="1600" height="900" fetchpriority="high">
+    +  </picture>
+
+       <section>
+         <h2>Live tail</h2>
+         <p>{{tail_text}}</p>
+    -    <img src="img/tail-2400.png" alt="Live tail with highlighted errors" style="width:100%;max-width:800px">
+    +    <picture>
+    +      <source type="image/avif" srcset="img/tail-800.avif 800w, img/tail-1600.avif 1600w" sizes="(min-width: 860px) 800px, 100vw">
+    +      <source type="image/webp" srcset="img/tail-800.webp 800w, img/tail-1600.webp 1600w" sizes="(min-width: 860px) 800px, 100vw">
+    +      <img src="img/tail-1600.png" alt="Live tail with highlighted errors" width="1600" height="900" loading="lazy" style="width:100%;max-width:800px;height:auto">
+    +    </picture>
+       </section>
+    ```
+
+    Apply the same change to `filters-2400.png`. `contributors.jpg` is already a sized, lazy-loaded photo. Add AVIF/WebP variants for it only if this page gets real traffic.
+verify:
+  static_only: HTML template with template placeholders, no executable code

@@ -1,0 +1,106 @@
+id: gen-1-00334-review
+category: review
+language: bash
+patterns:
+- bash-quoting
+- bash-builtins
+facts:
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    hi, i wrote this script for our nightly orders export. it works but im new to bash and not sure if its written ok. can you look at it and tell me what is wrong? the csv files are big (a few hundred thousand lines each)
+
+    ```bash
+    #!/bin/bash
+    # nightly orders ETL: raw/*.csv -> clean/orders.ndjson
+
+    RAW_DIR=/data/etl/raw
+    OUT=/data/etl/clean/orders.ndjson
+    LOG=/data/etl/etl.log
+    DEFAULT_CUR="EUR"
+
+    echo "start etl" >> $LOG
+    > $OUT
+
+    for f in $(ls $RAW_DIR/*.csv); do
+      echo "reading $f" >> $LOG
+      while IFS=, read -r id customer amount currency; do
+        if [ $id = "id" ]; then continue; fi
+        if [ -z "$currency" ]; then currency=$DEFAULT_CUR; fi
+        meta="{\"source\":\"shopdb-export\",\"schema\":\"v3\",\"pipeline\":\"orders-nightly\"}"
+        loaded_at=$(date +%s)
+        echo "{\"id\":\"$id\",\"customer\":\"$customer\",\"amount\":$amount,\"currency\":\"$currency\",\"loaded_at\":$loaded_at,\"meta\":$meta}" >> $OUT
+      done < $f
+    done
+
+    echo "done" >> $LOG
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly batch, per-row loop)
+
+    #### [Bug] Unquoted variables and `ls` in the `for` loop
+    - **Where:** `for f in $(ls $RAW_DIR/*.csv)`, `[ $id = "id" ]`, `>> $OUT`, `< $f`
+    - **Issue:** a file name with a space is split into two names. An empty `$id` makes `[ $id = "id" ]` a syntax error. With no CSV files, the loop runs once with the literal text `*.csv`.
+    - **Fix:** loop over the glob directly, use `nullglob`, and quote every variable that holds a path or a value.
+
+    #### [Bug] CSV and JSON are parsed too simply
+    - **Where:** `IFS=, read` and the `echo "{...}"` line
+    - **Issue:** a customer name with a comma shifts all fields. A name with a `"` produces invalid JSON. If your data can contain these, use a real CSV tool (`csvkit`, `mlr`, Python `csv`) instead of bash.
+
+    #### [High] One `date` process per row
+    - **Where:** `loaded_at=$(date +%s)`
+    - **Issue:** `$(...)` forks a new process for every row. With hundreds of thousands of rows per file, that is the most expensive line in the script.
+    - **Fix:** use the bash builtin, which gives the same value without a fork (bash 4.2+):
+      ```bash
+      printf -v loaded_at '%(%s)T' -1
+      ```
+    - **Impact:** reduces E. It removes one process start per row.
+
+    #### [Medium] Output file is opened and closed for every row
+    - **Where:** `>> $OUT` inside the loop
+    - **Issue:** every row costs an open, a write and a close. Redirect once on the `done` line, so the file is opened once per input file.
+    - **Impact:** reduces E. It removes per-row file system calls.
+
+    #### [Low] Double quotes on literals that need no expansion
+    - **Where:** `meta="..."` (with all the `\"` escapes), `DEFAULT_CUR="EUR"`, `echo "start etl"`
+    - **Issue:** bash scans double-quoted text for `$`, backticks and backslashes. Single quotes are taken as is, and they remove the escaping. `meta` is also the same on every row, so build it once before the loop.
+    - **Impact:** in Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal in a loop used about 24% less CPU energy with single quotes (1,000,000 iterations) ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=dd9bbb4e-b056-4067-8ad2-7b1818a86f10,b265ef9b-adb9-4b56-a14b-ae34fdaa7247,28d92c15-79d7-44ca-8f43-a733fe2e265a,a9533378-71f0-49df-bd5f-1e5f27cda9c2)). Your literals are much shorter, so the saving here is small. The fix still makes the line easier to read. Keep the double quotes around `"$f"`, `"$OUT"` and the other variables, because those need to expand.
+
+    Fixed version:
+
+    ```bash
+    #!/bin/bash
+    # nightly orders ETL: raw/*.csv -> clean/orders.ndjson
+    set -u
+    shopt -s nullglob
+
+    RAW_DIR=/data/etl/raw
+    OUT=/data/etl/clean/orders.ndjson
+    LOG=/data/etl/etl.log
+    DEFAULT_CUR='EUR'
+    META='{"source":"shopdb-export","schema":"v3","pipeline":"orders-nightly"}'
+
+    echo 'start etl' >> "$LOG"
+    : > "$OUT"
+
+    for f in "$RAW_DIR"/*.csv; do
+      echo "reading $f" >> "$LOG"
+      while IFS=, read -r id customer amount currency; do
+        [ "$id" = 'id' ] && continue
+        [ -z "$currency" ] && currency=$DEFAULT_CUR
+        printf -v loaded_at '%(%s)T' -1
+        printf '{"id":"%s","customer":"%s","amount":%s,"currency":"%s","loaded_at":%s,"meta":%s}\n' \
+          "$id" "$customer" "$amount" "$currency" "$loaded_at" "$META"
+      done < "$f" >> "$OUT"
+    done
+
+    echo 'done' >> "$LOG"
+    ```
+
+    The output lines are the same as before. Only the quoting bugs and the cost per row changed.
+
+    **Already good:** `read -r` with `IFS=,` is the right way to read lines, and the header row is skipped.
+verify:
+  static_only: bash script operating on /data paths, not run by the verifier

@@ -1,0 +1,316 @@
+id: nochange-py-slugify-cache-001
+category: no-change
+language: python
+patterns: [memoize, context-tradeoff]
+messages:
+  - role: user
+    content: |
+      would adding @lru_cache make this greener? it's called when an editor creates a new article
+
+      ```python
+      import re
+      import unicodedata
+
+      def slugify(title: str) -> str:
+          text = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode()
+          text = re.sub(r"[^\w\s-]", "", text).strip().lower()
+          return re.sub(r"[-\s]+", "-", text)
+      ```
+  - role: assistant
+    content: |
+      No. A cache only saves work when the same input comes back. Every new article has a new title, so `lru_cache` would almost never hit. It would still hash every title and keep up to 128 old strings in memory for nothing.
+
+      The function is already fine for this job:
+      - It runs once per article creation, which is a cold path.
+      - The two `re.sub` patterns are string literals, so Python's internal regex cache compiles them once and reuses them.
+
+      Caching makes sense for pure functions that get called often with a small set of repeating inputs, for example formatting a country name from a code on every page render.
+---
+id: refactor-py-banned-words-001
+category: refactor
+language: python
+patterns: [regex-precompile]
+facts: [F-REGEX]
+messages:
+  - role: user
+    content: |
+      Our moderation job got super slow after the trust & safety team grew the banned word list to ~600 entries. Can you optimize it?
+
+      ```python
+      import re
+
+      def flag_messages(messages, banned_words):
+          flagged = []
+          for msg in messages:
+              for word in banned_words:
+                  if re.search(r"\b" + re.escape(word) + r"\b", msg, re.IGNORECASE):
+                      flagged.append(msg)
+                      break
+          return flagged
+      ```
+  - role: assistant
+    content: |
+      ```python
+      import re
+
+      def build_banned_pattern(banned_words):
+          alternatives = "|".join(re.escape(w) for w in sorted(banned_words, key=len, reverse=True))
+          return re.compile(r"\b(?:" + alternatives + r")\b", re.IGNORECASE)
+
+      def flag_messages(messages, banned_words):
+          pattern = build_banned_pattern(banned_words)
+          return [msg for msg in messages if pattern.search(msg)]
+      ```
+
+      **Green Notes**
+      - **Compile once, outside the loop** (reduces E): the old code built a new pattern string for every word and every message. Python's `re` module caches only a limited number of compiled patterns (512). With ~600 words, the cache thrashes and every call recompiles. In Green Metrics Tool micro-benchmarks, a forced recompile cost about 200× more per match than a cached pattern ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=3827c15a-4295-44a4-8025-a07e8653ab7e,b7a9f0bd-c9e0-4b95-9bda-e8a96f38020c,f3e0434d-744b-41a0-a0cc-9bf00d80500d)).
+      - **One alternation instead of 600 searches** (reduces E): each message is scanned once instead of up to 600 times.
+      - The result is the same list in the same order. If the word list is fixed for the lifetime of the job, call `build_banned_pattern` once at startup and pass the compiled pattern around.
+verify:
+  equivalence:
+    driver: |
+      import random
+      random.seed(7)
+      vocab = [f"w{i}" for i in range(400)] + ["spam", "scam", "free money", "c++", "a.b"]
+      banned = random.sample(vocab, 60) + ["free money", "c++"]
+      msgs = [" ".join(random.choice(vocab + ["hello", "WORLD"]) for _ in range(8)) for _ in range(400)]
+      msgs += ["get FREE MONEY now", "I like c++", "nothing here"]
+      for m in flag_messages(msgs, banned):
+          print(m)
+  benchmark:
+    driver: |
+      import random
+      random.seed(7)
+      banned = [f"badword{i}" for i in range(600)]
+      msgs = [" ".join(f"token{random.randint(0, 5000)}" for _ in range(12)) for _ in range(60)]
+      flag_messages(msgs, banned)
+    min_speedup: 5
+---
+id: review-py-access-log-001
+category: review
+language: python
+patterns: [regex-precompile, builtin-functions]
+facts: [F-REGEX]
+messages:
+  - role: user
+    content: |
+      Review please. Runs hourly on our nginx access logs (a few GB each) to find the top 20 client IPs.
+
+      ```python
+      import re
+
+      def top_ips(path):
+          hits = {}
+          lines = open(path).readlines()
+          for line in lines:
+              m = re.match(r'(\S+) \S+ \S+ \[([^\]]+)\] "(\w+) (\S+)', line)
+              if m:
+                  ip = m.group(1)
+                  hits[ip] = hits.get(ip, 0) + 1
+          return sorted(hits.items(), key=lambda x: x[1], reverse=True)[:20]
+      ```
+  - role: assistant
+    content: |
+      **Workload:** data pipeline (hourly batch)
+
+      #### [Bug] File handle is never closed
+      - **Where:** `open(path).readlines()`
+      - **Issue:** the file is left open until garbage collection.
+      - **Fix:** open it in a `with` block and iterate over the file object.
+
+      #### [Low] Regex not precompiled, unused groups
+      - **Where:** `re.match(...)` in the loop
+      - **Issue:** Python caches the compiled pattern, so this is a small cost. In Green Metrics Tool micro-benchmarks, a precompiled pattern used about 18% less energy than the inline call ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=3827c15a-4295-44a4-8025-a07e8653ab7e,b7a9f0bd-c9e0-4b95-9bda-e8a96f38020c,f3e0434d-744b-41a0-a0cc-9bf00d80500d)). The pattern also captures three groups that are never used.
+      - **Fix:** compile once and only capture the IP.
+
+      #### [Low] Full sort for a top 20
+      - **Where:** `sorted(...)[:20]`
+      - **Fix:** `Counter.most_common(20)` uses a heap and doesn't sort every IP.
+
+      ```python
+      import re
+      from collections import Counter
+
+      LINE_RE = re.compile(r'(\S+) \S+ \S+ \[[^\]]+\] "\w+ \S+')
+
+      def top_ips(path):
+          hits = Counter()
+          with open(path) as f:
+              for line in f:
+                  m = LINE_RE.match(line)
+                  if m:
+                      hits[m.group(1)] += 1
+          return hits.most_common(20)
+      ```
+verify:
+  green_block: 0
+  equivalence:
+    driver: |
+      import os, random, tempfile
+      random.seed(11)
+      lines = []
+      for i in range(3000):
+          ip = f"10.0.{random.randint(0, 3)}.{random.randint(0, 40)}"
+          lines.append(f'{ip} - - [10/Oct/2026:13:55:36 +0200] "GET /p/{i} HTTP/1.1" 200 512\n')
+      lines.append("garbage line\n")
+      with tempfile.NamedTemporaryFile("w", delete=False) as f:
+          f.writelines(lines)
+      print(top_ips(f.name))
+      os.unlink(f.name)
+---
+id: gen-py-points-in-radius-001
+category: generation
+language: python
+patterns: [hoist-invariants, builtin-functions]
+messages:
+  - role: user
+    content: |
+      write a function that returns all points within radius r of a center point. points is a list of (x, y) tuples, usually around a million of them
+  - role: assistant
+    content: |
+      ```python
+      def points_within(points, center, r):
+          cx, cy = center
+          r2 = r * r
+          return [
+              (x, y) for x, y in points
+              if (x - cx) * (x - cx) + (y - cy) * (y - cy) <= r2
+          ]
+      ```
+
+      **Green Notes**
+      - **Compare squared distances** (reduces E): `sqrt` is skipped for every one of the million points. `d <= r` is the same test as `d² <= r²` for non-negative values.
+      - **Hoist invariants:** `r * r` and the center coordinates are computed once, not per point.
+      - If the points are already in a NumPy array, or you run this query many times per second, a vectorized version or a spatial index (`scipy.spatial.cKDTree`) will be much faster. For a single pass over a plain list, this is the lean option.
+verify:
+  test: |
+    pts = [(0, 0), (3, 4), (5, 0.1), (-3, -4), (10, 10)]
+    assert points_within(pts, (0, 0), 5) == [(0, 0), (3, 4), (-3, -4)]
+    assert points_within([], (1, 1), 2) == []
+    assert points_within([(1, 1)], (1, 1), 0) == [(1, 1)]
+---
+id: nochange-py-match-statement-001
+category: no-change
+language: python
+patterns: [simple-conditions, context-tradeoff]
+facts: [F-COND]
+messages:
+  - role: user
+    content: |
+      Would rewriting this if/elif chain as match/case make it faster? It handles commands from our CLI.
+
+      ```python
+      def handle(cmd, args):
+          if cmd == "start":
+              return start(args)
+          elif cmd == "stop":
+              return stop(args)
+          elif cmd == "status":
+              return status(args)
+          elif cmd == "logs":
+              return logs(args)
+          else:
+              raise SystemExit(f"unknown command: {cmd}")
+      ```
+  - role: assistant
+    content: |
+      No. `match` with literal cases and an `if/elif` chain with `==` do the same comparisons. In Green Metrics Tool micro-benchmarks they differed by about 1%, which is measurement noise ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=123676d7-2121-4b9d-b78e-e065836fc608,a7780e2a-2934-4d26-b2a9-2cda7848adc1)). Your chain is already in the cheap form: simple equality checks, no complex conditions.
+
+      It also runs once per CLI invocation. Process startup and the actual command take orders of magnitude longer than four string comparisons.
+
+      Use `match` if you find it more readable. If the command list grows to dozens of entries, a dict that maps names to functions keeps it tidy:
+
+      ```python
+      COMMANDS = {"start": start, "stop": stop, "status": status, "logs": logs}
+
+      def handle(cmd, args):
+          try:
+              return COMMANDS[cmd](args)
+          except KeyError:
+              raise SystemExit(f"unknown command: {cmd}") from None
+      ```
+---
+id: refactor-py-cli-imports-001
+category: refactor
+language: python
+patterns: [keep-star-imports]
+facts: [F-IMPORT]
+messages:
+  - role: user
+    content: |
+      Can you tidy up this little disk usage CLI? Colleagues run it a lot in scripts and complain it's slow to start.
+
+      ```python
+      from os import *
+      from math import *
+      from pandas import *
+      import sys
+
+      def disk_usage(root):
+          total = 0
+          for dirpath, dirnames, filenames in walk(root):
+              for name in filenames:
+                  total += stat(path.join(dirpath, name)).st_size
+          return total
+
+      def main():
+          root = sys.argv[1]
+          size = disk_usage(root)
+          print(f"{root}: {ceil(size / 1024**2)} MB")
+          if "--csv" in sys.argv:
+              DataFrame([{"root": root, "bytes": size}]).to_csv("report.csv", index=False)
+
+      if __name__ == "__main__":
+          main()
+      ```
+  - role: assistant
+    content: |
+      ```python
+      from os import *
+      from math import *
+      import csv
+      import sys
+      from pathlib import Path
+
+      def disk_usage(root):
+          total = 0
+          for dirpath, dirnames, filenames in walk(root):
+              for name in filenames:
+                  total += stat(path.join(dirpath, name)).st_size
+          return total
+
+      def write_csv(root, size, out_path="report.csv"):
+          with Path(out_path).open("w", newline="") as f:
+              writer = csv.writer(f)
+              writer.writerow(["root", "bytes"])
+              writer.writerow([root, size])
+
+      def main():
+          root = sys.argv[1]
+          size = disk_usage(root)
+          print(f"{root}: {ceil(size / 1024**2)} MB")
+          if "--csv" in sys.argv:
+              write_csv(root, size)
+
+      if __name__ == "__main__":
+          main()
+      ```
+
+      **Green Notes**
+      - **No pandas for a two-cell CSV** (reduces E on every start): pandas and NumPy were loaded on every run, even without `--csv`. That import is the slow startup your colleagues see. In Green Metrics Tool micro-benchmarks, a Python start that imported a large library (sympy) used about 25× the energy of a start without it ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=b8705e55-3144-4871-8d37-0835189905ae,a347d140-8e85-456b-bf57-f8c77373c8fa)). The standard `csv` module does the same job and loads almost instantly.
+      - **Star imports left unchanged:** `from os import *` and `from math import *` stay as they are. Switching them to `import os` / explicit names makes no measurable energy difference, so there is nothing to gain from touching them.
+      - The file is opened with `Path.open`, because `from os import *` provides its own `open` function with a different signature than the built-in one.
+verify:
+  module: true
+  test: |
+    import builtins, os as _os, tempfile
+    d = tempfile.mkdtemp()
+    _os.makedirs(_os.path.join(d, "sub"))
+    with builtins.open(_os.path.join(d, "a.bin"), "wb") as f:
+        f.write(b"x" * 1000)
+    with builtins.open(_os.path.join(d, "sub", "b.bin"), "wb") as f:
+        f.write(b"y" * 24)
+    assert disk_usage(d) == 1024
+    out = _os.path.join(d, "r.csv")
+    write_csv("/data", 1024, out)
+    assert builtins.open(out).read().splitlines() == ["root,bytes", "/data,1024"]

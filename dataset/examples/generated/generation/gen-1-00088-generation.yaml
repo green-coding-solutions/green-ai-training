@@ -1,0 +1,96 @@
+id: gen-1-00088-generation
+category: generation
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    write store-and-forward buffer for our sensor gateway. msgs come in, flush to cloud in batches, if upload fails put them back first in line
+- role: assistant
+  content: |
+    The buffer is a `deque`. Taking from the front and putting a failed batch back at the front are both O(1) per message.
+
+    ```python
+    import threading
+    from collections import deque
+
+
+    class OutboundBuffer:
+        def __init__(self, send_batch, max_messages=10_000, batch_size=100):
+            self._send_batch = send_batch
+            self._max = max_messages
+            self._batch_size = batch_size
+            self._queue = deque()
+            self._lock = threading.Lock()
+            self.dropped = 0
+
+        def _trim(self):
+            # Offline for too long: drop the oldest messages first.
+            while len(self._queue) > self._max:
+                self._queue.popleft()
+                self.dropped += 1
+
+        def add(self, message):
+            with self._lock:
+                self._queue.append(message)
+                self._trim()
+
+        def flush(self):
+            """Send everything queued. Returns the number of messages sent."""
+            sent = 0
+            while True:
+                with self._lock:
+                    n = min(self._batch_size, len(self._queue))
+                    batch = [self._queue.popleft() for _ in range(n)]
+                if not batch:
+                    return sent
+                try:
+                    self._send_batch(batch)
+                except OSError:
+                    # Put the batch back in its original order, ahead of newer messages.
+                    with self._lock:
+                        self._queue.extendleft(reversed(batch))
+                        self._trim()
+                    return sent
+                sent += len(batch)
+    ```
+
+    `send_batch` gets a list of messages and should raise `OSError` (or a subclass such as `ConnectionError` or `TimeoutError`) when the upload fails. Message order is kept across retries.
+
+    **Green Notes**
+    - **Deque instead of a list** (reduces E): `list.insert(0, x)` and `list.pop(0)` shift every element. In Green Metrics Tool micro-benchmarks, 1,000,000 front inserts used over 1000× the CPU energy of 1,000,000 appends ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=1da9c13d-364b-4f71-b23f-785bf1caeac8,75a7d151-3a7b-4575-b3e1-de125ce00d00)). The buffer can grow large during an outage, which is when requeueing happens. A deque keeps both ends cheap on a small gateway CPU.
+    - **Batched uploads** (reduces network): one call per batch of up to 100 messages, not one per message. This means fewer round trips and less radio time.
+    - **Bounded queue:** the size cap stops memory from growing without limit during a long outage. Check `dropped` to see if data was lost.
+
+    *Not applied:* `deque(maxlen=...)`. On a full deque, `extendleft` silently drops from the right, which is the newest data. The explicit trim keeps "drop oldest" in both paths.
+verify:
+  green_block: 0
+  test: |-
+    calls = []
+    fail = [True]
+
+    def send(batch):
+        if fail[0]:
+            raise OSError("offline")
+        calls.append(list(batch))
+
+    buf = OutboundBuffer(send, max_messages=5, batch_size=2)
+    for i in range(4):
+        buf.add(i)
+    assert buf.flush() == 0
+    buf.add(4)
+    fail[0] = False
+    assert buf.flush() == 5
+    assert [m for b in calls for m in b] == [0, 1, 2, 3, 4]
+    assert buf.flush() == 0
+
+    calls.clear()
+    buf2 = OutboundBuffer(send, max_messages=3, batch_size=10)
+    for i in range(5):
+        buf2.add(i)
+    assert buf2.dropped == 2
+    assert buf2.flush() == 3
+    assert calls == [[2, 3, 4]]

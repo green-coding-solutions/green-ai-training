@@ -1,0 +1,112 @@
+id: gen-1-00135-estimate
+category: estimate
+language: javascript
+patterns:
+- dom-size
+- select-columns
+messages:
+- role: user
+  content: |
+    ```javascript
+    const express = require('express');
+    const db = require('./db');
+    const app = express();
+
+    // audit log page for the compliance team, ~20k rows now, grows daily
+    // how much energy would paginating this save?
+    app.get('/admin/audit', async (req, res) => {
+      const { rows } = await db.query(
+        'SELECT * FROM audit_log ORDER BY created_at DESC'
+      );
+      const body = rows.map(r => `
+        <tr>
+          <td>${r.created_at.toISOString()}</td>
+          <td>${r.user_email}</td>
+          <td>${r.action}</td>
+          <td>${r.details}</td>
+        </tr>`).join('');
+      res.send(`<html><body>
+        <h1>Audit log</h1>
+        <table>${body}</table>
+      </body></html>`);
+    });
+
+    app.listen(3000);
+    ```
+
+    ?
+- role: assistant
+  content: |
+    I can't give you a joule or CO2 figure without measuring your page. I can tell you where the saving comes from and how big the change is by counting.
+
+    **What changes**
+    - **DOM size:** today every visit builds a table with 20k rows, about 80k cells. With 50 rows per page that is about 200 cells. The browser does roughly 400× less layout and paint work, and it keeps that much less in memory. The factor stays the same as the log grows, while the current page keeps growing without a limit.
+    - **Transferred bytes and server work:** the response shrinks by about the same factor. The database also reads, serializes and sends 50 rows instead of 20k.
+    - **`SELECT *`:** if `audit_log` has wide columns you don't show (blobs, long JSON), naming only the four columns you render saves more. In Green Metrics Tool micro-benchmarks, the saving from skipping large unused columns grew with their size.
+
+    **What it is worth:** the saving per visit is large, but the total is `visits × saving per visit`. For a compliance page opened a few times a day, the absolute energy is small. The better reasons to do it are the slow page and the memory use. If the page is opened rarely, a simple fix is enough.
+
+    **How to measure it**
+    1. Open DevTools or Lighthouse and note the DOM element count, response size and time to render, before and after.
+    2. Run both versions as Green Metrics Tool browser usage scenarios (load the page, wait, scroll). That gives measured client and server energy per visit.
+    3. Multiply by your real visit count.
+
+    ```javascript
+    const PAGE_SIZE = 50;
+
+    const escapeHtml = s =>
+      String(s).replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+      })[c]);
+
+    function renderAuditPage(rows, page = 1, pageSize = PAGE_SIZE) {
+      const pages = Math.max(1, Math.ceil(rows.length / pageSize));
+      const current = Math.min(Math.max(1, page), pages);
+      const slice = rows.slice((current - 1) * pageSize, current * pageSize);
+      const body = slice.map(r =>
+        `<tr><td>${r.created_at.toISOString()}</td><td>${escapeHtml(r.user_email)}</td>` +
+        `<td>${escapeHtml(r.action)}</td><td>${escapeHtml(r.details)}</td></tr>`
+      ).join('');
+      const prev = current > 1 ? `<a href="?page=${current - 1}">Previous</a>` : '';
+      const next = current < pages ? `<a href="?page=${current + 1}">Next</a>` : '';
+      return `<html><body><h1>Audit log</h1><table>${body}</table>` +
+        `<nav>${prev} Page ${current} of ${pages} ${next}</nav></body></html>`;
+    }
+    ```
+
+    In the route, push the paging into SQL so the database never returns 20k rows:
+
+    ```javascript
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const { rows } = await db.query(
+      'SELECT created_at, user_email, action, details FROM audit_log ' +
+      'ORDER BY created_at DESC LIMIT $1 OFFSET $2',
+      [PAGE_SIZE, (page - 1) * PAGE_SIZE]
+    );
+    ```
+
+    Then call a renderer that takes the total row count. Get it from a cheap `COUNT(*)`, or use "Next" only when you got a full page.
+
+    **Trade-offs**
+    - Browser search (Ctrl+F) no longer covers the whole log. If the compliance team needs that, add a search or date filter instead.
+    - Deep `OFFSET` gets slower on very large tables. If you reach millions of rows, switch to keyset paging on `created_at`.
+    - I also escaped the values. The original put `user_email` and `details` into HTML raw, which is an XSS risk for an audit page.
+verify:
+  green_block: 0
+  test: |-
+    const assert = require('assert');
+    const rows = Array.from({ length: 1000 }, (_, i) => ({
+      created_at: new Date(Date.UTC(2026, 0, 1, 0, 0, i)),
+      user_email: `u${i}@example.com`,
+      action: 'login',
+      details: i === 51 ? '<script>x</script>' : 'ok',
+    }));
+    const p2 = renderAuditPage(rows, 2);
+    assert.strictEqual((p2.match(/<tr>/g) || []).length, 50);
+    assert.ok(p2.includes('Page 2 of 20'));
+    assert.ok(p2.includes('u50@example.com'));
+    assert.ok(!p2.includes('u49@example.com'));
+    assert.ok(p2.includes('&lt;script&gt;'));
+    assert.ok(!p2.includes('<script>'));
+    assert.ok(renderAuditPage(rows, 999).includes('Page 20 of 20'));
+    assert.ok(renderAuditPage([], 1).includes('Page 1 of 1'));

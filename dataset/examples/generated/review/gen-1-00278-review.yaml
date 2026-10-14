@@ -1,0 +1,147 @@
+id: gen-1-00278-review
+category: review
+language: java
+patterns:
+- memoize
+messages:
+- role: user
+  content: |
+    Can you review this enrichment step of our nightly order ETL? Requirements and context:
+
+    - About 30 million order lines per run, read from Parquet and processed in one JVM.
+    - Each line has a `categoryId`. We add the full category path ("Home > Garden > Tools") for the BI export.
+    - The category tree has roughly 4,000 nodes. It is loaded once at startup and never changes during a run.
+    - Output must stay identical, same order as the input. Unknown category ids must still give "UNKNOWN".
+    - I added a small cache last week because the step was slow, but the run time did not improve as much as I hoped. Sometimes the row count of the output is also off by a few rows, which I can't explain.
+
+    ```java
+    import java.util.ArrayDeque;
+    import java.util.Deque;
+    import java.util.HashMap;
+    import java.util.List;
+    import java.util.Map;
+    import java.util.stream.Collectors;
+
+    public class OrderLineEnricher {
+
+        public record OrderLine(long orderId, String sku, long amountCents, int categoryId) {}
+
+        public record EnrichedLine(long orderId, String sku, long amountCents, String categoryPath) {}
+
+        private final Map<Integer, Integer> parentOf;
+        private final Map<Integer, String> nameOf;
+        private final Map<Integer, String> pathCache = new HashMap<>();
+
+        public OrderLineEnricher(Map<Integer, Integer> parentOf, Map<Integer, String> nameOf) {
+            this.parentOf = parentOf;
+            this.nameOf = nameOf;
+        }
+
+        private String categoryPath(int categoryId) {
+            if (pathCache.containsKey(categoryId)) {
+                return pathCache.get(categoryId);
+            }
+            Deque<String> parts = new ArrayDeque<>();
+            Integer current = categoryId;
+            while (current != null) {
+                String name = nameOf.get(current);
+                if (name == null) {
+                    return "UNKNOWN";
+                }
+                parts.addFirst(name);
+                current = parentOf.get(current);
+            }
+            String path = String.join(" > ", parts);
+            pathCache.put(categoryId, path);
+            return path;
+        }
+
+        public List<EnrichedLine> enrich(List<OrderLine> lines) {
+            return lines.parallelStream()
+                    .map(l -> new EnrichedLine(l.orderId(), l.sku(), l.amountCents(),
+                            categoryPath(l.categoryId())))
+                    .collect(Collectors.toList());
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (per-row work, 30 million rows per run)
+
+    #### [Bug] Plain `HashMap` written from a parallel stream
+    - **Where:** `pathCache` and `categoryPath()`, called from `parallelStream()`
+    - **Issue:** `HashMap` is not thread-safe. Several worker threads call `put` at the same time, especially early in the run when the cache is empty. This can lose entries, corrupt the table, or return wrong values. It can also cause an endless loop in older JVMs. Your output row count is fixed by the stream, so the "few rows off" is most likely a symptom of the same race, for example a wrong path on some rows or a worker that failed. Treat it as a correctness bug, not noise.
+    - **Fix:** use a `ConcurrentHashMap`.
+    - **Impact:** correctness first. It also stops threads from wasting work on a damaged map.
+
+    #### [Medium] Cache is the right idea, but it is used in a costly way
+    - **Where:** `containsKey` followed by `get`, then `put` after the build
+    - **Issue:** the memoization fits your case well. The tree is fixed for the whole run and there are about 4,000 distinct ids against 30 million lookups, so each path should be built about 4,000 times instead of once per row. But a hit needs two hash lookups, and many threads can build the same path at once on a cold cache. That explains why the gain is smaller than expected.
+    - **Fix:** read once with `get`. On a miss, use `computeIfAbsent` with a builder that does not touch the cache itself. This is safe because the builder is not recursive. `computeIfAbsent` stores nothing when the builder returns `null`, so unknown ids are still not cached.
+    - **Impact:** reduces E per row. After warm-up, a row costs one map read instead of a tree walk, a `Deque` allocation and a string join.
+
+    #### [Low] Cache validity depends on an unwritten rule
+    - **Where:** the class as a whole
+    - **Issue:** the cache is only correct because `parentOf` and `nameOf` never change after construction. The cache is also unbounded, which is fine here because it can hold at most one entry per known category.
+    - **Fix:** add a short comment, and if the tree is reloaded, create a new enricher instead of mutating the maps. Don't memoize if the tree could change during a run.
+
+    ```java
+    import java.util.ArrayDeque;
+    import java.util.Deque;
+    import java.util.List;
+    import java.util.Map;
+    import java.util.concurrent.ConcurrentHashMap;
+    import java.util.stream.Collectors;
+
+    public class OrderLineEnricher {
+
+        public record OrderLine(long orderId, String sku, long amountCents, int categoryId) {}
+
+        public record EnrichedLine(long orderId, String sku, long amountCents, String categoryPath) {}
+
+        // parentOf and nameOf must not change after construction: paths are memoized.
+        private final Map<Integer, Integer> parentOf;
+        private final Map<Integer, String> nameOf;
+        private final Map<Integer, String> pathCache = new ConcurrentHashMap<>();
+
+        public OrderLineEnricher(Map<Integer, Integer> parentOf, Map<Integer, String> nameOf) {
+            this.parentOf = parentOf;
+            this.nameOf = nameOf;
+        }
+
+        // Returns null for unknown ids, so they are never cached.
+        private String buildPath(int categoryId) {
+            Deque<String> parts = new ArrayDeque<>();
+            Integer current = categoryId;
+            while (current != null) {
+                String name = nameOf.get(current);
+                if (name == null) {
+                    return null;
+                }
+                parts.addFirst(name);
+                current = parentOf.get(current);
+            }
+            return String.join(" > ", parts);
+        }
+
+        private String categoryPath(int categoryId) {
+            String cached = pathCache.get(categoryId);
+            if (cached != null) {
+                return cached;
+            }
+            String path = pathCache.computeIfAbsent(categoryId, this::buildPath);
+            return path != null ? path : "UNKNOWN";
+        }
+
+        public List<EnrichedLine> enrich(List<OrderLine> lines) {
+            return lines.parallelStream()
+                    .map(l -> new EnrichedLine(l.orderId(), l.sku(), l.amountCents(),
+                            categoryPath(l.categoryId())))
+                    .collect(Collectors.toList());
+        }
+    }
+    ```
+
+    **Already good:** the cache is keyed by the small id, unknown ids are not stored, and `collect(Collectors.toList())` on an ordered stream keeps the input order.
+verify:
+  static_only: Java code, needs a JDK and is not run by the Python/JS verifier

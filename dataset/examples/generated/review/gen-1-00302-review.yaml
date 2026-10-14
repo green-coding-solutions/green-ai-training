@@ -1,0 +1,126 @@
+id: gen-1-00302-review
+category: review
+language: java
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    Please review this class. It's part of our post-processing tool for a molecular dynamics group. After a batch of simulations finishes on the cluster, we pull a small JSON summary for each run (energy drift, temperature, step count) from the cluster's REST service and feed them into the statistics step.
+
+    Requirements:
+    - a batch has 150 to 400 runs
+    - the result list must stay in the same order as `runIds`, because the stats code zips it with the parameter table
+    - the cluster service allows at most 8 parallel connections per client
+    - it runs on a workstation, a few times per day
+
+    It works, but a full batch takes a long time and I am not sure it's clean.
+
+    ```java
+    public class RunSummaryFetcher {
+        private static final String BASE = "https://hpc-gateway.lab.internal/api/v2";
+        private static final HttpClient CLIENT = HttpClient.newHttpClient();
+
+        public static List<RunSummary> fetchAll(List<String> runIds) {
+            List<RunSummary> out = new ArrayList<>();
+            for (String id : runIds) {
+                try {
+                    HttpRequest req = HttpRequest.newBuilder(
+                            URI.create(BASE + "/runs/" + id + "/summary"))
+                        .header("Accept", "application/json")
+                        .GET()
+                        .build();
+                    HttpResponse<String> resp =
+                        CLIENT.send(req, HttpResponse.BodyHandlers.ofString());
+                    if (resp.statusCode() == 200) {
+                        out.add(RunSummary.fromJson(id, resp.body()));
+                    }
+                } catch (Exception e) {
+                    // ignore, run will be missing
+                }
+            }
+            return out;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    **Workload:** script / data pipeline (scientific post-processing)
+
+    #### [Bug] Failed runs are silently dropped
+    - **Where:** `catch (Exception e) { }` and the `if (resp.statusCode() == 200)` without `else`
+    - **Issue:** a timeout, a 500 or a 404 just removes the run from the list. Your stats code zips the result with the parameter table, so every run after a missing one is paired with the wrong parameters. That gives wrong science without any error. The catch also swallows `InterruptedException`, so the thread cannot be cancelled cleanly.
+    - **Fix:** collect failures and fail loudly (see the code below).
+
+    #### [High] Requests run strictly one after another
+    - **Where:** the `for` loop with `CLIENT.send(...)`
+    - **Issue:** each request waits for the full round trip before the next one starts. For 150 to 400 runs, the machine mostly sits idle and waits on the network while it stays powered and holds resources the whole time. The service allows 8 parallel connections, and you use 1.
+    - **Fix:** use `sendAsync` and keep up to 8 requests in flight. Results are collected by index, so the order stays the same as `runIds`.
+    - **Impact:** reduces wall time and idle holding time by up to about the concurrency limit. CPU energy savings are smaller. In Green Metrics Tool micro-benchmarks with 10 HTTP requests in Python, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib` ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=97acc9a0-3856-4bbb-b816-2b64030fba98,6415cccb-ad1a-4d87-ae46-92740c5e285b)). The gain is mostly time. Keep the limit at 8, because more connections than the service allows cause errors and retries.
+    - **Pattern:** https://patterns.greensoftware.foundation/development/use-async-instead-of-sync
+
+    #### [Medium] No timeouts
+    - **Where:** `HttpClient.newHttpClient()` and the request builder
+    - **Issue:** there is no connect timeout and no request timeout. One hung connection blocks the whole batch forever.
+    - **Fix:** set both, as shown below.
+
+    ```java
+    public class RunSummaryFetcher {
+        private static final String BASE = "https://hpc-gateway.lab.internal/api/v2";
+        private static final int MAX_IN_FLIGHT = 8;
+        private static final HttpClient CLIENT = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(10))
+            .build();
+
+        public static List<RunSummary> fetchAll(List<String> runIds)
+                throws InterruptedException {
+            Semaphore slots = new Semaphore(MAX_IN_FLIGHT);
+            List<CompletableFuture<RunSummary>> futures = new ArrayList<>(runIds.size());
+
+            for (String id : runIds) {
+                slots.acquire();
+                HttpRequest req = HttpRequest.newBuilder(
+                        URI.create(BASE + "/runs/" + id + "/summary"))
+                    .header("Accept", "application/json")
+                    .timeout(Duration.ofSeconds(30))
+                    .GET()
+                    .build();
+                CompletableFuture<RunSummary> f = CLIENT
+                    .sendAsync(req, HttpResponse.BodyHandlers.ofString())
+                    .thenApply(resp -> {
+                        if (resp.statusCode() != 200) {
+                            throw new IllegalStateException("HTTP " + resp.statusCode());
+                        }
+                        return RunSummary.fromJson(id, resp.body());
+                    });
+                f.whenComplete((r, e) -> slots.release());
+                futures.add(f);
+            }
+
+            List<RunSummary> out = new ArrayList<>(runIds.size());
+            List<String> failed = new ArrayList<>();
+            for (int i = 0; i < futures.size(); i++) {
+                try {
+                    out.add(futures.get(i).join());
+                } catch (CompletionException e) {
+                    failed.add(runIds.get(i) + " (" + e.getCause() + ")");
+                }
+            }
+            if (!failed.isEmpty()) {
+                throw new IllegalStateException(
+                    failed.size() + " run summaries failed: " + failed);
+            }
+            return out;
+        }
+    }
+    ```
+
+    The semaphore is released when a request finishes, whether it succeeds or fails, so the limit of 8 always holds. `out` is filled in the order of `futures`, which is the order of `runIds`.
+
+    Do not add automatic retries here unless you need them. If you do, retry only transient errors (timeouts, 503), with a small fixed maximum.
+
+    **Already good:** one shared `HttpClient`, so connections are reused. The `Accept` header is set explicitly.
+verify:
+  static_only: Java code needs a network service and RunSummary class; not testable with stdlib-only runner

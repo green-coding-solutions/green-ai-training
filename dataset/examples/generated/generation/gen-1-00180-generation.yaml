@@ -1,0 +1,76 @@
+id: gen-1-00180-generation
+category: generation
+language: javascript
+patterns:
+- memoize
+messages:
+- role: user
+  content: |
+    hi, in our monorepo CI we want to build only the packages that changed. I get list of changed files from git diff (can be some hundreds, many in same folder). For every file I need find nearest package.json going up the folders, and then give back the unique package folders. pls write node function for this, we use ESM. sorry for my english
+- role: assistant
+  content: |
+    Here is a finder that remembers the answer for each folder. Files in the same folder share one lookup, and parent folders are checked only once.
+
+    ```javascript
+    import fs from "node:fs";
+    import path from "node:path";
+
+    export function makePackageFinder(root, exists = fs.existsSync) {
+      const cache = new Map(); // folder -> package folder, or null
+
+      function find(dir) {
+        if (cache.has(dir)) return cache.get(dir);
+        let result;
+        if (exists(path.join(root, dir, "package.json"))) {
+          result = dir;
+        } else if (dir === ".") {
+          result = null;
+        } else {
+          result = find(path.dirname(dir));
+        }
+        cache.set(dir, result);
+        return result;
+      }
+
+      return (file) => find(path.dirname(file));
+    }
+
+    export function packagesToBuild(changedFiles, root = process.cwd(), exists = fs.existsSync) {
+      const findPackage = makePackageFinder(root, exists);
+      const packages = new Set();
+      for (const file of changedFiles) {
+        const pkg = findPackage(file);
+        if (pkg !== null) packages.add(pkg);
+      }
+      return [...packages].sort();
+    }
+    ```
+
+    ```javascript
+    const files = process.argv.slice(2); // e.g. from: git diff --name-only origin/main...
+    console.log(packagesToBuild(files));
+    ```
+
+    Folder names are relative to the repo root, and the root itself is `"."`. Files with no `package.json` above them are skipped.
+
+    **Green Notes**
+    - **Memoize per folder** (reduces E): hundreds of changed files usually sit in a few folders. Without the `Map`, every file repeats the same `package.json` checks on disk. Now each folder is checked once, and a parent folder is also checked only once.
+    - **Cache lives inside one call**: it is created in `makePackageFinder`, so it is bounded by the number of folders and gets freed when the CI step ends. It is safe because the file system does not change during the run.
+    - *Not applied:* a cache that survives between runs. In a long-running watch process, a new `package.json` would be missed unless you clear it.
+verify:
+  green_block: 0
+  test: |-
+    const calls = [];
+    const present = new Set(["package.json", "packages/api/package.json"]);
+    const exists = (p) => { calls.push(p); return present.has(p); };
+    const files = [
+      "packages/api/src/a.js",
+      "packages/api/src/b.js",
+      "packages/api/test/c.js",
+      "docs/x.md",
+    ];
+    const got = packagesToBuild(files, ".", exists);
+    if (JSON.stringify(got) !== JSON.stringify([".", "packages/api"])) throw new Error(JSON.stringify(got));
+    if (calls.length !== 5) throw new Error("expected 5 lookups, got " + calls.length);
+    const none = packagesToBuild(["a/b.txt"], ".", () => false);
+    if (none.length !== 0) throw new Error("expected no packages");

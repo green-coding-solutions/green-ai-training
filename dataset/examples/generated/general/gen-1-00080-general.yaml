@@ -1,0 +1,82 @@
+id: gen-1-00080-general
+category: general
+language: java
+patterns:
+- none
+messages:
+- role: user
+  content: |
+    I'm writing a small Java 17 CLI tool that I run by hand to rename files in a folder. Requirements:
+
+    - It takes a directory path as the first argument.
+    - It should rename every `*.jpeg` file to `*.jpg` (case-insensitive on the extension).
+    - If a file with the new name already exists, it must NOT overwrite it. It should print a warning and skip that file.
+    - Print one line per renamed file, and a summary at the end.
+    - Exit code 1 if the path is not a directory.
+
+    How do I write this with `java.nio.file`? I only want the standard library.
+- role: assistant
+  content: |-
+    Use `Files.list` to read the folder and `Files.move` to rename. `Files.move` throws `FileAlreadyExistsException` if the target exists (unless you pass `REPLACE_EXISTING`), so the no-overwrite rule is covered by default. The explicit `Files.exists` check lets you print a clear warning first.
+
+    ```java
+    import java.io.IOException;
+    import java.nio.file.Files;
+    import java.nio.file.Path;
+    import java.nio.file.Paths;
+    import java.util.List;
+    import java.util.stream.Stream;
+
+    public class RenameJpeg {
+        public static void main(String[] args) throws IOException {
+            if (args.length < 1) {
+                System.err.println("Usage: RenameJpeg <directory>");
+                System.exit(1);
+            }
+
+            Path dir = Paths.get(args[0]);
+            if (!Files.isDirectory(dir)) {
+                System.err.println("Not a directory: " + dir);
+                System.exit(1);
+            }
+
+            List<Path> files;
+            try (Stream<Path> stream = Files.list(dir)) {
+                files = stream
+                        .filter(Files::isRegularFile)
+                        .filter(p -> p.getFileName().toString().toLowerCase().endsWith(".jpeg"))
+                        .sorted()
+                        .toList();
+            }
+
+            int renamed = 0;
+            int skipped = 0;
+
+            for (Path file : files) {
+                String name = file.getFileName().toString();
+                String newName = name.substring(0, name.length() - 5) + ".jpg";
+                Path target = file.resolveSibling(newName);
+
+                if (Files.exists(target)) {
+                    System.err.println("Warning: " + newName + " already exists, skipping " + name);
+                    skipped++;
+                    continue;
+                }
+
+                Files.move(file, target);
+                System.out.println(name + " -> " + newName);
+                renamed++;
+            }
+
+            System.out.println("Renamed " + renamed + ", skipped " + skipped);
+        }
+    }
+    ```
+
+    Notes:
+
+    - `Files.list` is not recursive. Use `Files.walk(dir)` if you also want subfolders.
+    - The stream is opened in try-with-resources and collected to a list first. This closes the directory handle before you start renaming.
+    - `.toList()` needs Java 16 or newer, so it works on your Java 17.
+    - On a case-insensitive file system (Windows, default macOS), `photo.JPEG` and `photo.jpg` count as the same name. The `exists` check will then skip the file. That is usually what you want.
+    - There is a small gap between `exists` and `move`. For a manual tool this is fine, because `Files.move` still refuses to overwrite and throws instead. Catch `FileAlreadyExistsException` if other programs write to the folder at the same time.

@@ -1,0 +1,190 @@
+id: gen-1-00469-review
+category: review
+language: go
+patterns:
+- batch-db-writes
+- dom-size
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    Review please, diff only. Handlers from our simulation results service. A run uploads a CSV of about 50k samples (t, energy, temperature), and people open the run page to look at them. Postgres, lib/pq.
+
+    ```go
+    func ingestSamples(w http.ResponseWriter, r *http.Request) {
+        runID := r.PathValue("id")
+        cr := csv.NewReader(r.Body)
+        for {
+            rec, err := cr.Read()
+            if err == io.EOF {
+                break
+            }
+            if err != nil {
+                http.Error(w, err.Error(), http.StatusBadRequest)
+                return
+            }
+            t, _ := strconv.ParseFloat(rec[0], 64)
+            e, _ := strconv.ParseFloat(rec[1], 64)
+            c, _ := strconv.ParseFloat(rec[2], 64)
+            _, err = db.Exec(
+                `INSERT INTO samples (run_id, t, energy, temp) VALUES ($1, $2, $3, $4)`,
+                runID, t, e, c)
+            if err != nil {
+                http.Error(w, err.Error(), http.StatusInternalServerError)
+                return
+            }
+        }
+        w.WriteHeader(http.StatusNoContent)
+    }
+
+    type Sample struct{ T, Energy, Temp float64 }
+
+    func showRun(w http.ResponseWriter, r *http.Request) {
+        runID := r.PathValue("id")
+        rows, err := db.Query(
+            `SELECT t, energy, temp FROM samples WHERE run_id = $1 ORDER BY t`, runID)
+        if err != nil {
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+            return
+        }
+        var out []Sample
+        for rows.Next() {
+            var s Sample
+            if err := rows.Scan(&s.T, &s.Energy, &s.Temp); err != nil {
+                http.Error(w, err.Error(), http.StatusInternalServerError)
+                return
+            }
+            out = append(out, s)
+        }
+        runTmpl.Execute(w, out)
+    }
+    ```
+- role: assistant
+  content: |
+    **Workload:** web backend (ingest endpoint plus a results page)
+
+    #### [Bug] Parse errors are ignored
+    - **Where:** the three `strconv.ParseFloat` calls, and `rec[0..2]` without a length check
+    - **Issue:** a bad cell becomes `0` and is stored as real data. A short row panics.
+    - **Fix:** return a 400 on bad input (in the diff below).
+
+    #### [Bug] Partial uploads stay in the table
+    - **Where:** `db.Exec` in autocommit mode
+    - **Issue:** if row 30,000 fails, the first 29,999 rows are already committed. A retry then duplicates them.
+    - **Fix:** one transaction per upload (in the diff below).
+
+    #### [Bug] `rows` is never closed and `rows.Err()` is never checked
+    - **Where:** `showRun`
+    - **Issue:** an early return leaks the connection. A failure in the middle of the result set looks like a short result.
+    - **Fix:** `defer rows.Close()` and check `rows.Err()`.
+
+    #### [High] One INSERT round trip per row
+    - **Where:** `ingestSamples` loop
+    - **Issue:** 50k samples mean 50k statements, each with its own network round trip and its own commit.
+    - **Fix:** stream the rows through `COPY` inside one transaction.
+    - **Impact:** reduces E and network per upload. In Green Metrics Tool micro-benchmarks, inserting 500,000 rows in batches of 5,000, `COPY` used about 22× less CPU energy than one `execute()` per row ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=8e80b599-3332-432f-8c7e-1cfb93a3a354,8b4c205d-5fb1-40af-ab77-0427ca572f4e,adff4e53-2f1a-4d88-9c0d-dd681d02923f)). With batches of only about 100 rows the gap was small, so this matters for your 50k-row uploads and not for tiny ones.
+
+    #### [High] The page renders every sample
+    - **Where:** `showRun` returns all rows into `runTmpl`
+    - **Issue:** 50k table rows means hundreds of thousands of DOM nodes. The server builds all of it, the browser lays it all out, and the user looks at maybe 50 rows.
+    - **Fix:** page the query with `LIMIT`/`OFFSET` and render one page at a time.
+    - **Impact:** reduces E on server and client, and reduces transferred bytes, on every page view.
+
+    ```diff
+     func ingestSamples(w http.ResponseWriter, r *http.Request) {
+         runID := r.PathValue("id")
+    +    tx, err := db.BeginTx(r.Context(), nil)
+    +    if err != nil {
+    +        http.Error(w, err.Error(), http.StatusInternalServerError)
+    +        return
+    +    }
+    +    defer tx.Rollback()
+    +    stmt, err := tx.Prepare(pq.CopyIn("samples", "run_id", "t", "energy", "temp"))
+    +    if err != nil {
+    +        http.Error(w, err.Error(), http.StatusInternalServerError)
+    +        return
+    +    }
+         cr := csv.NewReader(r.Body)
+    +    cr.FieldsPerRecord = 3
+         for {
+             rec, err := cr.Read()
+             if err == io.EOF {
+                 break
+             }
+             if err != nil {
+                 http.Error(w, err.Error(), http.StatusBadRequest)
+                 return
+             }
+    -        t, _ := strconv.ParseFloat(rec[0], 64)
+    -        e, _ := strconv.ParseFloat(rec[1], 64)
+    -        c, _ := strconv.ParseFloat(rec[2], 64)
+    -        _, err = db.Exec(
+    -            `INSERT INTO samples (run_id, t, energy, temp) VALUES ($1, $2, $3, $4)`,
+    -            runID, t, e, c)
+    -        if err != nil {
+    +        t, err1 := strconv.ParseFloat(rec[0], 64)
+    +        e, err2 := strconv.ParseFloat(rec[1], 64)
+    +        c, err3 := strconv.ParseFloat(rec[2], 64)
+    +        if err1 != nil || err2 != nil || err3 != nil {
+    +            http.Error(w, "bad number in row", http.StatusBadRequest)
+    +            return
+    +        }
+    +        if _, err = stmt.Exec(runID, t, e, c); err != nil {
+                 http.Error(w, err.Error(), http.StatusInternalServerError)
+                 return
+             }
+         }
+    +    if _, err := stmt.Exec(); err != nil { // flush the COPY
+    +        http.Error(w, err.Error(), http.StatusInternalServerError)
+    +        return
+    +    }
+    +    if err := stmt.Close(); err != nil {
+    +        http.Error(w, err.Error(), http.StatusInternalServerError)
+    +        return
+    +    }
+    +    if err := tx.Commit(); err != nil {
+    +        http.Error(w, err.Error(), http.StatusInternalServerError)
+    +        return
+    +    }
+         w.WriteHeader(http.StatusNoContent)
+     }
+
+     func showRun(w http.ResponseWriter, r *http.Request) {
+         runID := r.PathValue("id")
+    +    const pageSize = 200
+    +    page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+    +    if page < 0 {
+    +        page = 0
+    +    }
+         rows, err := db.Query(
+    -        `SELECT t, energy, temp FROM samples WHERE run_id = $1 ORDER BY t`, runID)
+    +        `SELECT t, energy, temp FROM samples WHERE run_id = $1 ORDER BY t LIMIT $2 OFFSET $3`,
+    +        runID, pageSize, page*pageSize)
+         if err != nil {
+             http.Error(w, err.Error(), http.StatusInternalServerError)
+             return
+         }
+    +    defer rows.Close()
+         var out []Sample
+         for rows.Next() {
+             ...
+         }
+    +    if err := rows.Err(); err != nil {
+    +        http.Error(w, err.Error(), http.StatusInternalServerError)
+    +        return
+    +    }
+         runTmpl.Execute(w, out)
+     }
+    ```
+
+    Behavior notes:
+    - `COPY` has no `ON CONFLICT`. If clients re-upload the same run, delete that run's samples in the same transaction, or load into a temp table first.
+    - Paging needs a stable order. If `t` is not unique per run, add a tie-breaker column to the `ORDER BY`.
+    - The template needs "previous" and "next" links that pass `page`.
+    - For very deep pages, keyset paging (`WHERE t > $last`) avoids scanning the skipped rows.
+    - If the page is meant for plots, serve a downsampled series instead of raw rows.
+
+    **Already good:** the query selects only the three columns it needs.
+verify:
+  static_only: needs a running PostgreSQL, lib/pq and a Go toolchain with HTTP handlers

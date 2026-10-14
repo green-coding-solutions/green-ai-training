@@ -1,0 +1,85 @@
+id: gen-1-00152-generation
+category: generation
+language: yaml
+patterns:
+- minimize-environments
+facts: []
+messages:
+- role: user
+  content: |
+    k8s cronjob to delete preview namespaces older than 3 days, label is env=preview
+- role: assistant
+  content: |
+    ```yaml
+    apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: preview-reaper
+      namespace: ops
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    metadata:
+      name: preview-reaper
+    rules:
+      - apiGroups: [""]
+        resources: ["namespaces"]
+        verbs: ["get", "list", "delete"]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    metadata:
+      name: preview-reaper
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: ClusterRole
+      name: preview-reaper
+    subjects:
+      - kind: ServiceAccount
+        name: preview-reaper
+        namespace: ops
+    ---
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata:
+      name: preview-reaper
+      namespace: ops
+    spec:
+      schedule: "0 */6 * * *"
+      concurrencyPolicy: Forbid
+      successfulJobsHistoryLimit: 1
+      failedJobsHistoryLimit: 3
+      jobTemplate:
+        spec:
+          activeDeadlineSeconds: 300
+          ttlSecondsAfterFinished: 3600
+          template:
+            spec:
+              serviceAccountName: preview-reaper
+              restartPolicy: Never
+              containers:
+                - name: reaper
+                  image: alpine/k8s:1.31.0
+                  resources:
+                    requests: {cpu: 10m, memory: 32Mi}
+                    limits: {cpu: 100m, memory: 64Mi}
+                  command: ["/bin/sh", "-c"]
+                  args:
+                    - |
+                      set -eu
+                      max_age_s=$((3 * 24 * 3600))
+                      cutoff=$(date -u -d "@$(( $(date +%s) - max_age_s ))" +%Y-%m-%dT%H:%M:%SZ)
+                      kubectl get ns -l 'env=preview,keep!=true' \
+                        -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.creationTimestamp}{"\n"}{end}' \
+                        | awk -v c="$cutoff" '$2 < c {print $1}' \
+                        | xargs -r kubectl delete ns --wait=false
+    ```
+
+    **Green Notes**
+    - **Expire idle preview environments** (reduces E and M): preview namespaces for merged or abandoned PRs keep pods, volumes and load balancers running for nobody. A TTL sweep removes them, so you need fewer nodes and stop paying the idle power cost.
+      https://patterns.greensoftware.foundation/development/minimizing-deployed-environments
+    - **Narrow selector:** only namespaces labeled `env=preview` are touched. Staging and prod are never matched. Add `keep=true` to a namespace to opt out of cleanup, for example while someone is debugging.
+    - **Small footprint:** the job runs four times a day with tiny resource limits, so the cleanup itself costs almost nothing.
+    - *Trade-off:* deleting a namespace also deletes its data. Three days is a guess, so tune it to how long your reviews usually take.
+verify:
+  static_only: Kubernetes manifests need a cluster and kubectl; cannot be executed in the sandbox

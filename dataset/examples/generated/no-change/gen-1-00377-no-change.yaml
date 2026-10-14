@@ -1,0 +1,47 @@
+id: gen-1-00377-no-change
+category: no-change
+language: javascript
+patterns:
+- builtin-functions
+- context-tradeoff
+messages:
+- role: user
+  content: |
+    Our linter plugin wants me to swap the manual loop for built-ins (Math.min/Math.max/reduce). Gateway is a small ARM box on Node 20. This runs once per second per sensor on a window of 64 readings, some can be null or NaN when a Modbus read fails. Diff only please, if there is one.
+
+    ```javascript
+    const { publish } = require('./mqtt');
+
+    function summarizeWindow(samples) {
+      let min = Infinity;
+      let max = -Infinity;
+      let sum = 0;
+      let n = 0;
+      for (let i = 0; i < samples.length; i++) {
+        const v = samples[i];
+        if (v === null || Number.isNaN(v)) continue;
+        if (v < min) min = v;
+        if (v > max) max = v;
+        sum += v;
+        n++;
+      }
+      if (n === 0) return null;
+      return { min, max, mean: sum / n, n };
+    }
+
+    function onTick(sensorId, ring) {
+      const s = summarizeWindow(ring.snapshot());
+      if (s) publish(`gw/${sensorId}/stats`, JSON.stringify(s));
+    }
+    ```
+- role: assistant
+  content: |
+    No diff. Keep it as it is.
+
+    - **One pass.** The loop computes min, max, sum and count in a single traversal with no allocation. The built-in version needs a `filter` for the bad readings, then `Math.min`, `Math.max` and `reduce`. That is about four passes plus a temporary array, every second, for every sensor.
+    - **Bad readings are handled in the same pass.** `null` and `NaN` are skipped inline. With `Math.min(...arr)` a single `NaN` makes the whole result `NaN`. A `null` silently counts as `0`.
+    - **The spread form also has a size limit.** `Math.min(...arr)` can overflow the argument limit on large arrays. That is not a risk at 64 items, but the loop has no such limit if the window grows.
+
+    The built-ins are the better default for plain collections. Here they would add work and risk on a hot, fixed-size path, so the linter rule does not pay off. Suppress it on this function with a one-line comment that says why.
+verify:
+  static_only: answer contains no code change; the original code is kept as is

@@ -1,0 +1,117 @@
+id: gen-1-00395-refactor
+category: refactor
+language: java
+patterns:
+- batch-db-writes
+- avoid-exception-flow
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```java
+    public class WaitlistImporter {
+        private final DataSource ds;
+
+        public WaitlistImporter(DataSource ds) {
+            this.ds = ds;
+        }
+
+        // lines come from the marketing export for the launch landing page
+        public int importLines(List<String> lines) throws SQLException {
+            int saved = 0;
+            for (String line : lines) {
+                String[] p = line.split(",");
+                if (p.length < 2) continue;
+                String email = p[0].trim().toLowerCase();
+                int referrerId;
+                try {
+                    referrerId = Integer.parseInt(p[1].trim());
+                } catch (NumberFormatException e) {
+                    referrerId = 0;
+                }
+                try (Connection c = ds.getConnection();
+                     PreparedStatement ps = c.prepareStatement(
+                             "INSERT INTO waitlist (email, referrer_id) VALUES (?, ?)")) {
+                    ps.setString(1, email);
+                    ps.setInt(2, referrerId);
+                    ps.executeUpdate();
+                    saved++;
+                }
+            }
+            return saved;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    ```java
+    public class WaitlistImporter {
+        private static final String INSERT_SQL =
+                "INSERT INTO waitlist (email, referrer_id) VALUES (?, ?)";
+        private static final int BATCH_SIZE = 1000;
+
+        private final DataSource ds;
+
+        public WaitlistImporter(DataSource ds) {
+            this.ds = ds;
+        }
+
+        // lines come from the marketing export for the launch landing page
+        public int importLines(List<String> lines) throws SQLException {
+            int saved = 0;
+            try (Connection c = ds.getConnection();
+                 PreparedStatement ps = c.prepareStatement(INSERT_SQL)) {
+                c.setAutoCommit(false);
+                try {
+                    int pending = 0;
+                    for (String line : lines) {
+                        String[] p = line.split(",");
+                        if (p.length < 2) continue;
+                        ps.setString(1, p[0].trim().toLowerCase());
+                        ps.setInt(2, parseReferrer(p[1].trim()));
+                        ps.addBatch();
+                        if (++pending == BATCH_SIZE) {
+                            ps.executeBatch();
+                            c.commit();
+                            saved += pending;
+                            pending = 0;
+                        }
+                    }
+                    if (pending > 0) {
+                        ps.executeBatch();
+                        c.commit();
+                        saved += pending;
+                    }
+                } catch (SQLException e) {
+                    c.rollback();
+                    throw e;
+                }
+            }
+            return saved;
+        }
+
+        // Same result as Integer.parseInt(s), or 0 if it is not a number.
+        // Checks the text first, so a normal "-" or "n/a" does not throw.
+        private static int parseReferrer(String s) {
+            int start = (!s.isEmpty() && (s.charAt(0) == '-' || s.charAt(0) == '+')) ? 1 : 0;
+            if (s.length() == start) return 0;
+            for (int i = start; i < s.length(); i++) {
+                if (Character.digit(s.charAt(i), 10) < 0) return 0;
+            }
+            try {
+                return Integer.parseInt(s);
+            } catch (NumberFormatException e) { // only for digits that overflow int
+                return 0;
+            }
+        }
+    }
+    ```
+
+    **Green Notes**
+    - **One connection, batched inserts** (reduces E and network): the old code opened a connection and sent one statement per line. Now it sends one statement per 1,000 rows over a single connection. For a big export this removes thousands of round trips and connection setups. With the PostgreSQL JDBC driver you can add `reWriteBatchedInserts=true` to the URL so each batch becomes a multi-row insert.
+    - **No exception for expected input** (reduces E): placeholders like `-` or `n/a` in the referrer column are normal, but each one used to throw a `NumberFormatException` and build a stack trace. The helper checks the text first. `try/catch` stays only for the rare overflow case, so results are the same as before.
+    - **Behavior change:** the old version committed every row on its own. Now each chunk of 1,000 is one transaction. If a row fails, that chunk is rolled back and the exception is thrown. Earlier chunks stay committed.
+    - For a list of a few dozen lines the gain from batching would be small. It pays off because this runs on large exports.
+verify:
+  static_only: Java with JDBC DataSource; needs a database and a JDK, not runnable in the stdlib Python/JS verifier

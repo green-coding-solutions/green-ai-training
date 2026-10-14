@@ -1,0 +1,66 @@
+id: gen-1-00282-estimate
+category: estimate
+language: java
+patterns:
+- string-join
+messages:
+- role: user
+  content: |
+    Hello, we have a Java service who reads our app logs every night and make a digest of the lines with one level (ERROR or WARN). Somebody told me the `+=` on the String is bad for the energy and CO2. How much energy we will save when we change it? It run on 4 servers, about 2 million lines per night, maybe 5% are matching.
+
+    ```java
+    public static String buildDigest(List<String> lines, String level) {
+        String out = "";
+        int count = 0;
+        for (String line : lines) {
+            if (line.contains(" " + level + " ")) {
+                out += count + ": " + line.trim() + "\n";
+                count++;
+            }
+        }
+        out += "total=" + count + "\n";
+        return out;
+    }
+    ```
+- role: assistant
+  content: |
+    The change will probably help, but I can't give you a trustworthy number in joules or CO2 without measuring your job. I have no measured Java figure for this, and I won't invent one.
+
+    **Why it helps (counting, not measuring):** Java strings are immutable. Each `out += ...` creates a new String and copies everything built so far. With about 100,000 matching lines (5% of 2 million), the digest grows with every match. The total copying grows roughly with the square of the number of matches. A `StringBuilder` appends into one growing buffer, so the copying grows only linearly.
+
+    **What decides your saving:**
+    - The number of matching lines. With 100,000 matches the effect is large. With 50 matches you would not see it.
+    - The average line length. Longer lines mean more bytes copied each time.
+    - Garbage collection. The `+=` version creates a lot of short-lived large strings, so GC work also goes down.
+
+    Note that the `" " + level + " "` inside the loop is also rebuilt for every one of the 2 million lines. That is a small cost per line, but it is easy to move out.
+
+    ```java
+    public static String buildDigest(List<String> lines, String level) {
+        String needle = " " + level + " ";
+        StringBuilder out = new StringBuilder();
+        int count = 0;
+        for (String line : lines) {
+            if (line.contains(needle)) {
+                out.append(count).append(": ").append(line.trim()).append('\n');
+                count++;
+            }
+        }
+        out.append("total=").append(count).append('\n');
+        return out.toString();
+    }
+    ```
+
+    The output is exactly the same.
+
+    **How to measure your saving:**
+    1. Time and allocation: write a JMH benchmark that runs both versions on a real night's log file. Compare time per call. Use `-prof gc` to see allocated bytes per call.
+    2. Energy: run the old and new job on the same file as a Green Metrics Tool usage scenario. If that is too much work, `perf stat -e power/energy-pkg/` (RAPL) or total CPU time from `time` is a good proxy.
+    3. Your yearly figure: multiply the measured difference per run by 4 servers and the number of nights. Use your own measured values, not a general factor.
+
+    **Green Notes**
+    - **Join strings instead of `+=` in loops** (reduces E): `StringBuilder` avoids copying the whole digest on every match, which matters because your digest has many entries.
+    - **Hoist loop-invariant work** (reduces E): the search text is built once, not 2 million times.
+    - *Not applied:* if the digest is only written to a file, you can skip the big string and write each line with a `BufferedWriter`. That also saves memory, but it changes the method signature, so it is your decision.
+verify:
+  static_only: Java code needs a JDK, which the verifier does not provide; no measured facts are quoted

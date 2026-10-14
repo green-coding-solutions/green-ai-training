@@ -1,0 +1,62 @@
+id: gen-1-00064-no-change
+category: no-change
+language: python
+patterns:
+- vectorize-or-jit
+- context-tradeoff
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    fix this, its the slowest part in the profiler
+
+    ```python
+    from fastapi import FastAPI, HTTPException
+    from pydantic import BaseModel, Field
+
+    app = FastAPI()
+
+    class CartItem(BaseModel):
+        sku: str
+        qty: int = Field(ge=1, le=99)
+        weight_g: int = Field(ge=0)
+        unit_cents: int = Field(ge=0)
+
+    class Cart(BaseModel):
+        items: list[CartItem] = Field(max_length=30)
+        country: str
+
+    RATES = {"DE": 490, "AT": 590, "FR": 690}
+
+    @app.post("/cart/summary")
+    def cart_summary(cart: Cart):
+        if cart.country not in RATES:
+            raise HTTPException(status_code=422, detail="unsupported country")
+        total_weight = 0
+        subtotal = 0
+        for item in cart.items:
+            total_weight += item.weight_g * item.qty
+            subtotal += item.unit_cents * item.qty
+        shipping = RATES[cart.country]
+        if total_weight > 5000:
+            shipping += ((total_weight - 5000) // 1000 + 1) * 150
+        return {
+            "subtotal_cents": subtotal,
+            "shipping_cents": shipping,
+            "total_cents": subtotal + shipping,
+        }
+    ```
+- role: assistant
+  content: |
+    There is nothing to fix in the loop. It is already efficient for this input.
+
+    - **The loop is tiny.** A cart has at most 30 items, so it does at most 30 multiplications and additions. That is microseconds.
+    - **NumPy or Numba would be slower here.** Converting 30 items to an array costs more than the loop itself. Numba also adds a compile step on the first call, a heavy dependency, and more memory per worker.
+    - **Where the time really goes.** In a profiler, the loop line is likely just where the request shows up. Request parsing and Pydantic validation of up to 30 models usually cost more. That is the price of the input checks, and I would keep it.
+
+    JIT and vectorizing pay off on large, repeated numeric loops. In Green Metrics Tool micro-benchmarks, a pure Python quantization loop over 10,000,000 samples used about 4× more CPU energy than the Numba version ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=dc2ed71b-e8ed-48d5-be04-0dd9dfe1443f,2b9e7f88-4aad-42ee-a9e6-25ff4e6ea712)). This endpoint handles 30 items per call, so that result does not carry over.
+
+    If the endpoint feels slow, profile the whole request and look at what runs around this function: database calls, other services, or serialization. Those are the places where a change would show up.
+verify:
+  static_only: answer contains no code; the point is that no change is needed

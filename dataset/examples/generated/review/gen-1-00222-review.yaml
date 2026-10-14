@@ -1,0 +1,161 @@
+id: gen-1-00222-review
+category: review
+language: java
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    Review this. Only give me the diff, no rewrite of the whole class. It's our scoring gateway in front of the model server, and p95 for a batch request is bad.
+
+    ```java
+    package io.acme.scoring;
+
+    import com.fasterxml.jackson.databind.ObjectMapper;
+    import java.net.URI;
+    import java.net.http.HttpClient;
+    import java.net.http.HttpRequest;
+    import java.net.http.HttpRequest.BodyPublishers;
+    import java.net.http.HttpResponse.BodyHandlers;
+    import java.util.ArrayList;
+    import java.util.List;
+
+    public class ScoringService {
+        private final String featureUrl;
+        private final String modelUrl;
+        private final ObjectMapper mapper = new ObjectMapper();
+
+        public ScoringService(String featureUrl, String modelUrl) {
+            this.featureUrl = featureUrl;
+            this.modelUrl = modelUrl;
+        }
+
+        // called by the batch endpoint, usually 20-60 user ids
+        public List<Score> scoreAll(List<String> userIds) throws Exception {
+            List<Score> out = new ArrayList<>();
+            for (String id : userIds) {
+                HttpClient client = HttpClient.newHttpClient();
+
+                HttpRequest fr = HttpRequest.newBuilder(URI.create(featureUrl + "/features/" + id))
+                        .GET().build();
+                String features = client.send(fr, BodyHandlers.ofString()).body();
+
+                HttpRequest mr = HttpRequest.newBuilder(URI.create(modelUrl + "/predict"))
+                        .header("Content-Type", "application/json")
+                        .POST(BodyPublishers.ofString(features)).build();
+                String resp = client.send(mr, BodyHandlers.ofString()).body();
+
+                out.add(mapper.readValue(resp, Score.class));
+            }
+            return out;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (ML inference gateway)
+
+    #### [Bug] No status check, no timeout
+    - **Where:** both `client.send(...).body()` calls
+    - **Issue:** a 500 or 429 from the feature store is passed to the model as if it were features. A hung upstream blocks the request thread forever.
+    - **Fix:** check the status code and set request timeouts (in the diff).
+
+    #### [High] 2 × N blocking calls in sequence
+    - **Where:** the `for` loop in `scoreAll`
+    - **Issue:** the users are independent, but each one waits for the previous one. With 60 ids that is 120 round trips in a row. Batch latency is the sum of all calls, and the request thread sits blocked the whole time. The model server is idle between calls, so its hardware is poorly used.
+    - **Fix:** run the users concurrently with `sendAsync` and chain feature fetch → predict per user. Cap the number in flight so you don't flood the model server. Results keep the input order.
+    - **Impact:** E: mostly less wall time and less thread holding time. In Green Metrics Tool micro-benchmarks, 10 HTTP requests used about 7% less CPU energy and about 17% less wall time with async than with sync ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=97acc9a0-3856-4bbb-b816-2b64030fba98,6415cccb-ad1a-4d87-ae46-92740c5e285b)). Expect a small CPU gain and a large latency gain.
+    - **Pattern:** https://patterns.greensoftware.foundation/development/use-async-instead-of-sync
+
+    #### [Medium] New `HttpClient` per user
+    - **Where:** `HttpClient.newHttpClient()` inside the loop
+    - **Issue:** each client has its own connection pool and selector thread, so keep-alive connections are never reused. That means a new TCP (and TLS) handshake per call.
+    - **Fix:** one shared client in a field.
+
+    ```text
+    @@ ScoringService @@
+    +    private static final int MAX_IN_FLIGHT = 8;
+    +    private final HttpClient client = HttpClient.newBuilder()
+    +            .connectTimeout(Duration.ofSeconds(2))
+    +            .build();
+         private final ObjectMapper mapper = new ObjectMapper();
+
+    @@ scoreAll @@
+    -    public List<Score> scoreAll(List<String> userIds) throws Exception {
+    -        List<Score> out = new ArrayList<>();
+    -        for (String id : userIds) {
+    -            HttpClient client = HttpClient.newHttpClient();
+    -
+    -            HttpRequest fr = HttpRequest.newBuilder(URI.create(featureUrl + "/features/" + id))
+    -                    .GET().build();
+    -            String features = client.send(fr, BodyHandlers.ofString()).body();
+    -
+    -            HttpRequest mr = HttpRequest.newBuilder(URI.create(modelUrl + "/predict"))
+    -                    .header("Content-Type", "application/json")
+    -                    .POST(BodyPublishers.ofString(features)).build();
+    -            String resp = client.send(mr, BodyHandlers.ofString()).body();
+    -
+    -            out.add(mapper.readValue(resp, Score.class));
+    -        }
+    -        return out;
+    -    }
+    +    public List<Score> scoreAll(List<String> userIds) {
+    +        Semaphore permits = new Semaphore(MAX_IN_FLIGHT);
+    +        List<CompletableFuture<Score>> futures = new ArrayList<>(userIds.size());
+    +        for (String id : userIds) {
+    +            permits.acquireUninterruptibly();
+    +            futures.add(scoreOne(id).whenComplete((s, e) -> permits.release()));
+    +        }
+    +        return futures.stream().map(CompletableFuture::join).toList();
+    +    }
+    +
+    +    private CompletableFuture<Score> scoreOne(String id) {
+    +        HttpRequest fr = HttpRequest.newBuilder(URI.create(featureUrl + "/features/" + id))
+    +                .timeout(Duration.ofSeconds(5))
+    +                .GET().build();
+    +        return client.sendAsync(fr, BodyHandlers.ofString())
+    +                .thenApply(this::requireOk)
+    +                .thenCompose(features -> {
+    +                    HttpRequest mr = HttpRequest.newBuilder(URI.create(modelUrl + "/predict"))
+    +                            .timeout(Duration.ofSeconds(10))
+    +                            .header("Content-Type", "application/json")
+    +                            .POST(BodyPublishers.ofString(features)).build();
+    +                    return client.sendAsync(mr, BodyHandlers.ofString());
+    +                })
+    +                .thenApply(this::requireOk)
+    +                .thenApply(this::parse);
+    +    }
+    +
+    +    private String requireOk(HttpResponse<String> r) {
+    +        if (r.statusCode() != 200) {
+    +            throw new IllegalStateException("upstream " + r.uri() + " returned " + r.statusCode());
+    +        }
+    +        return r.body();
+    +    }
+    +
+    +    private Score parse(String json) {
+    +        try {
+    +            return mapper.readValue(json, Score.class);
+    +        } catch (IOException e) {
+    +            throw new UncheckedIOException(e);
+    +        }
+    +    }
+
+    @@ imports @@
+    +import java.io.IOException;
+    +import java.io.UncheckedIOException;
+    +import java.net.http.HttpResponse;
+    +import java.time.Duration;
+    +import java.util.concurrent.CompletableFuture;
+    +import java.util.concurrent.Semaphore;
+    ```
+
+    Notes on behavior:
+    - Output order equals input order.
+    - `scoreAll` no longer declares `throws Exception`. A failed user now surfaces as a `CompletionException` from `join()`. Callers that catch `Exception` still compile.
+    - `MAX_IN_FLIGHT` is a starting value. Tune it against what the model server can batch. If the model server also offers a batch `/predict` endpoint, one call for all users would cut more round trips than concurrency does.
+    - If a batch is usually 1-2 ids, the async path buys you little. Keep it only for the 20-60 id case.
+verify:
+  static_only: Java code needs a running feature store and model server over HTTP; not runnable with stdlib Python/JS checks

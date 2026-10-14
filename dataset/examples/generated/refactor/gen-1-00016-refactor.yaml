@@ -1,0 +1,178 @@
+id: gen-1-00016-refactor
+category: refactor
+language: html
+patterns:
+- css-animations
+- dom-size
+facts:
+- F-ANIM
+messages:
+- role: user
+  content: |
+    We have an internal page that shows the latest requests from our REST API (support uses it to check customer errors). It stays open on a few laptops all day. Please optimize/refactor it. Requirements:
+
+    - keep the "Live" indicator that pulses
+    - keep the status filter (2xx / 4xx / 5xx)
+    - keep the refresh every 10 s
+    - the endpoint stays `/api/admin/requests?limit=2000`, I can't change the backend now
+    - support says the page gets laggy and the fan spins up after a few hours
+
+    ```html
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>API request log</title>
+      <style>
+        body { font-family: sans-serif; margin: 16px; }
+        #live-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #2a9d4b; }
+        table { border-collapse: collapse; width: 100%; }
+        td, th { border-bottom: 1px solid #ddd; padding: 4px 8px; text-align: left; }
+        tr.s5 td:nth-child(3) { color: #c0392b; font-weight: bold; }
+      </style>
+    </head>
+    <body>
+      <h1>API requests <span id="live-dot"></span> Live</h1>
+      <select id="status-filter">
+        <option value="all">All</option>
+        <option value="2">2xx</option>
+        <option value="4">4xx</option>
+        <option value="5">5xx</option>
+      </select>
+      <table id="log">
+        <thead><tr><th>Time</th><th>Path</th><th>Status</th><th>ms</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+
+      <script>
+        let logs = [];
+
+        async function load() {
+          const res = await fetch('/api/admin/requests?limit=2000');
+          logs = await res.json();
+          render();
+        }
+
+        function render() {
+          const f = document.getElementById('status-filter').value;
+          let html = '';
+          logs.forEach(function (l) {
+            if (f === 'all' || String(l.status).startsWith(f)) {
+              html += '<tr class="s' + String(l.status)[0] + '"><td>' + l.time + '</td><td>' +
+                l.path + '</td><td>' + l.status + '</td><td>' + l.ms + '</td></tr>';
+            }
+          });
+          document.getElementById('rows').innerHTML = html;
+        }
+
+        let t = 0;
+        setInterval(function () {
+          t += 0.1;
+          document.getElementById('live-dot').style.opacity = 0.5 + 0.5 * Math.sin(t);
+        }, 50);
+
+        document.getElementById('status-filter').addEventListener('change', render);
+        setInterval(load, 10000);
+        load();
+      </script>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    ```html
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>API request log</title>
+      <style>
+        body { font-family: sans-serif; margin: 16px; }
+        #live-dot {
+          display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #2a9d4b;
+          animation: pulse 1.2s ease-in-out infinite alternate;
+        }
+        @keyframes pulse { from { opacity: 1; } to { opacity: 0.2; } }
+        @media (prefers-reduced-motion: reduce) { #live-dot { animation: none; } }
+        table { border-collapse: collapse; width: 100%; }
+        td, th { border-bottom: 1px solid #ddd; padding: 4px 8px; text-align: left; }
+        tr.s5 td:nth-child(3) { color: #c0392b; font-weight: bold; }
+        #pager { margin: 8px 0; }
+      </style>
+    </head>
+    <body>
+      <h1>API requests <span id="live-dot"></span> Live</h1>
+      <select id="status-filter">
+        <option value="all">All</option>
+        <option value="2">2xx</option>
+        <option value="4">4xx</option>
+        <option value="5">5xx</option>
+      </select>
+      <div id="pager">
+        <button id="prev" type="button">Prev</button>
+        <span id="page-info"></span>
+        <button id="next" type="button">Next</button>
+      </div>
+      <table id="log">
+        <thead><tr><th>Time</th><th>Path</th><th>Status</th><th>ms</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+
+      <script>
+        const PAGE_SIZE = 100;
+        let logs = [];
+        let page = 0;
+
+        const rowsEl = document.getElementById('rows');
+        const filterEl = document.getElementById('status-filter');
+
+        async function load() {
+          const res = await fetch('/api/admin/requests?limit=2000');
+          logs = await res.json();
+          render();
+        }
+
+        function render() {
+          const f = filterEl.value;
+          const visible = f === 'all' ? logs : logs.filter(l => String(l.status).startsWith(f));
+          const pages = Math.max(1, Math.ceil(visible.length / PAGE_SIZE));
+          page = Math.min(page, pages - 1);
+
+          const frag = document.createDocumentFragment();
+          for (const l of visible.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)) {
+            const tr = document.createElement('tr');
+            tr.className = 's' + String(l.status)[0];
+            for (const value of [l.time, l.path, l.status, l.ms]) {
+              const td = document.createElement('td');
+              td.textContent = value;
+              tr.appendChild(td);
+            }
+            frag.appendChild(tr);
+          }
+          rowsEl.replaceChildren(frag);
+
+          document.getElementById('page-info').textContent =
+            'Page ' + (page + 1) + ' of ' + pages + ' (' + visible.length + ' requests)';
+          document.getElementById('prev').disabled = page === 0;
+          document.getElementById('next').disabled = page >= pages - 1;
+        }
+
+        filterEl.addEventListener('change', () => { page = 0; render(); });
+        document.getElementById('prev').addEventListener('click', () => { page--; render(); });
+        document.getElementById('next').addEventListener('click', () => { page++; render(); });
+
+        setInterval(load, 10000);
+        load();
+      </script>
+    </body>
+    </html>
+    ```
+
+    **Green Notes**
+    - **CSS keyframes instead of a 50 ms JS timer** (reduces E): the old timer woke the main thread 20 times per second, all day, just to change one opacity value. Now the browser animates `opacity` itself and no script runs. In Green Metrics Tool browser benchmarks, a 20-second animation used about 161 J CPU energy with `requestAnimationFrame` style updates and about 145 J with CSS `@keyframes` (about 10% less) ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=4a2085fd-6f43-4f26-a3ee-2a6fcd7db594,58ee50a2-7110-4418-beea-df6ffba5425a)). The gap is small per second but this page runs for hours. I also added `prefers-reduced-motion` so the dot stops pulsing for users who turn animations off.
+    - **100 rows in the DOM instead of up to 2000** (reduces E): the old page rebuilt a table of up to 2000 rows every 10 seconds, and the browser had to parse, style and lay it out each time. Now only one page of rows exists. The filter works on the full list, so you still see all matching requests, one page at a time.
+    - **Behavior changes:** you now page through the results (Prev/Next), and changing the filter goes back to page 1. A refresh keeps your current page, unless it no longer exists.
+    - **Bug fixed:** the old code put `l.path` straight into `innerHTML`. A request path with markup in it would be run as HTML. `textContent` shows it as plain text.
+    - *Not applied:* a smaller `limit` in the API call. That needs a backend change, and it would cut transferred data further. It is worth doing later.
+verify:
+  static_only: Browser page with fetch and DOM APIs; cannot run in the stdlib Python/Node harness

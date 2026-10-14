@@ -1,0 +1,74 @@
+id: gen-1-00050-generation
+category: generation
+language: javascript
+patterns:
+- hoist-invariants
+messages:
+- role: user
+  content: |
+    im new to javascript and not sure how to do this part. i have a canvas and call getImageData() on it, its already resized to 224x224. my model (onnxruntime-web, resnet style) wants a Float32Array in channel-first order (all R, then all G, then all B), normalized with the imagenet mean and std. can you write the function? it runs on every webcam frame so i hope its ok
+- role: assistant
+  content: |
+    Here is a function that does the conversion in one pass:
+
+    ```javascript
+    const MEAN = [0.485, 0.456, 0.406];
+    const STD = [0.229, 0.224, 0.225];
+
+    // (v / 255 - mean) / std  ==  v * scale - offset
+    const SCALE = STD.map((s) => 1 / (255 * s));
+    const OFFSET = MEAN.map((m, c) => m / STD[c]);
+
+    function imageDataToTensorData(imageData) {
+      const { data, width, height } = imageData;
+      const plane = width * height;
+      const out = new Float32Array(3 * plane);
+
+      const [sr, sg, sb] = SCALE;
+      const [or, og, ob] = OFFSET;
+      const gOff = plane;
+      const bOff = 2 * plane;
+
+      for (let i = 0, p = 0; i < plane; i++, p += 4) {
+        out[i] = data[p] * sr - or;
+        out[gOff + i] = data[p + 1] * sg - og;
+        out[bOff + i] = data[p + 2] * sb - ob;
+        // data[p + 3] is alpha, the model does not use it
+      }
+      return out;
+    }
+    ```
+
+    Use it like this:
+
+    ```javascript
+    const ctx = canvas.getContext("2d");
+    const imageData = ctx.getImageData(0, 0, 224, 224);
+    const input = new ort.Tensor("float32", imageDataToTensorData(imageData), [1, 3, 224, 224]);
+    const results = await session.run({ input });
+    ```
+
+    Check that the mean and std match what your model was trained with. The values above are the usual ImageNet ones. Also check the input name in `session.run`.
+
+    **Green Notes**
+    - **Hoisted per-channel constants** (reduces E): the divide by 255, the mean and the std are folded into one multiply and one subtract. They are computed once at load time, not for every pixel of every frame.
+    - **Hoisted `plane`, channel offsets and constants into locals** (reduces E): the loop body only does index math and arithmetic. No array lookups for `MEAN` or `STD` and no `width * height` inside the loop.
+    - **One preallocated `Float32Array`** (reduces E): no per-pixel `push` and no intermediate arrays, so there is less garbage collection work on every frame.
+    - *Not applied:* a Web Worker. For one 224x224 frame at a time this loop is small, so keep it on the main thread until profiling shows it blocks rendering.
+verify:
+  test: |-
+    const W = 3, H = 2;
+    const raw = new Uint8ClampedArray(W * H * 4);
+    for (let i = 0; i < raw.length; i++) raw[i] = (i * 37 + 11) % 256;
+    const img = { data: raw, width: W, height: H };
+    const out = imageDataToTensorData(img);
+    if (!(out instanceof Float32Array) || out.length !== 3 * W * H) throw new Error("bad shape");
+    const plane = W * H;
+    for (let c = 0; c < 3; c++) {
+      for (let i = 0; i < plane; i++) {
+        const expected = (raw[i * 4 + c] / 255 - MEAN[c]) / STD[c];
+        if (Math.abs(out[c * plane + i] - expected) > 1e-4) {
+          throw new Error("mismatch at channel " + c + " pixel " + i);
+        }
+      }
+    }

@@ -1,0 +1,79 @@
+id: gen-1-00326-generation
+category: generation
+language: python
+patterns:
+- keep-star-imports
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    write encode/decode for our lora gateway frame. header = version u8 + count u16, then readings (sensor id u16, temp in centi-C i16, unix ts u32), crc32 at the end. all our files use `from struct import *` so keep that
+- role: assistant
+  content: |
+    Here is the frame codec. The `from struct import *` line stays as you asked:
+
+    ```python
+    import zlib
+    from struct import *
+
+    VERSION = 1
+    HEADER = Struct("<BH")     # version, count
+    READING = Struct("<HhI")   # sensor id, centi-degrees C, unix ts
+    CRC = Struct("<I")
+
+
+    def encode_frame(readings):
+        """readings: list of (sensor_id, temp_c, unix_ts)"""
+        n = len(readings)
+        buf = bytearray(HEADER.size + n * READING.size + CRC.size)
+        HEADER.pack_into(buf, 0, VERSION, n)
+        offset = HEADER.size
+        for sensor_id, temp_c, ts in readings:
+            READING.pack_into(buf, offset, sensor_id, round(temp_c * 100), ts)
+            offset += READING.size
+        CRC.pack_into(buf, offset, zlib.crc32(memoryview(buf)[:offset]))
+        return bytes(buf)
+
+
+    def decode_frame(data):
+        if len(data) < HEADER.size + CRC.size:
+            raise ValueError("frame too short")
+        view = memoryview(data)
+        (crc,) = CRC.unpack_from(data, len(data) - CRC.size)
+        if zlib.crc32(view[:-CRC.size]) != crc:
+            raise ValueError("bad crc")
+        version, n = HEADER.unpack_from(data, 0)
+        if version != VERSION:
+            raise ValueError(f"unsupported version {version}")
+        if len(data) != HEADER.size + n * READING.size + CRC.size:
+            raise ValueError("length does not match count")
+        body = view[HEADER.size:-CRC.size]
+        return [(sid, centi / 100, ts) for sid, centi, ts in READING.iter_unpack(body)]
+    ```
+
+    The CRC is checked before anything else is parsed, so a corrupt frame is rejected early. Temperatures are stored as whole centi-degrees, so values are rounded to 0.01 °C.
+
+    **Green Notes**
+    - **One buffer, one pass** (reduces E): the frame is written into a preallocated `bytearray` with `pack_into`. This avoids building a new `bytes` object for every reading and joining them afterwards, which matters on a small gateway that encodes frames all day.
+    - **`Struct` objects created once** at module level, and `iter_unpack` decodes all readings in one call instead of slicing in a Python loop.
+    - **Star import left as is:** in Green Metrics Tool micro-benchmarks, `from x import *` and `import x` showed no measurable energy difference. There is no reason to change it for energy, so keeping your convention is fine.
+verify:
+  green_block: 0
+  test: |-
+    frame = encode_frame([(7, 21.5, 1760000000), (9, -3.25, 1760000060)])
+    assert len(frame) == 3 + 2 * 8 + 4
+    assert decode_frame(frame) == [(7, 21.5, 1760000000), (9, -3.25, 1760000060)]
+    assert decode_frame(encode_frame([])) == []
+    bad = bytearray(frame)
+    bad[5] ^= 0xFF
+    try:
+        decode_frame(bytes(bad))
+        raise SystemExit("expected ValueError")
+    except ValueError:
+        pass
+    try:
+        decode_frame(b"\x01")
+        raise SystemExit("expected ValueError")
+    except ValueError:
+        pass

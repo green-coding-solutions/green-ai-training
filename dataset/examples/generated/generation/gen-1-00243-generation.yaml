@@ -1,0 +1,59 @@
+id: gen-1-00243-generation
+category: generation
+language: python
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    python func to upload junit xml report to our artifact server, POST, files are 5-20MB
+- role: assistant
+  content: |
+    This assumes the server accepts `Content-Encoding: gzip` on request bodies. Many do, but check yours.
+
+    ```python
+    import gzip
+    import urllib.request
+
+    MIN_COMPRESS_BYTES = 1024
+
+
+    def prepare_body(data: bytes) -> tuple[bytes, dict]:
+        """Return the request body and the headers that describe it."""
+        headers = {"Content-Type": "application/xml"}
+        if len(data) >= MIN_COMPRESS_BYTES:
+            data = gzip.compress(data, compresslevel=5)
+            headers["Content-Encoding"] = "gzip"
+        return data, headers
+
+
+    def upload_report(url: str, path: str, token: str, timeout: float = 30) -> int:
+        with open(path, "rb") as f:
+            raw = f.read()
+        body, headers = prepare_body(raw)
+        headers["Authorization"] = f"Bearer {token}"
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status
+    ```
+
+    **Green Notes**
+    - **Compress the request body** (reduces network): JUnit XML is repetitive text and shrinks a lot, so far fewer bytes leave the CI runner on every build.
+      https://patterns.greensoftware.foundation/development/data-handling/compress-transmitted-data
+    - **Fast codec, moderate level** (reduces E): this runs on every build, so compression cost adds up. In Green Metrics Tool micro-benchmarks, compressing 100 MB of text used about 67 J with gzip and about 3019 J with brotli at its max quality ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=2584305c-7a1e-47e2-b6cc-26276962035e,addc5f5e-55da-47f8-956d-240d06304e4e,fb08d3c3-ba41-4f0f-85fd-0b6c34e6c39b,f1479db0-c453-4aaa-9116-e137621fad07,7b3bb87d-3b43-4f82-be99-0327405205b8,905bd408-6b31-4237-a4da-14b8fad90613,7f213a20-8028-4080-9583-6e465c217bb5,8e93a8d2-60b0-4831-905b-764b68257bc7)). Max-quality codecs only fit files compressed once and served many times. This energy comparison says nothing about file size. If `zstd` is available on both ends, it is cheaper than gzip.
+    - **Small bodies stay raw:** below 1 KB the gzip header and CPU work give no real gain.
+
+    *Not applied:* if you later upload already-compressed files (ZIP, JPEG, MP4 artifacts), send them as they are. Compressing them again gains nothing.
+verify:
+  module: true
+  test: |-
+    big = b"<testcase name='t'/>\n" * 2000
+    body, headers = prepare_body(big)
+    assert headers["Content-Encoding"] == "gzip"
+    assert len(body) < len(big)
+    assert gzip.decompress(body) == big
+    small, h2 = prepare_body(b"<a/>")
+    assert small == b"<a/>"
+    assert "Content-Encoding" not in h2

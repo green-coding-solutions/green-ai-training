@@ -1,0 +1,52 @@
+id: gen-1-00477-review
+category: review
+language: go
+patterns:
+- string-join
+- builtin-functions
+messages:
+- role: user
+  content: "Hello, can you rewiew this pls? Its from our lab tool who write a text report after a simulation run. Usualy we\
+    \ have around 200k samples per run and it is getting very slow, specialy at the end. I dont know why. Go version is 1.22.\n\
+    \n```go\npackage main\n\nimport (\n\t\"fmt\"\n\t\"strconv\"\n)\n\ntype Sample struct {\n\tT      float64\n\tValue  float64\n\
+    \tSensor string\n}\n\nfunc median(vals []float64) float64 {\n\tsorted := make([]float64, len(vals))\n\tcopy(sorted, vals)\n\
+    \tfor i := 0; i < len(sorted); i++ {\n\t\tfor j := i + 1; j < len(sorted); j++ {\n\t\t\tif sorted[j] < sorted[i] {\n\t\
+    \t\t\tsorted[i], sorted[j] = sorted[j], sorted[i]\n\t\t\t}\n\t\t}\n\t}\n\tn := len(sorted)\n\tif n == 0 {\n\t\treturn\
+    \ 0\n\t}\n\tif n%2 == 1 {\n\t\treturn sorted[n/2]\n\t}\n\treturn (sorted[n/2-1] + sorted[n/2]) / 2\n}\n\nfunc buildReport(samples\
+    \ []Sample) string {\n\tcols := []string{\"t\", \"value\", \"sensor\"}\n\theader := \"\"\n\tfor i, c := range cols {\n\
+    \t\tif i > 0 {\n\t\t\theader += \",\"\n\t\t}\n\t\theader += c\n\t}\n\tout := header + \"\\n\"\n\n\tvals := []float64{}\n\
+    \tfor _, s := range samples {\n\t\tout += strconv.FormatFloat(s.T, 'f', 3, 64) + \",\" +\n\t\t\tstrconv.FormatFloat(s.Value,\
+    \ 'g', -1, 64) + \",\" +\n\t\t\ts.Sensor + \"\\n\"\n\t\tvals = append(vals, s.Value)\n\t}\n\n\ttotal := 0.0\n\tfor _,\
+    \ v := range vals {\n\t\ttotal += v\n\t}\n\tmean := total / float64(len(vals))\n\tout += fmt.Sprintf(\"# mean=%.4f median=%.4f\
+    \ n=%d\\n\", mean, median(vals), len(vals))\n\treturn out\n}\n```\n"
+- role: assistant
+  content: "**Workload:** script / data pipeline (one batch run, but the cost grows quadratically with the sample count)\n\
+    \n#### [Bug] Empty input prints `mean=NaN`\n- **Where:** `buildReport`, the `mean` line\n- **Issue:** with zero samples,\
+    \ `total / float64(len(vals))` is `0/0`. Go does not panic for floats, so the report says `mean=NaN`.\n- **Fix:** return\
+    \ a header and `# n=0` for empty input. The code below does this. It changes the output for empty runs only.\n\n#### [High]\
+    \ Hand-written O(n²) sort in `median`\n- **Where:** the two nested `for` loops in `median`\n- **Issue:** every pair of\
+    \ values is compared. With 200k samples that is about 20 billion comparisons and many swaps, only to find the middle value.\
+    \ This is most likely the slowdown you see at the end of the run.\n- **Fix:** use `sort.Float64s`, which is O(n log n).\
+    \ Keep the copy, so the caller's slice is not reordered.\n- **Impact:** reduces E from quadratic to n log n in the number\
+    \ of samples.\n\n#### [High] `out +=` in the sample loop\n- **Where:** `out += ...` inside `for _, s := range samples`\n\
+    - **Issue:** Go strings are immutable. Each `+=` allocates a new string and copies everything written so far. The bytes\
+    \ copied grow quadratically with the report size, and the garbage collector has to clean up all the old copies.\n- **Fix:**\
+    \ write into one `strings.Builder` and call `Grow` once up front.\n- **Impact:** reduces E and memory churn. Copying becomes\
+    \ linear in the report size.\n\n#### [Low] Header loop and extra pass for the sum\n- **Where:** the `cols` loop and the\
+    \ `total` loop\n- **Issue:** `strings.Join` does the header in one call. The sum can be added inside the main loop, and\
+    \ `vals` can be allocated with the right capacity. The header is tiny, so this is mostly about readability. The gain is\
+    \ small next to the two findings above.\n\n```go\npackage main\n\nimport (\n\t\"fmt\"\n\t\"sort\"\n\t\"strconv\"\n\t\"\
+    strings\"\n)\n\ntype Sample struct {\n\tT      float64\n\tValue  float64\n\tSensor string\n}\n\nfunc median(vals []float64)\
+    \ float64 {\n\tn := len(vals)\n\tif n == 0 {\n\t\treturn 0\n\t}\n\tsorted := make([]float64, n)\n\tcopy(sorted, vals)\n\
+    \tsort.Float64s(sorted)\n\tif n%2 == 1 {\n\t\treturn sorted[n/2]\n\t}\n\treturn (sorted[n/2-1] + sorted[n/2]) / 2\n}\n\
+    \nfunc buildReport(samples []Sample) string {\n\tvar b strings.Builder\n\tb.Grow(len(samples)*32 + 64)\n\n\tb.WriteString(strings.Join([]string{\"\
+    t\", \"value\", \"sensor\"}, \",\"))\n\tb.WriteByte('\\n')\n\n\tvals := make([]float64, 0, len(samples))\n\ttotal := 0.0\n\
+    \tfor _, s := range samples {\n\t\tb.WriteString(strconv.FormatFloat(s.T, 'f', 3, 64))\n\t\tb.WriteByte(',')\n\t\tb.WriteString(strconv.FormatFloat(s.Value,\
+    \ 'g', -1, 64))\n\t\tb.WriteByte(',')\n\t\tb.WriteString(s.Sensor)\n\t\tb.WriteByte('\\n')\n\t\tvals = append(vals, s.Value)\n\
+    \t\ttotal += s.Value\n\t}\n\n\tif len(vals) == 0 {\n\t\tb.WriteString(\"# n=0\\n\")\n\t\treturn b.String()\n\t}\n\tfmt.Fprintf(&b,\
+    \ \"# mean=%.4f median=%.4f n=%d\\n\", total/float64(len(vals)), median(vals), len(vals))\n\treturn b.String()\n}\n```\n\
+    \nThe mean is summed in the same order as before, so the printed value is the same. If a `Sensor` name can contain a comma\
+    \ or a newline, the CSV will break. Use `encoding/csv` for that, but it can change the quoting in the output.\n\n**Already\
+    \ good:** `copy` before sorting, so the input is not modified. `strconv.FormatFloat` instead of `fmt.Sprintf` per field.\n"
+verify:
+  static_only: Go toolchain is not part of the stdlib + numpy test harness

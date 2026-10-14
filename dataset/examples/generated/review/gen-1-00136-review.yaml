@@ -1,0 +1,83 @@
+id: gen-1-00136-review
+category: review
+language: bash
+patterns:
+- bash-quoting
+- bash-builtins
+facts:
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    Can you review this batch inference wrapper? It runs on a small CPU-only edge box and classifies every JPEG that a camera drops into a folder (usually tens of thousands per run). `./infer` is our own ONNX runtime CLI.
+
+    Requirements: it must stay plain bash (no extra tools), the output file names must stay `<image name>.json`, and failures must still be logged to `errors.log`. Please point out bugs first, then anything that wastes CPU.
+
+    ```bash
+    #!/bin/bash
+    # batch_classify.sh <input_dir> <out_dir>
+    INPUT_DIR=$1
+    OUT_DIR=$2
+    MODEL="/opt/models/resnet50-int8.onnx"
+
+    mkdir -p $OUT_DIR
+
+    for f in $(ls $INPUT_DIR/*.jpg); do
+        name=$(basename $f .jpg)
+        SCHEMA="{\"type\":\"object\",\"properties\":{\"label\":{\"type\":\"string\"},\"score\":{\"type\":\"number\"}},\"required\":[\"label\",\"score\"]}"
+        OPTS="--threads 4 --topk 5 --format json"
+        echo "Processing $f"
+        ./infer $OPTS --model $MODEL --schema "$SCHEMA" --input $f > $OUT_DIR/$name.json
+        if [ $? -ne 0 ]; then
+            echo "FAILED: $f" >> $OUT_DIR/errors.log
+        fi
+    done
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (batch ML inference on an edge node)
+
+    #### [Bug] Unquoted paths and `$(ls ...)` break on spaces
+    - **Where:** `for f in $(ls $INPUT_DIR/*.jpg)`, `mkdir -p $OUT_DIR`, `--input $f`, `> $OUT_DIR/$name.json`
+    - **Issue:** the shell splits these values at spaces. A file called `cam 1 0007.jpg` becomes three bad arguments. If the folder has no JPEGs, `ls` fails and the loop runs on an error string. Unquoted expansions are also glob-expanded.
+    - **Fix:** loop over the glob directly and quote every variable that holds a path: `"$f"`, `"$OUT_DIR"`, `"$MODEL"`.
+
+    #### [Medium] Constant strings rebuilt on every iteration, with escaped double quotes
+    - **Where:** `SCHEMA=...` and `OPTS=...` inside the loop
+    - **Issue:** neither string changes between images, so they are assigned again for every file. The schema is also double-quoted, so bash scans it for `$`, backticks and backslashes, and you need `\"` everywhere. That is hard to read and easy to break.
+    - **Fix:** set them once before the loop. Use single quotes for the schema and the model path, since nothing needs expansion. Keep the options in an array so they stay separate arguments without relying on word splitting.
+    - **Impact:** reduces E per file, in a loop that runs tens of thousands of times. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal in a loop used about 24% less CPU energy with single quotes ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=dd9bbb4e-b056-4067-8ad2-7b1818a86f10,b265ef9b-adb9-4b56-a14b-ae34fdaa7247,28d92c15-79d7-44ca-8f43-a733fe2e265a,a9533378-71f0-49df-bd5f-1e5f27cda9c2)). Your schema is much shorter, so the saving per assignment is small. Hoisting removes the repeated work completely. Keep double quotes around variables.
+
+    #### [Low] Two forks per file for string work
+    - **Where:** `$(basename $f .jpg)` and `[ $? -ne 0 ]`
+    - **Issue:** `$(basename ...)` starts a new process for each image. Bash can strip the path and the suffix itself. Testing `$?` on a separate line also works, but `if ! cmd` is shorter and safer if someone adds a line in between.
+    - **Fix:** `name=${f##*/}; name=${name%.jpg}` and `if ! ./infer ...`.
+    - **Impact:** reduces E slightly per file. The inference itself dominates the runtime.
+
+    ```bash
+    #!/bin/bash
+    # batch_classify.sh <input_dir> <out_dir>
+    INPUT_DIR=$1
+    OUT_DIR=$2
+    MODEL='/opt/models/resnet50-int8.onnx'
+    SCHEMA='{"type":"object","properties":{"label":{"type":"string"},"score":{"type":"number"}},"required":["label","score"]}'
+    OPTS=(--threads 4 --topk 5 --format json)
+
+    mkdir -p "$OUT_DIR"
+    shopt -s nullglob
+
+    for f in "$INPUT_DIR"/*.jpg; do
+        name=${f##*/}
+        name=${name%.jpg}
+        echo "Processing $f"
+        if ! ./infer "${OPTS[@]}" --model "$MODEL" --schema "$SCHEMA" --input "$f" > "$OUT_DIR/$name.json"; then
+            echo "FAILED: $f" >> "$OUT_DIR/errors.log"
+        fi
+    done
+    ```
+
+    Behavior notes: output names and the error log are unchanged. With `nullglob`, an empty input folder now does nothing instead of passing a broken file list.
+
+    **Already good:** failures are logged without stopping the run, and the int8 model is a sensible choice for a CPU-only box.
+verify:
+  static_only: needs the custom ./infer ONNX binary and model files

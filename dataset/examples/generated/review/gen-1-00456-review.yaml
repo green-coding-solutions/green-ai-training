@@ -1,0 +1,178 @@
+id: gen-1-00456-review
+category: review
+language: javascript
+patterns:
+- batch-db-writes
+- select-columns
+facts:
+- F-PG-SELECT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    ?
+
+    ```javascript
+    const express = require("express");
+    const pool = require("./db");
+    const router = express.Router();
+
+    // POST /api/checkout
+    // body: { customerId, items: [{ productId, qty }] }
+    router.post("/checkout", async (req, res) => {
+      const { customerId, items } = req.body;
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+
+        const ids = items.map((i) => i.productId);
+        const { rows: products } = await client.query(
+          "SELECT * FROM products WHERE id = ANY($1)",
+          [ids]
+        );
+        const byId = {};
+        for (const p of products) byId[p.id] = p;
+
+        let total = 0;
+        for (const item of items) {
+          total += byId[item.productId].price_cents * item.qty;
+        }
+
+        const order = await client.query(
+          "INSERT INTO orders (customer_id, total_cents, status) VALUES ($1, $2, 'new') RETURNING id",
+          [customerId, total]
+        );
+        const orderId = order.rows[0].id;
+
+        for (const item of items) {
+          await client.query(
+            "INSERT INTO order_items (order_id, product_id, qty, unit_price_cents) VALUES ($1, $2, $3, $4)",
+            [orderId, item.productId, item.qty, byId[item.productId].price_cents]
+          );
+          await client.query(
+            "UPDATE products SET stock = stock - $1 WHERE id = $2",
+            [item.qty, item.productId]
+          );
+        }
+
+        await client.query("COMMIT");
+        client.release();
+        res.json({ orderId, total });
+      } catch (err) {
+        res.status(500).json({ error: err.message });
+      }
+    });
+
+    module.exports = router;
+    ```
+- role: assistant
+  content: |
+    **Workload:** web backend (checkout endpoint, runs for every order)
+
+    #### [Bug] Connection leak and open transaction on errors
+    - **Where:** the `catch` block
+    - **Issue:** on any error there is no `ROLLBACK` and no `client.release()`. The connection stays checked out with an open transaction. A few failed checkouts can exhaust the pool and block the whole API. An unknown `productId` triggers this: `byId[...]` is `undefined` and the price lookup throws.
+    - **Fix:** validate the input, roll back on error, and release in `finally`.
+
+    #### [Bug] Stock can go negative
+    - **Where:** `UPDATE products SET stock = stock - $1`
+    - **Issue:** nothing checks that enough stock exists, so two parallel orders can oversell the last item.
+    - **Fix:** make the update conditional (`AND stock >= qty`) and abort the order if a row was not updated.
+
+    #### [Security] Internal error text returned to the client
+    - **Where:** `res.status(500).json({ error: err.message })`
+    - **Issue:** database error messages can reveal table and constraint names.
+    - **Fix:** log the error on the server and return a generic message.
+
+    #### [High] `SELECT *` on the products table
+    - **Where:** the first query
+    - **Issue:** the code only uses `id` and `price_cents`. Product tables often carry descriptions, specs and JSON blobs, and all of them are read, sent over the connection and parsed by `pg` on every checkout. In Green Metrics Tool micro-benchmarks on a 52-column products table with large text columns, naming 10 columns used about 5.5× to 7× less CPU energy than `SELECT *` ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=b7203ffe-39ae-4e84-bf85-998c9389ea46,4702c2ee-13d5-4d70-bcfe-31e193104a8e)). The gain depends on how wide your table is.
+    - **Fix:** `SELECT id, price_cents`.
+    - **Impact:** E and network, on every order.
+    - **Pattern:** https://patterns.greensoftware.foundation/development/data-handling/reduce-transmitted-data
+
+    #### [Medium] Two statements per cart line
+    - **Where:** the `for` loop with `INSERT` and `UPDATE`
+    - **Issue:** a cart with N lines makes 2N round trips inside an open transaction. This holds row locks longer. Carts are small, so the energy gain per order is modest, but it is paid on every order. Two round trips replace 2N.
+    - **Fix:** one `INSERT ... SELECT FROM unnest(...)` and one `UPDATE ... FROM unnest(...)`. COPY is not needed for 1-30 rows.
+
+    ```javascript
+    const express = require("express");
+    const pool = require("./db");
+    const router = express.Router();
+
+    router.post("/checkout", async (req, res) => {
+      const { customerId, items } = req.body;
+      if (!Array.isArray(items) || items.length === 0) {
+        return res.status(400).json({ error: "empty cart" });
+      }
+
+      // merge duplicate lines so each product appears once
+      const qtyById = new Map();
+      for (const { productId, qty } of items) {
+        if (!Number.isInteger(qty) || qty < 1) {
+          return res.status(400).json({ error: "invalid quantity" });
+        }
+        qtyById.set(productId, (qtyById.get(productId) || 0) + qty);
+      }
+      const ids = [...qtyById.keys()];
+      const qtys = ids.map((id) => qtyById.get(id));
+
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+
+        const { rows: products } = await client.query(
+          "SELECT id, price_cents FROM products WHERE id = ANY($1::int[])",
+          [ids]
+        );
+        if (products.length !== ids.length) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: "unknown product" });
+        }
+        const priceById = new Map(products.map((p) => [p.id, p.price_cents]));
+        const prices = ids.map((id) => priceById.get(id));
+        const total = prices.reduce((sum, price, i) => sum + price * qtys[i], 0);
+
+        const stock = await client.query(
+          `UPDATE products p SET stock = p.stock - v.qty
+           FROM unnest($1::int[], $2::int[]) AS v(id, qty)
+           WHERE p.id = v.id AND p.stock >= v.qty`,
+          [ids, qtys]
+        );
+        if (stock.rowCount !== ids.length) {
+          await client.query("ROLLBACK");
+          return res.status(409).json({ error: "insufficient stock" });
+        }
+
+        const order = await client.query(
+          "INSERT INTO orders (customer_id, total_cents, status) VALUES ($1, $2, 'new') RETURNING id",
+          [customerId, total]
+        );
+        const orderId = order.rows[0].id;
+
+        await client.query(
+          `INSERT INTO order_items (order_id, product_id, qty, unit_price_cents)
+           SELECT $1, * FROM unnest($2::int[], $3::int[], $4::int[])`,
+          [orderId, ids, qtys, prices]
+        );
+
+        await client.query("COMMIT");
+        res.json({ orderId, total });
+      } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
+        console.error("checkout failed", err);
+        res.status(500).json({ error: "checkout failed" });
+      } finally {
+        client.release();
+      }
+    });
+
+    module.exports = router;
+    ```
+
+    Behavior changes: duplicate `productId` lines are now merged into one order line, and the stock check makes some orders fail with 409 that used to succeed. The `::int[]` casts assume integer ids, so change them if your ids are UUIDs or bigints.
+
+    **Already good:** the whole checkout runs in one transaction, and the product lookup is a single `ANY($1)` query instead of one query per line.
+verify:
+  static_only: needs a running PostgreSQL server and the pg package

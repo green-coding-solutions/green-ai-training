@@ -1,0 +1,69 @@
+id: gen-1-00349-generation
+category: generation
+language: java
+patterns:
+- set-membership
+facts: []
+messages:
+- role: user
+  content: |
+    hi, im new to java. i work on a small gateway (raspberry pi class box) that gets sensor readings from our devices over MQTT. some readings come from devices we dont know (old test devices, neighbors misconfigured stuff) and i want to throw them away before saving. we have a file registered_devices.txt with one device id per line, about 3000 ids. readings come in batches of few hundred many times per second.
+
+    can you write me a class for this? i dont know if i should use a list or what
+- role: assistant
+  content: |
+    Load the IDs once into a `HashSet`. Each check is then one hash lookup, no matter how many devices are registered.
+
+    ```java
+    import java.io.IOException;
+    import java.nio.file.Files;
+    import java.nio.file.Path;
+    import java.util.List;
+    import java.util.Set;
+    import java.util.stream.Collectors;
+
+    public class DeviceFilter {
+
+        public record SensorReading(String deviceId, long timestampMs, double value) {}
+
+        private final Set<String> registered;
+
+        public DeviceFilter(Path registryFile) throws IOException {
+            try (var lines = Files.lines(registryFile)) {
+                this.registered = lines
+                        .map(String::trim)
+                        .filter(line -> !line.isEmpty() && !line.startsWith("#"))
+                        .collect(Collectors.toUnmodifiableSet());
+            }
+        }
+
+        public boolean isRegistered(String deviceId) {
+            return registered.contains(deviceId);
+        }
+
+        public List<SensorReading> keepRegistered(List<SensorReading> batch) {
+            return batch.stream()
+                    .filter(reading -> registered.contains(reading.deviceId()))
+                    .toList();
+        }
+    }
+    ```
+
+    Usage:
+
+    ```java
+    // once, at startup
+    DeviceFilter filter = new DeviceFilter(Path.of("registered_devices.txt"));
+
+    // for every incoming batch
+    List<DeviceFilter.SensorReading> clean = filter.keepRegistered(batch);
+    ```
+
+    Create the filter once and reuse it. If you build it per batch, you read the file again every time. The set is read-only, so several threads can use it safely. If you add devices while the gateway runs, build a new `DeviceFilter` and swap the reference.
+
+    **Green Notes**
+    - **Set for repeated membership tests** (reduces E): with a `List`, every reading scans up to 3000 IDs. With a `HashSet`, it is one lookup. The gateway checks every reading, so the saving repeats on every batch and matters on a small CPU.
+    - **Registry loaded once:** the file is read and parsed at startup, not per batch.
+    - *Not applied:* a set only pays off with repeated lookups. If you checked one ID once, a plain list scan would be cheaper than building the set.
+verify:
+  static_only: Java code, no Java runtime in the verifier

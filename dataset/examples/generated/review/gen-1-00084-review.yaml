@@ -1,0 +1,91 @@
+id: gen-1-00084-review
+category: review
+language: bash
+patterns:
+- compress-stored
+- context-tradeoff
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    Can you review our packaging step before I merge it? Context and requirements:
+
+    - It runs at the end of the build stage on every merge to main, roughly 60 times a day.
+    - The test jobs (same pipeline, same shared volume) unpack `build.tar.xz` within a few minutes. The pipeline cleanup job deletes it after the run.
+    - The release bundle stays on the release server for 90 days, and people download it now and then for rollbacks.
+    - I want it to fail loudly on errors and I don't want half-written release files lying around.
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    BUILD_DIR="build"
+    STAGE_DIR="/mnt/ci-shared/${CI_PIPELINE_ID}"
+    RELEASE_DIR="/srv/releases"
+    VERSION="$(cat VERSION)"
+
+    mkdir -p "$STAGE_DIR"
+
+    # hand build output to the test jobs
+    tar -cf - "$BUILD_DIR" | xz -9e -T0 > "$STAGE_DIR/build.tar.xz"
+
+    # release bundle, kept 90 days
+    tar -cf - "$BUILD_DIR" docs | xz -9e -T0 > "$RELEASE_DIR/app-$VERSION.tar.xz"
+
+    echo "Release $VERSION written"
+    ```
+- role: assistant
+  content: |
+    **Workload:** CI/CD script (about 60 runs per day)
+
+    #### [Bug] Half-written release file on failure
+    - **Where:** the second `tar | xz > "$RELEASE_DIR/..."` line
+    - **Issue:** `pipefail` stops the script when `tar` or `xz` fails, but the redirect has already created the final file. A rollback download can then pick up a truncated bundle. Running the same version twice also overwrites the old file in place.
+    - **Fix:** write to a temp file in the same directory, then `mv` it. The rename is atomic.
+
+    #### [High] Maximum-effort xz on every run, for data that lives minutes
+    - **Where:** `xz -9e -T0` for `build.tar.xz`
+    - **Issue:** this file is unpacked a few minutes later and then deleted. Nobody saves storage or transfer from it, so the compression work buys almost nothing. It is the most expensive step in the script, and it runs 60 times a day. In Green Metrics Tool measurements on 100 MB of text, xz used about 29× more energy to compress than zstd ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=2584305c-7a1e-47e2-b6cc-26276962035e,addc5f5e-55da-47f8-956d-240d06304e4e,fb08d3c3-ba41-4f0f-85fd-0b6c34e6c39b,f1479db0-c453-4aaa-9116-e137621fad07,7b3bb87d-3b43-4f82-be99-0327405205b8,905bd408-6b31-4237-a4da-14b8fad90613,7f213a20-8028-4080-9583-6e465c217bb5,8e93a8d2-60b0-4831-905b-764b68257bc7)). xz at `-9e` is stronger still. Data that is kept for minutes should not be compressed.
+    - **Fix:** write a plain `tar`. If the shared volume turns out to be a slow network mount, use a fast codec such as `zstd -1` there and measure it.
+    - **Impact:** reduces E (CPU) on every pipeline run.
+
+    #### [Medium] Heavy codec for a bundle that is rebuilt often
+    - **Where:** `xz -9e -T0` for the release bundle
+    - **Issue:** compressing the release bundle is worth it. It is stored for 90 days, and that is far above the break-even. The Green Coding Solutions estimate for zstd is about 0.15 days of storage, and for xz about 7 days. But the bundle is rebuilt 60 times a day and rarely downloaded, so the compression cost is paid far more often than the size benefit is used. Measured on text, zstd used a fraction of the energy of gzip, xz and 7-Zip. These figures compare energy, not file size. xz will give a somewhat smaller file.
+    - **Fix:** use zstd at a moderate level. If the bundle is large and downloaded over slow links, you can raise the level, but check the CPU time of the build step first. If only tagged releases need the smallest file, use a stronger codec for those and zstd for the rest.
+    - **Impact:** reduces E (CPU) per run, and still cuts storage for 90 days (reduces M on the storage side).
+
+    #### [Low] Minor cleanups
+    - `$(cat VERSION)` forks a process. `$(<VERSION)` is a bash builtin and does the same.
+    - Strings with nothing to expand can use single quotes. Keep the double quotes around variables.
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    BUILD_DIR='build'
+    STAGE_DIR="/mnt/ci-shared/${CI_PIPELINE_ID}"
+    RELEASE_DIR='/srv/releases'
+    VERSION="$(<VERSION)"
+
+    mkdir -p "$STAGE_DIR"
+
+    # short-lived handoff: no compression
+    tar -cf "$STAGE_DIR/build.tar" "$BUILD_DIR"
+
+    # release bundle: fast codec, atomic publish
+    tmp="$(mktemp "$RELEASE_DIR/.app-$VERSION.XXXXXX")"
+    trap 'rm -f "$tmp"' EXIT
+    tar -cf - "$BUILD_DIR" docs | zstd -T0 -9 -q -f -o "$tmp"
+    mv "$tmp" "$RELEASE_DIR/app-$VERSION.tar.zst"
+
+    echo "Release $VERSION written"
+    ```
+
+    The test jobs must now unpack `build.tar` with `tar -xf`. Rollback tooling must use `tar --zstd -xf app-<version>.tar.zst`, or `zstd -dc file | tar -x`. Check any script that matches the `.tar.xz` name.
+
+    **Already good:** `set -euo pipefail`, and `-T0` uses all cores for the codec.
+verify:
+  static_only: needs zstd, xz and a CI shared volume

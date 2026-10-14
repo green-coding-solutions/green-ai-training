@@ -1,0 +1,103 @@
+id: gen-1-00173-review
+category: review
+language: rust
+patterns:
+- efficient-algorithm
+messages:
+- role: user
+  content: |
+    review pls, runs on our sensor gateway for every batch
+
+    ```rust
+    #[derive(Clone, Debug)]
+    pub struct Reading {
+        pub sensor_id: u32,
+        pub ts: u64,
+        pub value: f32,
+    }
+
+    pub struct Calibration {
+        pub from_ts: u64, // list is sorted ascending by from_ts
+        pub offset: f32,
+    }
+
+    pub fn apply_calibration(readings: &mut Vec<Reading>, cals: &Vec<Calibration>) {
+        for r in readings.iter_mut() {
+            let mut offset = 0.0;
+            for c in cals.iter() {
+                if c.from_ts <= r.ts {
+                    offset = c.offset;
+                }
+            }
+            r.value += offset;
+        }
+    }
+
+    pub fn moving_avg(values: &Vec<f32>, window: usize) -> Vec<f32> {
+        let mut out = Vec::new();
+        for i in 0..values.len() {
+            let start = if i + 1 >= window { i + 1 - window } else { 0 };
+            let slice = &values[start..=i];
+            let sum: f32 = slice.iter().sum();
+            out.push(sum / slice.len() as f32);
+        }
+        out
+    }
+    ```
+- role: assistant
+  content: |
+    **Workload:** IoT gateway (batch processing)
+
+    #### [Bug] `window = 0` returns NaN
+    - **Where:** `moving_avg`
+    - **Issue:** with `window == 0` every slice is empty, so each result is `0.0 / 0.0`. A bad config value silently fills the output with NaN.
+    - **Fix:** reject it up front with an `assert!`. This turns silent bad data into a clear failure.
+
+    #### [High] Full calibration scan for every reading
+    - **Where:** inner loop in `apply_calibration`
+    - **Issue:** the list is sorted by `from_ts`, but the loop walks all of it for each reading and never stops. That is `readings × calibrations` comparisons per batch.
+    - **Fix:** use `partition_point` (binary search). It finds the last entry with `from_ts <= ts`, which is the same entry the loop picks, also for equal `from_ts` values. Cost drops to `readings × log(calibrations)`.
+    - **Impact:** reduces E on every batch. It grows with the size of the calibration history, which only gets longer on a long-running gateway.
+
+    #### [Medium] Window sum is recomputed for every output value
+    - **Where:** `moving_avg`
+    - **Issue:** each step re-adds up to `window` values, so the work is `n × window`.
+    - **Fix:** keep a running sum. Add the new value, subtract the one that left the window. The work is `n`, independent of window size.
+    - **Impact:** reduces E, and the gain grows with the window size.
+
+    #### [Low] Signatures and allocation
+    - **Where:** `&Vec<T>` parameters, `Vec::new()` in `moving_avg`
+    - **Issue:** `&[T]` accepts more callers at no cost, and the output length is known, so one allocation is enough.
+
+    ```rust
+    pub fn apply_calibration(readings: &mut [Reading], cals: &[Calibration]) {
+        for r in readings.iter_mut() {
+            // cals must be sorted ascending by from_ts
+            let idx = cals.partition_point(|c| c.from_ts <= r.ts);
+            if idx > 0 {
+                r.value += cals[idx - 1].offset;
+            }
+        }
+    }
+
+    pub fn moving_avg(values: &[f32], window: usize) -> Vec<f32> {
+        assert!(window > 0, "window must be > 0");
+        let mut out = Vec::with_capacity(values.len());
+        let mut sum = 0.0f64;
+        for (i, &v) in values.iter().enumerate() {
+            sum += v as f64;
+            if i >= window {
+                sum -= values[i - window] as f64;
+            }
+            let count = (i + 1).min(window);
+            out.push((sum / count as f64) as f32);
+        }
+        out
+    }
+    ```
+
+    The running sum uses `f64`, so the last bits of the averages can differ slightly from the old `f32` sums. `partition_point` relies on the sorted order you documented. If a config reload can break that order, sort on load.
+
+    **Already good:** readings are changed in place, with no copy of the batch.
+verify:
+  static_only: Rust code, needs rustc/cargo which the harness does not provide

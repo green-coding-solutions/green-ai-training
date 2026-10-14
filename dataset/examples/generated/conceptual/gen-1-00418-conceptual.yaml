@@ -1,0 +1,40 @@
+id: gen-1-00418-conceptual
+category: conceptual
+language: text
+patterns:
+- regex-precompile
+- context-tradeoff
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    We're having a design discussion in our data team and I'd like a clear answer. We run a nightly Python ETL that normalizes and validates records from about 20 partner feeds. Each feed has its own set of regexes: date formats, ID formats, phone cleanup, and so on. Overall that is roughly 150 fixed patterns, applied to tens of millions of fields per run.
+
+    One colleague says we must move every `re.match(...)` to a precompiled `re.compile(...)` at module level because it is "greener". Another says Python caches regexes anyway, so it is pointless churn across the codebase. We also have a newer feature where patterns are built from per-partner config at runtime, e.g. `re.match(f"^{prefix}-\\d{{6}}$", value)`.
+
+    Requirements for your answer: tell us who is right, when precompiling matters and when it doesn't, and what we should do about the dynamic patterns. Please also tell us how to check this on our own pipeline, not just in theory.
+- role: assistant
+  content: |-
+    Both are partly right. It depends on which kind of pattern you mean.
+
+    **Fixed patterns (your ~150):** the "pointless" camp is mostly right.
+    - Python's `re` module keeps an internal cache of compiled patterns, up to 512. Your 150 fit easily, so `re.match(pattern, s)` compiles each one once, not once per field.
+    - In Green Metrics Tool micro-benchmarks, 1,000,000 matches with a precompiled pattern used about 18% less CPU energy than inline `re.match(pattern, s)` ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=3827c15a-4295-44a4-8025-a07e8653ab7e,b7a9f0bd-c9e0-4b95-9bda-e8a96f38020c,f3e0434d-744b-41a0-a0cc-9bf00d80500d)). The gain comes from skipping the cache lookup on each call.
+    - That is a small, real win on a hot path. It is not a reason for a big rewrite. Precompile in the code you touch anyway, especially inside per-field loops. A module-level `NAME = re.compile(...)` also reads well and gives the pattern a name. Do not open a codebase-wide refactor for it.
+
+    **Dynamic patterns (the f-string ones):** this is where the real risk is.
+    - If the pattern text takes only a few distinct values (one prefix per partner), the cache handles it. Compile it once per partner and keep the result in a dict or `functools.lru_cache`.
+    - If the pattern text can take many distinct values, for example a value from the record itself, the cache stops working. It holds 512 entries. Fixed patterns plus many dynamic ones can push each other out, so the pipeline recompiles all the time.
+    - In the same micro-benchmarks, forcing a recompile on every call cost about 200× more per match than a cached pattern ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=3827c15a-4295-44a4-8025-a07e8653ab7e,b7a9f0bd-c9e0-4b95-9bda-e8a96f38020c,f3e0434d-744b-41a0-a0cc-9bf00d80500d)). Compare that with the 18% above: this is the case worth fixing.
+    - If you build the pattern from user-controlled text, also use `re.escape()` on it. That is a correctness and safety point, not an energy one.
+
+    **What I would do:**
+    1. Leave the fixed patterns alone unless you are in that code anyway.
+    2. Check that the dynamic patterns have a bounded set of values. Compile them once per value and reuse them.
+    3. If a dynamic pattern is just a literal prefix check, `str.startswith` plus a small fixed regex is simpler and cheaper than building a new regex.
+
+    **How to check on your pipeline:**
+    - Profile one run with `cProfile` and look for `re._compile` or `sre_compile` in the top entries. If they show up with a high call count, you have a cache problem. If they don't, you don't.
+    - For energy, run the pipeline on a fixed sample file as a usage scenario in the Green Metrics Tool, before and after the change. If you can't do that, compare CPU time with `perf stat` or `time` on the same input as a proxy.
+    - Judge by the change on your own data. Don't extrapolate from the micro-benchmark figures.

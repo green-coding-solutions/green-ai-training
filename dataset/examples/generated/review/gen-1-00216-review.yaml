@@ -1,0 +1,110 @@
+id: gen-1-00216-review
+category: review
+language: python
+patterns:
+- compress-stored
+- text-compression
+messages:
+- role: user
+  content: |
+    hello, I make small script for our landing page deploy. it make .gz files from the files in dist so nginx can send them. but the deploy is slow now and the dist folder is more big than before, I dont understand why. can you look please?
+
+    ```python
+    import gzip
+    import sys
+    from pathlib import Path
+
+    DIST = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("dist")
+    EXTS = {".html", ".css", ".js", ".json", ".svg", ".png", ".jpg",
+            ".jpeg", ".webp", ".woff2", ".map"}
+
+
+    def compress_file(path):
+        data = path.read_bytes()
+        out = path.with_name(path.name + ".gz")
+        with gzip.open(out, "wb", compresslevel=9) as f:
+            f.write(data)
+        print("compressed", path, len(data), "->", out.stat().st_size)
+
+
+    def main():
+        for p in DIST.rglob("*"):
+            if p.is_file() and p.suffix.lower() in EXTS:
+                compress_file(p)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (build/deploy step, runs on every deploy, output served many times)
+
+    #### [High] Already-compressed formats are gzipped too
+    - **Where:** `EXTS` contains `.png`, `.jpg`, `.jpeg`, `.webp`, `.woff2`
+    - **Issue:** these formats are already compressed. Gzip finds almost nothing to remove, and the `.gz` is often a little bigger than the original. So you spend CPU time and then store a second copy that no client benefits from. This is why `dist` grew.
+    - **Fix:** only compress text formats: HTML, CSS, JS, JSON, SVG, XML, plain text.
+    - **Impact:** reduces E in the build and storage (M) for every deploy.
+
+    #### [Medium] Every file is recompressed on every deploy
+    - **Where:** `main()` calls `compress_file` for all files, with no check
+    - **Issue:** most assets do not change between deploys, but they are compressed again each time. This is the slow part of your deploy.
+    - **Fix:** skip a file when its `.gz` is newer than the source.
+
+    #### [Low] Output is not reproducible, and a bigger `.gz` can be kept
+    - **Where:** `gzip.open(...)`
+    - **Issue:** `gzip.open` writes the current time into the header. The same input gives different bytes each run, which can change ETags and make CDN or rsync copy files again for nothing. Also, a `.gz` is kept even when it is not smaller.
+    - **Fix:** use `gzip.compress(..., mtime=0)` and keep the result only if it is smaller.
+
+    ```python
+    import gzip
+    import sys
+    from pathlib import Path
+
+    DIST = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("dist")
+    TEXT_EXTS = {".html", ".css", ".js", ".mjs", ".json", ".svg", ".xml", ".txt"}
+
+
+    def compress_file(path):
+        out = path.with_name(path.name + ".gz")
+        if out.exists() and out.stat().st_mtime >= path.stat().st_mtime:
+            return False  # up to date
+        data = path.read_bytes()
+        packed = gzip.compress(data, compresslevel=9, mtime=0)
+        if len(packed) >= len(data):
+            out.unlink(missing_ok=True)
+            return False  # not worth storing
+        out.write_bytes(packed)
+        return True
+
+
+    def main(dist):
+        done = 0
+        for path in sorted(dist.rglob("*")):
+            if path.is_file() and path.suffix.lower() in TEXT_EXTS:
+                done += compress_file(path)
+        return done
+
+
+    if __name__ == "__main__":
+        print(main(DIST), "files compressed")
+    ```
+
+    The script now prints one summary line instead of one line per file. Make sure nginx uses `gzip_static on;`. Otherwise the `.gz` files are never served.
+
+    **Already good:** precompressing at build time is the right place for static assets, because the work is done once and the result is served many times. Level 9 is fine for that reason. It would not be fine for per-request compression.
+verify:
+  module: true
+  test: |-
+    import tempfile, gzip
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as d:
+        dist = Path(d)
+        (dist / "index.html").write_text("<p>hello</p>" * 500)
+        (dist / "logo.png").write_bytes(b"\x89PNG" + bytes(range(256)) * 10)
+        (dist / "tiny.txt").write_text("a")
+        assert main(dist) == 1
+        assert gzip.decompress((dist / "index.html.gz").read_bytes()) == (dist / "index.html").read_bytes()
+        assert not (dist / "logo.png.gz").exists()
+        assert not (dist / "tiny.txt.gz").exists()
+        assert main(dist) == 0

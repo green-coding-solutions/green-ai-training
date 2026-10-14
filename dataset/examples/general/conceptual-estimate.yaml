@@ -1,0 +1,257 @@
+id: conceptual-compiled-languages-001
+category: conceptual
+language: text
+patterns: [vectorize-or-jit, context-tradeoff]
+facts: [F-NUMBA]
+messages:
+  - role: user
+    content: |
+      Should we rewrite our Python services in Rust to be greener? I keep reading that compiled languages use way less energy.
+  - role: assistant
+    content: |
+      Only for the parts where it actually pays off. The language benchmarks you've read measure CPU-bound code. Most services spend most of their time waiting on databases, networks and disks, and a rewrite doesn't change that.
+
+      A rewrite makes sense when:
+      - a profiler shows a **CPU-bound hot path** (parsing, numeric loops, compression, image processing),
+      - the code runs **at scale** (every request, many instances, continuously),
+      - and it is stable, so the rewrite isn't thrown away soon.
+
+      Usually you can get most of the gain without changing the language:
+      - fix the algorithm (an O(n²) loop costs more than the interpreter overhead),
+      - use libraries that run in C (NumPy, `re`, built-ins),
+      - JIT-compile the hot loop. In Green Metrics Tool micro-benchmarks, a per-sample loop used about 4× less energy with Numba `@njit` than in pure Python, ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=dc2ed71b-e8ed-48d5-be04-0dd9dfe1443f,2b9e7f88-4aad-42ee-a9e6-25ff4e6ea712))
+      - or move just that one function into a Rust extension (PyO3).
+
+      For prototypes and internal tools, developer time is the main footprint. Rewriting them in Rust usually costs more than it saves.
+---
+id: conceptual-set-always-faster-001
+category: conceptual
+language: text
+patterns: [set-membership, context-tradeoff]
+facts: [F-MEMB]
+messages:
+  - role: user
+    content: |
+      Is it always better to use a set instead of a list for `x in collection` checks?
+  - role: assistant
+    content: |
+      No. It depends on how often you look up.
+
+      - **One lookup:** keep the list. Building a set means hashing every element, which costs more than one linear scan. In Green Metrics Tool micro-benchmarks, converting a list to a set for a single lookup used about 50% more energy than scanning the list ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=70871c0f-e630-4755-a459-b98e5d4031f2,722fea72-6f69-4acb-8ce7-632caeb444f4)).
+      - **Many lookups against the same data:** build the set once, then each lookup is O(1) instead of O(n). This is where sets win, often by orders of magnitude.
+      - **Tiny collections** (a handful of items): the difference is negligible either way. Write what is clearest.
+
+      Also note that a set loses order and duplicates. If you need those for output, keep the list for output and use a set only for the lookups.
+---
+id: conceptual-async-energy-001
+category: conceptual
+language: text
+patterns: [async-concurrent-io]
+facts: [F-HTTP]
+messages:
+  - role: user
+    content: |
+      Does async/await actually save energy, or does it just make things faster?
+  - role: assistant
+    content: |
+      Mostly it makes I/O-bound work finish sooner. That saves energy indirectly.
+
+      Async doesn't make the CPU do less work per request. It lets one process wait on many requests at once instead of one after another. The effects:
+      - **Shorter wall time:** the process, its memory and its connections are held for less time.
+      - **Fewer processes or threads** needed for the same concurrency, so a smaller machine can handle the load (reduces M).
+      - **Direct CPU savings are small.** In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async used about 7% less CPU energy, and about 17% less wall time ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=97acc9a0-3856-4bbb-b816-2b64030fba98,6415cccb-ad1a-4d87-ae46-92740c5e285b)).
+
+      It helps when there are many independent waits: API fan-out, crawlers, health checks, a server with many concurrent clients. It doesn't help for one request, or for CPU-bound work. There it only adds complexity.
+---
+id: conceptual-avif-always-001
+category: conceptual
+language: text
+patterns: [modern-image-formats, context-tradeoff]
+facts: [F-IMGRENDER, F-IMGENC]
+messages:
+  - role: user
+    content: |
+      Is AVIF always the greenest image format? Should we convert everything to AVIF?
+  - role: assistant
+    content: |
+      Not always. AVIF usually gives the smallest files for photos, and fewer bytes over the network is the main saving. But it has costs on both ends:
+
+      - **Encoding is expensive.** In Green Metrics Tool measurements, encoding images to AVIF cost about 7× as much energy as JPEG ([measurements](https://metrics.green-coding.io/stats.html?id=81a932bc-04da-443b-93cf-d4d8468de247)). That is fine once at upload or build time. Never encode on the fly per request.
+      - **Decoding costs a bit more.** Rendering pages with AVIF images cost about 19% more CPU energy on the client than JPG ([measurements](https://metrics.green-coding.io/stats.html?id=b31ca361-1745-4fac-8e6b-a97ec99bf476)). The transfer savings usually outweigh this for large photos on high-traffic pages, but not necessarily for small thumbnails.
+
+      A practical approach:
+      - Photos: serve AVIF and WebP with a JPEG fallback via `<picture>`, encoded once.
+      - Icons, logos, diagrams: SVG.
+      - Screenshots and UI graphics with few colors: lossless WebP or optimized PNG.
+      - Low-traffic pages: the encoding work may never pay off. WebP or a well-compressed JPEG is fine.
+---
+id: conceptual-sci-code-levers-001
+category: conceptual
+language: text
+patterns: [none]
+messages:
+  - role: user
+    content: |
+      What is the SCI score in simple words, and which parts of it can I influence as a developer?
+  - role: assistant
+    content: |
+      SCI (Software Carbon Intensity) is a rate: carbon emissions per unit of work, like per request or per user.
+
+      `SCI = (E × I + M) per R`
+
+      - **E** – energy the software uses. Developers influence this most directly: efficient algorithms, less data transferred, smaller pages, fewer wasted computations.
+      - **I** – carbon intensity of the electricity, which depends on where and when the code runs. Code can't change it, but it can *enable* lower values, e.g. by making batch jobs deferrable so they run when or where the grid is cleaner. The deployment decides.
+      - **M** – embodied emissions of the hardware, i.e. making it. You lower your share by needing less hardware: smaller images, less memory, fewer always-on environments, right-sized instances.
+      - **R** – the functional unit you divide by. It makes the score comparable as you grow, e.g. per API call.
+
+      In everyday code reviews, you mostly move **E** and **M**.
+---
+id: conceptual-website-priorities-001
+category: conceptual
+language: text
+patterns: [lazy-load-images, modern-image-formats, minify-assets, remove-unused-css, system-fonts-and-deps, text-compression]
+messages:
+  - role: user
+    content: |
+      We want to make our company website greener. Where should we start? It's a typical marketing site with a blog.
+  - role: assistant
+    content: |
+      Start with what every visitor downloads. Open your browser's network tab on the home page and a blog post, sort by size, and work from the top. On typical marketing sites, the order is usually:
+
+      1. **Images:** serve modern formats (AVIF/WebP with fallback) and lazy-load everything below the first screen.
+      2. **JavaScript:** remove libraries you barely use (sliders, jQuery for one toggle, chat widgets on every page), minify and bundle the rest.
+      3. **CSS:** remove unused CSS from frameworks, minify.
+      4. **Fonts:** use the system font stack, or one subsetted WOFF2 file instead of several weights.
+      5. **Text compression:** make sure HTML, CSS, JS and JSON are served with gzip or Brotli.
+
+      Then measure before and after. Page weight in bytes is a good first proxy. For real energy numbers, run a scenario with the Green Metrics Tool, which measures a browser loading your page. Don't trust website "carbon calculators" for comparisons between small changes, because they mostly estimate from bytes alone.
+---
+id: estimate-py-string-join-001
+category: estimate
+language: python
+patterns: [string-join]
+facts: [F-STRCAT]
+messages:
+  - role: user
+    content: |
+      If I replace the `+=` loop with `"".join()` in our report generator, how much energy do we save? The function runs about 1000 times a day and builds strings of ~50k lines.
+
+      ```python
+      def build(lines):
+          out = ""
+          for line in lines:
+              out += line + "\n"
+          return out
+      ```
+  - role: assistant
+    content: |
+      I can't give you a reliable number for your system without measuring, but I can tell you the direction and the order of magnitude to expect.
+
+      **What drives the saving:** `+=` on a string can copy the growing result again on each iteration, so the work grows roughly with the square of the length. `join` computes the final size once and copies every piece once.
+
+      **Measured reference:** in Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces with `+=` used ~469 J of CPU energy, and `"".join()` ~1.8 J, roughly 260× less ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=732b88b3-e081-409d-a987-d1a929b357e4,527c0154-dbb1-4c82-b98f-838f994af603,2fca8771-9ad9-4ec0-b51f-2ee78ee20865)). Your strings are smaller (50k lines), so the absolute difference per call is smaller and depends on line length and Python version. The direction is the same.
+
+      **How to get your own number:**
+      1. Quick CPU-time proxy: `python -m timeit -s "lines = ['x' * 80] * 50_000" "out = ''.join(l + '\n' for l in lines)"` and the same for the `+=` version.
+      2. Real energy: wrap both versions in a small script, run each as a Green Metrics Tool usage scenario on the same machine, and compare the CPU energy. Multiply the per-call difference by 1000 calls per day.
+
+      Either way, `join` is the better code here, so the change is worth making even before you have the exact figure.
+
+      ```python
+      def build(lines):
+          return "".join(line + "\n" for line in lines)
+      ```
+verify:
+  equivalence:
+    driver: |
+      print(repr(build([f"line {i}" for i in range(500)])))
+---
+id: estimate-web-lazy-images-001
+category: estimate
+language: html
+patterns: [lazy-load-images, modern-image-formats]
+messages:
+  - role: user
+    content: |
+      Our recipe pages have about 25 step-by-step JPEG photos each, all loaded eagerly. If we lazy-load them and switch to WebP, how much CO2 do we save per month? We have ~200k page views per month.
+  - role: assistant
+    content: |
+      The saving is real, but I'd be making up numbers if I gave you a CO2 figure without your data. Here is how to calculate it with numbers you can collect in an afternoon.
+
+      **1. Bytes saved by WebP:** convert a sample of 20 photos at the quality you'd use and compare file sizes. For photos, WebP is usually noticeably smaller than JPEG at the same visual quality, but the ratio depends on your images and encoder settings.
+
+      **2. Bytes saved by lazy loading:** this depends on how far visitors scroll. Your analytics' scroll-depth report gives you the share of visitors who reach each step. Images a visitor never scrolls to are never downloaded.
+
+      **3. Monthly transfer saved:**
+      `page views × (bytes per page today − expected bytes per page after)`
+
+      **4. From bytes to energy and CO2:** this is the uncertain step. Network energy per GB varies widely between studies and isn't proportional for small changes. Treat any per-GB factor as a rough estimate and say which one you used.
+
+      **Better than a model: measure.** Build two versions of a typical recipe page and run both as Green Metrics Tool browser scenarios, one loading only the first screen and one scrolling to the end. That gives you measured energy on the client for both user types. Weight them with your scroll-depth data.
+
+      What I can say without numbers: with 25 eager photos per page, most visitors download many images they never see, so lazy loading is likely the larger of the two savings. Keep the first one or two images eager so the page still appears quickly.
+---
+id: estimate-py-list-insert-001
+category: estimate
+language: python
+patterns: [deque-or-append]
+facts: [F-LISTINS]
+messages:
+  - role: user
+    content: |
+      roughly how much would switching `history.insert(0, event)` to a deque save? we add about 2 million events per hour, history is capped at 10k entries
+  - role: assistant
+    content: |
+      Direction first: `list.insert(0, x)` shifts every element in the list by one slot, so each insert costs work proportional to the list length, here up to 10k element moves. `deque.appendleft(x)` costs the same small amount no matter how long the deque is.
+
+      Measured reference: in Green Metrics Tool micro-benchmarks, 1,000,000 front inserts into a growing list used ~1515 J, while 1,000,000 appends used ~1.2 J, over 1000× difference ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=1da9c13d-364b-4f71-b23f-785bf1caeac8,75a7d151-3a7b-4575-b3e1-de125ce00d00)). That benchmark let the list grow to a million entries. Your list is capped at 10k, so each insert moves fewer elements and the gap is smaller. It is still a large factor at 2 million inserts per hour.
+
+      To get your number, time both versions with your cap:
+
+      ```python
+      import timeit
+      setup = "from collections import deque; lst = [0] * 10_000; dq = deque(lst, maxlen=10_000)"
+      print(timeit.timeit("lst.insert(0, 1); lst.pop()", setup=setup, number=200_000))
+      print(timeit.timeit("dq.appendleft(1)", setup=setup, number=200_000))
+      ```
+
+      For real energy instead of CPU time, run both variants as Green Metrics Tool usage scenarios. The deque version is also simpler, because `maxlen` drops old entries for you:
+
+      ```python
+      from collections import deque
+      history = deque(maxlen=10_000)
+      history.appendleft(event)
+      ```
+verify:
+  green_block: 0
+  run: true
+---
+id: estimate-nginx-gzip-level-001
+category: estimate
+language: nginx
+patterns: [text-compression]
+messages:
+  - role: user
+    content: |
+      how much energy does it save to go from gzip_comp_level 9 to 5 on our nginx? mostly JSON API responses, 20-200 KB each
+  - role: assistant
+    content: |
+      I don't have a measured figure for gzip level 9 vs 5 on your traffic, so I won't invent one. What is known:
+
+      - **CPU:** higher gzip levels search harder for repeated patterns. From level 5 to 9 the CPU cost per byte rises noticeably, while the output usually gets only slightly smaller. Level 9 is mainly worth it for static files compressed once.
+      - **Bytes:** for JSON, the extra size reduction from 5 to 9 is typically small. That is a little more network traffic per response, which you can measure directly.
+
+      **How to measure it on your data:**
+      1. Save a sample of real responses (e.g. 100 typical payloads).
+      2. Compare size and CPU time per level:
+         ```bash
+         for level in 5 9; do
+           /usr/bin/time -f "level $level: %U s user" sh -c "for f in samples/*.json; do gzip -$level -c \"\$f\"; done > /dev/null"
+           echo "level $level bytes: $(cat samples/*.json | gzip -$level | wc -c)"
+         done
+         ```
+      3. Multiply the CPU difference per response by your requests per day, and the byte difference by your traffic.
+
+      For a measured energy value instead of CPU time, run the same comparison as a Green Metrics Tool usage scenario. In most API setups, level 5 (or 4-6) is the better trade-off.
+verify:
+  static_only: "nginx/shell guidance"

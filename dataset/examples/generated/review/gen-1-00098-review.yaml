@@ -1,0 +1,124 @@
+id: gen-1-00098-review
+category: review
+language: html
+patterns:
+- css-animations
+- dom-size
+facts:
+- F-ANIM
+messages:
+- role: user
+  content: |
+    Hello, this is category page of our webshop, we have around 2500 products in the biggest category. Customers say the page is slow on phone and the fan on my laptop is going crazy. Can you look what is wrong? Thanks
+
+    ```html
+    <div class="promo-bar">
+      <div id="promo-text">FREE SHIPPING over 50 EUR • SUMMER SALE -20% • NEW: eco range</div>
+    </div>
+    <div id="grid"></div>
+
+    <script>
+      var products = window.__PRODUCTS__; // [{id, name, price, img}, ...]
+      var grid = document.getElementById('grid');
+
+      for (var i = 0; i < products.length; i++) {
+        var p = products[i];
+        grid.innerHTML += '<div class="cell"><div class="card"><div class="card-inner">' +
+          '<div class="img-wrap"><img src="' + p.img + '"></div>' +
+          '<div class="info"><span class="name">' + p.name + '</span>' +
+          '<span class="price">' + p.price + '</span></div>' +
+          '</div></div></div>';
+      }
+
+      var promo = document.getElementById('promo-text');
+      var x = 0;
+      setInterval(function () {
+        x -= 1;
+        if (x < -promo.offsetWidth) x = window.innerWidth;
+        promo.style.marginLeft = x + 'px';
+      }, 16);
+    </script>
+    ```
+- role: assistant
+  content: |
+    **Workload:** web frontend (e-commerce category page, every visit)
+
+    #### [Security] Product data goes into `innerHTML` unescaped
+    - **Where:** the grid loop (`p.name`, `p.price`, `p.img`)
+    - **Issue:** if a name or image URL contains HTML, it runs as markup on your page. This is an XSS risk.
+    - **Fix:** escape the values (see the helper in the fix below), or build the nodes with `textContent`.
+
+    #### [High] All 2500 products are rendered at once
+    - **Where:** the `for` loop that fills `#grid`
+    - **Issue:** the page builds about 2500 cards with 5 wrapper `div`s each. That is more than 12,000 extra nodes for the browser to style, lay out and keep in memory. Most of them are far below the screen. Phones suffer most.
+    - **Fix:** render a first page and add more on request. Ideally the API also returns only one page at a time, so the rest is never sent. Also use one `article` per card instead of three nested wrappers.
+    - **Impact:** reduces client E and memory on every visit. It also cuts transferred bytes if the server paginates.
+
+    ```javascript
+    const PAGE = 48;
+    let shown = 0;
+    const grid = document.getElementById("grid");
+    const moreBtn = document.getElementById("show-more");
+
+    const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
+    function showMore() {
+      const html = products.slice(shown, shown + PAGE).map((p) =>
+        `<article class="card">
+           <img src="${esc(p.img)}" alt="${esc(p.name)}">
+           <span class="name">${esc(p.name)}</span>
+           <span class="price">${esc(p.price)}</span>
+         </article>`).join("");
+      grid.insertAdjacentHTML("beforeend", html);
+      shown = Math.min(shown + PAGE, products.length);
+      moreBtn.hidden = shown >= products.length;
+    }
+
+    moreBtn.addEventListener("click", showMore);
+    showMore();
+    ```
+
+    ```html
+    <div id="grid"></div>
+    <button id="show-more" type="button">Show more products</button>
+    ```
+
+    #### [High] `grid.innerHTML +=` inside the loop
+    - **Where:** the grid loop
+    - **Issue:** every `+=` serializes the whole grid to a string, appends, and parses it again. All earlier cards are destroyed and rebuilt each time, so the work grows quadratically with the product count. Image elements are also recreated.
+    - **Fix:** build one string and insert it once, as in `showMore()` above.
+
+    #### [High] Promo text is moved by a timer that never stops
+    - **Where:** `setInterval(..., 16)` on `#promo-text`
+    - **Issue:** it runs about 60 times per second for as long as the tab is open, even when the tab is in the background. Each tick writes `marginLeft`, which forces a layout. Then the next tick reads `offsetWidth`, which forces layout again. With a huge DOM, every layout is expensive, and this is likely why the fan is loud.
+    - **Fix:** use a CSS animation on `transform`. The browser can run it on the compositor without layout and without JavaScript.
+    - **Impact:** reduces client E for the whole time the page is open. In Green Metrics Tool measurements, a CSS `@keyframes` animation used about 10% less CPU energy than a JavaScript `requestAnimationFrame` version ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=4a2085fd-6f43-4f26-a3ee-2a6fcd7db594,58ee50a2-7110-4418-beea-df6ffba5425a)). Your 16 ms timer with forced layout is worse than that test case.
+
+    ```css
+    .promo-bar { overflow: hidden; white-space: nowrap; }
+    #promo-text {
+      display: inline-block;
+      padding-left: 100%;
+      animation: promo-scroll 20s linear infinite;
+    }
+    .promo-bar:hover #promo-text { animation-play-state: paused; }
+    @keyframes promo-scroll {
+      from { transform: translateX(0); }
+      to   { transform: translateX(-100%); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      #promo-text { animation: none; padding-left: 0; }
+    }
+    ```
+
+    Then delete the `setInterval` block. The `var promo` and `var x` lines are not needed any more.
+
+    #### [Low] Ship the text without motion if it is short
+    - **Where:** the promo bar
+    - **Issue:** three short messages may fit on a phone screen without scrolling. A static bar costs nothing.
+    - **Fix:** if you keep the scroll, the `prefers-reduced-motion` rule above already stops it for users who ask for less motion.
+
+    **Already good:** the data is read from one array, so no extra requests are made per product.
+verify:
+  static_only: browser DOM, CSS and JavaScript

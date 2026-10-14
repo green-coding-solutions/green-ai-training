@@ -1,0 +1,89 @@
+id: gen-1-00298-estimate
+category: estimate
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    ```python
+    from urllib.parse import parse_qs
+
+    TEMPLATES = {"a": "hero_a.html", "b": "hero_b.html"}
+
+
+    def read_visit(cookies, query_string):
+        params = parse_qs(query_string)
+
+        # most first-time visitors have no cookie, how much energy would .get() save here?
+        try:
+            variant = cookies["ab_variant"]
+        except KeyError:
+            variant = "a"
+
+        try:
+            campaign = params["utm_campaign"][0]
+        except KeyError:
+            campaign = None
+
+        try:
+            source = params["utm_source"][0]
+        except KeyError:
+            source = "direct"
+
+        return {
+            "template": TEMPLATES.get(variant, TEMPLATES["a"]),
+            "campaign": campaign,
+            "source": source,
+        }
+    ```
+
+    ?
+- role: assistant
+  content: |
+    Direction: `dict.get(key, default)` is a little cheaper than `try/except KeyError` when the key is often missing. Raising and catching an exception is the expensive part, and it only happens on a miss.
+
+    Measured reference: in Green Metrics Tool micro-benchmarks, 10,000,000 dict lookups where about half of the keys were missing used ~67 J with `dict.get` and ~76 J with `try/except KeyError` ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=4753302a-710f-4132-8001-9da3ba960d13,d7ded3f2-f9e7-4781-905e-9782a8305b8f,8f054455-adbc-402d-b593-0191d1061cd8)). That is about 12% less with `get`. When misses are rare, `try/except` is cheap, so the gain shrinks.
+
+    Your case has frequent misses (new visitors with no cookie, most links without UTM tags), so `get` is the better fit. Per request the saving is tiny, because you do three lookups. Don't scale the benchmark figure to your traffic. The template rendering and the response will cost far more than this function.
+
+    The same logic with `get`, which is also shorter:
+
+    ```python
+    from urllib.parse import parse_qs
+
+    TEMPLATES = {"a": "hero_a.html", "b": "hero_b.html"}
+
+
+    def read_visit(cookies, query_string):
+        params = parse_qs(query_string)
+        variant = cookies.get("ab_variant", "a")
+        return {
+            "template": TEMPLATES.get(variant, TEMPLATES["a"]),
+            "campaign": params.get("utm_campaign", [None])[0],
+            "source": params.get("utm_source", ["direct"])[0],
+        }
+    ```
+
+    **How to measure it on your data:**
+    1. Save a sample of real cookie dicts and query strings from your logs.
+    2. Time both versions on that sample:
+       ```python
+       import timeit
+       print(timeit.timeit(lambda: read_visit_old(cookies, qs), number=200_000))
+       print(timeit.timeit(lambda: read_visit(cookies, qs), number=200_000))
+       ```
+    3. Multiply the CPU time difference per call by your requests per day.
+
+    For measured energy instead of CPU time, run both variants as a Green Metrics Tool usage scenario.
+verify:
+  green_block: 0
+  test: |-
+    r = read_visit({}, "")
+    assert r == {"template": "hero_a.html", "campaign": None, "source": "direct"}
+    r = read_visit({"ab_variant": "b"}, "utm_campaign=spring&utm_source=ads")
+    assert r == {"template": "hero_b.html", "campaign": "spring", "source": "ads"}
+    r = read_visit({"ab_variant": "zzz"}, "utm_source=mail")
+    assert r["template"] == "hero_a.html" and r["source"] == "mail" and r["campaign"] is None

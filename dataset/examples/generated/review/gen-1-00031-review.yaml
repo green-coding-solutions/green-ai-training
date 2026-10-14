@@ -1,0 +1,127 @@
+id: gen-1-00031-review
+category: review
+language: typescript
+patterns:
+- async-concurrent-io
+messages:
+- role: user
+  content: |
+    Hi, I made the landing page script for our small SaaS. It works but the numbers appear slow after the page opens and I dont know why. Can you look if something is wrong?
+
+    ```typescript
+    interface Stats { users: number; countries: number }
+    interface Testimonial { name: string; text: string }
+    interface Plan { id: string; name: string; price: number }
+
+    const API = "https://api.tidyboard.io";
+
+    async function getJson<T>(path: string): Promise<T> {
+      const res = await fetch(API + path);
+      return res.json();
+    }
+
+    async function initLanding() {
+      const config = await getJson<{ featuredPlanId: string }>("/config");
+      const stats = await getJson<Stats>("/stats");
+      const testimonials = await getJson<Testimonial[]>("/testimonials?limit=3");
+      const plan = await getJson<Plan>("/plans/" + config.featuredPlanId);
+
+      document.querySelector("#stats")!.textContent =
+        `${stats.users} users in ${stats.countries} countries`;
+
+      const list = document.querySelector("#testimonials")!;
+      for (const t of testimonials) {
+        list.innerHTML += `<blockquote>${t.text}<cite>${t.name}</cite></blockquote>`;
+      }
+
+      document.querySelector("#featured-plan")!.textContent =
+        `${plan.name}: $${plan.price}/month`;
+    }
+
+    initLanding();
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (frontend landing page, runs on every visit)
+
+    #### [Bug] No error handling
+    - **Where:** `getJson` and `initLanding`
+    - **Issue:** `fetch` does not throw on 404 or 500. `res.json()` then fails or returns an error body. If any one call fails, `initLanding` throws and the page stays empty, even if the other three calls worked.
+    - **Fix:** check `res.ok`, and let each section render on its own.
+
+    #### [Security] Server text written with `innerHTML`
+    - **Where:** `list.innerHTML += ...`
+    - **Issue:** `t.text` and `t.name` go into the page as HTML. If the API ever returns markup, it runs in your visitors' browsers. `+=` on `innerHTML` also re-parses the whole list on every loop turn.
+    - **Fix:** build elements and set `textContent`.
+
+    #### [High] Independent requests wait for each other
+    - **Where:** the four `await getJson(...)` lines
+    - **Issue:** this is why the numbers feel slow. `/stats` and `/testimonials` do not need the result of `/config`, but they only start after it finishes. The page waits for four round trips in a row. Only `/plans/...` really depends on `/config`.
+    - **Fix:** start the independent calls together. Keep `config → plan` as one chain, because the plan needs the id. The total wait becomes the longest chain, not the sum of all four.
+    - **Impact:** reduces idle time per visit (the page, the tab and the server connections stay busy for less time). The bytes and the number of requests stay the same, so the energy saving is modest. It is mostly wall time. It applies to every visitor.
+
+    #### [Low] Runs after the whole script is parsed
+    - **Issue:** if the script tag has no `defer` or `type="module"`, `#stats` may not exist yet when the code runs. Add `defer` to the script tag.
+
+    ```typescript
+    interface Stats { users: number; countries: number }
+    interface Testimonial { name: string; text: string }
+    interface Plan { id: string; name: string; price: number }
+
+    const API = "https://api.tidyboard.io";
+
+    async function getJson<T>(path: string): Promise<T> {
+      const res = await fetch(API + path);
+      if (!res.ok) throw new Error(`${path} failed with status ${res.status}`);
+      return (await res.json()) as T;
+    }
+
+    function show<T>(result: PromiseSettledResult<T>, render: (value: T) => void) {
+      if (result.status === "fulfilled") render(result.value);
+      else console.warn(result.reason);
+    }
+
+    async function initLanding() {
+      // The plan needs the config, so these two stay in one chain.
+      const planRequest = getJson<{ featuredPlanId: string }>("/config").then((config) =>
+        getJson<Plan>(`/plans/${encodeURIComponent(config.featuredPlanId)}`)
+      );
+
+      const [stats, testimonials, plan] = await Promise.allSettled([
+        getJson<Stats>("/stats"),
+        getJson<Testimonial[]>("/testimonials?limit=3"),
+        planRequest,
+      ]);
+
+      show(stats, (s) => {
+        document.querySelector("#stats")!.textContent =
+          `${s.users} users in ${s.countries} countries`;
+      });
+
+      show(testimonials, (items) => {
+        const list = document.querySelector("#testimonials")!;
+        const nodes = items.map((t) => {
+          const quote = document.createElement("blockquote");
+          const cite = document.createElement("cite");
+          quote.textContent = t.text;
+          cite.textContent = t.name;
+          quote.append(cite);
+          return quote;
+        });
+        list.append(...nodes);
+      });
+
+      show(plan, (p) => {
+        document.querySelector("#featured-plan")!.textContent =
+          `${p.name}: $${p.price}/month`;
+      });
+    }
+
+    initLanding();
+    ```
+
+    **Green Notes**
+    - **Use async network calls** (reduces E, mostly wall time): `Promise.allSettled` overlaps the independent requests instead of waiting for them one by one. https://patterns.greensoftware.foundation/development/use-async-instead-of-sync
+    - *Not applied:* merging the calls into one endpoint. It would save round trips too, but it needs a backend change, so it is a separate decision.
+verify:
+  static_only: needs browser DOM, fetch and a remote API

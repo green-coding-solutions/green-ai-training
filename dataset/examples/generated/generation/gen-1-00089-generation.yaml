@@ -1,0 +1,102 @@
+id: gen-1-00089-generation
+category: generation
+language: python
+patterns:
+- vectorize-or-jit
+messages:
+- role: user
+  content: |
+    I need a small CLI script for our fleet team. Input is a CSV file with a header row and three columns: `timestamp` (unix seconds), `lat`, `lon`. It is one GPS track from one vehicle, sorted by time. Files can have a few million rows.
+
+    The script should print:
+    - number of points
+    - total distance in km (haversine between consecutive points)
+    - max speed in km/h
+    - how many segments are faster than a limit I pass with `--limit` (default 120)
+
+    Segments with a time difference of 0 should be ignored for speed. numpy is OK, but I would like to avoid extra dependencies if possible.
+- role: assistant
+  content: |
+    The per-segment math is the same for every row and does not depend on earlier results, so it can run as whole-array NumPy operations. No Python loop and no extra dependency are needed.
+
+    ```python
+    import argparse
+
+    import numpy as np
+
+    EARTH_RADIUS_KM = 6371.0088
+
+
+    def segment_distances_km(lat, lon):
+        """Haversine distance between consecutive points (degrees in, km out)."""
+        lat = np.radians(lat)
+        lon = np.radians(lon)
+        dlat = np.diff(lat)
+        dlon = np.diff(lon)
+        a = np.sin(dlat / 2) ** 2 + np.cos(lat[:-1]) * np.cos(lat[1:]) * np.sin(dlon / 2) ** 2
+        return 2 * EARTH_RADIUS_KM * np.arcsin(np.sqrt(a))
+
+
+    def summarize(ts, lat, lon, limit_kmh=120.0):
+        n = len(ts)
+        if n < 2:
+            return {"points": n, "distance_km": 0.0, "max_kmh": 0.0, "over_limit": 0}
+
+        dist = segment_distances_km(lat, lon)
+        dt_h = np.diff(ts) / 3600.0
+
+        valid = dt_h > 0  # ignore segments with no time difference
+        speed = dist[valid] / dt_h[valid]
+
+        return {
+            "points": n,
+            "distance_km": float(dist.sum()),
+            "max_kmh": float(speed.max()) if speed.size else 0.0,
+            "over_limit": int(np.count_nonzero(speed > limit_kmh)),
+        }
+
+
+    def main():
+        parser = argparse.ArgumentParser(description="Summarize a GPS track CSV.")
+        parser.add_argument("csv_path")
+        parser.add_argument("--limit", type=float, default=120.0, help="speed limit in km/h")
+        args = parser.parse_args()
+
+        data = np.loadtxt(args.csv_path, delimiter=",", skiprows=1, usecols=(0, 1, 2), ndmin=2)
+        if data.size == 0:
+            data = data.reshape(0, 3)
+        result = summarize(data[:, 0], data[:, 1], data[:, 2], args.limit)
+
+        print(f"points:      {result['points']}")
+        print(f"distance:    {result['distance_km']:.2f} km")
+        print(f"max speed:   {result['max_kmh']:.1f} km/h")
+        print(f"over {args.limit:g} km/h: {result['over_limit']} segments")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    Usage: `python track_summary.py track.csv --limit 100`
+
+    **Green Notes**
+    - **Vectorize the numeric work** (reduces E): the haversine, time difference and speed filter each run as one NumPy call over the whole array. The interpreter is not entered once per row, which matters at millions of rows.
+    - **Boolean mask instead of a loop with `if`**: zero-time segments are dropped with `dt_h > 0`, so there is no division by zero and no per-row branch.
+    - *Not applied:* a Numba JIT. Every step here is already an array operation, so a JIT would add a dependency and compile time for little gain. It would only make sense for a loop where each step needs the previous result.
+verify:
+  module: true
+  green_block: 0
+  test: |-
+    import numpy as np
+    ts = np.array([0.0, 3600.0, 3600.0])
+    lat = np.array([0.0, 0.0, 0.0])
+    lon = np.array([0.0, 1.0, 1.0])
+    r = summarize(ts, lat, lon, 100.0)
+    assert r["points"] == 3
+    assert abs(r["distance_km"] - 111.195) < 0.01
+    assert abs(r["max_kmh"] - 111.195) < 0.01
+    assert r["over_limit"] == 1
+    assert summarize(np.array([1.0]), np.array([0.0]), np.array([0.0]))["distance_km"] == 0.0
+    assert summarize(np.array([]), np.array([]), np.array([]))["points"] == 0
+    r2 = summarize(np.array([5.0, 5.0]), np.array([0.0, 0.0]), np.array([0.0, 1.0]))
+    assert r2["max_kmh"] == 0.0 and r2["over_limit"] == 0

@@ -1,0 +1,89 @@
+id: gen-1-00159-generation
+category: generation
+language: python
+patterns:
+- keep-star-imports
+- builtin-functions
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    I'm adding a `summarize` subcommand to our ops script `logstat.py`. The top of the file looks like this:
+
+    ```python
+    import argparse
+    import sys
+    from collections import defaultdict
+    from statistics import *
+    ```
+
+    Requirements:
+    - Input is an iterable of access-log lines like `2026-10-01T12:00:03 GET /api/items 200 0.134` (timestamp, method, path, status, latency in seconds).
+    - Group by path. For each path print: path, request count, median latency, max latency. Three decimals for latencies.
+    - Sort the output by path.
+    - Lines that don't have 5 fields or have a latency that isn't a number should be skipped. Print how many were skipped to stderr at the end, and return that number.
+    - Logs can be large, so don't load the whole file into memory.
+    - Our team style is star import from statistics in the ops scripts, so please stay consistent with that.
+- role: assistant
+  content: |
+    The star import stays as it is. `median` comes from it.
+
+    ```python
+    import sys
+    from collections import defaultdict
+    from statistics import *
+
+
+    def summarize(lines):
+        latencies = defaultdict(list)
+        skipped = 0
+
+        for line in lines:
+            parts = line.split()
+            if len(parts) != 5:
+                skipped += 1
+                continue
+            try:
+                latency = float(parts[4])
+            except ValueError:
+                skipped += 1
+                continue
+            latencies[parts[2]].append(latency)
+
+        for path in sorted(latencies):
+            values = latencies[path]
+            print(f"{path} {len(values)} {median(values):.3f} {max(values):.3f}")
+
+        if skipped:
+            print(f"skipped {skipped} malformed lines", file=sys.stderr)
+        return skipped
+    ```
+
+    Call it with an open file, for example `summarize(open(path))`. It reads one line at a time.
+
+    **Green Notes**
+    - **Star import kept** (no change to E): in Green Metrics Tool micro-benchmarks, `from x import *` and `import x` showed no measurable energy difference. Matching your team style costs nothing. Loading a heavy module is what costs energy, and `statistics` is small.
+    - **Stream, then group once** (reduces E, memory): the file is read in a single pass and only the latency floats are kept per path. Sorting touches only the distinct paths.
+    - **Built-ins for the math** (reduces E): `median` and `max` run in the standard library, so there are no hand-written loops.
+verify:
+  green_block: 0
+  test: |-
+    import contextlib
+    import io
+
+    lines = [
+        "2026-10-01T12:00:01 GET /health 200 0.010",
+        "2026-10-01T12:00:02 GET /api/items 200 0.100",
+        "2026-10-01T12:00:03 GET /api/items 200 0.300",
+        "this is not a log line",
+        "2026-10-01T12:00:04 GET /api/items 500 0.200",
+        "2026-10-01T12:00:05 GET /api/items 200 fast",
+    ]
+    out = io.StringIO()
+    err = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        skipped = summarize(iter(lines))
+    assert skipped == 2
+    assert out.getvalue() == "/api/items 3 0.200 0.300\n/health 1 0.010 0.010\n"
+    assert "skipped 2" in err.getvalue()

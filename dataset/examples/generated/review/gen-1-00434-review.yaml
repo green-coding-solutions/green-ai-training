@@ -1,0 +1,91 @@
+id: gen-1-00434-review
+category: review
+language: python
+patterns:
+- torch-no-grad
+- string-join
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    Review of our landing page "recommended for you" endpoint. Diff only please, no essay. It's hit on every page view of the shop home, CPU box, no GPU.
+
+    ```python
+    import torch
+    from flask import Flask, request
+
+    app = Flask(__name__)
+    model = torch.jit.load("models/reco.pt")
+    model.eval()
+    CATALOG = load_catalog()
+
+    @app.route("/api/landing/recs")
+    def landing_recs():
+        uid = request.args.get("uid", "")
+        feats = build_features(uid)
+        x = torch.tensor([feats], dtype=torch.float32)
+        scores = model(x)[0]
+        top = torch.topk(scores, k=8).indices.tolist()
+
+        html = '<section class="recs">'
+        for idx in top:
+            p = CATALOG[idx]
+            html += '<a class="card" href="/p/' + p["slug"] + '">'
+            html += '<img src="' + p["img"] + '" alt="' + p["name"] + '">'
+            html += '<span>' + p["name"] + '</span></a>'
+        html += '</section>'
+        return html
+    ```
+- role: assistant
+  content: |
+    **Workload:** web backend (runs on every home page view, CPU inference)
+
+    #### [Security] Product fields are not HTML-escaped
+    - **Where:** the card markup in `landing_recs`
+    - **Issue:** `name`, `slug` and `img` go straight into HTML. A catalog name with `"` or `<` breaks the page, or injects markup if catalog data is ever user-editable.
+    - **Fix:** `html.escape(..., quote=True)` on every field. Output changes only for values that contain special characters.
+
+    #### [High] Autograd bookkeeping during inference
+    - **Where:** `scores = model(x)[0]`
+    - **Issue:** this runs outside `torch.no_grad()`, so PyTorch tracks gradient state for a pure forward pass. That is wasted work on every page view.
+    - **Fix:** wrap the forward pass and `topk` in `torch.no_grad()`.
+    - **Impact:** reduces E per request. In Green Metrics Tool micro-benchmarks, 100,000 CPU inferences used about 14% less CPU energy with `torch.no_grad()` ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=42de8e68-4536-43f4-a9bd-427ec42affd1,7e6a3886-425a-4992-9f14-180bede2d841)). The saving is per call, so it scales with your traffic.
+
+    #### [Low] `+=` string building
+    - **Where:** the `html` loop
+    - **Issue:** about 24 appends per request for 8 cards. At this size the cost is negligible. `join` is still the better default because it is linear and easier to read, and it makes the escaping fix cleaner.
+    - **Fix:** collect parts in a list and join once.
+
+    Changed function only:
+
+    ```python
+    from html import escape
+
+    @app.route("/api/landing/recs")
+    def landing_recs():
+        uid = request.args.get("uid", "")
+        feats = build_features(uid)
+        x = torch.tensor([feats], dtype=torch.float32)
+        with torch.no_grad():
+            scores = model(x)[0]
+            top = torch.topk(scores, k=8).indices.tolist()
+
+        parts = ['<section class="recs">']
+        for idx in top:
+            p = CATALOG[idx]
+            slug = escape(p["slug"], quote=True)
+            img = escape(p["img"], quote=True)
+            name = escape(p["name"], quote=True)
+            parts.append(
+                f'<a class="card" href="/p/{slug}">'
+                f'<img src="{img}" alt="{name}">'
+                f'<span>{name}</span></a>'
+            )
+        parts.append('</section>')
+        return ''.join(parts)
+    ```
+
+    **Already good:** the model is loaded once at import time and put in `eval()` mode, and the response is limited to 8 items.
+verify:
+  static_only: needs PyTorch, Flask and a TorchScript model file, which are not in the stdlib-only test environment

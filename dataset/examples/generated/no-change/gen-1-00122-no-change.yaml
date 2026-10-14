@@ -1,0 +1,40 @@
+id: gen-1-00122-no-change
+category: no-change
+language: go
+patterns:
+- regex-precompile
+- context-tradeoff
+messages:
+- role: user
+  content: "We have a Go service that cleans user text before it goes to our embedding model (gRPC call to a separate inference\
+    \ server). It handles a steady stream of requests, and each request has 1 to 64 texts. Before I ship it, I want to be\
+    \ sure we don't waste CPU on the preprocessing. Requirements: output must stay byte-identical, because it affects cached\
+    \ embeddings, and it must be safe to call from many goroutines. Can you optimize it, or is it fine?\n\n```go\npackage\
+    \ preprocess\n\nimport (\n\t\"regexp\"\n\t\"strings\"\n\t\"unicode/utf8\"\n)\n\nconst maxRunes = 2048\n\nvar (\n\turlRe\
+    \    = regexp.MustCompile(`https?://\\S+`)\n\temailRe  = regexp.MustCompile(`[\\w.+-]+@[\\w-]+\\.[\\w.-]+`)\n\tdigitsRe\
+    \ = regexp.MustCompile(`\\d{4,}`)\n\twsRe     = regexp.MustCompile(`\\s+`)\n)\n\n// Clean normalizes one text for the\
+    \ embedding model.\nfunc Clean(text string) string {\n\ttext = urlRe.ReplaceAllString(text, \"<url>\")\n\ttext = emailRe.ReplaceAllString(text,\
+    \ \"<email>\")\n\ttext = digitsRe.ReplaceAllString(text, \"<num>\")\n\ttext = wsRe.ReplaceAllString(text, \" \")\n\ttext\
+    \ = strings.TrimSpace(text)\n\n\tif utf8.RuneCountInString(text) > maxRunes {\n\t\tr := []rune(text)\n\t\ttext = string(r[:maxRunes])\n\
+    \t}\n\treturn text\n}\n\n// CleanBatch cleans all texts of one request.\nfunc CleanBatch(texts []string) []string {\n\t\
+    out := make([]string, len(texts))\n\tfor i, t := range texts {\n\t\tout[i] = Clean(t)\n\t}\n\treturn out\n}\n```\n"
+- role: assistant
+  content: |
+    It's already fine. I would ship it as it is.
+
+    - **Regexes are compiled once.** They are package-level `MustCompile` variables, so the compile cost is paid at startup, not per text. This is the part that matters in Go: the `regexp` package has no internal cache of compiled patterns, so calling `regexp.MustCompile` or `regexp.MatchString` inside `Clean` would recompile on every call.
+    - **Goroutine safety is fine.** A compiled `*regexp.Regexp` is safe for concurrent use, so no locks are needed.
+    - **The slice is allocated once.** `CleanBatch` uses `make([]string, len(texts))` with the exact size, so there is no regrowth.
+    - **The rune conversion is rare.** It only runs for texts over 2048 runes.
+
+    The embedding call on the inference server will cost far more than these four regex passes. Rewriting them by hand would make the code harder to read and could change the output, which you said must stay identical.
+
+    If profiling later shows `Clean` high in the CPU profile (`go test -bench . -cpuprofile cpu.out`, then `go tool pprof`), two options are worth looking at. Neither is needed now:
+    - Cut very long texts before the regex passes, not after. This saves work on huge inputs, but it can change the output, for example when a URL is cut in half. Only do it if you accept new cache keys.
+    - Replace the regexes with a single hand-written scanner. This only pays off if the cleaning step is a measured hot spot, and you would need tests that compare the old and new output on real data.
+
+    **Green Notes**
+    - **Compile regex once** (reduces E): already done. Nothing to change.
+    - *Not applied:* hand-written scanner or reordering. There is no measured hot spot, and the output must stay byte-identical.
+verify:
+  static_only: Go code, no Go toolchain in the verifier

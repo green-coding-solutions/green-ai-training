@@ -1,0 +1,114 @@
+id: gen-1-00187-generation
+category: generation
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    I'm writing the server-side part of our marketing landing page. No framework for this piece, the web layer just hands me the query params as a plain dict of strings. Can you write the Python for the hero section?
+
+    Requirements:
+    - Visitors can arrive with `utm_campaign` and `utm_source` in the URL. Both are optional. Most of our traffic is organic, so usually neither is there.
+    - We keep a dict of campaigns, keyed by slug, e.g. `"spring-sale"`. Each campaign can override any of `headline`, `cta_text`, `cta_url`, `hero_image`. Overrides are optional, and many campaigns only set a headline.
+    - If the campaign does not set `cta_text`, use a source-specific button text from a second dict (e.g. newsletter visitors get "Read the update"). If there is none, use the default.
+    - Unknown campaigns and sources (people edit URLs, old links, typos) must just fall back to the defaults. Slugs are case-insensitive and sometimes have stray spaces.
+    - One function that resolves the content, one that renders the hero HTML. All text must be HTML-escaped.
+- role: assistant
+  content: |
+    Use `dict.get` with a default for every optional lookup. Most visitors have no campaign, so a miss is the normal case, not an error:
+
+    ```python
+    from html import escape
+
+    DEFAULTS = {
+        "headline": "Ship faster with fewer surprises",
+        "cta_text": "Start free trial",
+        "cta_url": "/signup",
+        "hero_image": "/img/hero-default.webp",
+    }
+
+
+    def _clean(value):
+        return (value or "").strip().lower()
+
+
+    def resolve_content(params, campaigns, source_cta_text, defaults=DEFAULTS):
+        campaign = campaigns.get(_clean(params.get("utm_campaign")), {})
+        content = {field: campaign.get(field, default) for field, default in defaults.items()}
+        if "cta_text" not in campaign:
+            source = _clean(params.get("utm_source"))
+            content["cta_text"] = source_cta_text.get(source, content["cta_text"])
+        return content
+
+
+    def render_hero(content):
+        return (
+            '<section class="hero">'
+            f'<img src="{escape(content["hero_image"])}" alt="">'
+            f'<h1>{escape(content["headline"])}</h1>'
+            f'<a class="cta" href="{escape(content["cta_url"])}">{escape(content["cta_text"])}</a>'
+            "</section>"
+        )
+    ```
+
+    Example:
+
+    ```python
+    campaigns = {
+        "spring-sale": {"headline": "Spring sale: 30% off annual plans", "cta_text": "Claim the offer"},
+    }
+    sources = {"newsletter": "Read the update"}
+
+    print(resolve_content({}, campaigns, sources)["headline"])
+    # Ship faster with fewer surprises
+    print(resolve_content({"utm_campaign": " Spring-Sale "}, campaigns, sources)["cta_text"])
+    # Claim the offer
+    print(resolve_content({"utm_campaign": "old-link", "utm_source": "newsletter"}, campaigns, sources)["cta_text"])
+    # Read the update
+    ```
+
+    **Green Notes**
+    - **`dict.get` instead of `try/except KeyError`** (reduces E): with organic traffic, most lookups miss. A miss through `get` is a plain lookup. A miss through `try/except` raises and catches an exception every time. In Green Metrics Tool micro-benchmarks (10,000,000 dict lookups, about half of the keys missing), `dict.get` used about 12% less CPU energy than `try/except KeyError` ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=4753302a-710f-4132-8001-9da3ba960d13,d7ded3f2-f9e7-4781-905e-9782a8305b8f,8f054455-adbc-402d-b593-0191d1061cd8)). The gain per request is small, but it applies to every page view.
+    - **Empty defaults instead of branches:** `params.get(...)` returns `None` for a missing param, and `_clean` turns that into `""`. Then the unknown-key case flows through the same lookup, with no special path.
+
+    *Not applied:* if misses were rare, `try/except KeyError` would be just as cheap, because the cost is in raising. Here misses are the common case, so `get` is the better fit.
+verify:
+  green_block: 0
+  test: |-
+    campaigns = {
+        "spring-sale": {
+            "headline": "Spring sale",
+            "cta_text": "Claim offer",
+            "hero_image": "/img/spring.webp",
+        },
+        "docs-push": {"headline": "Read the docs"},
+    }
+    sources = {"newsletter": "Read the update"}
+
+    organic = resolve_content({}, campaigns, sources)
+    assert organic == DEFAULTS
+    assert organic is not DEFAULTS
+
+    assert resolve_content({"utm_campaign": "", "utm_source": ""}, campaigns, sources) == DEFAULTS
+
+    spring = resolve_content({"utm_campaign": " Spring-Sale ", "utm_source": "newsletter"}, campaigns, sources)
+    assert spring["headline"] == "Spring sale"
+    assert spring["cta_text"] == "Claim offer"
+    assert spring["cta_url"] == "/signup"
+    assert spring["hero_image"] == "/img/spring.webp"
+
+    docs = resolve_content({"utm_campaign": "DOCS-PUSH", "utm_source": "Newsletter"}, campaigns, sources)
+    assert docs["headline"] == "Read the docs"
+    assert docs["cta_text"] == "Read the update"
+
+    unknown = resolve_content({"utm_campaign": "old-link", "utm_source": "twitter"}, campaigns, sources)
+    assert unknown == DEFAULTS
+
+    html = render_hero({"headline": "<b>Hi</b>", "cta_text": "Go & see", "cta_url": "/a?x=1&y=2", "hero_image": "/i.webp"})
+    assert "&lt;b&gt;Hi&lt;/b&gt;" in html
+    assert "Go &amp; see" in html
+    assert 'href="/a?x=1&amp;y=2"' in html
+    assert html.startswith('<section class="hero">') and html.endswith("</section>")

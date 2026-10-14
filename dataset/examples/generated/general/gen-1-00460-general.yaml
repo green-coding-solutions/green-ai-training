@@ -1,0 +1,56 @@
+id: gen-1-00460-general
+category: general
+language: javascript
+patterns:
+- none
+messages:
+- role: user
+  content: |
+    I'm building the cart for our shop in JavaScript and I keep running into float problems with prices. Example: `0.1 + 0.2` gives `0.30000000000000004`, and last week a cart total showed `59.989999999999995`. Requirements:
+
+    - Prices are in EUR with 2 decimals
+    - I need to add up line items, apply a percentage discount (like 15%) and add 19% VAT
+    - The total shown to the customer must match what we charge via the payment provider
+    - No extra libraries if possible
+
+    What is the right way to handle money in JS? A short example would help.
+- role: assistant
+  content: |-
+    Don't use floats for money. Store and calculate amounts as **integer cents**, and only format to euros when you show them.
+
+    The float error comes from binary floating point. `0.1` and `0.2` can't be stored exactly, so small errors add up. Integers up to `Number.MAX_SAFE_INTEGER` are exact, and that is far more than any cart needs.
+
+    ```javascript
+    // All amounts are integer cents.
+    const toCents = (euros) => Math.round(euros * 100);
+
+    // Percentages as integer basis points: 15% = 1500, 19% = 1900.
+    const applyBps = (cents, bps) => Math.round((cents * bps) / 10000);
+
+    function cartTotal(items, discountBps, vatBps) {
+      const subtotal = items.reduce((sum, i) => sum + i.unitCents * i.qty, 0);
+      const discount = applyBps(subtotal, discountBps);
+      const net = subtotal - discount;
+      const vat = applyBps(net, vatBps);
+      return { subtotal, discount, net, vat, total: net + vat };
+    }
+
+    const fmt = new Intl.NumberFormat("de-DE", { style: "currency", currency: "EUR" });
+    const formatCents = (cents) => fmt.format(cents / 100);
+
+    const items = [
+      { unitCents: toCents(19.99), qty: 3 },
+      { unitCents: toCents(4.5), qty: 2 },
+    ];
+    const t = cartTotal(items, 1500, 1900);
+    console.log(t.total);              // 6.9 EUR style value as integer cents
+    console.log(formatCents(t.total)); // formatted for display
+    ```
+
+    Points to keep in mind:
+
+    - **Convert once, at the edge.** Parse user input or DB values to cents as soon as they come in. Use `Math.round`, not `parseInt` or `Math.floor`, when converting from a decimal.
+    - **Rounding is a business rule.** Here VAT and discount are rounded once on the whole cart. Some shops round per line item. The two can differ by a cent, so pick one, write it down, and make sure the invoice uses the same rule.
+    - **Send cents to the payment provider.** Stripe, Adyen and Mollie take amounts in minor units or as decimal strings. Never send a float. If the provider returns a decimal string, convert it with a string parse instead of `parseFloat(...) * 100`.
+    - **Store cents in the database** as an integer column (`BIGINT` or `INTEGER`), or as `NUMERIC(12,2)` and convert when you read it. Do not use `FLOAT`.
+    - **Large or fractional amounts.** For per-unit prices with more than 2 decimals, or multiple currencies with different minor units (JPY has 0, KWD has 3), use `BigInt` or a decimal library such as `decimal.js`. For a single-currency EUR cart, integers are enough.

@@ -1,0 +1,114 @@
+id: gen-1-00109-review
+category: review
+language: javascript
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    Review pls. Nightly job, pulls ~400 station series from our climate API and computes per-station mean/std for the anomaly dashboard. Only want the diff, no essay.
+
+    ```javascript
+    // anomaly_report.js
+    const BASE = process.env.CLIM_API || "https://climate-data.example.org/api/v2";
+
+    async function fetchSeries(stationId, start, end) {
+      const url = `${BASE}/stations/${stationId}/series?start=${start}&end=${end}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`station ${stationId}: HTTP ${res.status}`);
+      return res.json();
+    }
+
+    function mean(xs) {
+      return xs.reduce((a, b) => a + b) / xs.length;
+    }
+
+    function std(xs, m) {
+      const v = xs.reduce((a, x) => a + (x - m) ** 2, 0) / (xs.length - 1);
+      return Math.sqrt(v);
+    }
+
+    async function anomalyReport(stationIds, start, end) {
+      const report = [];
+      for (const id of stationIds) {
+        const series = await fetchSeries(id, start, end);
+        const temps = series.points
+          .map((p) => p.temp)
+          .filter((t) => t !== null);
+        const m = mean(temps);
+        report.push({ id, n: temps.length, mean: m, std: std(temps, m) });
+      }
+      return report;
+    }
+
+    module.exports = { anomalyReport };
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline
+
+    #### [Bug] One empty station kills the whole run
+    - **Where:** `mean()` and `std()`
+    - **Issue:** `reduce` without an initial value throws a `TypeError` on an empty array. A station with no valid readings aborts the job. With one reading, `std` divides by zero and returns `NaN`.
+    - **Fix:** return `null` when there are fewer than 2 values.
+
+    #### [Medium] Requests run one after another
+    - **Where:** `await fetchSeries(...)` inside the `for` loop
+    - **Issue:** the 400 requests are independent, but each waits for the previous one. The process sits idle on network latency the whole time.
+    - **Fix:** run them with a small worker pool. Don't use a bare `Promise.all` over 400 items. That opens all connections at once and may trigger rate limits on the API.
+    - **Impact:** mostly cuts wall time and the time the job holds its node. CPU energy drops only modestly. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib` ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=97acc9a0-3856-4bbb-b816-2b64030fba98,6415cccb-ad1a-4d87-ae46-92740c5e285b)). Measure your job with `time` or `perf stat` before and after.
+
+    The result order and the fail-fast behavior stay the same.
+
+    ```javascript
+    async function mapLimit(items, limit, fn) {
+      const results = new Array(items.length);
+      let next = 0;
+      async function worker() {
+        while (next < items.length) {
+          const i = next++;
+          try {
+            results[i] = await fn(items[i]);
+          } catch (err) {
+            next = items.length; // stop other workers from taking new items
+            throw err;
+          }
+        }
+      }
+      const n = Math.min(limit, items.length);
+      await Promise.all(Array.from({ length: n }, worker));
+      return results;
+    }
+
+    function mean(xs) {
+      return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null;
+    }
+
+    function std(xs, m) {
+      if (xs.length < 2) return null;
+      const v = xs.reduce((a, x) => a + (x - m) ** 2, 0) / (xs.length - 1);
+      return Math.sqrt(v);
+    }
+
+    async function anomalyReport(stationIds, start, end, concurrency = 8) {
+      return mapLimit(stationIds, concurrency, async (id) => {
+        const series = await fetchSeries(id, start, end);
+        const temps = series.points
+          .map((p) => p.temp)
+          .filter((t) => t !== null);
+        const m = mean(temps);
+        return { id, n: temps.length, mean: m, std: std(temps, m) };
+      });
+    }
+    ```
+
+    #### [Low] No request timeout
+    - **Where:** `fetch(url)` in `fetchSeries`
+    - **Issue:** a hung connection blocks a worker forever.
+    - **Fix:** `fetch(url, { signal: AbortSignal.timeout(30_000) })`
+
+    **Already good:** the function rejects on non-2xx responses instead of parsing an error body.
+verify:
+  static_only: needs a network call to the climate API

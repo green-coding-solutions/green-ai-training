@@ -1,0 +1,73 @@
+id: gen-1-00378-generation
+category: generation
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    Need a small script for our CI. It reads a concatenated job log on stdin and a file `signatures.txt` (one regex per line, `#` comments, roughly 800 lines, known flaky-failure signatures). Output: per signature, how many log lines matched, most frequent first. Code only, skip the walkthrough.
+- role: assistant
+  content: |
+    ```python
+    import re
+    import sys
+    from collections import Counter
+
+
+    def load_signatures(path):
+        sigs = []
+        with open(path, encoding="utf-8") as f:
+            for n, line in enumerate(f, 1):
+                line = line.rstrip("\n")
+                if not line or line.startswith("#"):
+                    continue
+                try:
+                    sigs.append((line, re.compile(line)))
+                except re.error as exc:
+                    print(f"{path}:{n}: skipped invalid pattern: {exc}", file=sys.stderr)
+        return sigs
+
+
+    def count_matches(lines, sigs):
+        counts = Counter()
+        for line in lines:
+            for text, rx in sigs:
+                if rx.search(line):
+                    counts[text] += 1
+        return counts
+
+
+    def main(argv):
+        sigs = load_signatures(argv[1] if len(argv) > 1 else "signatures.txt")
+        counts = count_matches(sys.stdin, sigs)
+        for text, n in counts.most_common():
+            print(f"{n:6d}  {text}")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main(sys.argv))
+    ```
+
+    **Green Notes**
+    - **Compile each regex once** (reduces E): every signature is compiled in `load_signatures`, not inside the per-line loop. Python's `re` module caches only 512 patterns. With about 800 signatures cycling over every log line, that cache would thrash and recompile patterns again and again. In Green Metrics Tool micro-benchmarks, a precompiled pattern used about 18% less CPU energy than inline `re.match` even when the cache hits ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=3827c15a-4295-44a4-8025-a07e8653ab7e,b7a9f0bd-c9e0-4b95-9bda-e8a96f38020c,f3e0434d-744b-41a0-a0cc-9bf00d80500d)).
+    - **Streaming input:** the log is read line by line from stdin, so memory stays flat for large job logs.
+    - *Not applied:* merging all signatures into one alternation. You need per-signature counts, and one big pattern would hide which signature matched.
+verify:
+  module: true
+  test: |-
+    import io, os, tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as tf:
+        tf.write("# flaky\nconnection reset\nTimeout \\d+ms\n(bad\n\n")
+        p = tf.name
+    sigs = load_signatures(p)
+    os.unlink(p)
+    assert len(sigs) == 2
+    lines = ["a connection reset b\n", "Timeout 30ms\n", "Timeout 5ms connection reset\n", "ok\n"]
+    c = count_matches(io.StringIO("".join(lines)), sigs)
+    assert c["connection reset"] == 2
+    assert c["Timeout \\d+ms"] == 2
+    assert c.most_common()[0][1] == 2

@@ -1,0 +1,71 @@
+id: gen-1-00424-refactor
+category: refactor
+language: dockerfile
+patterns:
+- small-container-images
+messages:
+- role: user
+  content: |
+    hi, i wrote a c++ solver for heat flow in a metal plate (cmake project, binary is called heatsolver, uses openblas and openmp). i put it in docker so my group can run it on the lab server. it works but the image is about 1.6 GB and building takes long. i dont really know what is wrong, can you make it better?
+
+    ```dockerfile
+    FROM ubuntu:latest
+
+    RUN apt-get update
+    RUN apt-get install -y build-essential cmake git python3 python3-pip wget vim libopenblas-dev libgomp1
+    RUN pip3 install numpy matplotlib
+
+    COPY . /app
+    WORKDIR /app
+
+    RUN mkdir build
+    RUN cd build && cmake .. && make -j4
+
+    CMD ["./build/heatsolver", "config/plate.cfg"]
+    ```
+- role: assistant
+  content: |
+    The image is big because it still contains the whole build toolchain, the source, and tools the solver never uses. The fix is a multi-stage build: compile in one stage, copy only the binary into a small runtime stage.
+
+    ```dockerfile
+    FROM debian:12-slim AS build
+
+    RUN apt-get update \
+        && apt-get install -y --no-install-recommends build-essential cmake libopenblas-dev \
+        && rm -rf /var/lib/apt/lists/*
+
+    WORKDIR /src
+    COPY . .
+    RUN cmake -S . -B build && cmake --build build -j"$(nproc)"
+
+
+    FROM debian:12-slim
+
+    RUN apt-get update \
+        && apt-get install -y --no-install-recommends libopenblas0 libgomp1 \
+        && rm -rf /var/lib/apt/lists/*
+
+    COPY --from=build /src/build/heatsolver /usr/local/bin/heatsolver
+    COPY config/ /app/config/
+
+    WORKDIR /app
+    CMD ["heatsolver", "config/plate.cfg"]
+    ```
+
+    Add a `.dockerignore` so the build context stays small and local build output does not leak in:
+
+    ```text
+    .git
+    build
+    *.csv
+    *.png
+    ```
+
+    **Green Notes**
+    - **Multi-stage build** (reduces M and network): compilers, cmake, headers and the source tree stay in the build stage. The final image has only the binary, the config, and the two runtime libraries. Every pull on the lab server moves far fewer bytes and uses less disk.
+    - **Fewer packages** (reduces M): `git`, `wget`, `vim`, `python3`, `pip`, `numpy` and `matplotlib` are gone. Nothing in your `CMD` uses them. If you run a plotting script inside the container, tell me. Then it should go into its own image or stage.
+    - **One `RUN` for apt, with cleanup:** `update` and `install` in the same layer, `--no-install-recommends`, and the package lists deleted in that same layer. Separate `RUN apt-get update` lines can leave a stale cache, and deleted files in a later layer still count toward the image size.
+    - **Pinned base:** `debian:12-slim` instead of `ubuntu:latest`, so the build does not change when the tag moves. Both stages use the same base, so the libraries match.
+    - **Check next:** your `cmake ..` has no `-DCMAKE_BUILD_TYPE`. If `CMakeLists.txt` does not set one, the solver may be compiled without optimization, and that costs more energy on every run than the image size does. I left it unchanged because optimization flags can slightly change floating-point results. Check that your results still match before you switch to `Release`.
+verify:
+  static_only: Dockerfile needs a container build and a project source tree; cannot be run in the sandbox

@@ -1,0 +1,70 @@
+id: gen-1-00353-generation
+category: generation
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    I need a Python function for our nightly invoicing job (webshop, B2B and B2C mixed). It gets the order lines for the day as an iterable of dicts, usually a generator reading from the DB, so it can be a few million lines. Each line has `order_id`, `customer_id`, `sku`, `qty` and `unit_price_cents` (int).
+
+    Requirements:
+    - Two lookup tables come in as dicts: `customer_discounts` maps customer_id to a percent discount (int, 0-100). Only our contract customers are in there, so most customers are not.
+    - `sku_unit_markdowns` maps sku to cents taken off each unit. Only a small part of the catalog has one.
+    - Markdown is applied first (the unit price must not go below 0), then multiplied by qty, then the customer discount is applied to that line.
+    - Money stays in integer cents. Round the discounted line half up.
+    - Return a dict `order_id -> total_cents`.
+    - Don't load all lines into memory.
+- role: assistant
+  content: |
+    ```python
+    from collections import defaultdict
+
+
+    def order_totals(lines, customer_discounts, sku_unit_markdowns):
+        totals = defaultdict(int)
+        for line in lines:
+            unit = max(line["unit_price_cents"] - sku_unit_markdowns.get(line["sku"], 0), 0)
+            amount = unit * line["qty"]
+
+            pct = customer_discounts.get(line["customer_id"], 0)
+            if pct:
+                # integer math, rounds half up
+                amount = (amount * (100 - pct) + 50) // 100
+
+            totals[line["order_id"]] += amount
+        return dict(totals)
+    ```
+
+    ```python
+    lines = [
+        {"order_id": "A", "customer_id": "c1", "sku": "s1", "qty": 2, "unit_price_cents": 1000},
+        {"order_id": "A", "customer_id": "c1", "sku": "s2", "qty": 1, "unit_price_cents": 505},
+        {"order_id": "B", "customer_id": "c2", "sku": "s2", "qty": 3, "unit_price_cents": 250},
+    ]
+    print(order_totals(lines, {"c1": 10}, {"s1": 100}))
+    # {'A': 2075, 'B': 750}
+    ```
+
+    **Green Notes**
+    - **`dict.get(key, default)` instead of `try/except KeyError`** (reduces E): here most lookups miss, because few customers and few SKUs have an entry. Raising an exception is the expensive part, so a `try/except` would pay that cost on nearly every line. In Green Metrics Tool micro-benchmarks with about half of the keys missing, `dict.get` used about 12% less CPU energy than `try/except KeyError` over 10,000,000 lookups ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=4753302a-710f-4132-8001-9da3ba960d13,d7ded3f2-f9e7-4781-905e-9782a8305b8f,8f054455-adbc-402d-b593-0191d1061cd8)). With mostly misses, the gap should be larger. When misses are rare, `try/except` is cheap and either style is fine.
+    - **Single pass over the iterable:** lines are consumed one by one, so memory stays flat even for millions of lines.
+    - **`if pct:` skips the discount math** for customers without a contract, which is the common case.
+
+    Rounding happens per line, not per order. If your invoices must round once per order, apply the discount to a running order subtotal instead.
+verify:
+  green_block: 0
+  test: |-
+    lines = [
+        {"order_id": "A", "customer_id": "c1", "sku": "s1", "qty": 2, "unit_price_cents": 1000},
+        {"order_id": "A", "customer_id": "c1", "sku": "s2", "qty": 1, "unit_price_cents": 505},
+        {"order_id": "B", "customer_id": "c2", "sku": "s2", "qty": 3, "unit_price_cents": 250},
+        {"order_id": "B", "customer_id": "c2", "sku": "s1", "qty": 1, "unit_price_cents": 50},
+    ]
+    assert order_totals(lines, {"c1": 10}, {"s1": 100}) == {"A": 2075, "B": 750}
+    assert order_totals(iter(lines), {}, {}) == {"A": 2505, "B": 800}
+    assert order_totals([], {"c1": 10}, {"s1": 100}) == {}
+    one = [{"order_id": "X", "customer_id": "c", "sku": "s", "qty": 1, "unit_price_cents": 5}]
+    assert order_totals(one, {"c": 50}, {}) == {"X": 3}

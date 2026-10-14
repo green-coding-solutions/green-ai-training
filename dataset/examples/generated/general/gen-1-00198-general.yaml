@@ -1,0 +1,98 @@
+id: gen-1-00198-general
+category: general
+language: go
+patterns:
+- none
+messages:
+- role: user
+  content: |
+    I'm building a small REST API in Go (net/http, Go 1.22, no framework) and I want to add request timeouts the right way. Requirements:
+
+    - Slow clients must not be able to hold connections open forever.
+    - Some handlers call a database and an external service. They should stop work when the client goes away or when a deadline passes.
+    - Return a 503 with a short JSON error if a handler takes too long.
+
+    Right now I just have this:
+
+    ```go
+    func main() {
+        mux := http.NewServeMux()
+        mux.HandleFunc("GET /orders/{id}", getOrder)
+        log.Fatal(http.ListenAndServe(":8080", mux))
+    }
+    ```
+
+    What should I change? Please show a working example and explain which timeout does what, because I always mix them up.
+- role: assistant
+  content: |-
+    Use an explicit `http.Server` with connection-level timeouts, wrap the handler with `http.TimeoutHandler` for the per-request deadline, and pass `r.Context()` into your database and HTTP calls.
+
+    ```go
+    package main
+
+    import (
+        "context"
+        "database/sql"
+        "encoding/json"
+        "errors"
+        "log"
+        "net/http"
+        "time"
+    )
+
+    var db *sql.DB // opened elsewhere
+
+    func getOrder(w http.ResponseWriter, r *http.Request) {
+        id := r.PathValue("id")
+
+        var status string
+        err := db.QueryRowContext(r.Context(),
+            "SELECT status FROM orders WHERE id = $1", id).Scan(&status)
+        switch {
+        case errors.Is(err, sql.ErrNoRows):
+            http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+            return
+        case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+            return // the client is gone or TimeoutHandler already replied
+        case err != nil:
+            log.Printf("get order %s: %v", id, err)
+            http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+            return
+        }
+
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]string{"id": id, "status": status})
+    }
+
+    func main() {
+        mux := http.NewServeMux()
+        mux.HandleFunc("GET /orders/{id}", getOrder)
+
+        handler := http.TimeoutHandler(mux, 5*time.Second, `{"error":"request timed out"}`)
+
+        srv := &http.Server{
+            Addr:              ":8080",
+            Handler:           handler,
+            ReadHeaderTimeout: 5 * time.Second,
+            ReadTimeout:       10 * time.Second,
+            WriteTimeout:      15 * time.Second,
+            IdleTimeout:       60 * time.Second,
+        }
+        log.Fatal(srv.ListenAndServe())
+    }
+    ```
+
+    **What each timeout does**
+
+    - `ReadHeaderTimeout`: how long a client has to send the request headers. This stops slow-header attacks (slowloris).
+    - `ReadTimeout`: how long to read the whole request, including the body.
+    - `WriteTimeout`: how long until the response must be fully written. Keep it larger than the `TimeoutHandler` duration, or the connection closes before your 503 can be sent.
+    - `IdleTimeout`: how long a keep-alive connection may sit unused between requests.
+    - `http.TimeoutHandler`: the per-request deadline for your handler. When it fires, it sends a 503 with the body you gave it and cancels `r.Context()`.
+
+    **Things to know**
+
+    - `TimeoutHandler` only sends the 503. It cannot stop your goroutine. The work stops only if your code uses the context, so always use `QueryRowContext`, `http.NewRequestWithContext(r.Context(), ...)` and so on.
+    - The body string is sent as is, but `TimeoutHandler` does not set `Content-Type`. If clients need `application/json`, write a small wrapper that sets the header before calling the inner handler.
+    - For a tighter budget on one slow call, derive a child context: `ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second); defer cancel()`.
+    - `TimeoutHandler` buffers the response, so it is a poor fit for streaming or server-sent events. Use `http.ResponseController` with per-request deadlines for those routes.

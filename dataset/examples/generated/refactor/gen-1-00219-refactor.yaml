@@ -1,0 +1,112 @@
+id: gen-1-00219-refactor
+category: refactor
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    hello, i wrote this buffer for our gateway that collects sensor frames and sends them to the cloud in batches. it runs on a small ARM box and the CPU is always quite high when many devices are sending. i dont know what is wrong, the code looks ok to me. can you make it better?
+
+    ```python
+    class UplinkBuffer:
+        def __init__(self, max_frames=5000):
+            self.frames = []
+            self.max_frames = max_frames
+            self.dropped = 0
+
+        def push(self, device_id, payload, ts):
+            # buffer full: drop the oldest frame
+            if len(self.frames) >= self.max_frames:
+                self.frames.pop()
+                self.dropped += 1
+            self.frames.insert(0, (ts, device_id, payload))
+
+        def next_batch(self, size=20):
+            batch = []
+            while self.frames and len(batch) < size:
+                batch.append(self.frames.pop())
+            return batch
+
+        def pending(self):
+            return len(self.frames)
+
+        def pending_for(self, device_id):
+            return sum(1 for f in self.frames if f[1] == device_id)
+
+        def oldest_age(self, now):
+            if not self.frames:
+                return 0
+            return now - self.frames[-1][0]
+    ```
+- role: assistant
+  content: |
+    The problem is `self.frames.insert(0, ...)`. A Python list is an array, so inserting at the front moves every frame already in the buffer. When the buffer is nearly full, each incoming frame shifts thousands of entries. A `collections.deque` adds and removes at both ends without shifting.
+
+    ```python
+    from collections import deque
+
+
+    class UplinkBuffer:
+        def __init__(self, max_frames=5000):
+            self.frames = deque()  # oldest frame on the left, newest on the right
+            self.max_frames = max_frames
+            self.dropped = 0
+
+        def push(self, device_id, payload, ts):
+            # buffer full: drop the oldest frame
+            if len(self.frames) >= self.max_frames:
+                self.frames.popleft()
+                self.dropped += 1
+            self.frames.append((ts, device_id, payload))
+
+        def next_batch(self, size=20):
+            batch = []
+            while self.frames and len(batch) < size:
+                batch.append(self.frames.popleft())
+            return batch
+
+        def pending(self):
+            return len(self.frames)
+
+        def pending_for(self, device_id):
+            return sum(1 for f in self.frames if f[1] == device_id)
+
+        def oldest_age(self, now):
+            if not self.frames:
+                return 0
+            return now - self.frames[0][0]
+    ```
+
+    **Green Notes**
+    - **No front insertion into a list** (reduces E): `insert(0, x)` costs time proportional to the buffer size on every frame, so the CPU cost per frame grows as the buffer fills up. `deque.append()` and `popleft()` cost the same no matter how full the buffer is. In Green Metrics Tool micro-benchmarks, 1,000,000 `list.insert(0, x)` calls used about 1515 J of CPU energy, and 1,000,000 `list.append(x)` calls used about 1.2 J ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=1da9c13d-364b-4f71-b23f-785bf1caeac8,75a7d151-3a7b-4575-b3e1-de125ce00d00)). Your list is capped at `max_frames`, so your real gap depends on how full it gets. The cost still scales with the buffer size.
+    - **Same behavior:** I flipped the direction. The oldest frame is now at the left and the newest at the right. Batches still come out oldest first, the oldest frame is still the one dropped when the buffer is full, and `oldest_age()` reads index `0` instead of `-1`.
+    - **Kept as is:** `pending_for()` scans the whole buffer, but a deque is fine for that. If you call it for every frame, keep a per-device counter instead. If you only call it for debugging, leave it.
+    - Indexing into the middle of a deque is slower than in a list. This code never does that, so it is not a problem here.
+verify:
+  equivalence:
+    driver: |
+      buf = UplinkBuffer(max_frames=50)
+      for i in range(130):
+          buf.push(f"dev{i % 7}", {"seq": i}, 1000 + i)
+          if i % 17 == 0:
+              print("batch", buf.next_batch(5))
+      print("pending", buf.pending())
+      print("dropped", buf.dropped)
+      print("dev3", buf.pending_for("dev3"))
+      print("age", buf.oldest_age(2000))
+      while buf.pending():
+          print(buf.next_batch(20))
+      print("age empty", buf.oldest_age(2000))
+      print("pending", buf.pending(), "dropped", buf.dropped)
+  benchmark:
+    driver: |
+      buf = UplinkBuffer(max_frames=30000)
+      for i in range(60000):
+          buf.push(f"dev{i % 50}", i, i)
+      while buf.pending():
+          buf.next_batch(20)
+      print(buf.dropped)
+    min_speedup: 3

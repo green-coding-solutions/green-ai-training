@@ -1,0 +1,139 @@
+id: gen-1-00070-review
+category: review
+language: python
+patterns:
+- torch-no-grad
+- avoid-exception-flow
+facts:
+- F-NOGRAD
+- F-EXC
+messages:
+- role: user
+  content: |
+    Please review this model quality gate. It runs in our GitLab CI on every merge request that touches `models/` or `features/`. Roughly 40 MRs a day, CPU-only runners.
+
+    Requirements:
+    - Run the candidate model over the golden set (about 30k samples, a few hundred slices, one per tenant/device type).
+    - Fail the job if accuracy in any slice is below its threshold, or if more than 20% of a slice's predictions are low-confidence.
+    - Most slices have no entry in `thresholds.json`, so they use the defaults.
+    - Keep it plain Python, no new dependencies.
+
+    ```python
+    import json
+    import sys
+
+    import torch
+
+    from ci_models import load_model, load_golden
+
+
+    def check(model_path, golden_path, thresholds_path, default_acc=0.90, default_conf=0.50):
+        model = load_model(model_path)
+        model.eval()
+        with open(thresholds_path) as f:
+            cfg = json.load(f)
+        acc_min = cfg.get("accuracy", {})
+        conf_min = cfg.get("confidence", {})
+
+        stats = {}
+        for features, label, slice_name in load_golden(golden_path):
+            x = torch.tensor(features, dtype=torch.float32).unsqueeze(0)
+            probs = torch.softmax(model(x), dim=1)
+            conf, pred = probs.max(dim=1)
+            try:
+                min_conf = conf_min[slice_name]
+            except KeyError:
+                min_conf = default_conf
+            s = stats.setdefault(slice_name, {"n": 0, "ok": 0, "low": 0})
+            s["n"] += 1
+            s["ok"] += int(pred.item() == label)
+            if conf.item() < min_conf:
+                s["low"] += 1
+
+        failures = []
+        for name, s in sorted(stats.items()):
+            acc = s["ok"] / s["n"]
+            if acc < acc_min.get(name, default_acc):
+                failures.append(f"{name}: accuracy {acc:.3f}")
+            if s["low"] / s["n"] > 0.2:
+                failures.append(f"{name}: {s['low']} low-confidence predictions")
+        return failures
+
+
+    if __name__ == "__main__":
+        failures = check(*sys.argv[1:4])
+        for line in failures:
+            print("FAIL", line)
+        sys.exit(0 if failures else 1)
+    ```
+- role: assistant
+  content: |
+    **Workload:** CI/CD job (CPU inference over 30k samples, runs on every MR)
+
+    #### [Bug] Exit code is inverted
+    - **Where:** `sys.exit(0 if failures else 1)`
+    - **Issue:** With failures the job exits 0 (green). With no failures it exits 1 (red). The gate blocks good models and passes bad ones.
+    - **Fix:** `sys.exit(1 if failures else 0)`.
+
+    #### [High] Inference runs with autograd enabled
+    - **Where:** the loop calling `model(x)`
+    - **Issue:** `model.eval()` only changes layer behavior (dropout, batch norm). It does not stop PyTorch from recording the autograd graph. Every forward pass builds graph state that is never used.
+    - **Fix:** wrap the loop in `torch.inference_mode()`. Outputs are identical.
+    - **Impact:** reduces E on every sample, and the gate runs 30k samples per MR. In Green Metrics Tool micro-benchmarks, 100,000 CPU inferences used about 14% less CPU energy with `torch.no_grad()` than without ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=42de8e68-4536-43f4-a9bd-427ec42affd1,7e6a3886-425a-4992-9f14-180bede2d841)). That is a different model, so measure your own.
+
+    #### [Medium] Exceptions used for a common lookup miss
+    - **Where:** `try: conf_min[slice_name] except KeyError`
+    - **Issue:** You said most slices have no entry, so the `except` branch runs for most samples. Raising and catching an exception costs more than a plain lookup.
+    - **Fix:** `conf_min.get(slice_name, default_conf)`.
+    - **Impact:** reduces E per sample. In Green Metrics Tool micro-benchmarks, 10,000,000 dict lookups with about half the keys missing used about 12% less CPU energy with `dict.get` than with `try/except KeyError` ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=4753302a-710f-4132-8001-9da3ba960d13,d7ded3f2-f9e7-4781-905e-9782a8305b8f,8f054455-adbc-402d-b593-0191d1061cd8)). The lookup is small next to the model call, so this is a tidy-up more than a big saving. `try/except` is fine when misses are rare.
+
+    ```python
+    import json
+    import sys
+
+    import torch
+
+    from ci_models import load_model, load_golden
+
+
+    def check(model_path, golden_path, thresholds_path, default_acc=0.90, default_conf=0.50):
+        model = load_model(model_path)
+        model.eval()
+        with open(thresholds_path) as f:
+            cfg = json.load(f)
+        acc_min = cfg.get("accuracy", {})
+        conf_min = cfg.get("confidence", {})
+
+        stats = {}
+        with torch.inference_mode():
+            for features, label, slice_name in load_golden(golden_path):
+                x = torch.tensor(features, dtype=torch.float32).unsqueeze(0)
+                probs = torch.softmax(model(x), dim=1)
+                conf, pred = probs.max(dim=1)
+                min_conf = conf_min.get(slice_name, default_conf)
+                s = stats.setdefault(slice_name, {"n": 0, "ok": 0, "low": 0})
+                s["n"] += 1
+                s["ok"] += int(pred.item() == label)
+                if conf.item() < min_conf:
+                    s["low"] += 1
+
+        failures = []
+        for name, s in sorted(stats.items()):
+            acc = s["ok"] / s["n"]
+            if acc < acc_min.get(name, default_acc):
+                failures.append(f"{name}: accuracy {acc:.3f}")
+            if s["low"] / s["n"] > 0.2:
+                failures.append(f"{name}: {s['low']} low-confidence predictions")
+        return failures
+
+
+    if __name__ == "__main__":
+        failures = check(*sys.argv[1:4])
+        for line in failures:
+            print("FAIL", line)
+        sys.exit(1 if failures else 0)
+    ```
+
+    **Already good:** thresholds are read once, outside the loop. The per-slice lookups after the loop run once per slice, so `.get` there is fine. Slice results are sorted, so the CI log is stable between runs.
+verify:
+  static_only: needs PyTorch and the project-specific ci_models module

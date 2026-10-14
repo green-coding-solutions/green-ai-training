@@ -1,0 +1,54 @@
+id: gen-1-00032-conceptual
+category: conceptual
+language: text
+patterns:
+- compress-transmitted
+- context-tradeoff
+facts:
+- F-COMPRESS-CODECS
+static_only: bash script needs ssh, tar, xz and zstd binaries and a remote host
+messages:
+- role: user
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # ship_logs.sh - nightly log shipping to the archive host
+    set -euo pipefail
+
+    SRC_DIR="/var/log/shop"
+    DEST_HOST="archive-01.internal"
+    DEST_DIR="/srv/archive/shop"
+    STAMP="$(date +%F)"
+
+    tar -cf - -C "$SRC_DIR" . \
+      | xz -9e -T0 \
+      | ssh "$DEST_HOST" "cat > $DEST_DIR/logs-$STAMP.tar.xz"
+
+    echo "shipped logs for $STAMP"
+    ```
+    ?
+- role: assistant
+  content: |-
+    Compressing before sending is a good idea here, but `xz -9e` is the most expensive way to do it.
+
+    Each night's logs are compressed once and sent once, so nothing spreads the compression cost over later reads. In Green Metrics Tool micro-benchmarks, compressing 100 MB of English text with default settings used about 16 J with zstd and about 458 J with xz, roughly 29× more ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=2584305c-7a1e-47e2-b6cc-26276962035e,addc5f5e-55da-47f8-956d-240d06304e4e,fb08d3c3-ba41-4f0f-85fd-0b6c34e6c39b,f1479db0-c453-4aaa-9116-e137621fad07,7b3bb87d-3b43-4f82-be99-0327405205b8,905bd408-6b31-4237-a4da-14b8fad90613,7f213a20-8028-4080-9583-6e465c217bb5,8e93a8d2-60b0-4831-905b-764b68257bc7)). `-9e` is even heavier than the xz default. These figures compare energy only, not output size. xz usually makes smaller files.
+
+    A cheaper version of your pipeline:
+
+    ```bash
+    tar -cf - -C "$SRC_DIR" . \
+      | zstd -T0 -q \
+      | ssh "$DEST_HOST" "cat > $DEST_DIR/logs-$STAMP.tar.zst"
+    ```
+
+    When to keep or drop compression:
+    - **Slow or metered link (WAN, VPN):** fewer bytes on the wire is worth a cheap codec like zstd.
+    - **Fast LAN or same datacenter:** compression may save very little. Measure before assuming it helps.
+    - **Rotated `*.log.gz` files in `SRC_DIR`:** they are already compressed, so this step gains nothing on them. Skip them or ship them as they are.
+    - **Long-term storage where size matters most:** recompress on the archive host with a stronger codec, once, off the sending path.
+
+    To measure on your data, run both pipelines with `perf stat` or `time` as a CPU-time proxy, and compare the output sizes too.
+
+    **Green Notes**
+    - **Compress transmitted data** (reduces network and E): use a fast codec for data that is compressed on every run. https://patterns.greensoftware.foundation/development/data-handling/compress-transmitted-data
+    - *Not applied:* heavier codecs like xz or brotli, because this data is compressed once per night and not served many times.

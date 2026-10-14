@@ -1,0 +1,166 @@
+id: gen-1-00012-refactor
+category: refactor
+language: go
+patterns:
+- set-membership
+messages:
+- role: user
+  content: |
+    hello, my log summary tool is very slow when access.log is big (few million lines). blocked_ips.txt have about 20k lines. i think is the contains function but not sure. can you make it more fast pls?
+
+    ```go
+    package main
+
+    import (
+        "bufio"
+        "fmt"
+        "os"
+        "sort"
+        "strings"
+    )
+
+    func contains(list []string, s string) bool {
+        for _, v := range list {
+            if v == s {
+                return true
+            }
+        }
+        return false
+    }
+
+    func loadLines(path string) ([]string, error) {
+        f, err := os.Open(path)
+        if err != nil {
+            return nil, err
+        }
+        defer f.Close()
+        var out []string
+        sc := bufio.NewScanner(f)
+        for sc.Scan() {
+            out = append(out, strings.TrimSpace(sc.Text()))
+        }
+        return out, sc.Err()
+    }
+
+    func main() {
+        blocked, err := loadLines("blocked_ips.txt")
+        if err != nil {
+            fmt.Fprintln(os.Stderr, err)
+            os.Exit(1)
+        }
+
+        f, err := os.Open("access.log")
+        if err != nil {
+            fmt.Fprintln(os.Stderr, err)
+            os.Exit(1)
+        }
+        defer f.Close()
+
+        counts := map[string]int{}
+        skipped := 0
+        sc := bufio.NewScanner(f)
+        for sc.Scan() {
+            fields := strings.Fields(sc.Text())
+            ip := fields[0]
+            if contains(blocked, ip) {
+                skipped++
+                continue
+            }
+            if len(fields) > 6 {
+                counts[fields[6]]++
+            }
+        }
+
+        paths := make([]string, 0, len(counts))
+        for p := range counts {
+            paths = append(paths, p)
+        }
+        sort.Strings(paths)
+        for _, p := range paths {
+            fmt.Printf("%s %d\n", p, counts[p])
+        }
+        fmt.Println("skipped:", skipped)
+    }
+    ```
+- role: assistant
+  content: |
+    Yes, `contains` is the problem. It scans up to 20k strings for every log line. I changed the blocked list to a map, which is built once.
+
+    ```go
+    package main
+
+    import (
+        "bufio"
+        "fmt"
+        "os"
+        "sort"
+        "strings"
+    )
+
+    func loadSet(path string) (map[string]struct{}, error) {
+        f, err := os.Open(path)
+        if err != nil {
+            return nil, err
+        }
+        defer f.Close()
+        set := make(map[string]struct{})
+        sc := bufio.NewScanner(f)
+        for sc.Scan() {
+            if ip := strings.TrimSpace(sc.Text()); ip != "" {
+                set[ip] = struct{}{}
+            }
+        }
+        return set, sc.Err()
+    }
+
+    func main() {
+        blocked, err := loadSet("blocked_ips.txt")
+        if err != nil {
+            fmt.Fprintln(os.Stderr, err)
+            os.Exit(1)
+        }
+
+        f, err := os.Open("access.log")
+        if err != nil {
+            fmt.Fprintln(os.Stderr, err)
+            os.Exit(1)
+        }
+        defer f.Close()
+
+        counts := map[string]int{}
+        skipped := 0
+        sc := bufio.NewScanner(f)
+        for sc.Scan() {
+            fields := strings.Fields(sc.Text())
+            if len(fields) == 0 {
+                continue
+            }
+            if _, bad := blocked[fields[0]]; bad {
+                skipped++
+                continue
+            }
+            if len(fields) > 6 {
+                counts[fields[6]]++
+            }
+        }
+
+        paths := make([]string, 0, len(counts))
+        for p := range counts {
+            paths = append(paths, p)
+        }
+        sort.Strings(paths)
+        for _, p := range paths {
+            fmt.Printf("%s %d\n", p, counts[p])
+        }
+        fmt.Println("skipped:", skipped)
+    }
+    ```
+
+    **Green Notes**
+    - **Map lookup instead of a slice scan** (reduces E): the work per log line goes from up to 20k string comparisons to one hash lookup. Total work goes from lines × blocked IPs to about lines + blocked IPs. This is where your time goes.
+    - **Built once, used many times:** the set costs one pass over the file. It pays off here because you look up millions of times. For a single lookup, a plain slice scan is cheaper than building a set.
+    - **`map[string]struct{}`** stores only the keys, with no value overhead. Duplicate IPs in the file are harmless.
+    - **Bug fixed:** an empty line in `access.log` made `fields[0]` panic. Those lines are now skipped. Empty lines in `blocked_ips.txt` are also ignored, so they cannot match anything.
+    - The output is the same for valid logs.
+verify:
+  static_only: Go, no compiler available

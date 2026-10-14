@@ -1,0 +1,83 @@
+id: gen-1-00192-refactor
+category: refactor
+language: bash
+patterns:
+- bash-builtins
+messages:
+- role: user
+  content: |
+    We have a deploy helper that builds nginx upstream blocks from our host inventory. The inventory has about 5,000 lines now and the script runs on every deploy and every PR preview, so it adds up. It feels slow for what it does.
+
+    Requirements:
+    - must stay a bash script (CI runners are Linux, bash 5), no Python or other tools to install
+    - output must stay exactly the same, other jobs diff it
+    - keep it readable, the ops team maintains it
+
+    ```bash
+    #!/usr/bin/env bash
+    # gen-upstreams.sh - build nginx upstream entries from the host inventory
+    # usage: gen-upstreams.sh inventory.txt > upstreams.conf
+    set -u
+
+    inv="$1"
+    count=0
+
+    echo "# generated upstreams"
+    while read -r line; do
+        # skip blank lines and comments
+        if [ -z "$(echo "$line" | tr -d ' \t')" ]; then
+            continue
+        fi
+        if [ "$(echo "$line" | cut -c1)" = "#" ]; then
+            continue
+        fi
+
+        host=$(echo "$line" | awk '{print $1}')
+        role=$(echo "$line" | awk '{print $2}')
+        port=$(echo "$line" | awk '{print $3}')
+        role=$(echo "$role" | tr 'A-Z' 'a-z')
+        if [ -z "$port" ]; then
+            port=8080
+        fi
+        short=$(echo "$host" | sed 's/\..*$//')
+
+        echo "server $host:$port; # $role $short"
+        count=$(expr $count + 1)
+    done < "$inv"
+    echo "# total: $count"
+    ```
+
+    Inventory lines look like `web-01.eu.example.com WEB 8443 # canary`.
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # gen-upstreams.sh - build nginx upstream entries from the host inventory
+    # usage: gen-upstreams.sh inventory.txt > upstreams.conf
+    set -u
+
+    inv="$1"
+    count=0
+
+    printf '%s\n' '# generated upstreams'
+    while read -r host role port _; do
+        # skip blank lines and comments
+        [[ -z $host || $host == '#'* ]] && continue
+
+        role=${role,,}
+        port=${port:-8080}
+        short=${host%%.*}
+
+        printf 'server %s:%s; # %s %s\n' "$host" "$port" "$role" "$short"
+        count=$((count + 1))
+    done < "$inv"
+    printf '# total: %s\n' "$count"
+    ```
+
+    **Green Notes**
+    - **Shell builtins instead of forks** (reduces E): the old loop started up to nine external processes per data line (`tr`, `cut`, `awk` three times, `tr`, `sed`, `expr`). Each one also needed a subshell for `$(...)`. For 5,000 lines that is tens of thousands of process starts per deploy. Now the loop starts none. `read` splits the fields, `${role,,}` lowercases, `${host%%.*}` cuts the short name, and `$((...))` counts.
+    - **Same output**: `read` already trims leading and trailing whitespace and splits on spaces and tabs, like `awk` did. Extra fields such as `# canary` go into `_`. A comment line has `#` as its first word, so it is skipped as before.
+    - **Small differences to know**: `${role,,}` also lowercases non-ASCII letters, while `tr 'A-Z' 'a-z'` did not. This only matters if a role contains such letters. It needs bash 4+, which your runners have. A last line without a trailing newline is still ignored, as before.
+    - *Not applied:* rewriting the whole thing in `awk`. One `awk` process would also work, but the pure-bash version keeps the structure your ops team already knows.
+verify:
+  static_only: bash script; no bash runner for equivalence checks

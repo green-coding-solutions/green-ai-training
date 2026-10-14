@@ -1,0 +1,84 @@
+id: gen-1-00489-no-change
+category: no-change
+language: python
+patterns:
+- vectorize-or-jit
+- context-tradeoff
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    We have a small helper in our GitHub Actions pipeline that runs after pytest on every PR. It reads the pytest-json-report file (about 1,500 tests), finds the unusually slow tests and writes a markdown table into the job summary.
+
+    Requirements: no extra dependencies in the CI image if possible, must work on Python 3.11+, output must stay readable for reviewers. Someone on the team said we should rewrite the number crunching with numpy or numba because "loops in Python are slow and we want our CI to be efficient". Is that worth it?
+
+    ```python
+    import json
+    import statistics
+    import sys
+    from pathlib import Path
+
+    SLOW_FACTOR = 3.0
+    TOP_N = 10
+
+
+    def load_durations(path):
+        report = json.loads(Path(path).read_text())
+        durations = {}
+        for t in report["tests"]:
+            total = sum(
+                t.get(phase, {}).get("duration", 0.0)
+                for phase in ("setup", "call", "teardown")
+            )
+            durations[t["nodeid"]] = total
+        return durations
+
+
+    def summarize(durations):
+        values = sorted(durations.values())
+        p50 = statistics.median(values)
+        p95 = statistics.quantiles(values, n=20)[-1]
+        return p50, p95
+
+
+    def main(path):
+        durations = load_durations(path)
+        if len(durations) < 2:
+            print("Not enough tests to compare.")
+            return 0
+        p50, p95 = summarize(durations)
+        slow = [
+            (name, d)
+            for name, d in durations.items()
+            if d > p95 and d > SLOW_FACTOR * p50
+        ]
+        slow.sort(key=lambda item: -item[1])
+        print(f"Median: {p50:.3f}s, p95: {p95:.3f}s")
+        print("| Test | Seconds |")
+        print("|---|---|")
+        for name, d in slow[:TOP_N]:
+            print(f"| `{name}` | {d:.2f} |")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main(sys.argv[1]))
+    ```
+- role: assistant
+  content: |
+    No, leave it as it is. This script is already efficient for what it does.
+
+    - **The data is tiny.** It handles about 1,500 numbers. One sort, one `median`, one `quantiles` and one pass over a dict are negligible next to starting the interpreter and parsing the JSON file.
+    - **numpy would cost more than it saves.** It adds a dependency to the CI image and an import on every run. That is more work than the few calculations it would replace.
+    - **numba would be worse.** It compiles the function in every new process. On a short-lived CI step, the compile time is far larger than the loop it speeds up.
+    - **The code already uses the standard library well.** `statistics` and `sorted` run in C, and the list comprehension is a single pass.
+
+    JIT and vectorization pay off on big, repeated numeric loops. In Green Metrics Tool micro-benchmarks, a pure Python quantization loop over 10,000,000 samples used about 4× less CPU energy with Numba ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=dc2ed71b-e8ed-48d5-be04-0dd9dfe1443f,2b9e7f88-4aad-42ee-a9e6-25ff4e6ea712)). That is a very different scale from 1,500 floats once per PR.
+
+    If you want to lower the energy of the pipeline, look at the test run itself, which is the real cost:
+    - Cancel superseded runs on the same PR with `concurrency` and `cancel-in-progress: true`.
+    - Cache dependencies so they are not downloaded on every run.
+    - Run tests in parallel with `pytest-xdist`, or skip suites for paths that did not change.
+verify:
+  static_only: answer contains no code; the user's script is correct and deliberately left unchanged

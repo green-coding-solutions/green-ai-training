@@ -1,0 +1,66 @@
+id: gen-1-00200-generation
+category: generation
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    Hello, I need python function who take a list of product image paths and give back one embedding for each image. We use resnet18 from torchvision, for the "similar products" box in our shop. Server have only CPU. Catalog is around 40k images. Please save the result in a npy file too, thank you
+- role: assistant
+  content: |
+    ```python
+    from pathlib import Path
+
+    import numpy as np
+    import torch
+    from PIL import Image
+    from torchvision import models
+    from torchvision.models import ResNet18_Weights
+
+
+    def _load_rgb(path):
+        with Image.open(path) as img:
+            return img.convert("RGB")
+
+
+    def embed_images(paths, out_file, batch_size=64):
+        weights = ResNet18_Weights.DEFAULT
+        model = models.resnet18(weights=weights)
+        model.fc = torch.nn.Identity()  # keep the 512-d features, drop the classifier
+        model.eval()
+        preprocess = weights.transforms()
+
+        chunks = []
+        with torch.inference_mode():
+            for i in range(0, len(paths), batch_size):
+                batch = torch.stack(
+                    [preprocess(_load_rgb(p)) for p in paths[i:i + batch_size]]
+                )
+                chunks.append(model(batch).numpy())
+
+        if chunks:
+            embeddings = np.concatenate(chunks)
+        else:
+            embeddings = np.empty((0, 512), dtype=np.float32)
+
+        np.save(out_file, embeddings)
+        return embeddings
+
+
+    if __name__ == "__main__":
+        files = sorted(str(p) for p in Path("catalog/images").glob("*.jpg"))
+        embed_images(files, "embeddings.npy")
+    ```
+
+    Row `i` of the saved array belongs to `paths[i]`. Keep the sorted file list next to the `.npy` file, so you can map rows back to products.
+
+    **Green Notes**
+    - **`torch.inference_mode()`** (reduces E): the model only predicts, so PyTorch does not need to record the graph for backpropagation. In Green Metrics Tool micro-benchmarks, 100,000 CPU inferences used about 14% less energy with `torch.no_grad()` than without it ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=42de8e68-4536-43f4-a9bd-427ec42affd1,7e6a3886-425a-4992-9f14-180bede2d841)). `inference_mode()` is the stricter version of the same idea. That benchmark measured `no_grad`, not `inference_mode`.
+    - **`model.eval()`** is needed for correct results, not for energy: it turns off dropout and makes batch norm use its saved statistics.
+    - The model is loaded once and the images go through in batches, so the setup cost is paid once for all 40k images and not once per image.
+    - *Not applied:* quantization and multiprocessing. For a job you run when the catalog changes, the extra setup and the possible loss of embedding quality are not worth it.
+verify:
+  static_only: needs torch, torchvision, Pillow and pretrained weights (network download)

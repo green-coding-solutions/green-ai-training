@@ -1,0 +1,85 @@
+id: gen-1-00107-generation
+category: generation
+language: javascript
+patterns:
+- regex-precompile
+messages:
+- role: user
+  content: |
+    hi, im new to node. i have a sentiment model (onnx) behind a small express api and i need a function that cleans the tweet text before i send it to the model. it should remove links, @names, html tags and extra spaces, and change things like can't -> cannot, won't -> will not.
+
+    my first try looped over a list of contractions and made a new RegExp for each one inside the function. it works but the api feels slow when many requests come in and i dont know why. can you write it the right way?
+- role: assistant
+  content: |
+    The slow part is probably building a new `RegExp` for every contraction on every request. That compiles a pattern each time and scans the text once per contraction. Build the patterns once at startup and handle all contractions in one pass:
+
+    ```javascript
+    const CONTRACTIONS = new Map([
+      ["can't", "cannot"],
+      ["won't", "will not"],
+      ["don't", "do not"],
+      ["doesn't", "does not"],
+      ["didn't", "did not"],
+      ["isn't", "is not"],
+      ["i'm", "i am"],
+      ["i've", "i have"],
+      ["you're", "you are"],
+      ["we're", "we are"],
+      ["they'll", "they will"],
+    ]);
+
+    const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+    // Built once when the module loads, reused for every request.
+    const CONTRACTION_RE = new RegExp(
+      "\\b(" +
+        [...CONTRACTIONS.keys()]
+          .sort((a, b) => b.length - a.length)
+          .map(escapeRegExp)
+          .join("|") +
+        ")\\b",
+      "g"
+    );
+    const CURLY_APOSTROPHE_RE = /[\u2018\u2019]/g;
+    const HTML_TAG_RE = /<[^>]+>/g;
+    const URL_RE = /https?:\/\/\S+|www\.\S+/g;
+    const MENTION_RE = /(?<!\w)@\w+/g;
+    const WHITESPACE_RE = /\s+/g;
+
+    function cleanText(text) {
+      return String(text)
+        .toLowerCase()
+        .replace(CURLY_APOSTROPHE_RE, "'")
+        .replace(HTML_TAG_RE, " ")
+        .replace(URL_RE, " ")
+        .replace(MENTION_RE, " ")
+        .replace(CONTRACTION_RE, (match) => CONTRACTIONS.get(match))
+        .replace(WHITESPACE_RE, " ")
+        .trim();
+    }
+
+    module.exports = { cleanText };
+    ```
+
+    Notes on behavior:
+    - The text is lowercased first, so the contraction map only needs lowercase keys.
+    - Curly apostrophes (`’`) are turned into plain ones, because phone keyboards often type them.
+    - The `(?<!\w)` in the mention pattern keeps email addresses like `a@b.com` from being cut apart.
+
+    **Green Notes**
+    - **Compile regexes once** (reduces E): the fixed patterns are module-level constants, and the contraction pattern is built one time from the map. Per request, the engine no longer builds eleven patterns. In JavaScript the win for fixed literals is small, because engines already cache them. Building `new RegExp(...)` inside a function or loop is the costly case.
+    - **One pass instead of many** (reduces E): a single alternation scans the text once, not once per contraction. This matters most on a per-request path that runs before every model call.
+    - *Not applied:* caching cleaned results. Tweets are mostly unique, so a cache would mostly miss and just use memory.
+verify:
+  test: |-
+    const assert = require("assert");
+    assert.strictEqual(
+      cleanText("I can\u2019t believe it!! Visit https://x.com/a?b=1 @bob <b>great</b>"),
+      "i cannot believe it!! visit great"
+    );
+    assert.strictEqual(
+      cleanText("Won't you? I'm sure they'll go"),
+      "will not you? i am sure they will go"
+    );
+    assert.strictEqual(cleanText("mail me: a@b.com   now"), "mail me: a@b.com now");
+    assert.strictEqual(cleanText(""), "");

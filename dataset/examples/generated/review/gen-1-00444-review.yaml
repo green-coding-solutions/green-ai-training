@@ -1,0 +1,96 @@
+id: gen-1-00444-review
+category: review
+language: dockerfile
+patterns:
+- small-container-images
+messages:
+- role: user
+  content: |
+    review pls, this goes on ~300 field gateways (arm64, cellular uplink)
+
+    ```dockerfile
+    FROM node:20
+
+    WORKDIR /app
+
+    RUN apt-get update && apt-get install -y build-essential python3 git curl vim
+
+    COPY . .
+
+    RUN npm install
+    RUN npm run build
+
+    ENV NODE_ENV=production
+    ENV MQTT_URL=mqtt://broker.internal:1883
+    ENV MODBUS_PORT=/dev/ttyS1
+
+    EXPOSE 8080
+    CMD ["node", "dist/index.js"]
+    ```
+- role: assistant
+  content: |
+    **Workload:** IoT gateway service (Node.js, image pulled by every device on each update)
+
+    #### [Security] `COPY . .` can bake secrets into the image
+    - **Where:** `COPY . .`
+    - **Issue:** without a `.dockerignore` this copies `.git`, a local `.env`, `node_modules` and anything else in the folder. Those files stay in the layer and ship to all 300 devices.
+    - **Fix:** add a `.dockerignore` (`.git`, `node_modules`, `.env*`, `dist`, tests) and copy only what the build needs.
+
+    #### [Security] Runs as root
+    - **Where:** no `USER` line
+    - **Issue:** a bug in the gateway or a dependency gives root on the device.
+    - **Fix:** `USER node`. For the serial port, add the container to the `dialout` group at runtime (`--group-add dialout` or `group_add` in compose), instead of running as root.
+
+    #### [High] Full `node:20` image as the runtime
+    - **Where:** `FROM node:20`
+    - **Issue:** the full Debian image carries compilers, git and many tools the gateway never uses at runtime. Every device downloads and stores them over a cellular link, on every update. Node 20 is also past end of life.
+    - **Fix:** a multi-stage build. Build in one stage, and copy only `dist` and production `node_modules` into a `node:22-bookworm-slim` runtime stage.
+    - **Impact:** reduces network bytes and storage (E and M) on every device for every pull. The saving grows with the fleet size and update frequency.
+
+    #### [High] Build tools and editors in the final image
+    - **Where:** `apt-get install -y build-essential python3 git curl vim`
+    - **Issue:** `build-essential` and `python3` are only needed if a native module (for example a serial port library) has to compile. `git`, `curl` and `vim` are not needed at all. The apt lists are also left in the layer.
+    - **Fix:** keep the toolchain in the build stage only, with `--no-install-recommends`, and delete `/var/lib/apt/lists/*` in the same `RUN`. If your native modules ship prebuilt arm64 binaries, you can drop the toolchain completely.
+
+    #### [High] Dependencies are reinstalled on every code change
+    - **Where:** `COPY . .` before `npm install`
+    - **Issue:** any edit to a source file invalidates the layer, so `npm install` runs again and downloads everything. It also makes the push to the registry large, because the dependency layer changes each time.
+    - **Fix:** copy `package.json` and `package-lock.json` first, run `npm ci`, then copy the source.
+
+    #### [Medium] Dev dependencies end up in production
+    - **Where:** `npm install` runs before `ENV NODE_ENV=production`
+    - **Issue:** the env var is set too late to have any effect, so TypeScript, test tools and other dev packages are installed and kept.
+    - **Fix:** use `npm ci` for the build, then `npm prune --omit=dev` in the build stage. Set `NODE_ENV=production` in the runtime stage.
+
+    ```dockerfile
+    # syntax=docker/dockerfile:1
+    FROM node:22-bookworm-slim AS build
+    WORKDIR /app
+    # only needed if a native module has no prebuilt arm64 binary
+    RUN apt-get update \
+        && apt-get install -y --no-install-recommends python3 make g++ \
+        && rm -rf /var/lib/apt/lists/*
+    COPY package.json package-lock.json ./
+    RUN npm ci
+    COPY tsconfig.json ./
+    COPY src ./src
+    RUN npm run build && npm prune --omit=dev
+
+    FROM node:22-bookworm-slim
+    ENV NODE_ENV=production \
+        MQTT_URL=mqtt://broker.internal:1883 \
+        MODBUS_PORT=/dev/ttyS1
+    WORKDIR /app
+    COPY --chown=node:node package.json ./
+    COPY --from=build --chown=node:node /app/node_modules ./node_modules
+    COPY --from=build --chown=node:node /app/dist ./dist
+    USER node
+    EXPOSE 8080
+    CMD ["node", "dist/index.js"]
+    ```
+
+    Adjust `tsconfig.json` and `src` to match your project layout. Build with `docker buildx build --platform linux/arm64` so the native modules match the devices.
+
+    **Already good:** `EXPOSE`, a plain `CMD` in exec form (so Node gets stop signals directly), and configuration through env vars.
+verify:
+  static_only: Dockerfile review, needs a Docker build and a Node project

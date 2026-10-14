@@ -1,0 +1,33 @@
+id: gen-1-00015-no-change
+category: no-change
+language: go
+patterns:
+- select-columns
+- context-tradeoff
+messages:
+- role: user
+  content: "```go\npackage calib\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"math\"\n)\n\ntype Point struct {\n\tRunID\
+    \  int64\n\tChannel string\n\tRaw    float64\n\tRef    float64\n}\n\nfunc LoadPoints(db *sql.DB, runID int64) ([]Point,\
+    \ error) {\n\trows, err := db.Query(\"SELECT * FROM calibration_points WHERE run_id = ? ORDER BY raw_value\", runID)\n\
+    \tif err != nil {\n\t\treturn nil, err\n\t}\n\tdefer rows.Close()\n\n\tvar pts []Point\n\tfor rows.Next() {\n\t\tvar p\
+    \ Point\n\t\tif err := rows.Scan(&p.RunID, &p.Channel, &p.Raw, &p.Ref); err != nil {\n\t\t\treturn nil, err\n\t\t}\n\t\
+    \tpts = append(pts, p)\n\t}\n\treturn pts, rows.Err()\n}\n\n// FitLinear returns slope and intercept of a least-squares\
+    \ line Ref = a*Raw + b.\nfunc FitLinear(pts []Point) (a, b float64, err error) {\n\tn := float64(len(pts))\n\tif n < 2\
+    \ {\n\t\treturn 0, 0, fmt.Errorf(\"need at least 2 points, got %d\", len(pts))\n\t}\n\tvar sx, sy, sxx, sxy float64\n\t\
+    for _, p := range pts {\n\t\tsx += p.Raw\n\t\tsy += p.Ref\n\t\tsxx += p.Raw * p.Raw\n\t\tsxy += p.Raw * p.Ref\n\t}\n\t\
+    den := n*sxx - sx*sx\n\tif math.Abs(den) < 1e-12 {\n\t\treturn 0, 0, fmt.Errorf(\"degenerate x values\")\n\t}\n\ta = (n*sxy\
+    \ - sx*sy) / den\n\tb = (sy - a*sx) / n\n\treturn a, b, nil\n}\n```\n\n?\n"
+- role: assistant
+  content: "This is already efficient. I would not change anything for energy.\n\n- **`SELECT *` is harmless here.** The table\
+    \ has four small columns and you scan all four. Naming them would transfer the same bytes. Column selection only pays\
+    \ off when you skip wide columns you don't need, such as big text or blob fields.\n- **The query is already narrow in\
+    \ rows.** It filters on `run_id` and returns only one run's points.\n- **The fit is a single pass.** `FitLinear` uses\
+    \ running sums, O(n), with no extra allocations.\n\nOne optional change, for robustness and not for energy: if someone\
+    \ adds a column to `calibration_points`, `rows.Scan` will fail at runtime because the column count no longer matches.\
+    \ An explicit list avoids that:\n\n```go\nrows, err := db.Query(\n\t\"SELECT run_id, channel, raw_value, reference_value\
+    \ FROM calibration_points WHERE run_id = ? ORDER BY raw_value\",\n\trunID,\n)\n```\n\nIf the table later gets wide columns\
+    \ (raw waveforms, notes, JSON metadata) that this function does not read, name the columns then. That is when `SELECT\
+    \ *` starts to cost real energy.\n\nSmall tip: if you often load thousands of points, `pts := make([]Point, 0, expected)`\
+    \ saves a few slice regrowths. For calibration-sized data it does not matter.\n"
+verify:
+  static_only: Go code needs a database driver and a SQL database; not run in the Python/JS harness

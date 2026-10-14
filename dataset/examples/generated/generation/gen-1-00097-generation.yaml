@@ -1,0 +1,67 @@
+id: gen-1-00097-generation
+category: generation
+language: python
+patterns:
+- simple-conditions
+facts:
+- F-COND
+messages:
+- role: user
+  content: |
+    hello, i make small gateway in python for our sensor nodes (raspberry pi, runs all day). nodes send packet like dict with "node", "type" and "raw" value. types are temp, humidity, battery, door and heartbeat. I need function who convert the packet to clean reading with real units. temp raw is in 1/100 degree, humidity in 1/10 percent, battery is millivolt (3000 = empty, 4200 = full), door is 0 or 1. Unknown type should give None. thank you!
+- role: assistant
+  content: |
+    ```python
+    def _battery_percent(mv):
+        pct = (mv - 3000) * 100 / 1200
+        return round(min(100.0, max(0.0, pct)))
+
+
+    _CONVERTERS = {
+        "temp": lambda raw: raw / 100,
+        "humidity": lambda raw: raw / 10,
+        "battery": _battery_percent,
+        "door": lambda raw: "open" if raw == 1 else "closed",
+        "heartbeat": lambda raw: None,
+    }
+
+
+    def normalize(packet):
+        convert = _CONVERTERS.get(packet.get("type"))
+        if convert is None:
+            return None
+        return {
+            "node": packet["node"],
+            "kind": packet["type"],
+            "value": convert(packet["raw"]),
+        }
+    ```
+
+    Example:
+
+    ```python
+    print(normalize({"node": "n7", "type": "temp", "raw": 2315}))
+    # {'node': 'n7', 'kind': 'temp', 'value': 23.15}
+    print(normalize({"node": "n7", "type": "battery", "raw": 3600}))
+    # {'node': 'n7', 'kind': 'battery', 'value': 50}
+    print(normalize({"node": "n7", "type": "unknown", "raw": 1}))
+    # None
+    ```
+
+    **Green Notes**
+    - **Dict dispatch on the type string** (reduces E): each packet costs one hash lookup and one call, not a chain of comparisons. The gateway runs all day, so this work repeats for every packet. In Green Metrics Tool micro-benchmarks, simple equality branches used about 16% less CPU energy than complex range/modulo conditions ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=123676d7-2121-4b9d-b78e-e065836fc608,a7780e2a-2934-4d26-b2a9-2cda7848adc1)).
+    - **Each branch is a plain equality check or a small function**, so the code stays simple. Adding a new sensor type is one new dict entry.
+    - *Not applied:* `match`/`case`. With the same conditions, `match` and `if/elif` differed by about 1% in the same benchmarks, which is noise ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=123676d7-2121-4b9d-b78e-e065836fc608,a7780e2a-2934-4d26-b2a9-2cda7848adc1)). The dict is just easier to extend.
+verify:
+  green_block: 0
+  test: |-
+    assert normalize({"node": "n1", "type": "temp", "raw": 2315}) == {"node": "n1", "kind": "temp", "value": 23.15}
+    assert normalize({"node": "n1", "type": "humidity", "raw": 655}) == {"node": "n1", "kind": "humidity", "value": 65.5}
+    assert normalize({"node": "n1", "type": "battery", "raw": 3600})["value"] == 50
+    assert normalize({"node": "n1", "type": "battery", "raw": 2500})["value"] == 0
+    assert normalize({"node": "n1", "type": "battery", "raw": 4500})["value"] == 100
+    assert normalize({"node": "n1", "type": "door", "raw": 1})["value"] == "open"
+    assert normalize({"node": "n1", "type": "door", "raw": 0})["value"] == "closed"
+    assert normalize({"node": "n1", "type": "heartbeat", "raw": 0})["value"] is None
+    assert normalize({"node": "n1", "type": "gps", "raw": 5}) is None
+    assert normalize({"node": "n1", "raw": 5}) is None

@@ -1,0 +1,58 @@
+id: gen-1-00376-no-change
+category: no-change
+language: javascript
+patterns:
+- efficient-algorithm
+- context-tradeoff
+messages:
+- role: user
+  content: |
+    hi, i have object detection on a raspberry pi camera (yolo model, onnx runtime node). after the model i do NMS in js. my colleague say it is O(n^2) and we must use some spatial tree or grid, he say its not green. is he right? i dont want to make code more complicated for nothing
+
+    ```javascript
+    function iou(a, b) {
+      const x1 = Math.max(a.x1, b.x1);
+      const y1 = Math.max(a.y1, b.y1);
+      const x2 = Math.min(a.x2, b.x2);
+      const y2 = Math.min(a.y2, b.y2);
+      const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+      const areaA = (a.x2 - a.x1) * (a.y2 - a.y1);
+      const areaB = (b.x2 - b.x1) * (b.y2 - b.y1);
+      return inter / (areaA + areaB - inter);
+    }
+
+    function nms(dets, scoreThr = 0.3, iouThr = 0.5) {
+      const cand = dets
+        .filter(d => d.score >= scoreThr)
+        .sort((a, b) => b.score - a.score);
+      const keep = [];
+      const dead = new Array(cand.length).fill(false);
+      for (let i = 0; i < cand.length; i++) {
+        if (dead[i]) continue;
+        keep.push(cand[i]);
+        for (let j = i + 1; j < cand.length; j++) {
+          if (!dead[j] && cand[j].cls === cand[i].cls && iou(cand[i], cand[j]) > iouThr) {
+            dead[j] = true;
+          }
+        }
+      }
+      return keep;
+    }
+    ```
+
+    the model gives about 8400 raw boxes per frame, we run 1 frame per second.
+- role: assistant
+  content: |
+    Your colleague is right about the worst case, but it does not matter here. Keep your code.
+
+    Why it is already fine:
+    - **The score filter runs first.** The O(n²) part only sees boxes above 0.3, not the 8400 raw ones. On a normal camera frame that is a small set.
+    - **It sorts once and skips suppressed boxes.** A box that is already removed never starts its own inner loop, so the real work is usually far below n².
+    - **The inner loop is cheap.** It is a class check and a few arithmetic operations, with no allocations.
+    - **The model dominates.** The forward pass over the frame costs far more than NMS on a few dozen boxes, and you run once per second. A grid or tree needs extra code, extra allocations and more bugs at box borders. For small n that costs more than it saves.
+
+    A spatial index starts to pay off when n is in the thousands after filtering. That can happen if you lower `scoreThr` a lot (for example for accuracy evaluation) or run a very crowded scene. If that happens, the cheap fix is not a tree. Cap the candidates after the sort, for example `.slice(0, 300)`. This keeps the worst case bounded and changes nothing for normal frames.
+
+    To be sure, log `cand.length` for a day on the device and time `nms()` with `performance.now()`. If `cand.length` stays small, you are done.
+verify:
+  static_only: No code block in the answer. The answer says to keep the original code.

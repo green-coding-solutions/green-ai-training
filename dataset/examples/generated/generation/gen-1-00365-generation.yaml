@@ -1,0 +1,49 @@
+id: gen-1-00365-generation
+category: generation
+language: javascript
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    Node 22 ETL job, `pg` pool, Postgres. Nightly extract of products changed since the last run. Warehouse loader needs only id, sku, name, category_id, price_cents, currency, stock, updated_at. The table is wide (descriptions, spec JSONB, raw supplier XML, etc.), a few million rows. Batched, async generator, I'll feed it to the loader. Just the code.
+- role: assistant
+  content: |
+    ```javascript
+    const BATCH_SIZE = 5000;
+
+    const EXTRACT_SQL = `
+      SELECT id, sku, name, category_id, price_cents, currency, stock, updated_at
+      FROM products
+      WHERE updated_at >= $1 AND id > $2
+      ORDER BY id
+      LIMIT $3`;
+
+    export async function* extractChangedProducts(pool, since) {
+      let lastId = 0;
+      for (;;) {
+        const { rows } = await pool.query(EXTRACT_SQL, [since, lastId, BATCH_SIZE]);
+        if (rows.length === 0) return;
+        yield rows;
+        lastId = rows[rows.length - 1].id;
+      }
+    }
+    ```
+
+    ```javascript
+    for await (const batch of extractChangedProducts(pool, lastRunAt)) {
+      await loadIntoWarehouse(batch);
+    }
+    ```
+
+    **Green Notes**
+    - **Named columns, no `SELECT *`** (reduces E and network): the description, spec JSONB and supplier XML stay in Postgres. They are not read, sent over the wire or parsed into JS objects. In Green Metrics Tool micro-benchmarks, reading 2,500 rows from a 52-column table with large text columns used about 7× less CPU energy with 10 named columns than with `SELECT *` ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=b7203ffe-39ae-4e84-bf85-998c9389ea46,4702c2ee-13d5-4d70-bcfe-31e193104a8e)). The saving grows with the size of the skipped columns.
+      https://patterns.greensoftware.foundation/development/data-handling/reduce-transmitted-data
+    - **Keyset batches** (`id > $2 ... LIMIT`): memory stays bounded, and each batch is an index range scan instead of a growing `OFFSET` skip.
+
+    If the loader later needs another column, add it to `EXTRACT_SQL` by name.
+verify:
+  static_only: needs a PostgreSQL server and the pg package

@@ -1,0 +1,112 @@
+id: gen-1-00259-refactor
+category: refactor
+language: javascript
+patterns:
+- system-fonts-and-deps
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```javascript
+    const _ = require('lodash');
+    const numeral = require('numeral');
+
+    // cart summary for the checkout sidebar
+    function summarizeCart(items, couponPct) {
+      const byCategory = _.groupBy(items, 'category');
+      const lines = _.map(byCategory, (group, category) => {
+        const subtotal = _.sumBy(group, (i) => i.price * i.qty);
+        return {
+          category,
+          count: _.sumBy(group, 'qty'),
+          subtotal,
+          label: numeral(subtotal).format('$0,0.00'),
+        };
+      });
+      const total = _.sumBy(lines, 'subtotal');
+      const discount = _.round((total * (couponPct || 0)) / 100, 2);
+      return {
+        lines: _.sortBy(lines, 'category'),
+        total: numeral(total - discount).format('$0,0.00'),
+        discount: numeral(discount).format('$0,0.00'),
+        itemCount: _.sumBy(items, 'qty'),
+        isEmpty: _.isEmpty(items),
+      };
+    }
+
+    module.exports = { summarizeCart };
+    ```
+- role: assistant
+  content: |
+    ```javascript
+    const money = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
+
+    // cart summary for the checkout sidebar
+    function summarizeCart(items, couponPct) {
+      const byCategory = new Map();
+      let itemCount = 0;
+
+      for (const { category, price, qty } of items) {
+        let line = byCategory.get(category);
+        if (!line) {
+          line = { category, count: 0, subtotal: 0 };
+          byCategory.set(category, line);
+        }
+        line.count += qty;
+        line.subtotal += price * qty;
+        itemCount += qty;
+      }
+
+      const lines = [...byCategory.values()]
+        .sort((a, b) => (a.category < b.category ? -1 : a.category > b.category ? 1 : 0))
+        .map((line) => ({ ...line, label: money.format(line.subtotal) }));
+
+      let total = 0;
+      for (const line of lines) total += line.subtotal;
+      const discount = Math.round(((total * (couponPct || 0)) / 100) * 100) / 100;
+
+      return {
+        lines,
+        total: money.format(total - discount),
+        discount: money.format(discount),
+        itemCount,
+        isEmpty: items.length === 0,
+      };
+    }
+
+    module.exports = { summarizeCart };
+    ```
+
+    **Green Notes**
+    - **Dropped two dependencies for trivial work** (reduces E, M and network): `lodash` and `numeral` were used only for grouping, summing, sorting and money formatting. Plain loops, `Map`, `sort` and the built-in `Intl.NumberFormat` do the same. If this file reaches the browser, that is less JavaScript to download, parse and run on every page load. On the server, it is fewer modules to load at startup and fewer packages in the image.
+    - **One pass over the items:** the old code walked the list for `groupBy`, then again for each `sumBy`. Now the groups, counts and subtotals come from a single loop.
+    - **Formatter created once:** `Intl.NumberFormat` is built at module level, not on every call.
+    - **Behavior:** the output is the same for USD amounts in `en-US`. In rare half-cent cases, `Intl` and `numeral` can round differently.
+    - *Not applied:* if `lodash` is used widely elsewhere in the app, removing it from this file saves little by itself. The gain comes when the last import is gone.
+verify:
+  test: |-
+    const assert = require('assert');
+    const r = summarizeCart(
+      [
+        { category: 'shoes', price: 10, qty: 2 },
+        { category: 'hats', price: 5.5, qty: 4 },
+        { category: 'shoes', price: 20, qty: 1 },
+      ],
+      10
+    );
+    assert.deepStrictEqual(r.lines.map((l) => l.category), ['hats', 'shoes']);
+    assert.strictEqual(r.lines[0].subtotal, 22);
+    assert.strictEqual(r.lines[0].count, 4);
+    assert.strictEqual(r.lines[0].label, '$22.00');
+    assert.strictEqual(r.lines[1].subtotal, 40);
+    assert.strictEqual(r.lines[1].label, '$40.00');
+    assert.strictEqual(r.total, '$55.80');
+    assert.strictEqual(r.discount, '$6.20');
+    assert.strictEqual(r.itemCount, 7);
+    assert.strictEqual(r.isEmpty, false);
+    const e = summarizeCart([]);
+    assert.strictEqual(e.isEmpty, true);
+    assert.strictEqual(e.total, '$0.00');
+    assert.strictEqual(e.itemCount, 0);
+    assert.deepStrictEqual(e.lines, []);

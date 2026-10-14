@@ -1,0 +1,75 @@
+id: gen-1-00182-review
+category: review
+language: bash
+patterns:
+- bash-quoting
+facts:
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    ?
+
+    ```bash
+    #!/bin/bash
+    # build landing pages, one per campaign
+    OUT=$1
+    mkdir -p $OUT
+    rm -rf $OUT/*
+
+    while IFS=, read -r slug title cta; do
+      STYLE="<style>:root{--brand:#0a7}body{margin:0;font-family:system-ui,sans-serif}.hero{padding:4rem 1rem;text-align:center}.btn{display:inline-block;padding:.8rem 1.4rem;border-radius:6px;background:var(--brand);color:#fff}</style>"
+      FOOTER="<footer><p>&copy; Example Inc. <a href=\"/privacy\">Privacy</a> <a href=\"/terms\">Terms</a></p></footer>"
+      page="<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">$STYLE<title>$title</title></head><body><section class=\"hero\"><h1>$title</h1><a class=\"btn\" href=\"/signup?c=$slug\">$cta</a></section>$FOOTER</body></html>"
+      echo $page > $OUT/$slug.html
+    done < campaigns.csv
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (build step, one loop pass per campaign)
+
+    #### [Bug] `rm -rf $OUT/*` with an empty or unset `$1`
+    - **Where:** `OUT=$1`, `rm -rf $OUT/*`
+    - **Issue:** if the script is run without an argument, this becomes `rm -rf /*`. A path with a space also splits into two arguments.
+    - **Fix:** require the argument, quote the path, and use `${out:?}` as a guard.
+
+    #### [Bug] Unquoted variables and `echo $page`
+    - **Where:** `echo $page > $OUT/$slug.html`
+    - **Issue:** word splitting collapses runs of whitespace in titles and CTAs. Glob characters such as `*` in a title can expand to file names. The redirect target breaks if the path contains spaces.
+    - **Fix:** `printf '%s\n' "$page"`, or the `printf` template below, and quote every variable expansion.
+
+    #### [Medium] Constant strings rebuilt for every page
+    - **Where:** `STYLE=` and `FOOTER=` inside the loop
+    - **Issue:** both values are identical for every campaign, but bash assigns and scans them again on each pass.
+    - **Fix:** define them once before the loop.
+    - **Impact:** reduces E per page. The work per row drops to the part that really changes.
+
+    #### [Low] Double quotes around literals that need no expansion
+    - **Where:** `STYLE`, `FOOTER`, and the `\"` escapes in the page string
+    - **Issue:** bash scans double-quoted text for `$`, backticks and backslashes. Single-quoted text is taken as is. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal in a loop used about 24% less CPU energy with single quotes ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=dd9bbb4e-b056-4067-8ad2-7b1818a86f10,b265ef9b-adb9-4b56-a14b-ae34fdaa7247,28d92c15-79d7-44ca-8f43-a733fe2e265a,a9533378-71f0-49df-bd5f-1e5f27cda9c2)).
+    - **Fix:** use single quotes for the literals. The `\"` escapes also disappear. Keep double quotes around variables.
+    - **Impact:** reduces E slightly. Once the literals are outside the loop they are scanned only once, so the saving here is small. The main gain is readability.
+
+    ```bash
+    #!/bin/bash
+    set -eu
+    # build landing pages, one per campaign
+
+    out=${1:?usage: build.sh OUT_DIR}
+    mkdir -p "$out"
+    rm -rf "${out:?}"/*
+
+    style='<style>:root{--brand:#0a7}body{margin:0;font-family:system-ui,sans-serif}.hero{padding:4rem 1rem;text-align:center}.btn{display:inline-block;padding:.8rem 1.4rem;border-radius:6px;background:var(--brand);color:#fff}</style>'
+    footer='<footer><p>&copy; Example Inc. <a href="/privacy">Privacy</a> <a href="/terms">Terms</a></p></footer>'
+    template='<!doctype html><html lang="en"><head><meta charset="utf-8">%s<title>%s</title></head><body><section class="hero"><h1>%s</h1><a class="btn" href="/signup?c=%s">%s</a></section>%s</body></html>\n'
+
+    while IFS=, read -r slug title cta; do
+      printf "$template" "$style" "$title" "$title" "$slug" "$cta" "$footer" > "$out/$slug.html"
+    done < campaigns.csv
+    ```
+
+    The template needs double quotes in `printf "$template"` only to expand the variable. Titles and CTAs are passed as arguments, so a `%` in them is safe. If `campaigns.csv` is not fully trusted, escape `&`, `<` and `>` in `title` and `cta` before they go into the HTML.
+
+    **Already good:** one pass over the CSV with `read`, with no `cat | while` and no subprocess per line.
+verify:
+  static_only: bash build script that reads a CSV and writes files; no deterministic stdout comparison

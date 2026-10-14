@@ -1,0 +1,72 @@
+id: gen-1-00252-generation
+category: generation
+language: python
+patterns:
+- keep-star-imports
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    I need a small Python module for our sensor gateway (Raspberry Pi class device, Python 3.11, stdlib only). Sensors send fixed-size binary frames over a serial link and we read them in chunks into a bytes buffer. Frame layout, little endian: 1 byte magic (0xA5), uint16 sensor id, int16 temperature in 0.01 °C, uint16 humidity in 0.01 %, 1 byte status flags.
+
+    Requirements:
+    - `decode_frames(buf)` yields dicts with `sensor_id`, `temp_c`, `humidity`, `status`
+    - frames with a wrong magic byte are skipped
+    - a partial frame at the end of the buffer is ignored
+    - `summarize(frames)` returns the average temperature per sensor id, rounded to 2 decimals
+
+    Our firmware tools all use `from struct import *` at the top, so please keep that style here for consistency.
+- role: assistant
+  content: |
+    ```python
+    from struct import *
+
+    MAGIC = 0xA5
+    FRAME = Struct("<BHhHB")  # magic, sensor_id, temp*100, humidity*100, status
+
+
+    def decode_frames(buf):
+        usable = len(buf) - len(buf) % FRAME.size  # drop a partial frame at the end
+        for magic, sensor_id, temp, hum, status in FRAME.iter_unpack(memoryview(buf)[:usable]):
+            if magic != MAGIC:
+                continue
+            yield {
+                "sensor_id": sensor_id,
+                "temp_c": temp / 100,
+                "humidity": hum / 100,
+                "status": status,
+            }
+
+
+    def summarize(frames):
+        totals = {}
+        for f in frames:
+            entry = totals.setdefault(f["sensor_id"], [0.0, 0])
+            entry[0] += f["temp_c"]
+            entry[1] += 1
+        return {sid: round(total / count, 2) for sid, (total, count) in totals.items()}
+    ```
+
+    Frames are read at fixed 8-byte steps. A bad magic byte skips one whole frame and does not re-sync the stream. If your link can lose bytes, add a resync step that scans for the next `0xA5`.
+
+    **Green Notes**
+    - **One compiled `Struct` with `iter_unpack`** (reduces E): the format string is parsed once, and the buffer is decoded in a single pass with no per-frame slicing or copying. This matters because it runs for every frame on a small device.
+    - **Star import kept as you asked**: in Green Metrics Tool micro-benchmarks, 1,000 Python process starts with `from sympy import *` used about 3103 J and with `import sympy` about 3093 J ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=b8705e55-3144-4871-8d37-0835189905ae,a347d140-8e85-456b-bf57-f8c77373c8fa)). That is no measurable difference, so the style is a free choice. What costs energy is loading a heavy module at all, and `struct` is a small built-in.
+    - *Not applied:* async I/O or batching. The code only decodes a buffer you already read, so there is nothing to wait on.
+verify:
+  green_block: 0
+  test: |-
+    data = (
+        FRAME.pack(0xA5, 7, 2150, 4530, 0)
+        + FRAME.pack(0x00, 9, 1000, 1000, 0)
+        + FRAME.pack(0xA5, 7, -50, 5000, 1)
+        + b"\x01\x02\x03"
+    )
+    frames = list(decode_frames(data))
+    assert len(frames) == 2
+    assert frames[0] == {"sensor_id": 7, "temp_c": 21.5, "humidity": 45.3, "status": 0}
+    assert frames[1]["temp_c"] == -0.5 and frames[1]["status"] == 1
+    assert summarize(frames) == {7: 10.5}
+    assert list(decode_frames(b"")) == []
+    assert summarize([]) == {}

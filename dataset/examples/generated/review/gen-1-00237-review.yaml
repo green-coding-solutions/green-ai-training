@@ -1,0 +1,100 @@
+id: gen-1-00237-review
+category: review
+language: javascript
+patterns:
+- remove-unused-css
+messages:
+- role: user
+  content: |
+    review pls, this is our css step in the deploy pipeline
+
+    ```javascript
+    // scripts/build-css.js
+    const fs = require('fs');
+    const { PurgeCSS } = require('purgecss');
+    const postcss = require('postcss');
+    const cssnano = require('cssnano');
+
+    const isCI = process.env.CI === 'true';
+
+    async function build() {
+      const raw = fs.readFileSync('dist/bundle.css', 'utf8'); // bootstrap + our styles
+      let css = raw;
+
+      // purge is slow, skip it on CI
+      if (!isCI) {
+        const [res] = await new PurgeCSS().purge({
+          content: ['src/**/*.html'],
+          css: [{ raw }],
+          safelist: [/^btn-/, /^col-/, /^text-/, /^bg-/, /^d-/, /^m[tbxy]?-/, /^p[tbxy]?-/],
+        });
+        css = res.css;
+      }
+
+      const out = await postcss([cssnano()]).process(css, { from: undefined });
+      fs.writeFileSync('dist/site.min.css', out.css);
+      console.log('css bytes:', Buffer.byteLength(out.css));
+    }
+
+    build().catch((e) => {
+      console.error(e);
+      process.exit(1);
+    });
+    ```
+- role: assistant
+  content: |
+    **Workload:** CI/CD build step for a web frontend
+
+    #### [High] Unused CSS is purged only on developer machines
+    - **Where:** `if (!isCI)`
+    - **Issue:** the deploy build runs in CI, so the purge is skipped exactly where the shipped file is made. Every visitor downloads and parses the whole Bootstrap bundle, including rules no page uses.
+    - **Fix:** always purge. If the step is too slow, cache `node_modules` or run it once per build instead of skipping it.
+    - **Impact:** reduces network bytes and browser parse work on every page view. This is a per-visit cost, so it matters more than the build time you save.
+
+    #### [Bug] Classes used in JavaScript will be removed
+    - **Where:** `content: ['src/**/*.html']`
+    - **Issue:** PurgeCSS only keeps selectors it finds in the content files. State classes that your scripts add (for example `is-open`) and classes built from strings (for example `alert-${type}`) do not appear in the HTML, so they will be stripped once the purge actually runs in CI. The UI would then break in production only.
+    - **Fix:** scan the JS files too, and safelist the names that are built dynamically.
+
+    #### [Medium] Safelist keeps most of the framework
+    - **Where:** the `safelist` regexes
+    - **Issue:** `/^btn-/`, `/^col-/`, `/^text-/`, `/^bg-/`, spacing and display prefixes cover most of Bootstrap's utility classes. They keep unused rules even when no page uses them.
+    - **Fix:** remove the broad prefixes. Safelist only the names that are really generated at runtime.
+
+    ```javascript
+    const fs = require('fs');
+    const { PurgeCSS } = require('purgecss');
+    const postcss = require('postcss');
+    const cssnano = require('cssnano');
+
+    async function build() {
+      const raw = fs.readFileSync('dist/bundle.css', 'utf8'); // bootstrap + our styles
+
+      const [res] = await new PurgeCSS().purge({
+        content: ['src/**/*.html', 'src/**/*.js'],
+        css: [{ raw }],
+        safelist: {
+          standard: ['is-open', 'is-active'],
+          greedy: [/^alert-/], // built as `alert-${type}` in src/js
+        },
+      });
+
+      const out = await postcss([cssnano()]).process(res.css, { from: undefined });
+      fs.writeFileSync('dist/site.min.css', out.css);
+      console.log('css bytes:', Buffer.byteLength(out.css));
+    }
+
+    build().catch((e) => {
+      console.error(e);
+      process.exit(1);
+    });
+    ```
+
+    Check the result once: build, then click through the pages that open menus, modals and alerts. Anything that looks unstyled needs a safelist entry or a content path.
+
+    **Already good:** `cssnano` minifies the output, and the build exits with a non-zero code on failure.
+
+    **Green Notes**
+    - **Remove unused CSS** (reduces network and E): https://patterns.greensoftware.foundation/development/media-and-code-efficiency/remove-unused-css
+verify:
+  static_only: needs purgecss, postcss and cssnano packages and project files

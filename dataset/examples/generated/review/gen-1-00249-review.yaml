@@ -1,0 +1,144 @@
+id: gen-1-00249-review
+category: review
+language: java
+patterns:
+- efficient-algorithm
+- avoid-exception-flow
+messages:
+- role: user
+  content: |
+    Could you review this class? It's part of our checkout service (Java 17, Spring Boot). Every night we get a stock feed CSV from our warehouses, about 200k rows. Each SKU appears once per warehouse, so roughly 8 rows per SKU. Warehouses that are offline send "N/A" or an empty string as quantity. We create one `StockReconciler` per feed file and then call `findShortages` for every batch of pending orders, about 5k order lines per batch and many batches per night.
+
+    Requirements: the first row with a usable quantity wins for a SKU, SKUs without any usable quantity count as 0 available, and the result keeps the order of the input lines. I would like to keep those semantics. Please tell me what is wrong and what you would change.
+
+    ```java
+    import java.util.ArrayList;
+    import java.util.List;
+
+    public class StockReconciler {
+
+        public record FeedRow(String sku, String qty) {}
+        public record OrderLine(String sku, int quantity) {}
+        public record Shortage(String sku, int wanted, int available) {}
+
+        private final List<FeedRow> feed;
+
+        public StockReconciler(List<FeedRow> feed) {
+            this.feed = feed;
+        }
+
+        private int availableFor(String sku) {
+            for (FeedRow row : feed) {
+                if (row.sku().equals(sku)) {
+                    try {
+                        return Integer.parseInt(row.qty().trim());
+                    } catch (NumberFormatException e) {
+                        // offline warehouse: "N/A" or empty, try next row
+                    }
+                }
+            }
+            return 0;
+        }
+
+        public List<Shortage> findShortages(List<OrderLine> lines) {
+            List<Shortage> result = new ArrayList<>();
+            for (OrderLine line : lines) {
+                int available = availableFor(line.sku());
+                if (available < line.quantity()) {
+                    result.add(new Shortage(line.sku(), line.quantity(), available));
+                }
+            }
+            return result;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly batch, repeated for every order batch)
+
+    #### [Bug] `null` quantity crashes the whole batch
+    - **Where:** `availableFor`, `row.qty().trim()`
+    - **Issue:** if the CSV parser gives `null` for a missing column, `trim()` throws a `NullPointerException`. The `catch` only handles `NumberFormatException`, so one bad row aborts the run.
+    - **Fix:** treat `null` like blank. The rewrite below does this. It changes a crash into "skip this row", which fits your rule for offline warehouses.
+
+    #### [High] Linear scan of the whole feed for every order line
+    - **Where:** `availableFor`, called from `findShortages`
+    - **Issue:** each lookup walks the feed list until it finds a usable row. With 5k lines and 200k rows, a batch can do up to 5k × 200k string comparisons, and SKUs near the end of the feed or without stock scan everything. The feed does not change between batches, but the same scan is repeated every time.
+    - **Fix:** build a `Map<String, Integer>` once in the constructor, then every lookup is O(1). Use `putIfAbsent` so the first usable row wins, as you required.
+    - **Impact:** reduces E in the nightly job. Work per batch drops from lines × rows to about lines, and the one-time index cost is paid once per feed file.
+
+    #### [Medium] Exceptions used for expected input
+    - **Where:** `catch (NumberFormatException e)`
+    - **Issue:** "N/A" and empty values are normal in your feed, not errors. Every one of them creates an exception object with a stack trace, and with about 8 rows per SKU and offline warehouses, this happens many times per lookup. I have no JVM measurements for this, but filling in a stack trace is far more work than a character check.
+    - **Fix:** check the string with a small helper that returns `null` for unusable values and call `parseInt`-style logic only on digits. With the index above, this runs once per feed row, not once per lookup.
+    - **Impact:** reduces E for every unusable row.
+
+    #### [Low] "Unknown" and "zero" look the same
+    - **Where:** `return 0;`
+    - **Issue:** a SKU with no usable quantity is reported as a shortage with `available = 0`. That matches your stated rule, so I kept it. Downstream code cannot tell "all warehouses offline" from "really out of stock". An `Optional` or a flag on `Shortage` would help later.
+
+    ```java
+    import java.util.ArrayList;
+    import java.util.HashMap;
+    import java.util.List;
+    import java.util.Map;
+
+    public class StockReconciler {
+
+        public record FeedRow(String sku, String qty) {}
+        public record OrderLine(String sku, int quantity) {}
+        public record Shortage(String sku, int wanted, int available) {}
+
+        // first usable quantity per SKU
+        private final Map<String, Integer> availableBySku = new HashMap<>();
+
+        public StockReconciler(List<FeedRow> feed) {
+            for (FeedRow row : feed) {
+                Integer qty = parseQty(row.qty());
+                if (qty != null) {
+                    availableBySku.putIfAbsent(row.sku(), qty);
+                }
+            }
+        }
+
+        // Returns null for null, blank, "N/A" and out-of-range values. No exceptions.
+        private static Integer parseQty(String raw) {
+            if (raw == null) return null;
+            String s = raw.trim();
+            int i = 0;
+            boolean negative = false;
+            if (!s.isEmpty() && (s.charAt(0) == '-' || s.charAt(0) == '+')) {
+                negative = s.charAt(0) == '-';
+                i = 1;
+            }
+            if (i == s.length()) return null;
+            long value = 0;
+            for (; i < s.length(); i++) {
+                char c = s.charAt(i);
+                if (c < '0' || c > '9') return null;
+                value = value * 10 + (c - '0');
+                if (value > 2_147_483_648L) return null;
+            }
+            if (negative) value = -value;
+            if (value < Integer.MIN_VALUE || value > Integer.MAX_VALUE) return null;
+            return (int) value;
+        }
+
+        public List<Shortage> findShortages(List<OrderLine> lines) {
+            List<Shortage> result = new ArrayList<>();
+            for (OrderLine line : lines) {
+                int available = availableBySku.getOrDefault(line.sku(), 0);
+                if (available < line.quantity()) {
+                    result.add(new Shortage(line.sku(), line.quantity(), available));
+                }
+            }
+            return result;
+        }
+    }
+    ```
+
+    One thing to watch: the index is built once, so it no longer sees changes made to the `feed` list after construction. That is fine if you create a new reconciler per feed file, as you describe.
+
+    **Already good:** records keep the data simple, the result order follows the input lines, and one reconciler per feed file is the right lifetime for an index.
+verify:
+  static_only: Java code, the verifier has no JVM

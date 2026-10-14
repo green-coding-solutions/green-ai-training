@@ -1,0 +1,49 @@
+id: gen-1-00214-generation
+category: generation
+language: sql
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+messages:
+- role: user
+  content: |
+    hello, i need sql for my dashboard page. it show the last 50 error from our logs, so people can see what is broken now. table is app_logs and have this columns: id, logged_at, level, service, host, request_id, message, stack_trace (very long text), raw_payload (big json as text). On the page i show only time, service and the message. Sorry for my english, thank you!
+- role: assistant
+  content: |
+    ```sql
+    SELECT id, logged_at, service, message
+    FROM app_logs
+    WHERE level = 'ERROR'
+    ORDER BY logged_at DESC, id DESC
+    LIMIT 50;
+    ```
+
+    I kept `id` so each row can link to a detail view. Load the heavy columns only when someone opens one entry:
+
+    ```sql
+    SELECT stack_trace, raw_payload, host, request_id
+    FROM app_logs
+    WHERE id = 123;
+    ```
+
+    An index helps the list query find the newest errors without sorting the whole table:
+
+    ```sql
+    CREATE INDEX idx_app_logs_level_time ON app_logs (level, logged_at DESC);
+    ```
+
+    **Green Notes**
+    - **Select only the 4 columns the page shows** (reduces E and network): `stack_trace` and `raw_payload` are large, and the list does not need them. With `SELECT *`, the database would read and send them for all 50 rows on every refresh. In Green Metrics Tool measurements on a PostgreSQL table with large text columns, `SELECT *` used about 7× the energy of naming the needed columns ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=b7203ffe-39ae-4e84-bf85-998c9389ea46,4702c2ee-13d5-4d70-bcfe-31e193104a8e)).
+      https://patterns.greensoftware.foundation/development/data-handling/reduce-transmitted-data
+    - **`LIMIT 50` with the index** (reduces E): the database returns 50 rows and does not scan or sort all the logs.
+    - **Detail on demand**: the big columns are fetched for one row only when a user clicks it.
+verify:
+  green_block: 0
+  sql:
+    setup: CREATE TABLE app_logs (id INTEGER PRIMARY KEY, logged_at TEXT, level TEXT, service TEXT, host TEXT, request_id
+      TEXT, message TEXT, stack_trace TEXT, raw_payload TEXT); INSERT INTO app_logs VALUES (1,'2026-10-01 10:00:00','ERROR','api','h1','r1','boom','trace1','{}'),(2,'2026-10-01
+      10:05:00','INFO','api','h1','r2','ok','','{}'),(3,'2026-10-01 10:10:00','ERROR','worker','h2','r3','fail','trace3','{}'),(4,'2026-10-01
+      10:10:00','ERROR','api','h1','r4','timeout','trace4','{}'); CREATE INDEX idx_app_logs_level_time ON app_logs (level,
+      logged_at DESC);
+    compare: false

@@ -1,0 +1,55 @@
+id: gen-1-00218-generation
+category: generation
+language: go
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    I'm building the member directory endpoint for our SaaS backend (Go, net/http, database/sql with pgx stdlib, Postgres). Requirements:
+
+    - `GET /api/v1/teams/members?team_id=42&after=1200&limit=50`
+    - returns the members of one team as JSON: id, display name, email, avatar URL and role
+    - only active users (`deactivated_at IS NULL`)
+    - cursor pagination by id, default limit 50, max 200
+    - response also has a `next_cursor` so the frontend can load the next page
+    - the `users` table is big: it also has `bio`, `profile_json`, `notification_prefs`, `last_login_ip`, `password_hash` and about 40 more columns
+
+    Please write the handler and the query. The db handle is passed in.
+- role: assistant
+  content: "```go\npackage members\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"strconv\"\n)\n\
+    \nconst (\n\tdefaultLimit = 50\n\tmaxLimit     = 200\n)\n\n// Only the columns the response needs. No SELECT *.\nconst\
+    \ listMembersSQL = `\nSELECT id, display_name, email, COALESCE(avatar_url, ''), role\nFROM users\nWHERE team_id = $1\n\
+    \  AND deactivated_at IS NULL\n  AND id > $2\nORDER BY id\nLIMIT $3`\n\ntype member struct {\n\tID          int64  `json:\"\
+    id\"`\n\tDisplayName string `json:\"display_name\"`\n\tEmail       string `json:\"email\"`\n\tAvatarURL   string `json:\"\
+    avatar_url\"`\n\tRole        string `json:\"role\"`\n}\n\ntype page struct {\n\tMembers    []member `json:\"members\"\
+    `\n\tNextCursor *int64   `json:\"next_cursor,omitempty\"`\n}\n\nfunc ListMembers(db *sql.DB) http.HandlerFunc {\n\treturn\
+    \ func(w http.ResponseWriter, r *http.Request) {\n\t\tq := r.URL.Query()\n\n\t\tteamID, err := strconv.ParseInt(q.Get(\"\
+    team_id\"), 10, 64)\n\t\tif err != nil {\n\t\t\thttp.Error(w, \"invalid team_id\", http.StatusBadRequest)\n\t\t\treturn\n\
+    \t\t}\n\n\t\tvar after int64\n\t\tif s := q.Get(\"after\"); s != \"\" {\n\t\t\tif after, err = strconv.ParseInt(s, 10,\
+    \ 64); err != nil {\n\t\t\t\thttp.Error(w, \"invalid after\", http.StatusBadRequest)\n\t\t\t\treturn\n\t\t\t}\n\t\t}\n\
+    \n\t\tlimit := defaultLimit\n\t\tif s := q.Get(\"limit\"); s != \"\" {\n\t\t\tif limit, err = strconv.Atoi(s); err !=\
+    \ nil || limit < 1 {\n\t\t\t\thttp.Error(w, \"invalid limit\", http.StatusBadRequest)\n\t\t\t\treturn\n\t\t\t}\n\t\t\t\
+    if limit > maxLimit {\n\t\t\t\tlimit = maxLimit\n\t\t\t}\n\t\t}\n\n\t\trows, err := db.QueryContext(r.Context(), listMembersSQL,\
+    \ teamID, after, limit)\n\t\tif err != nil {\n\t\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\
+    \t\t\treturn\n\t\t}\n\t\tdefer rows.Close()\n\n\t\tout := page{Members: make([]member, 0, limit)}\n\t\tfor rows.Next()\
+    \ {\n\t\t\tvar m member\n\t\t\tif err := rows.Scan(&m.ID, &m.DisplayName, &m.Email, &m.AvatarURL, &m.Role); err != nil\
+    \ {\n\t\t\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\t\t\treturn\n\t\t\t}\n\t\t\tout.Members\
+    \ = append(out.Members, m)\n\t\t}\n\t\tif err := rows.Err(); err != nil {\n\t\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\
+    \t\t\treturn\n\t\t}\n\n\t\t// A full page means there may be more rows.\n\t\tif len(out.Members) == limit {\n\t\t\tlast\
+    \ := out.Members[len(out.Members)-1].ID\n\t\t\tout.NextCursor = &last\n\t\t}\n\n\t\tw.Header().Set(\"Content-Type\", \"\
+    application/json\")\n\t\t_ = json.NewEncoder(w).Encode(out)\n\t}\n}\n```\n\nNotes on behavior:\n\n- If the last page has\
+    \ exactly `limit` rows, the client gets one more cursor and then an empty page. That keeps the query simple.\n- For speed,\
+    \ `users` should have an index on `(team_id, id)`.\n\n**Green Notes**\n- **Named columns instead of `SELECT *`** (reduces\
+    \ E, network): the query reads 5 columns, not the 40+ on `users`. `bio`, `profile_json` and `password_hash` never leave\
+    \ the database. In Green Metrics Tool micro-benchmarks on PostgreSQL, reading rows from a 52-column table with large text\
+    \ columns used about 5.5× to 7× less CPU energy when 10 needed columns were named instead of using `SELECT *`. The saving\
+    \ grows with the size of the skipped columns. It also keeps `password_hash` out of the Go process. https://patterns.greensoftware.foundation/development/data-handling/reduce-transmitted-data\n\
+    - **Capped cursor pagination** (reduces E, network): at most 200 rows per request, and the `id > $2` cursor avoids the\
+    \ growing skip cost of `OFFSET`.\n- *Not applied:* response caching. Member lists change when people join or leave, and\
+    \ a stale list could show deactivated users.\n"
+verify:
+  static_only: Go with database/sql needs a Postgres driver and a running database

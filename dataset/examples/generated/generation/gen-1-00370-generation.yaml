@@ -1,0 +1,72 @@
+id: gen-1-00370-generation
+category: generation
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    Hello, I need small python function for our nightly ETL. We get CSV from the shop system with 2 millions rows every night, and column order_date is like 14/03/2026 (day first). I must add 3 new columns: iso date, iso week number and quarter like 2026-Q1. Bad dates should be skipped and counted, not crash. Input and output are file objects, we use csv module. Sorry for my english, thanks!
+- role: assistant
+  content: |
+    The file has millions of rows but only a few hundred different dates. So parse each distinct date string once and reuse the result:
+
+    ```python
+    import csv
+    from datetime import datetime
+    from functools import lru_cache
+
+
+    @lru_cache(maxsize=4096)
+    def date_parts(raw: str) -> tuple[str, int, str]:
+        """Return (iso_date, iso_week, quarter) for a 'dd/mm/yyyy' string."""
+        d = datetime.strptime(raw.strip(), "%d/%m/%Y").date()
+        quarter = f"{d.year}-Q{(d.month - 1) // 3 + 1}"
+        return d.isoformat(), d.isocalendar().week, quarter
+
+
+    def add_date_columns(src, dst) -> int:
+        """Copy src to dst with iso_date, iso_week, quarter added.
+        Rows with a bad order_date are skipped. Returns how many were skipped."""
+        reader = csv.DictReader(src)
+        fields = list(reader.fieldnames) + ["iso_date", "iso_week", "quarter"]
+        writer = csv.DictWriter(dst, fieldnames=fields, lineterminator="\n")
+        writer.writeheader()
+
+        skipped = 0
+        for row in reader:
+            try:
+                iso_date, iso_week, quarter = date_parts(row["order_date"])
+            except ValueError:
+                skipped += 1
+                continue
+            row["iso_date"] = iso_date
+            row["iso_week"] = iso_week
+            row["quarter"] = quarter
+            writer.writerow(row)
+        return skipped
+    ```
+
+    The cache returns a tuple, so a cached value can never be changed by accident. Bad dates raise an error and are not cached, so they are counted every time they appear.
+
+    **Green Notes**
+    - **Memoize repeated pure computations** (reduces E): `date_parts` is pure and gets the same few hundred inputs again and again. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations with 200 distinct inputs used about 9× less CPU energy with `@lru_cache` ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=ddf98f50-15ee-48e2-ab38-cc89acc88142,808b9a2c-1abf-4af5-9b04-3a6ce700fcdb)). Your saving depends on how costly `strptime` is compared with the cache lookup, so measure on a real file.
+    - `maxsize=4096` keeps memory bounded. Do not use `maxsize=None` for input you do not control.
+    - *Not applied:* if most dates were unique (for example full timestamps with seconds), the cache would only add overhead. Then I would remove it.
+verify:
+  module: true
+  test: |-
+    import io
+    date_parts.cache_clear()
+    src = "order_id,order_date,amount\n1,14/03/2026,10.5\n2,14/03/2026,3\n3,01/01/2027,5\n4,xx,1\n"
+    out = io.StringIO()
+    bad = add_date_columns(io.StringIO(src), out)
+    assert bad == 1, bad
+    lines = out.getvalue().splitlines()
+    assert lines[0] == "order_id,order_date,amount,iso_date,iso_week,quarter", lines[0]
+    assert len(lines) == 4, lines
+    assert lines[1].endswith("2026-03-14,11,2026-Q1"), lines[1]
+    assert lines[3].endswith("2027-01-01,53,2027-Q1"), lines[3]
+    assert date_parts.cache_info().hits == 1, date_parts.cache_info()

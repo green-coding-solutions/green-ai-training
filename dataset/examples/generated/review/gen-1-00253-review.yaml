@@ -1,0 +1,136 @@
+id: gen-1-00253-review
+category: review
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    Hi, I wrote a script that makes the product feed for our shop (we send it to a price comparison site every night). It works, but it takes a long time now with 40k products and I'm not sure what is wrong. Can you look at it?
+
+    ```python
+    import csv
+
+    CATEGORIES = {}  # id -> (name, parent_id)
+
+
+    def load_categories(path):
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                parent = int(row["parent_id"]) if row["parent_id"] else None
+                CATEGORIES[int(row["id"])] = (row["name"], parent)
+
+
+    def category_path(cat_id):
+        name, parent = CATEGORIES[cat_id]
+        if parent is None:
+            return name
+        return category_path(parent) + " > " + name
+
+
+    def export_feed(products, out_path):
+        with open(out_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["sku", "title", "category", "price"])
+            for p in products:
+                writer.writerow([
+                    p["sku"],
+                    p["title"].strip(),
+                    category_path(p["category_id"]),
+                    f'{p["price_cents"] / 100:.2f}',
+                ])
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly batch)
+
+    #### [Medium] The same category path is rebuilt for every product
+    - **Where:** `category_path(p["category_id"])` in `export_feed`
+    - **Issue:** `category_path` walks up the tree and joins strings every time it is called. The result only depends on the category id, and your shop has far fewer categories than products. So the same few hundred paths are rebuilt 40,000 times.
+    - **Fix:** memoize the function with `functools.lru_cache`. It is a pure function of `CATEGORIES`, and the number of categories is bounded, so the cache stays small.
+    - **Impact:** reduces E. The work per product drops from a walk up the tree to one dictionary lookup. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over 200 distinct inputs used about 9× less CPU energy with `lru_cache` ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=ddf98f50-15ee-48e2-ab38-cc89acc88142,808b9a2c-1abf-4af5-9b04-3a6ce700fcdb)). That only holds when inputs repeat, and they do here.
+
+    #### [Low] Clear the cache when categories are reloaded
+    - **Where:** `load_categories`
+    - **Issue:** once the function is cached, a second call to `load_categories` with a changed tree would still return old paths.
+    - **Fix:** call `category_path.cache_clear()` after loading.
+
+    ```python
+    import csv
+    from functools import lru_cache
+
+    CATEGORIES = {}  # id -> (name, parent_id)
+
+
+    def load_categories(path):
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                parent = int(row["parent_id"]) if row["parent_id"] else None
+                CATEGORIES[int(row["id"])] = (row["name"], parent)
+        category_path.cache_clear()
+
+
+    @lru_cache(maxsize=None)
+    def category_path(cat_id):
+        name, parent = CATEGORIES[cat_id]
+        if parent is None:
+            return name
+        return category_path(parent) + " > " + name
+
+
+    def export_feed(products, out_path):
+        with open(out_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["sku", "title", "category", "price"])
+            for p in products:
+                writer.writerow([
+                    p["sku"],
+                    p["title"].strip(),
+                    category_path(p["category_id"]),
+                    f'{p["price_cents"] / 100:.2f}',
+                ])
+    ```
+
+    Keep the price out of any cache. It changes, and the feed must show the current value. Category names rarely change, so caching them for one run is safe.
+
+    To see how much you really save, time `export_feed` before and after on your real data, for example with `time` or `perf stat`.
+verify:
+  equivalence:
+    driver: |
+      import os
+      import tempfile
+
+      CATEGORIES.update({
+          1: ("Home", None),
+          2: ("Kitchen", 1),
+          3: ("Knives", 2),
+          4: ("Garden", 1),
+          5: ("Tools", 4),
+      })
+      products = [
+          {"sku": "A1", "title": "  Chef knife ", "category_id": 3, "price_cents": 4999},
+          {"sku": "A2", "title": "Bread knife", "category_id": 3, "price_cents": 2950},
+          {"sku": "B1", "title": "Spade", "category_id": 5, "price_cents": 1999},
+          {"sku": "C1", "title": "Pot", "category_id": 2, "price_cents": 1250},
+          {"sku": "D1", "title": "Home sign", "category_id": 1, "price_cents": 500},
+      ] * 3
+      out = os.path.join(tempfile.mkdtemp(), "feed.csv")
+      export_feed(products, out)
+      with open(out, newline="") as fh:
+          print(fh.read())
+  test: |-
+    CATEGORIES.clear()
+    CATEGORIES.update({
+        1: ("Home", None),
+        2: ("Kitchen", 1),
+        3: ("Knives", 2),
+    })
+    category_path.cache_clear()
+    assert category_path(3) == "Home > Kitchen > Knives"
+    assert category_path(3) == "Home > Kitchen > Knives"
+    assert category_path.cache_info().hits >= 1
+    CATEGORIES[3] = ("Blades", 2)
+    category_path.cache_clear()
+    assert category_path(3) == "Home > Kitchen > Blades"

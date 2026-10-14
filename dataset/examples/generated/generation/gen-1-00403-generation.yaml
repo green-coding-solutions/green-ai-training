@@ -1,0 +1,56 @@
+id: gen-1-00403-generation
+category: generation
+language: bash
+patterns:
+- bash-quoting
+- bash-builtins
+facts:
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    Need a bash script for our CI that stamps our license header onto every .c and .h file under a directory (about 20k files, skipping vendor/). Skip files that already have a Copyright line. Year should be a parameter, default current year. Just the script please.
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    root=${1:?usage: add-license-header.sh <dir> [year]}
+    year=${2:-$(date +%Y)}
+
+    header_tpl='/*
+     * Copyright (c) @YEAR@ Example Corp.
+     *
+     * Licensed under the Apache License, Version 2.0 (the "License");
+     * you may not use this file except in compliance with the License.
+     * You may obtain a copy of the License at
+     *
+     *     http://www.apache.org/licenses/LICENSE-2.0
+     *
+     * Unless required by applicable law or agreed to in writing, software
+     * distributed under the License is distributed on an "AS IS" BASIS,
+     * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+     */
+    '
+    header=${header_tpl//@YEAR@/$year}
+
+    stamped=0
+    while IFS= read -r -d '' file; do
+      IFS= read -r -d '' content < "$file" || true
+      [[ $content == *'Copyright ('* ]] && continue
+      printf '%s%s' "$header" "$content" > "$file"
+      stamped=$((stamped + 1))
+    done < <(find "$root" -name vendor -prune -o -type f \( -name '*.c' -o -name '*.h' \) -print0)
+
+    printf 'stamped %s files\n' "$stamped"
+    ```
+
+    **Green Notes**
+    - **Single quotes for literals** (reduces E): the header and all fixed strings need no expansion, so they use single quotes. Bash then does not scan them for `$`, backticks or backslashes. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal in a loop used about 24% less CPU energy with single quotes than with double quotes ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=dd9bbb4e-b056-4067-8ad2-7b1818a86f10,b265ef9b-adb9-4b56-a14b-ae34fdaa7247,28d92c15-79d7-44ca-8f43-a733fe2e265a,a9533378-71f0-49df-bd5f-1e5f27cda9c2)). Here the header is assigned only once, so the gain is small. The habit matters more in loops. Variables like `"$file"` stay double-quoted, as they must.
+    - **No forks per file** (reduces E): the year is substituted once, outside the loop. The "already stamped" check uses `read` and `[[ ... ]]` instead of spawning `grep` or `head` for each of 20k files.
+    - **One `find` pass** with `-print0`, so file names with spaces or newlines are safe.
+
+    The script rewrites files in place. Run it on a clean checkout so `git diff` shows exactly what changed.
+verify:
+  static_only: bash script that rewrites files on the filesystem; no python/javascript verifier applies

@@ -1,0 +1,101 @@
+id: gen-1-00074-refactor
+category: refactor
+language: python
+patterns:
+- deque-or-append
+messages:
+- role: user
+  content: |
+    hi, I wrote a small rate limiter for our REST API. It works but my teammate said something about "pop(0)" being bad and I dont really understand why. can you look and make it better? not sure what is wrong
+
+    ```python
+    import time
+
+    WINDOW_SECONDS = 60
+    MAX_REQUESTS = 500
+
+    request_log = {}
+
+
+    def check_rate_limit(client_id, now=None):
+        if now is None:
+            now = time.time()
+        if client_id not in request_log:
+            request_log[client_id] = []
+        timestamps = request_log[client_id]
+
+        # remove old ones
+        while len(timestamps) > 0 and now - timestamps[0] >= WINDOW_SECONDS:
+            timestamps.pop(0)
+
+        if len(timestamps) >= MAX_REQUESTS:
+            retry_after = WINDOW_SECONDS - (now - timestamps[0])
+            return False, int(retry_after) + 1
+
+        timestamps.append(now)
+        return True, 0
+
+
+    def handle(client_id):
+        allowed, retry_after = check_rate_limit(client_id)
+        if not allowed:
+            return 429, {"error": "too many requests", "retry_after": retry_after}
+        return 200, {"ok": True}
+    ```
+- role: assistant
+  content: |
+    Your teammate is right. `pop(0)` on a list removes the first item and then moves every other item one place to the left. Each call costs time proportional to the list length. Your limiter does this for every expired timestamp, on every request. A `collections.deque` removes from the front without moving anything.
+
+    ```python
+    import time
+    from collections import deque
+
+    WINDOW_SECONDS = 60
+    MAX_REQUESTS = 500
+
+    request_log = {}
+
+
+    def check_rate_limit(client_id, now=None):
+        if now is None:
+            now = time.time()
+        timestamps = request_log.get(client_id)
+        if timestamps is None:
+            timestamps = request_log[client_id] = deque()
+
+        # drop timestamps that left the window
+        while timestamps and now - timestamps[0] >= WINDOW_SECONDS:
+            timestamps.popleft()
+
+        if len(timestamps) >= MAX_REQUESTS:
+            retry_after = WINDOW_SECONDS - (now - timestamps[0])
+            return False, int(retry_after) + 1
+
+        timestamps.append(now)
+        return True, 0
+
+
+    def handle(client_id):
+        allowed, retry_after = check_rate_limit(client_id)
+        if not allowed:
+            return 429, {"error": "too many requests", "retry_after": retry_after}
+        return 200, {"ok": True}
+    ```
+
+    The behavior is the same: same window, same limit, same `retry_after`.
+
+    **Green Notes**
+    - **`deque.popleft()` instead of `list.pop(0)`** (reduces E): removing the oldest timestamp is now O(1) and no longer shifts the rest of the list. This code runs on every API request, so the saving repeats on every call. With a limit of 500 per client the list is short, so the gain today is modest. It grows if you raise `MAX_REQUESTS` or have bursts that expire many entries at once.
+    - **`while timestamps` instead of `len(timestamps) > 0`:** same check, a bit simpler to read.
+    - **`.get()` instead of `in` plus a second lookup:** one dict lookup in the common case.
+    - *Not changed:* `request_log` keeps an empty deque for every client that ever called. If you have many one-time clients, delete the entry when its deque is empty, or run a cleanup now and then.
+verify:
+  equivalence:
+    driver: |-
+      for i in range(1500):
+          cid = "a" if i % 3 else "b"
+          print(i, cid, check_rate_limit(cid, now=1000.0 + i * 0.1))
+      for i in range(5):
+          print("later", check_rate_limit("a", now=1300.0 + i * 20))
+      print(sorted(request_log))
+      print({k: len(v) for k, v in sorted(request_log.items())})

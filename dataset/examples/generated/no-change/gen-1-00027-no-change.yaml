@@ -1,0 +1,105 @@
+id: gen-1-00027-no-change
+category: no-change
+language: python
+patterns:
+- keep-star-imports
+- context-tradeoff
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    We run a 1D diffusion profile script as a SLURM array, about 2000 short jobs per sweep, one Python process per job. Each job takes a second or two, so process startup is a big share of the runtime. I want to cut the energy per job.
+
+    Requirements: results must stay identical (same CSV, same numbers), the script must stay readable for the students who edit it, and I don't want to add dependencies.
+
+    A reviewer said the `from math import *` is sloppy and I should switch to explicit imports, and I assumed that would also make startup cheaper. Should I change it? Anything else you would touch?
+
+    ```python
+    import sys
+    from math import *
+    import pandas as pd
+
+    D = 1.2e-9        # diffusion coefficient, m^2/s
+    L = 5e-6          # film thickness, m
+    N_TERMS = 50
+
+
+    def concentration(x, t):
+        s = 0.0
+        for n in range(1, N_TERMS + 1):
+            k = (2 * n - 1) * pi / L
+            s += sin(k * x) / (2 * n - 1) * exp(-D * k * k * t)
+        return 4 / pi * s
+
+
+    def main(job_id):
+        t = 10.0 * (job_id + 1)
+        xs = [i * L / 100 for i in range(101)]
+        rows = [(x, concentration(x, t)) for x in xs]
+        df = pd.DataFrame(rows, columns=["x", "c"])
+        df.to_csv(f"profile_{job_id}.csv", index=False)
+
+
+    if __name__ == "__main__":
+        main(int(sys.argv[1]))
+    ```
+- role: assistant
+  content: |
+    Leave `from math import *` as it is. Switching to `from math import pi, sin, exp` (or `import math`) makes no measurable energy difference. In Green Metrics Tool micro-benchmarks, 1,000 Python process starts with `from sympy import *` and with `import sympy` used about the same energy (~3103 J vs ~3093 J) ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=b8705e55-3144-4871-8d37-0835189905ae,a347d140-8e85-456b-bf57-f8c77373c8fa)). The same was true for a built-in module. Explicit imports are a style choice, so do it for taste if you want, not for energy.
+
+    What costs energy at startup is loading a heavy module at all. In the same benchmarks, a start that imported `sympy` used about 25× the energy of a start that imported only a built-in module. `pandas` is also a large import, and here you use it for one thing: writing 101 rows to a CSV. With 2000 jobs per sweep, that load is paid 2000 times.
+
+    The standard `csv` module does the same job, adds no dependency, and floats are written with `repr`, as pandas does:
+
+    ```python
+    import csv
+    import sys
+    from math import *
+
+    D = 1.2e-9        # diffusion coefficient, m^2/s
+    L = 5e-6          # film thickness, m
+    N_TERMS = 50
+
+
+    def concentration(x, t):
+        s = 0.0
+        for n in range(1, N_TERMS + 1):
+            k = (2 * n - 1) * pi / L
+            s += sin(k * x) / (2 * n - 1) * exp(-D * k * k * t)
+        return 4 / pi * s
+
+
+    def main(job_id):
+        t = 10.0 * (job_id + 1)
+        xs = [i * L / 100 for i in range(101)]
+        rows = [(x, concentration(x, t)) for x in xs]
+        with open(f"profile_{job_id}.csv", "w", newline="") as f:
+            w = csv.writer(f, lineterminator="\n")
+            w.writerow(["x", "c"])
+            w.writerows(rows)
+
+
+    if __name__ == "__main__":
+        main(int(sys.argv[1]))
+    ```
+
+    **Green Notes**
+    - **Star import kept** (no change): `from math import *` vs explicit names showed no measurable difference, so the reviewer's change would not help energy.
+    - **Drop the heavy import** (reduces E): `csv` replaces `pandas`, so each of the 2000 processes skips loading a large library.
+    - *Not applied:* rewriting the 50-term sum with NumPy. It would bring back a heavy import, and the loop is tiny.
+
+    Check the CSVs from one old and one new job with `diff`. Then measure a sweep with the Green Metrics Tool, or compare `perf stat` on a single job, to see what the startup saving is on your cluster. If you later need DataFrames for analysis, keep pandas in the analysis step, not in the 2000 short jobs.
+verify:
+  module: true
+  test: |-
+    import os, tempfile
+    d = tempfile.mkdtemp()
+    os.chdir(d)
+    main(3)
+    with open("profile_3.csv") as f:
+        lines = f.read().split("\n")
+    assert lines[0] == "x,c"
+    assert lines[1] == "0.0,0.0"
+    assert len(lines) == 103 and lines[-1] == ""
+    assert float(lines[2].split(",")[1]) > 0

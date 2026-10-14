@@ -1,0 +1,61 @@
+id: gen-1-00275-generation
+category: generation
+language: java
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    Hello, I need help with a small java class for our CI runner (java 17). Every job have variables in 3 places: job, stage and global. Most jobs dont set most of the variables, so mostly the value is only in global or not exist at all. I want a method resolve(name, default) who look first in job, then stage, then global. And one more for int values like TIMEOUT_MINUTES, with default if is missing or wrong. This is call many times for every job on thousands of jobs per day. Thank you!
+- role: assistant
+  content: |
+    ```java
+    import java.util.List;
+    import java.util.Map;
+
+    public final class VariableResolver {
+        private final List<Map<String, String>> scopes;
+
+        public VariableResolver(Map<String, String> job,
+                                Map<String, String> stage,
+                                Map<String, String> global) {
+            this.scopes = List.of(job, stage, global); // most specific first
+        }
+
+        /** Returns the first value found in job, stage, global. Otherwise defaultValue. */
+        public String resolve(String name, String defaultValue) {
+            for (Map<String, String> scope : scopes) {
+                String value = scope.get(name);
+                if (value != null) {
+                    return value;
+                }
+            }
+            return defaultValue;
+        }
+
+        /** Same as resolve, but parsed as int. Missing or invalid gives defaultValue. */
+        public int resolveInt(String name, int defaultValue) {
+            String raw = resolve(name, null);
+            if (raw == null) {
+                return defaultValue; // common case: no exception
+            }
+            try {
+                return Integer.parseInt(raw.trim());
+            } catch (NumberFormatException e) {
+                return defaultValue; // rare case: a typo in the config
+            }
+        }
+    }
+    ```
+
+    Example: `resolver.resolveInt("TIMEOUT_MINUTES", 30)`.
+
+    **Green Notes**
+    - **No exceptions for missing values** (reduces E): "not set" is the normal case here, so it is handled with a `null` check on `Map.get`. Throwing and catching an exception for every missing variable costs much more. In Green Metrics Tool micro-benchmarks (Python, 10,000,000 dict lookups with about half of the keys missing), `dict.get` used about 12% less CPU energy than `try/except KeyError` ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=4753302a-710f-4132-8001-9da3ba960d13,d7ded3f2-f9e7-4781-905e-9782a8305b8f,8f054455-adbc-402d-b593-0191d1061cd8)). Java's cost profile is different, so measure it on your runner if it matters.
+    - **`try/catch` only for bad numbers:** a wrong value like `"abc"` should be rare, so catching `NumberFormatException` there is cheap and keeps the code simple. If bad values were common, check the characters first instead.
+    - **Scopes in a list:** the lookup order is set once in the constructor, so `resolve` has no extra work per call.
+    - Note: `Map.of(...)` maps throw on `get(null)`. Pass a real name and not `null`.
+verify:
+  static_only: Java code, no JVM-based verification available in the stdlib-only Python/JS harness

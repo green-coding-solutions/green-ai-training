@@ -1,0 +1,31 @@
+id: gen-1-00450-generation
+category: generation
+language: sql
+sql_dialect: postgres
+patterns:
+- compress-stored
+- context-tradeoff
+messages:
+- role: user
+  content: |
+    PG16, table `app_logs` (id bigserial, ts timestamptz, level text, service text, message text, context jsonb). Context is usually 3-8 KB of request metadata, message is a stack trace now and then. Retention is 14 days, a cron job deletes older rows. Default TOAST compression is still pglz. Migration only, no essay.
+- role: assistant
+  content: |
+    ```sql
+    ALTER TABLE app_logs ALTER COLUMN context SET COMPRESSION lz4;
+    ALTER TABLE app_logs ALTER COLUMN message SET COMPRESSION lz4;
+
+    -- optional: make lz4 the default for new columns in this database
+    -- ALTER DATABASE logs SET default_toast_compression = 'lz4';
+    ```
+
+    Check that your build has lz4 (`SHOW default_toast_compression;` and `SELECT pg_column_compression(context) FROM app_logs LIMIT 5;` after new inserts). If Postgres was built without `--with-lz4`, the `ALTER` fails.
+
+    **Green Notes**
+    - **Fast codec for data that is compressed constantly** (reduces E and storage): every insert compresses `context` and `message`, and lz4 costs far less CPU per value than pglz. The data still shrinks, so there is less disk I/O and WAL.
+      https://patterns.greensoftware.foundation/development/data-handling/compress-stored-data
+    - **Only new values change.** Existing rows keep pglz. With 14-day retention they age out by themselves, so I skipped the table rewrite that would recompress them.
+    - **Only large columns.** Postgres compresses values only after they pass about 2 KB (the TOAST threshold), so `level`, `service` and short messages are not touched. I left them alone.
+    - *Not applied:* heavier codecs or app-side compression. The rows live for two weeks and are written all the time, so extra CPU per insert would cost more than the bytes it saves.
+verify:
+  static_only: PostgreSQL-specific DDL (lz4 TOAST compression), not runnable in SQLite

@@ -1,0 +1,118 @@
+id: gen-1-00056-estimate
+category: estimate
+language: javascript
+patterns:
+- builtin-functions
+- efficient-algorithm
+messages:
+- role: user
+  content: |
+    ```javascript
+    // summary stats for one detector file, ~5M readings per file, a few thousand files per night
+    // would rewriting the loops with built-ins save energy?
+    function summarize(samples) {
+      const n = samples.length;
+
+      let min = samples[0];
+      for (let i = 1; i < n; i++) {
+        if (samples[i] < min) min = samples[i];
+      }
+
+      let max = samples[0];
+      for (let i = 1; i < n; i++) {
+        if (samples[i] > max) max = samples[i];
+      }
+
+      let sum = 0;
+      for (let i = 0; i < n; i++) {
+        sum += samples[i];
+      }
+      const mean = sum / n;
+
+      let sq = 0;
+      for (let i = 0; i < n; i++) {
+        const d = samples[i] - mean;
+        sq += d * d;
+      }
+      const sd = Math.sqrt(sq / (n - 1));
+
+      const sorted = samples.slice().sort((a, b) => a - b);
+      const mid = Math.floor(n / 2);
+      const median = n % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+
+      return { min, max, mean, sd, median };
+    }
+    ```
+
+    ?
+- role: assistant
+  content: |
+    Probably not from swapping the loops for built-ins. I can't give you a number, and I have no measured figure for this case.
+
+    - Plain `for` loops over numbers are already well optimized by V8. `reduce` or `forEach` with a callback is not cheaper than your loops.
+    - `Math.min(...samples)` and `Math.max(...samples)` are worse. With millions of values the spread throws a `RangeError` (too many arguments).
+
+    The cost in your function is elsewhere:
+
+    - **The sort.** `slice()` copies 5M boxed numbers, then a comparator sort runs a JS callback on every comparison, `O(n log n)` times. This is by far the biggest part.
+    - **Four passes over the data** where the first three can be one.
+
+    Same results, less work:
+
+    ```javascript
+    function summarize(samples) {
+      const n = samples.length;
+
+      let min = samples[0];
+      let max = samples[0];
+      let sum = 0;
+      for (let i = 0; i < n; i++) {
+        const v = samples[i];
+        if (v < min) min = v;
+        if (v > max) max = v;
+        sum += v;
+      }
+      const mean = sum / n;
+
+      let sq = 0;
+      for (let i = 0; i < n; i++) {
+        const d = samples[i] - mean;
+        sq += d * d;
+      }
+      const sd = Math.sqrt(sq / (n - 1));
+
+      // Typed array sort is numeric by default and needs no comparator callback.
+      const sorted = Float64Array.from(samples).sort();
+      const mid = Math.floor(n / 2);
+      const median = n % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+
+      return { min, max, mean, sd, median };
+    }
+    ```
+
+    **Green Notes**
+    - **Fewer passes** (reduces E): min, max and sum share one loop, so the data is read once instead of three times. Arithmetic order is unchanged, so `mean` and `sd` are identical.
+    - **Numeric typed-array sort** (reduces E): no comparator call per comparison, and a compact `Float64Array` copy instead of a boxed array. The median is the same.
+    - *Not applied:* replacing the loops with `reduce` or `Math.max(...)`. No gain, and the spread form can crash on large inputs.
+
+    **How to measure it:** take one representative file and run the old and new version in separate `node` processes, many times each. Compare CPU time with `perf stat` (or `time`), and profile with `node --cpu-prof` to see how much of the run the sort takes. For energy, run both as usage scenarios in the Green Metrics Tool. Then multiply the per-file difference by your nightly file count.
+
+    If you only need the median and the files keep growing, a selection algorithm (quickselect) avoids the full sort. That is a bigger change, so measure first.
+verify:
+  equivalence:
+    driver: |
+      let seed = 12345;
+      function rnd() {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        return seed / 2147483648;
+      }
+      const odd = [];
+      for (let i = 0; i < 20001; i++) odd.push(Math.round(rnd() * 100000) / 100 - 500);
+      const even = odd.slice(0, 20000);
+      console.log(JSON.stringify(summarize(odd)));
+      console.log(JSON.stringify(summarize(even)));
+      console.log(JSON.stringify(summarize([5, 1, 3])));
+  test: |-
+    const r = summarize([4, 1, 3, 2]);
+    console.assert(r.min === 1 && r.max === 4 && r.mean === 2.5 && r.median === 2.5);
+    console.assert(Math.abs(r.sd - Math.sqrt(5 / 3)) < 1e-12);

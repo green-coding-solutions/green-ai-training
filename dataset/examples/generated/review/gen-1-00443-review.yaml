@@ -1,0 +1,170 @@
+id: gen-1-00443-review
+category: review
+language: html
+patterns:
+- dom-size
+messages:
+- role: user
+  content: |
+    fix this, tab freezes when I open the attention page
+
+    ```html
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>Attention viewer</title>
+      <style>
+        .head { display: inline-block; margin: 4px; }
+        .row { display: flex; }
+        .cell { width: 2px; height: 2px; }
+      </style>
+    </head>
+    <body>
+      <h2>Attention maps</h2>
+      <select id="layer"></select>
+      <div id="maps"></div>
+      <script>
+        const maps = document.getElementById("maps");
+        const select = document.getElementById("layer");
+
+        async function load() {
+          const res = await fetch("/api/attention?run=latest");
+          const data = await res.json(); // data.layers[layer][head] = 128x128 numbers in 0..1
+          data.layers.forEach((_, i) => select.add(new Option("Layer " + i, i)));
+          data.layers.forEach((layer, l) => {
+            let html = `<div class="layer" id="layer-${l}" style="display:${l === 0 ? "block" : "none"}">`;
+            layer.forEach((head, h) => {
+              html += `<div class="head"><div>L${l} H${h}</div>`;
+              head.forEach((row, y) => {
+                html += `<div class="row">`;
+                row.forEach((v, x) => {
+                  html += `<div class="cell" title="${y},${x}: ${v.toFixed(3)}" style="background:rgba(0,0,255,${v})"></div>`;
+                });
+                html += `</div>`;
+              });
+              html += `</div>`;
+            });
+            html += `</div>`;
+            maps.innerHTML += html;
+          });
+        }
+
+        select.onchange = () => {
+          document.querySelectorAll(".layer").forEach((el) => (el.style.display = "none"));
+          document.getElementById("layer-" + select.value).style.display = "block";
+        };
+
+        load();
+      </script>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    **Workload:** web frontend (model inspection tool)
+
+    #### [High] One DOM node per matrix value
+    - **Where:** the `.cell` div inside the `row.forEach` loop
+    - **Issue:** every attention weight becomes a `div` with its own `title` and inline style. For 12 layers × 12 heads × 128×128 weights (the shape in your comment, assuming 12 × 12), that is about 2.4 million cell nodes plus about 18,000 row nodes. Parsing, style calculation and layout all scale with that count, and so does memory.
+    - **Fix:** draw each head on one `<canvas>`, one pixel per weight. A head is then one element, not about 16,500.
+    - **Impact:** reduces E (CPU and memory in the browser) from O(nodes) to O(1) elements per head. The pixel work is still O(weights), but it is a plain loop with no layout.
+    - **Pattern:** https://patterns.greensoftware.foundation/development/web-performance/avoid-excessive-dom-size
+
+    #### [High] All layers are built, but only one is shown
+    - **Where:** `data.layers.forEach` builds every layer; `display: none` hides them
+    - **Issue:** hidden nodes still exist in the DOM and still cost memory and parse time. Eleven of the twelve layers are never visible at load.
+    - **Fix:** render only the selected layer, and re-render on change.
+
+    #### [Medium] `innerHTML +=` inside the loop
+    - **Where:** `maps.innerHTML += html`
+    - **Issue:** each `+=` serializes all existing DOM, appends the string and parses everything again. Earlier layers are re-created every time, so the work grows quadratically with the layer count.
+    - **Fix:** with one layer rendered at a time, use `replaceChildren` and never re-parse existing nodes.
+
+    #### [Bug] No check on the fetch response
+    - **Where:** `await res.json()`
+    - **Issue:** on a 404 or 500 the error body is parsed as data, and `data.layers.forEach` throws with an unclear message.
+    - **Fix:** check `res.ok` first.
+
+    ```html
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>Attention viewer</title>
+      <style>
+        .head { display: inline-block; margin: 4px; }
+        canvas { width: 256px; height: 256px; image-rendering: pixelated; }
+        #info { height: 1.5em; font-family: monospace; }
+      </style>
+    </head>
+    <body>
+      <h2>Attention maps</h2>
+      <select id="layer"></select>
+      <div id="info"></div>
+      <div id="maps"></div>
+      <script>
+        const maps = document.getElementById("maps");
+        const select = document.getElementById("layer");
+        const info = document.getElementById("info");
+        let layers = [];
+
+        function drawHead(head, label) {
+          const n = head.length;
+          const canvas = document.createElement("canvas");
+          canvas.width = n;
+          canvas.height = n;
+          const img = canvas.getContext("2d").createImageData(n, n);
+          for (let y = 0; y < n; y++) {
+            for (let x = 0; x < n; x++) {
+              const shade = 255 - Math.round(head[y][x] * 255); // white to blue
+              const i = (y * n + x) * 4;
+              img.data[i] = shade;
+              img.data[i + 1] = shade;
+              img.data[i + 2] = 255;
+              img.data[i + 3] = 255;
+            }
+          }
+          canvas.getContext("2d").putImageData(img, 0, 0);
+          canvas.addEventListener("mousemove", (e) => {
+            const r = canvas.getBoundingClientRect();
+            const x = Math.min(n - 1, Math.floor(((e.clientX - r.left) / r.width) * n));
+            const y = Math.min(n - 1, Math.floor(((e.clientY - r.top) / r.height) * n));
+            info.textContent = `${label} ${y},${x}: ${head[y][x].toFixed(3)}`;
+          });
+          const box = document.createElement("div");
+          box.className = "head";
+          const title = document.createElement("div");
+          title.textContent = label;
+          box.append(title, canvas);
+          return box;
+        }
+
+        function showLayer(l) {
+          maps.replaceChildren(...layers[l].map((head, h) => drawHead(head, `L${l} H${h}`)));
+        }
+
+        async function load() {
+          const res = await fetch("/api/attention?run=latest");
+          if (!res.ok) {
+            maps.textContent = "Could not load attention data (" + res.status + ")";
+            return;
+          }
+          layers = (await res.json()).layers;
+          layers.forEach((_, i) => select.add(new Option("Layer " + i, i)));
+          showLayer(0);
+        }
+
+        select.onchange = () => showLayer(Number(select.value));
+
+        load();
+      </script>
+    </body>
+    </html>
+    ```
+
+    The hover tooltip now shows in the `#info` line instead of a native `title` per cell. The canvas draws one pixel per weight and is scaled up with `image-rendering: pixelated`, so the look is the same.
+
+    **Already good:** the data is fetched once and the layer switch needs no new request.
+verify:
+  static_only: browser DOM and canvas code that needs a real browser and a backend API

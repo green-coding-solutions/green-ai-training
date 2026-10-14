@@ -1,0 +1,182 @@
+id: gen-1-00486-review
+category: review
+language: python
+patterns:
+- vectorize-or-jit
+- efficient-algorithm
+messages:
+- role: user
+  content: |
+    Can you review the core of my frame post-processing script? It runs every night over the raw dumps from our line-scan camera. One file is around 600 frames of 640x480, 8-bit grayscale, and we get a few files per night. I left out the argparse wrapper.
+
+    Requirements:
+    - Output must stay byte-identical to what it produces now for normal settings, because QA diffs the files against old runs.
+    - Keep the function names, signatures and the printed lines.
+    - numpy is already installed on the box. I don't want other new dependencies.
+
+    ```python
+    import sys
+
+
+    def load_frames(path, width, height):
+        frame_size = width * height
+        with open(path, "rb") as f:
+            data = f.read()
+        if len(data) % frame_size:
+            raise ValueError(f"{path}: size is not a multiple of {width}x{height}")
+        return [data[i:i + frame_size] for i in range(0, len(data), frame_size)]
+
+
+    def stretch_frame(frame, gamma, low_pct, high_pct):
+        pixels = sorted(frame)
+        lo = pixels[int(len(pixels) * low_pct / 100)]
+        hi = pixels[min(len(pixels) - 1, int(len(pixels) * high_pct / 100))]
+        if hi == lo:
+            return bytes(frame)
+        out = bytearray(len(frame))
+        for i in range(len(frame)):
+            v = (frame[i] - lo) / (hi - lo)
+            if v < 0.0:
+                v = 0.0
+            elif v > 1.0:
+                v = 1.0
+            out[i] = int(round(v ** (1.0 / gamma) * 255))
+        return bytes(out)
+
+
+    def process(src, dst, width, height, gamma=0.8, low_pct=1.0, high_pct=99.0):
+        frames = load_frames(src, width, height)
+        with open(dst, "wb") as out:
+            for n, frame in enumerate(frames):
+                result = stretch_frame(frame, gamma, low_pct, high_pct)
+                out.write(result)
+                print(f"frame {n}: mean {sum(result) / len(result):.2f}")
+        print(f"{len(frames)} frames written to {dst}")
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly batch, CPU-bound)
+
+    #### [Bug] No validation of `gamma` and the percentiles
+    - **Where:** `process` / `stretch_frame`
+    - **Issue:** `gamma=0` fails with `ZeroDivisionError` at the first frame, after the input is already loaded. `low_pct=100` raises `IndexError`. A negative `low_pct` silently picks a pixel from the end of the sorted list, so the stretch is wrong without any error.
+    - **Fix:** check the arguments at the top of `process`, before reading the file (see the code below).
+
+    #### [High] Per-pixel Python loop
+    - **Where:** the `for i in range(len(frame))` loop in `stretch_frame`
+    - **Issue:** every frame runs 307,200 iterations with a division, a float power and a `round`, all in the interpreter. The result for a pixel depends only on its value (0-255) and on `lo`/`hi`. So only 256 different results exist per frame, and you compute them 307,200 times.
+    - **Fix:** build a 256-entry lookup table with the same scalar formula, then apply it with one numpy indexing operation. Because the table uses the same expression as before, the output stays byte-identical.
+    - **Impact:** reduces E on every frame of every file. Work per frame drops from about 300k interpreted iterations to 256 table entries plus one array operation.
+
+    #### [Medium] Full sort of every frame to find two percentiles
+    - **Where:** `pixels = sorted(frame)`
+    - **Issue:** this creates a 307k-element Python list and sorts it, just to read two values.
+    - **Fix:** 8-bit pixels have only 256 possible values. A histogram (`bincount`) with a cumulative sum gives the same k-th smallest value in one linear pass in C.
+    - **Impact:** reduces E per frame, no extra memory for the list.
+
+    #### [Low] Per-frame copies and Python-level mean
+    - **Where:** `load_frames` slicing, `sum(result)`
+    - **Issue:** each slice copies the frame, and `sum()` walks 307k Python ints just for a log line.
+    - **Fix:** one `uint8` array reshaped to `(frames, width*height)`, and `result.sum()`.
+
+    **Already good:** frames are written one at a time, and the clamp to `[0, 1]` is correct.
+
+    ```python
+    import numpy as np
+
+
+    def load_frames(path, width, height):
+        frame_size = width * height
+        data = np.fromfile(path, dtype=np.uint8)
+        if data.size % frame_size:
+            raise ValueError(f"{path}: size is not a multiple of {width}x{height}")
+        return data.reshape(-1, frame_size)
+
+
+    def build_lut(lo, hi, gamma):
+        inv = 1.0 / gamma
+        span = hi - lo
+        lut = np.empty(256, dtype=np.uint8)
+        for p in range(256):
+            v = min(1.0, max(0.0, (p - lo) / span))
+            lut[p] = int(round(v ** inv * 255))
+        return lut
+
+
+    def stretch_frame(frame, gamma, low_pct, high_pct):
+        n = frame.size
+        cum = np.cumsum(np.bincount(frame, minlength=256))
+        # value at sorted index k = first value whose cumulative count is > k
+        lo = int(np.searchsorted(cum, int(n * low_pct / 100), side="right"))
+        hi = int(np.searchsorted(cum, min(n - 1, int(n * high_pct / 100)), side="right"))
+        if hi == lo:
+            return frame
+        return build_lut(lo, hi, gamma)[frame]
+
+
+    def process(src, dst, width, height, gamma=0.8, low_pct=1.0, high_pct=99.0):
+        if gamma <= 0:
+            raise ValueError("gamma must be > 0")
+        if not 0 <= low_pct < high_pct <= 100:
+            raise ValueError("need 0 <= low_pct < high_pct <= 100")
+        frames = load_frames(src, width, height)
+        with open(dst, "wb") as out:
+            for n, frame in enumerate(frames):
+                result = stretch_frame(frame, gamma, low_pct, high_pct)
+                out.write(result.tobytes())
+                print(f"frame {n}: mean {int(result.sum()) / result.size:.2f}")
+        print(f"{len(frames)} frames written to {dst}")
+    ```
+
+    Numba is not needed here. Once the work is a 256-entry table, plain numpy is enough. The new validation only rejects inputs that crashed or gave wrong output before, so valid settings behave as before. You can check with your QA diff on one old file.
+verify:
+  test: |
+    f = np.array([0, 10, 20, 30, 40, 50, 60, 70, 80, 90] * 10, dtype=np.uint8)
+    out = stretch_frame(f, 1.0, 0, 100)
+    assert out.dtype == np.uint8
+    assert int(out.min()) == 0 and int(out.max()) == 255
+    flat = np.full(50, 7, dtype=np.uint8)
+    assert stretch_frame(flat, 0.8, 1.0, 99.0).tolist() == flat.tolist()
+    try:
+        process("nope.raw", "out.raw", 4, 4, gamma=0)
+        raise SystemExit("expected ValueError")
+    except ValueError:
+        pass
+  equivalence:
+    driver: |
+      import os, tempfile, hashlib
+      os.chdir(tempfile.mkdtemp())
+      w, h = 64, 48
+      state = 12345
+      buf = bytearray()
+      for f in range(6):
+          for i in range(w * h):
+              state = (state * 1103515245 + 12345) % 2**31
+              if f == 3:
+                  buf.append(100)
+              elif f == 4:
+                  buf.append(80 + (state >> 8) % 40)
+              else:
+                  buf.append((state >> 8) % 256)
+      with open("in.raw", "wb") as fh:
+          fh.write(bytes(buf))
+      process("in.raw", "out.raw", w, h)
+      process("in.raw", "out2.raw", w, h, gamma=2.2, low_pct=5, high_pct=95)
+      for name in ("out.raw", "out2.raw"):
+          with open(name, "rb") as fh:
+              print(hashlib.sha256(fh.read()).hexdigest())
+  benchmark:
+    driver: |
+      import os, tempfile
+      os.chdir(tempfile.mkdtemp())
+      w, h = 320, 240
+      state = 99
+      buf = bytearray()
+      for f in range(5):
+          for i in range(w * h):
+              state = (state * 1103515245 + 12345) % 2**31
+              buf.append((state >> 8) % 256)
+      with open("in.raw", "wb") as fh:
+          fh.write(bytes(buf))
+      process("in.raw", "out.raw", w, h)
+    min_speedup: 1.5

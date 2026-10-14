@@ -1,0 +1,107 @@
+id: gen-1-00286-review
+category: review
+language: java
+patterns:
+- string-join
+messages:
+- role: user
+  content: |
+    review pls, csv to json tool for our import folder, files get big
+
+    ```java
+    import java.io.IOException;
+    import java.nio.file.Files;
+    import java.nio.file.Path;
+    import java.util.List;
+
+    public class CsvToJson {
+        public static void main(String[] args) throws IOException {
+            List<String> lines = Files.readAllLines(Path.of(args[0]));
+            String[] header = lines.get(0).split(",");
+
+            String out = "[";
+            for (int i = 1; i < lines.size(); i++) {
+                String[] cols = lines.get(i).split(",");
+                String obj = "{";
+                for (int j = 0; j < header.length; j++) {
+                    obj += "\"" + header[j] + "\":\"" + cols[j] + "\"";
+                    if (j < header.length - 1) {
+                        obj += ",";
+                    }
+                }
+                obj += "}";
+                out += obj;
+                if (i < lines.size() - 1) {
+                    out += ",\n";
+                }
+            }
+            out += "]";
+            System.out.println(out);
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (CLI, batch over large files)
+
+    #### [Bug] Crashes on short rows and breaks on quotes
+    - **Where:** `cols[j]` and `"\"" + cols[j] + "\""`
+    - **Issue:** `split(",")` drops trailing empty fields, so a row like `a,b,` has 2 columns, not 3. Then `cols[j]` throws `ArrayIndexOutOfBoundsException`. Values with `"` or `\` also produce invalid JSON.
+    - **Fix:** use `split(",", -1)` to keep empty fields, treat missing columns as empty, and escape `\` and `"`. Quoted CSV fields with commas are still not supported. Use a CSV parser if your files have them.
+
+    #### [High] Output string rebuilt on every row
+    - **Where:** `out += obj;` and `out += ",\n";` in the outer loop
+    - **Issue:** a Java `String` is immutable. Each `+=` copies the whole `out` so far into a new string. For a file with many rows, the total copying grows with rows², and it creates a lot of garbage for the GC.
+    - **Fix:** append to one `StringBuilder`. Each piece is copied once, so the work is linear in the output size.
+    - **Impact:** reduces E (CPU and GC work) from O(n²) to O(n) in the output size. The cost grows with file size, so it matters most for your big files.
+
+    #### [Low] Per-row temporary strings
+    - **Where:** `obj += ...` in the inner loop
+    - **Issue:** `obj` is small, so the copying is cheap. It still adds a temporary string per row.
+    - **Fix:** write straight into the same builder. This is covered in the code below.
+
+    ```java
+    import java.io.IOException;
+    import java.nio.file.Files;
+    import java.nio.file.Path;
+    import java.util.List;
+
+    public class CsvToJson {
+        public static void main(String[] args) throws IOException {
+            List<String> lines = Files.readAllLines(Path.of(args[0]));
+            String[] header = lines.get(0).split(",", -1);
+
+            StringBuilder out = new StringBuilder("[");
+            for (int i = 1; i < lines.size(); i++) {
+                String[] cols = lines.get(i).split(",", -1);
+                if (i > 1) {
+                    out.append(",\n");
+                }
+                out.append('{');
+                for (int j = 0; j < header.length; j++) {
+                    if (j > 0) {
+                        out.append(',');
+                    }
+                    String value = j < cols.length ? cols[j] : "";
+                    out.append('"').append(escape(header[j])).append("\":\"")
+                       .append(escape(value)).append('"');
+                }
+                out.append('}');
+            }
+            out.append(']');
+            System.out.println(out);
+        }
+
+        private static String escape(String s) {
+            return s.replace("\\", "\\\\").replace("\"", "\\\"");
+        }
+    }
+    ```
+
+    Output is the same for valid input, except that short rows now give empty strings instead of crashing, and special characters are escaped.
+
+    **Already good:** the comma handling is correct, with no trailing comma after the last object.
+
+    If the files get much bigger than memory allows, read with `Files.newBufferedReader` and write each object to a `BufferedWriter` as you go. That also avoids holding the whole file and the whole output at once.
+verify:
+  static_only: Java source; no JDK-based runner in the verify pipeline

@@ -1,0 +1,101 @@
+id: gen-1-00172-review
+category: review
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    hi, i am new to python and wrote this for our CI. it compares the file hashes of the last build with the current ones and decides what must be rebuilt. it works but i feel something is wrong with it, can you look? the repo is big (about 200k files) and on feature branches the old cache is usually almost empty
+
+    ```python
+    import json
+
+
+    def load_hashes(path):
+        with open(path) as f:
+            return json.load(f)
+
+
+    def plan_rebuild(current, previous):
+        """current / previous: {file_path: sha256}"""
+        to_build = []
+        skipped = 0
+        for path, digest in current.items():
+            try:
+                old = previous[path]
+                if old == digest:
+                    skipped += 1
+                else:
+                    to_build.append(path)
+            except:
+                to_build.append(path)
+        return to_build, skipped
+
+
+    def write_plan(to_build, out_path):
+        with open(out_path, "w") as f:
+            for p in sorted(to_build):
+                f.write(p + "\n")
+    ```
+- role: assistant
+  content: |
+    **Workload:** CI/CD script (runs on every pipeline)
+
+    #### [Bug] Bare `except:` hides real errors
+    - **Where:** `plan_rebuild`, the `except:` branch
+    - **Issue:** a bare `except:` catches everything, not only a missing key. A typo in the code or a `KeyboardInterrupt` (Ctrl+C) would also end up as "rebuild this file". The pipeline would then quietly rebuild everything and never show the real error.
+    - **Fix:** don't use exceptions here at all (see next finding). If you ever do need `try`, catch `KeyError` only.
+
+    #### [Medium] A missing key is expected, but it is handled with an exception
+    - **Where:** `previous[path]` inside `try`
+    - **Issue:** on feature branches most paths are not in the old cache, so most lookups raise `KeyError`. Raising and catching is the expensive part of `try/except`. A normal "is it in the dict?" check costs much less.
+    - **Fix:** check with `in`. The result stays the same.
+    - **Impact:** reduces E on every pipeline run, per file. In Green Metrics Tool micro-benchmarks with 10,000,000 dict lookups where about half the keys were missing, `dict.get` used about 12% less CPU energy than `try/except KeyError` ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=4753302a-710f-4132-8001-9da3ba960d13,d7ded3f2-f9e7-4781-905e-9782a8305b8f,8f054455-adbc-402d-b593-0191d1061cd8)). When misses are rare, `try/except` is cheap, so this matters most on your almost-empty cache.
+
+    ```python
+    import json
+
+
+    def load_hashes(path):
+        with open(path) as f:
+            return json.load(f)
+
+
+    def plan_rebuild(current, previous):
+        """current / previous: {file_path: sha256}"""
+        to_build = []
+        skipped = 0
+        for path, digest in current.items():
+            if path in previous and previous[path] == digest:
+                skipped += 1
+            else:
+                to_build.append(path)
+        return to_build, skipped
+
+
+    def write_plan(to_build, out_path):
+        with open(out_path, "w") as f:
+            for p in sorted(to_build):
+                f.write(p + "\n")
+    ```
+
+    **Already good:** one pass over `current`, no repeated scans, and the plan file is written line by line.
+verify:
+  equivalence:
+    driver: |
+      current = {f"src/mod{i}.py": f"h{i % 7}" for i in range(50)}
+      current["src/none.py"] = None
+      previous = {f"src/mod{i}.py": f"h{i % 5}" for i in range(0, 50, 2)}
+      to_build, skipped = plan_rebuild(current, previous)
+      print(skipped)
+      print(to_build)
+      print(plan_rebuild({}, {}))
+      print(plan_rebuild({"a": "x"}, {}))
+      print(plan_rebuild({"a": "x"}, {"a": "x"}))
+  test: |-
+    assert plan_rebuild({"a": "1", "b": "2"}, {"a": "1"}) == (["b"], 1)
+    assert plan_rebuild({"a": "2"}, {"a": "1"}) == (["a"], 0)
+    assert plan_rebuild({}, {"a": "1"}) == ([], 0)

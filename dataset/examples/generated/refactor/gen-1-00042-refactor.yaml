@@ -1,0 +1,114 @@
+id: gen-1-00042-refactor
+category: refactor
+language: python
+patterns:
+- set-membership
+- builtin-functions
+messages:
+- role: user
+  content: |
+    ```python
+    #!/usr/bin/env python3
+    import sys
+
+    def load_lines(path):
+        with open(path) as f:
+            return [line.strip().lower() for line in f if line.strip()]
+
+    def main():
+        subscribers = load_lines(sys.argv[1])
+        unsubscribed = load_lines(sys.argv[2])
+
+        clean = []
+        for email in subscribers:
+            if email not in unsubscribed and email not in clean:
+                clean.append(email)
+
+        domains = {}
+        for email in clean:
+            domain = email.split("@")[-1]
+            if domain in domains:
+                domains[domain] = domains[domain] + 1
+            else:
+                domains[domain] = 1
+
+        top = []
+        for d in domains:
+            top.append((d, domains[d]))
+        top.sort(key=lambda x: x[1], reverse=True)
+
+        for email in clean:
+            print(email)
+        print("---")
+        for d, n in top[:5]:
+            print(d, n)
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```python
+    #!/usr/bin/env python3
+    import sys
+    from collections import Counter
+
+    def load_lines(path):
+        with open(path) as f:
+            return [line.strip().lower() for line in f if line.strip()]
+
+    def main():
+        subscribers = load_lines(sys.argv[1])
+        unsubscribed = set(load_lines(sys.argv[2]))
+
+        # dict.fromkeys drops duplicates and keeps first-seen order
+        clean = [e for e in dict.fromkeys(subscribers) if e not in unsubscribed]
+
+        domains = Counter(e.split("@")[-1] for e in clean)
+
+        for email in clean:
+            print(email)
+        print("---")
+        for d, n in domains.most_common(5):
+            print(d, n)
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **Set for the unsubscribe list** (reduces E): the list is checked once per subscriber. A list makes each check a scan, so the work grows with subscribers × unsubscribed. A set makes each check O(1). It pays off here only because the lookups repeat. For a single lookup, building the set would cost more than one scan.
+    - **`dict.fromkeys` for de-duplication** (reduces E): `email not in clean` scanned the growing result list for every address, which is O(n²). Now it is one pass, and the first-seen order is kept.
+    - **`Counter` and `most_common`** (reduces E): this replaces the hand-written count loop, the tuple list and the manual sort. It is less code, and the loop runs in C.
+    - The output is identical, including the order of the addresses and the order of domains with equal counts.
+verify:
+  module: true
+  equivalence:
+    driver: |
+      import os, sys, tempfile
+      d = tempfile.mkdtemp()
+      subs = []
+      for i in range(600):
+          subs.append(f"User{i % 250}@{['a.com', 'b.org', 'c.net', 'd.io', 'e.dev', 'f.co', 'g.me'][i % 7]}\n")
+      subs.append("\n")
+      subs.append("  spaced@a.com  \n")
+      unsub = [f"user{i}@{['a.com', 'b.org', 'c.net', 'd.io', 'e.dev', 'f.co', 'g.me'][i % 7]}\n" for i in range(0, 250, 5)]
+      with open(os.path.join(d, "subs.txt"), "w") as f:
+          f.writelines(subs)
+      with open(os.path.join(d, "unsub.txt"), "w") as f:
+          f.writelines(unsub)
+      sys.argv = ["prog", os.path.join(d, "subs.txt"), os.path.join(d, "unsub.txt")]
+      main()
+  benchmark:
+    driver: |
+      import os, sys, tempfile
+      d = tempfile.mkdtemp()
+      with open(os.path.join(d, "subs.txt"), "w") as f:
+          f.writelines(f"user{i % 6000}@host{i % 13}.com\n" for i in range(9000))
+      with open(os.path.join(d, "unsub.txt"), "w") as f:
+          f.writelines(f"user{i}@host{i % 13}.com\n" for i in range(0, 6000, 3))
+      sys.argv = ["prog", os.path.join(d, "subs.txt"), os.path.join(d, "unsub.txt")]
+      main()
+    min_speedup: 5

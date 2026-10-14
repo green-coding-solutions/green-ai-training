@@ -1,0 +1,157 @@
+id: gen-1-00297-review
+category: review
+language: python
+patterns:
+- keep-star-imports
+- set-membership
+- batch-db-writes
+- string-join
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    Please review this loader from our nightly order ETL. Requirements: it must stay idempotent (re-running the same CSV must not create duplicates), it only uses the stdlib, and it must keep returning the `(loaded, skipped, report)` tuple because our scheduler logs it. The nightly file has about 200k rows, and the job has become much slower as the table grew.
+
+    Our linter also complains about the star imports at the top. Someone said they cost extra at runtime. Should I change them?
+
+    ```python
+    import logging
+    from csv import *
+    from sqlite3 import *
+    from os.path import *
+
+    log = logging.getLogger("load_orders")
+
+
+    def load_orders(csv_path, db_path):
+        if not exists(csv_path):
+            raise FileNotFoundError(csv_path)
+
+        conn = connect(db_path)
+        cur = conn.cursor()
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS orders ("
+            "order_id TEXT PRIMARY KEY, customer TEXT, amount REAL, country TEXT)"
+        )
+
+        seen = [r[0] for r in cur.execute("SELECT order_id FROM orders")]
+        loaded = 0
+        skipped = 0
+        report = ""
+
+        with open(csv_path, newline="") as f:
+            for row in DictReader(f):
+                if row["order_id"] in seen:
+                    skipped += 1
+                    continue
+                cur.execute(
+                    "INSERT INTO orders VALUES (?, ?, ?, ?)",
+                    (row["order_id"], row["customer"].strip(),
+                     float(row["amount"]), row["country"].upper()),
+                )
+                conn.commit()
+                seen.append(row["order_id"])
+                loaded += 1
+                report += "loaded %s\n" % row["order_id"]
+
+        conn.close()
+        log.info("orders loaded=%d skipped=%d", loaded, skipped)
+        return loaded, skipped, report
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly batch, ~200k rows, growing table)
+
+    #### [High] Membership test on a list, once per row
+    - **Where:** `seen = [...]`, `row["order_id"] in seen`, `seen.append(...)`
+    - **Issue:** every `in` scans the whole list. The list holds all existing ids plus the new ones, so the work grows with rows × table size. That explains why the job slows down as the table grows. Here the lookups are repeated for every row, so a set pays off.
+    - **Fix:** build `seen` as a set once. Lookups become O(1).
+
+    #### [High] One commit per row
+    - **Where:** `conn.commit()` inside the loop
+    - **Issue:** each commit forces a disk sync, so 200k rows mean 200k syncs. This is the biggest cost of the job after the list scan.
+    - **Fix:** collect rows and write them with `executemany` in batches of a few thousand, inside one transaction.
+    - **Behavior change:** a bad row (for example a non-numeric `amount`) now rolls back the whole run instead of leaving a half-loaded table. Re-running stays safe, because ids already loaded are skipped.
+
+    #### [Medium] Report string built with `+=`
+    - **Where:** `report += ...`
+    - **Issue:** repeated concatenation can copy the growing string again and again, up to 200k times. Collect the lines in a list and join once at the end.
+
+    #### [Low] Connection is not closed on errors
+    - **Where:** `conn.close()` at the end
+    - **Fix:** `try/finally`. `with conn:` handles commit and rollback.
+
+    #### Star imports: leave them
+    Do not change them for energy reasons. In Green Metrics Tool micro-benchmarks, `from x import *` and `import x` showed no measurable energy difference. Changing them would only be a style choice. If the linter noise bothers you, add a `# noqa: F403` comment. I left them as they are below.
+
+    ```python
+    import logging
+    from csv import *
+    from sqlite3 import *
+    from os.path import *
+
+    log = logging.getLogger("load_orders")
+
+    BATCH = 5000
+    INSERT = "INSERT INTO orders VALUES (?, ?, ?, ?)"
+
+
+    def load_orders(csv_path, db_path):
+        if not exists(csv_path):
+            raise FileNotFoundError(csv_path)
+
+        conn = connect(db_path)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS orders ("
+                    "order_id TEXT PRIMARY KEY, customer TEXT, amount REAL, country TEXT)"
+                )
+                seen = {r[0] for r in conn.execute("SELECT order_id FROM orders")}
+                loaded = 0
+                skipped = 0
+                report = []
+                batch = []
+
+                with open(csv_path, newline="") as f:
+                    for row in DictReader(f):
+                        oid = row["order_id"]
+                        if oid in seen:
+                            skipped += 1
+                            continue
+                        seen.add(oid)
+                        batch.append((oid, row["customer"].strip(),
+                                      float(row["amount"]), row["country"].upper()))
+                        report.append("loaded %s\n" % oid)
+                        loaded += 1
+                        if len(batch) >= BATCH:
+                            conn.executemany(INSERT, batch)
+                            batch.clear()
+
+                if batch:
+                    conn.executemany(INSERT, batch)
+        finally:
+            conn.close()
+
+        log.info("orders loaded=%d skipped=%d", loaded, skipped)
+        return loaded, skipped, "".join(report)
+    ```
+
+    The return value is the same as before. Duplicates inside one file are still skipped, because `seen` is updated as rows are read.
+
+    **Already good:** the file is streamed with `DictReader` instead of being read into memory, and the insert uses parameters.
+verify:
+  test: |-
+    import os, tempfile
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "o.csv")
+    db = os.path.join(d, "o.db")
+    with open(p, "w", newline="") as f:
+        f.write("order_id,customer,amount,country\n")
+        f.write("A1, Ann ,10.5,de\nA2,Bob,3,us\nA1,Ann,10.5,de\n")
+    assert load_orders(p, db) == (2, 1, "loaded A1\nloaded A2\n")
+    assert load_orders(p, db) == (0, 3, "")
+    import sqlite3
+    rows = sqlite3.connect(db).execute("SELECT * FROM orders ORDER BY order_id").fetchall()
+    assert rows == [("A1", "Ann", 10.5, "DE"), ("A2", "Bob", 3.0, "US")]

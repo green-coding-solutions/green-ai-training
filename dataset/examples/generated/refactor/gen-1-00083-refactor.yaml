@@ -1,0 +1,87 @@
+id: gen-1-00083-refactor
+category: refactor
+language: sql
+patterns:
+- batch-db-writes
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    ```sql
+    DO $$
+    DECLARE
+        r record;
+        n integer := 0;
+    BEGIN
+        FOR r IN
+            SELECT request_id, model_version, label, score, scored_at
+            FROM scoring_raw
+            WHERE processed = false
+            ORDER BY scored_at
+        LOOP
+            IF r.score IS NULL THEN
+                CONTINUE;
+            END IF;
+
+            INSERT INTO predictions (request_id, model_version, label, score, confidence_band, scored_at)
+            VALUES (
+                r.request_id,
+                r.model_version,
+                r.label,
+                r.score,
+                CASE
+                    WHEN r.score >= 0.9 THEN 'high'
+                    WHEN r.score >= 0.6 THEN 'medium'
+                    ELSE 'low'
+                END,
+                r.scored_at
+            )
+            ON CONFLICT (request_id, model_version) DO NOTHING;
+
+            n := n + 1;
+        END LOOP;
+
+        UPDATE scoring_raw SET processed = true WHERE processed = false;
+
+        RAISE NOTICE 'inserted % predictions', n;
+    END $$;
+    ```
+
+    ?
+- role: assistant
+  content: |-
+    ```sql
+    WITH todo AS (
+        UPDATE scoring_raw
+        SET processed = true
+        WHERE processed = false
+        RETURNING request_id, model_version, label, score, scored_at
+    ),
+    ins AS (
+        INSERT INTO predictions (request_id, model_version, label, score, confidence_band, scored_at)
+        SELECT
+            request_id,
+            model_version,
+            label,
+            score,
+            CASE
+                WHEN score >= 0.9 THEN 'high'
+                WHEN score >= 0.6 THEN 'medium'
+                ELSE 'low'
+            END,
+            scored_at
+        FROM todo
+        WHERE score IS NOT NULL
+        ORDER BY scored_at
+        ON CONFLICT (request_id, model_version) DO NOTHING
+        RETURNING 1
+    )
+    SELECT count(*) AS inserted FROM ins;
+    ```
+
+    **Green Notes**
+    - **One set-based statement instead of a row loop** (reduces E): the old block ran one `INSERT` per scored row, each with its own plan, constraint check and index update. For N rows that is N statements. Now it is one `INSERT ... SELECT`, and the database writes all rows in a single pass.
+    - **Bug fix, rows could be lost:** the loop read `processed = false` rows first, and the final `UPDATE` marked every unprocessed row at that moment. A row that arrived during the loop was marked processed but never inserted. The `UPDATE ... RETURNING` now flags exactly the rows that get inserted, in the same statement.
+    - **Count is now correct:** `n` also counted rows skipped by `ON CONFLICT DO NOTHING`. The final `count(*)` reports only the rows actually inserted.
+    - **Same behavior otherwise:** rows with a `NULL` score are still marked processed and not inserted. `ORDER BY scored_at` keeps the earliest row when one `(request_id, model_version)` key appears twice in the same run.
+    - *Not applied:* `COPY`. The data is already in the database, so there is nothing to stream in from a client.

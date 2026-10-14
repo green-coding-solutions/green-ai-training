@@ -1,0 +1,71 @@
+id: gen-1-00488-review
+category: review
+language: go
+patterns:
+- compress-transmitted
+- regex-precompile
+messages:
+- role: user
+  content: "hello, I have small tool for our lab, it read the log file from the spectrometer and send the readings to our\
+    \ analysis server over the VPN. It work but is slow when the log is big (some days 500 MB) and the upload take long time.\
+    \ Can you review please? I am not so good in Go, sorry\n\n```go\npackage main\n\nimport (\n\t\"bufio\"\n\t\"bytes\"\n\t\
+    \"encoding/json\"\n\t\"fmt\"\n\t\"net/http\"\n\t\"os\"\n\t\"regexp\"\n\t\"strconv\"\n)\n\ntype Reading struct {\n\tChannel\
+    \ int     `json:\"channel\"`\n\tTime    string  `json:\"time\"`\n\tTemp    float64 `json:\"temp\"`\n\tCounts  float64\
+    \ `json:\"counts\"`\n}\n\nvar channels = []int{1, 2, 3, 4, 5, 6, 7, 8}\n\nfunc parseLog(path string) []Reading {\n\tf,\
+    \ _ := os.Open(path)\n\tsc := bufio.NewScanner(f)\n\tvar out []Reading\n\tfor sc.Scan() {\n\t\tline := sc.Text()\n\t\t\
+    for _, ch := range channels {\n\t\t\tre := regexp.MustCompile(fmt.Sprintf(`^(\\S+) ch=%d temp=([0-9.]+) counts=([0-9.]+)`,\
+    \ ch))\n\t\t\tm := re.FindStringSubmatch(line)\n\t\t\tif m == nil {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tt, _ := strconv.ParseFloat(m[2],\
+    \ 64)\n\t\t\tc, _ := strconv.ParseFloat(m[3], 64)\n\t\t\tout = append(out, Reading{ch, m[1], t, c})\n\t\t}\n\t}\n\treturn\
+    \ out\n}\n\nfunc upload(url string, rs []Reading) error {\n\tbody, _ := json.Marshal(rs)\n\tresp, err := http.Post(url,\
+    \ \"application/json\", bytes.NewReader(body))\n\tif err != nil {\n\t\treturn err\n\t}\n\tfmt.Println(\"status\", resp.Status)\n\
+    \treturn nil\n}\n\nfunc main() {\n\trs := parseLog(os.Args[1])\n\tif err := upload(os.Args[2], rs); err != nil {\n\t\t\
+    fmt.Println(\"error:\", err)\n\t}\n\tfmt.Println(\"sent\", len(rs), \"readings\")\n}\n```\n"
+- role: assistant
+  content: "**Workload:** data pipeline (script)\n\n#### [Bug] Errors are ignored, so failures look like success\n- **Where:**\
+    \ `os.Open`, `sc.Err()` (never checked), `json.Marshal`, and the response status in `upload`\n- **Issue:** if the file\
+    \ path is wrong, the tool sends an empty list and prints \"sent 0 readings\". `bufio.Scanner` also stops silently at the\
+    \ first line longer than 64 KB. A 500 error from the server is only printed as \"status\", and `main` still exits with\
+    \ code 0. The response body is never closed either.\n- **Fix:** return errors from `parseLog`, raise the scanner buffer\
+    \ limit, check `sc.Err()`, check the status code, and exit with a non-zero code on failure.\n\n#### [High] A new regex\
+    \ is compiled for every line and every channel\n- **Where:** `regexp.MustCompile(fmt.Sprintf(...))` inside the two loops\n\
+    - **Issue:** one compile for each channel for each line, so 8 compiles per line. Go has no internal cache for compiled\
+    \ patterns, so every compile is real work plus allocations and garbage. Most of these patterns can never match the line\
+    \ anyway.\n- **Fix:** the pattern only differs in the channel number. Compile one regex once at package level, capture\
+    \ the channel with `(\\d+)`, and check that it is 1 to 8. Each line is now matched once, not eight times. Since the channel\
+    \ is a number in a space-delimited field, one line can match only one channel, so the results stay the same.\n- **Impact:**\
+    \ E (CPU), per log line. It is the main cost for a big log.\n\n#### [High] The JSON body is sent uncompressed\n- **Where:**\
+    \ `json.Marshal` and `http.Post` in `upload`\n- **Issue:** the JSON repeats the keys `channel`, `time`, `temp`, `counts`\
+    \ for every reading, and the timestamps look very alike. This text compresses very well, and the upload goes over a VPN,\
+    \ so the bytes on the wire are what you wait for.\n- **Fix:** compress the body with `gzip` and send `Content-Encoding:\
+    \ gzip`. Use `gzip.BestSpeed`. The body is compressed once per run, and the slow codecs with a high level cost much more\
+    \ CPU for a small extra gain here. Also use `json.NewEncoder` straight into the gzip writer, so you do not hold the uncompressed\
+    \ JSON in memory as a second big copy.\n- **Pattern:** https://patterns.greensoftware.foundation/development/data-handling/compress-transmitted-data\n\
+    - **Impact:** network bytes and transfer time, per run. It costs some CPU, but much less than moving the bytes.\n\n####\
+    \ [Low] Default HTTP client has no timeout\n- **Where:** `http.Post`\n- **Fix:** use your own `http.Client` with a timeout,\
+    \ as below. A stuck upload will not hang forever.\n\n```go\npackage main\n\nimport (\n\t\"bufio\"\n\t\"bytes\"\n\t\"compress/gzip\"\
+    \n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"net/http\"\n\t\"os\"\n\t\"regexp\"\n\t\"strconv\"\n\t\"time\"\n)\n\ntype\
+    \ Reading struct {\n\tChannel int     `json:\"channel\"`\n\tTime    string  `json:\"time\"`\n\tTemp    float64 `json:\"\
+    temp\"`\n\tCounts  float64 `json:\"counts\"`\n}\n\nconst maxChannel = 8\n\nvar lineRe = regexp.MustCompile(`^(\\S+) ch=(\\\
+    d+) temp=([0-9.]+) counts=([0-9.]+)`)\n\nfunc parseLog(path string) ([]Reading, error) {\n\tf, err := os.Open(path)\n\t\
+    if err != nil {\n\t\treturn nil, err\n\t}\n\tdefer f.Close()\n\n\tsc := bufio.NewScanner(f)\n\tsc.Buffer(make([]byte,\
+    \ 0, 64*1024), 1024*1024)\n\tvar out []Reading\n\tfor sc.Scan() {\n\t\tm := lineRe.FindStringSubmatch(sc.Text())\n\t\t\
+    if m == nil {\n\t\t\tcontinue\n\t\t}\n\t\tch, err := strconv.Atoi(m[2])\n\t\tif err != nil || ch < 1 || ch > maxChannel\
+    \ {\n\t\t\tcontinue\n\t\t}\n\t\tt, err1 := strconv.ParseFloat(m[3], 64)\n\t\tc, err2 := strconv.ParseFloat(m[4], 64)\n\
+    \t\tif err1 != nil || err2 != nil {\n\t\t\tcontinue\n\t\t}\n\t\tout = append(out, Reading{ch, m[1], t, c})\n\t}\n\treturn\
+    \ out, sc.Err()\n}\n\nfunc upload(url string, rs []Reading) error {\n\tvar buf bytes.Buffer\n\tgz, err := gzip.NewWriterLevel(&buf,\
+    \ gzip.BestSpeed)\n\tif err != nil {\n\t\treturn err\n\t}\n\tif err := json.NewEncoder(gz).Encode(rs); err != nil {\n\t\
+    \treturn err\n\t}\n\tif err := gz.Close(); err != nil {\n\t\treturn err\n\t}\n\n\treq, err := http.NewRequest(http.MethodPost,\
+    \ url, &buf)\n\tif err != nil {\n\t\treturn err\n\t}\n\treq.Header.Set(\"Content-Type\", \"application/json\")\n\treq.Header.Set(\"\
+    Content-Encoding\", \"gzip\")\n\n\tclient := &http.Client{Timeout: 5 * time.Minute}\n\tresp, err := client.Do(req)\n\t\
+    if err != nil {\n\t\treturn err\n\t}\n\tdefer resp.Body.Close()\n\tio.Copy(io.Discard, resp.Body)\n\tif resp.StatusCode\
+    \ >= 300 {\n\t\treturn fmt.Errorf(\"upload failed: %s\", resp.Status)\n\t}\n\treturn nil\n}\n\nfunc main() {\n\tif len(os.Args)\
+    \ != 3 {\n\t\tfmt.Fprintln(os.Stderr, \"usage: specsend <logfile> <url>\")\n\t\tos.Exit(2)\n\t}\n\trs, err := parseLog(os.Args[1])\n\
+    \tif err != nil {\n\t\tfmt.Fprintln(os.Stderr, \"read error:\", err)\n\t\tos.Exit(1)\n\t}\n\tif err := upload(os.Args[2],\
+    \ rs); err != nil {\n\t\tfmt.Fprintln(os.Stderr, \"error:\", err)\n\t\tos.Exit(1)\n\t}\n\tfmt.Println(\"sent\", len(rs),\
+    \ \"readings\")\n}\n```\n\nTwo things to check:\n- Your analysis server must accept `Content-Encoding: gzip` on requests.\
+    \ Many servers only decompress responses by default, so ask who runs it, or add a small decompression middleware.\n- A\
+    \ number like `1.2.3` used to become `0` silently. Now such a line is skipped. If you need to keep these lines, say so\
+    \ and I will change it.\n\n**Already good:** a buffered `bufio.Scanner` reads the file line by line, so the log is not\
+    \ loaded into memory as a whole.\n"
+verify:
+  static_only: Go code, no Go toolchain or network in the verifier

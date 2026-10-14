@@ -1,0 +1,84 @@
+id: gen-1-00081-generation
+category: generation
+language: python
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    hello, I make REST api for insurance claims. Client send big JSON (50-200 KB, many same field names again and again) and we save the full JSON in sqlite table, one row for every change of the claim. We must keep it 7 years for audit, but only read it when auditor ask, maybe few times in month. Disk is growing too fast. Can you write save and load function for me? Python, only standard library please
+- role: assistant
+  content: |
+    Here is a version that stores the JSON compressed with `zlib`, which is in the standard library.
+
+    ```python
+    import json
+    import sqlite3
+    import zlib
+
+    MIN_COMPRESS_SIZE = 512   # tiny payloads: compression gains nothing
+    COMPRESS_LEVEL = 6        # moderate level, cheap on CPU
+
+    SCHEMA = """
+    CREATE TABLE IF NOT EXISTS claim_snapshots (
+        id          INTEGER PRIMARY KEY,
+        claim_id    TEXT NOT NULL,
+        created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        encoding    TEXT NOT NULL,   -- 'raw' or 'zlib'
+        body        BLOB NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_snapshots_claim ON claim_snapshots (claim_id);
+    """
+
+    def init_db(conn: sqlite3.Connection) -> None:
+        conn.executescript(SCHEMA)
+
+    def save_snapshot(conn: sqlite3.Connection, claim_id: str, payload: dict) -> int:
+        raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        if len(raw) >= MIN_COMPRESS_SIZE:
+            body, encoding = zlib.compress(raw, COMPRESS_LEVEL), "zlib"
+        else:
+            body, encoding = raw, "raw"
+        cur = conn.execute(
+            "INSERT INTO claim_snapshots (claim_id, encoding, body) VALUES (?, ?, ?)",
+            (claim_id, encoding, body),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+    def load_snapshot(conn: sqlite3.Connection, snapshot_id: int) -> dict | None:
+        row = conn.execute(
+            "SELECT encoding, body FROM claim_snapshots WHERE id = ?", (snapshot_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        encoding, body = row
+        raw = zlib.decompress(body) if encoding == "zlib" else body
+        return json.loads(raw.decode("utf-8"))
+    ```
+
+    **Green Notes**
+    - **Compress stored data** (reduces E and storage): JSON with repeated field names compresses well, and this data is written once and kept for years, so you save disk for a long time. Reads are rare, so decompression cost is small. https://patterns.greensoftware.foundation/development/data-handling/compress-stored-data
+    - **Fast codec, moderate level:** you write a snapshot on every claim change, so compression runs often. In Green Metrics Tool micro-benchmarks on 100 MB of text, zstd used about 4× less energy than gzip, while xz used about 29× more than zstd ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=2584305c-7a1e-47e2-b6cc-26276962035e,addc5f5e-55da-47f8-956d-240d06304e4e,fb08d3c3-ba41-4f0f-85fd-0b6c34e6c39b,f1479db0-c453-4aaa-9116-e137621fad07,7b3bb87d-3b43-4f82-be99-0327405205b8,905bd408-6b31-4237-a4da-14b8fad90613,7f213a20-8028-4080-9583-6e465c217bb5,8e93a8d2-60b0-4831-905b-764b68257bc7)). Those figures compare energy only, not file size. `zlib` level 6 is the gzip-class choice from the standard library. If you can add a package (or use Python 3.14+ with `compression.zstd`), zstd is a good next step.
+    - **`encoding` column:** small payloads stay raw, and you can change the codec later without breaking old rows.
+    - *Not applied:* heavy codecs (xz, brotli at max quality). They only make sense for data compressed once and kept very long, not for a write on every change.
+verify:
+  test: |-
+    conn = sqlite3.connect(":memory:")
+    init_db(conn)
+    big = {"claim_id": "C-1", "items": [{"description": "water damage in kitchen", "amount": i, "currency": "EUR"} for i in range(500)]}
+    small = {"a": 1}
+    big_id = save_snapshot(conn, "C-1", big)
+    small_id = save_snapshot(conn, "C-2", small)
+    assert load_snapshot(conn, big_id) == big
+    assert load_snapshot(conn, small_id) == small
+    assert load_snapshot(conn, 9999) is None
+    enc_big, body_big = conn.execute("SELECT encoding, body FROM claim_snapshots WHERE id=?", (big_id,)).fetchone()
+    enc_small, _ = conn.execute("SELECT encoding, body FROM claim_snapshots WHERE id=?", (small_id,)).fetchone()
+    assert enc_big == "zlib" and enc_small == "raw"
+    assert len(body_big) < len(json.dumps(big, separators=(",", ":")).encode()) // 4
+    uni = {"name": "Müller ü" * 100}
+    uid = save_snapshot(conn, "C-3", uni)
+    assert load_snapshot(conn, uid) == uni

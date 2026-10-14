@@ -1,0 +1,71 @@
+id: gen-1-00314-refactor
+category: refactor
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    hello, I have bash script on our order api server, run from cron every night. it take the old files from data folder and put in backup folder with compress. but it is very slow now and the cpu is busy long time, also some time I see files missing in backup. can you make it better pls?
+
+    ```bash
+    #!/bin/bash
+    # archive old api files
+
+    SRC=/var/lib/orderapi/data
+    DEST=/var/backups/orderapi
+    mkdir -p $DEST
+
+    for f in $(find $SRC -type f -mtime +1); do
+        name=$(basename $f)
+        cp $f $DEST/$name
+        xz -9e $DEST/$name
+        echo "compressed $name" >> $DEST/archive.log
+    done
+    ```
+
+    in the folder we have json request dumps, csv exports, and the customer upload (jpg, png, pdf, zip). we keep backup 14 days.
+- role: assistant
+  content: |
+    The missing files come from `basename`. Two files with the same name in different subfolders overwrite each other. The loop also breaks on names with spaces. This version fixes both.
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    SRC='/var/lib/orderapi/data'
+    DEST='/var/backups/orderapi'
+    LOG="$DEST/archive.log"
+
+    mkdir -p "$DEST"
+
+    while IFS= read -r -d '' f; do
+        rel=${f#"$SRC"/}
+        mkdir -p "$DEST/$(dirname "$rel")"
+        case "$rel" in
+            *.jpg|*.jpeg|*.png|*.webp|*.mp4|*.pdf|*.zip|*.gz|*.xz|*.zst)
+                # already compressed, a second pass only burns CPU
+                cp -p -- "$f" "$DEST/$rel"
+                echo "copied $rel" >> "$LOG"
+                ;;
+            *)
+                zstd -q -3 -f -o "$DEST/$rel.zst" -- "$f"
+                echo "compressed $rel" >> "$LOG"
+                ;;
+        esac
+    done < <(find "$SRC" -type f -mtime +1 -print0)
+    ```
+
+    Differences you will see:
+    - Backup files keep their subfolder path, so nothing is overwritten.
+    - Compressed files now end with `.zst`, not `.xz`. Restore with `zstd -d file.zst`.
+    - The script stops on the first error (`set -e`). Before, a failed `xz` was ignored.
+
+    **Green Notes**
+    - **Fast codec for data compressed every night** (reduces E): in Green Metrics Tool micro-benchmarks, compressing 100 MB of English text used ~16 J with zstd (default level) and ~458 J with xz, about 29× more ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=2584305c-7a1e-47e2-b6cc-26276962035e,addc5f5e-55da-47f8-956d-240d06304e4e,fb08d3c3-ba41-4f0f-85fd-0b6c34e6c39b,f1479db0-c453-4aaa-9116-e137621fad07,7b3bb87d-3b43-4f82-be99-0327405205b8,905bd408-6b31-4237-a4da-14b8fad90613,7f213a20-8028-4080-9583-6e465c217bb5,8e93a8d2-60b0-4831-905b-764b68257bc7)). `xz -9e` is the most expensive setting. That figure is for text, so measure your own JSON and CSV. The files will be somewhat bigger than with xz. For a 14-day retention this is usually the right trade. If disk space gets tight, raise the zstd level (for example `-9`) before you go back to xz.
+    - **Skip already-compressed files** (reduces E): jpg, png, pdf, zip and similar formats gain almost nothing from another pass. They are now copied as they are.
+    - *Not applied:* a short retention window means compressing at all is only worth it for the text files. If the data is kept just a few days, you could also skip compression for them and save the CPU completely.
+verify:
+  static_only: bash cron script that works on /var paths and needs the zstd binary

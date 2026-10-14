@@ -1,0 +1,148 @@
+id: gen-1-00461-review
+category: review
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    nightly batch over ~20M request latencies (ms) from nginx logs. review pls
+
+    ```python
+    EDGES = [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000]
+
+
+    def latency_histogram(latencies):
+        counts = [0] * (len(EDGES) + 1)
+        for v in latencies:
+            i = 0
+            while i < len(EDGES) and v > EDGES[i]:
+                i += 1
+            counts[i] += 1
+        return counts
+
+
+    def latency_stats(latencies):
+        n = len(latencies)
+        total = 0.0
+        for v in latencies:
+            total += v
+        mean = total / n
+        var = 0.0
+        for v in latencies:
+            var += (v - mean) ** 2
+        return mean, (var / n) ** 0.5
+
+
+    def flag_outliers(latencies, k=3.0):
+        mean, std = latency_stats(latencies)
+        out = []
+        for idx in range(len(latencies)):
+            if latencies[idx] > mean + k * std:
+                out.append(idx)
+        return out
+
+
+    def report(latencies):
+        mean, std = latency_stats(latencies)
+        print("n", len(latencies))
+        print("mean %.3f std %.3f" % (mean, std))
+        print("histogram", latency_histogram(latencies))
+        out = flag_outliers(latencies)
+        print("outliers", len(out), out[:5])
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (log processing, batch)
+
+    #### [Bug] Empty input crashes
+    - **Where:** `latency_stats`
+    - **Issue:** `total / n` raises `ZeroDivisionError` when a night has no lines (rotated log, failed export). `flag_outliers` and `report` fail with it.
+    - **Fix:** return `(0.0, 0.0)` for an empty input. This is a behavior change, but only for the case that crashed before.
+
+    #### [High] Pure Python loops over every sample
+    - **Where:** `latency_histogram`, `latency_stats`, `flag_outliers`
+    - **Issue:** each sample goes through the interpreter many times. The histogram does up to 11 comparisons per value in a `while` loop. Stats take two more passes. Outliers take another pass with `range(len(...))` indexing. That is per-sample work on ~20M values, every night.
+    - **Fix:** use NumPy. `searchsorted` + `bincount` give the histogram, `mean`/`std` give the stats, and a boolean mask gives the outliers. The bucket rule stays the same: a value equal to an edge falls in the lower bucket.
+    - **Impact:** reduces E on every run, in proportion to the number of samples. In Green Metrics Tool micro-benchmarks, a pure Python loop over 10,000,000 samples used about 4× more CPU energy than the same loop compiled with Numba ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=dc2ed71b-e8ed-48d5-be04-0dd9dfe1443f,2b9e7f88-4aad-42ee-a9e6-25ff4e6ea712)). NumPy removes the interpreter overhead in a similar way, but measure on your data.
+
+    #### [Medium] Stats are computed twice
+    - **Where:** `report` calls `latency_stats`, then `flag_outliers` calls it again
+    - **Issue:** a full extra pass over the data for the same two numbers.
+    - **Fix:** let `flag_outliers` accept precomputed stats. Convert the input to an array once in `report` and pass the array on. Better still, load the log values straight into an array (for example with `np.loadtxt`) so a 20M-element Python list never exists.
+
+    ```python
+    import numpy as np
+
+    EDGES = np.array([5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000], dtype=np.float64)
+
+
+    def _as_array(latencies):
+        return np.asarray(latencies, dtype=np.float64)
+
+
+    def latency_histogram(latencies):
+        idx = np.searchsorted(EDGES, _as_array(latencies), side="left")
+        return np.bincount(idx, minlength=len(EDGES) + 1).tolist()
+
+
+    def latency_stats(latencies):
+        a = _as_array(latencies)
+        if a.size == 0:
+            return 0.0, 0.0
+        return float(a.mean()), float(a.std())
+
+
+    def flag_outliers(latencies, k=3.0, stats=None):
+        a = _as_array(latencies)
+        mean, std = stats if stats is not None else latency_stats(a)
+        return np.flatnonzero(a > mean + k * std).tolist()
+
+
+    def report(latencies):
+        a = _as_array(latencies)
+        mean, std = latency_stats(a)
+        print("n", a.size)
+        print("mean %.3f std %.3f" % (mean, std))
+        print("histogram", latency_histogram(a))
+        out = flag_outliers(a, stats=(mean, std))
+        print("outliers", len(out), out[:5])
+    ```
+
+    Mean and standard deviation can differ from the loop version in the last digits, because NumPy sums in a different order. An outlier exactly on the threshold could flip, which is very unlikely with real latencies.
+verify:
+  equivalence:
+    driver: |
+      data = []
+      x = 12345
+      for i in range(5000):
+          x = (x * 1103515245 + 12345) % 2147483648
+          v = float(x % 2000)
+          if i % 997 == 0:
+              v = 20000.0
+          data.append(v)
+      data.extend([5.0, 10.0, 25.0, 5000.0, 5000.5])
+      report(data)
+      report([1.0, 2.0, 3.0])
+      print(latency_histogram([5, 5.0, 5.01, 10, 6000]))
+  benchmark:
+    driver: |
+      data = []
+      x = 99
+      for i in range(200000):
+          x = (x * 1103515245 + 12345) % 2147483648
+          data.append(float(x % 2000))
+      a = latency_histogram(data)
+      b = latency_stats(data)
+      c = flag_outliers(data)
+      print(sum(a), len(c))
+    min_speedup: 3
+  test: |-
+    assert latency_histogram([5, 5.01, 10, 6000]) == [1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+    assert latency_stats([]) == (0.0, 0.0)
+    m, s = latency_stats([2.0, 4.0])
+    assert m == 3.0 and s == 1.0
+    assert flag_outliers([1.0] * 20 + [100.0]) == [20]
+    assert flag_outliers([]) == []

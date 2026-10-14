@@ -1,0 +1,78 @@
+id: gen-1-00379-refactor
+category: refactor
+language: dockerfile
+patterns:
+- small-container-images
+messages:
+- role: user
+  content: |
+    ?
+
+    ```dockerfile
+    FROM ubuntu:22.04
+
+    RUN apt-get update
+    RUN apt-get install -y curl git nginx nodejs npm wget ca-certificates
+    RUN wget https://github.com/gohugoio/hugo/releases/download/v0.128.0/hugo_extended_0.128.0_linux-amd64.deb
+    RUN dpkg -i hugo_extended_0.128.0_linux-amd64.deb
+
+    WORKDIR /site
+    COPY . .
+    RUN npm install
+    RUN hugo --minify
+    RUN cp -r public/* /var/www/html/
+
+    EXPOSE 80
+    CMD ["nginx", "-g", "daemon off;"]
+    ```
+- role: assistant
+  content: |
+    ```dockerfile
+    # ---- build stage: tools live only here ----
+    FROM node:20-bookworm-slim AS build
+
+    ARG HUGO_VERSION=0.128.0
+    RUN apt-get update \
+        && apt-get install -y --no-install-recommends ca-certificates curl \
+        && curl -fsSL "https://github.com/gohugoio/hugo/releases/download/v${HUGO_VERSION}/hugo_extended_${HUGO_VERSION}_linux-amd64.tar.gz" \
+           | tar -xz -C /usr/local/bin hugo \
+        && apt-get purge -y curl \
+        && rm -rf /var/lib/apt/lists/*
+
+    WORKDIR /site
+
+    # dependencies first, so this layer is reused when only content changes
+    COPY package.json package-lock.json ./
+    RUN npm ci
+
+    COPY . .
+    RUN hugo --minify
+
+    # ---- runtime stage: only the static output ----
+    FROM nginx:1.27-alpine
+    COPY --from=build /site/public /usr/share/nginx/html
+
+    EXPOSE 80
+    ```
+
+    Add a `.dockerignore` so `COPY . .` does not send junk into the build:
+
+    ```text
+    .git
+    node_modules
+    public
+    resources
+    Dockerfile
+    ```
+
+    **Green Notes**
+    - **Multi-stage build** (reduces E, M, network): Node, npm, Hugo, curl and the build cache no longer ship in the final image. The runtime image is just nginx plus the generated files. Every pull, push and node start moves fewer bytes and uses less registry and disk space.
+    - **Small base for the runtime:** a static site needs only a web server, so `nginx:alpine` replaces a full Ubuntu image with nginx installed on top.
+    - **Layer order and cleanup:** `package*.json` is copied before the rest, so `npm ci` is cached when you only edit content. `apt-get update` and `install` are one `RUN` with `--no-install-recommends` and removed package lists. The old split `RUN apt-get update` layer could also go stale. Fewer rebuilt layers mean less CI compute per push.
+    - **Behavior changes to check:**
+      - `npm ci` needs a committed `package-lock.json`. It also installs exactly what the lockfile says, which is more reproducible than `npm install`.
+      - `git` is gone from the image. If your Hugo config uses `enableGitInfo`, install `git` in the build stage and keep `.git` in the build context.
+      - Hugo is now a tarball download and the version is an `ARG`, so you can bump it without editing the `RUN` line.
+    - *Not applied:* distroless or `scratch` as the runtime. They would save a few more MB, but nginx's config and debug tools are worth more for a docs site.
+verify:
+  static_only: Dockerfile needs a container build, network access and a registry; not runnable with stdlib Python

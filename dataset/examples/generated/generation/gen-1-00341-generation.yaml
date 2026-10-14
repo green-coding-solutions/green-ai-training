@@ -1,0 +1,98 @@
+id: gen-1-00341-generation
+category: generation
+language: python
+patterns:
+- keep-star-imports
+- deque-or-append
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    hello, I need rate limiter for our REST api, max N request per API key in last X seconds (sliding window, not fixed). every request will call it so it must be cheap. It return 429 with Retry-After header when too many.
+
+    this is the top of our api_utils.py, I will put it in this file, other people use it too so please dont change it:
+
+    ```python
+    from datetime import *
+    from json import *
+    ```
+
+    thank you!
+- role: assistant
+  content: |
+    Here is the limiter. I left your two star imports as they are and added only the imports the new code needs.
+
+    ```python
+    from datetime import *
+    from json import *
+    from collections import defaultdict, deque
+    from math import ceil
+    from time import monotonic
+
+
+    class SlidingWindowLimiter:
+        def __init__(self, limit, window_s):
+            if limit < 1 or window_s <= 0:
+                raise ValueError("limit must be >= 1 and window_s > 0")
+            self.limit = limit
+            self.window_s = window_s
+            self.hits = defaultdict(deque)  # api_key -> request times, oldest first
+
+        def check(self, api_key, now=None):
+            """Return (allowed, seconds_to_wait)."""
+            if now is None:
+                now = monotonic()
+            q = self.hits[api_key]
+            cutoff = now - self.window_s
+            while q and q[0] <= cutoff:
+                q.popleft()
+            if len(q) >= self.limit:
+                return False, q[0] + self.window_s - now
+            q.append(now)
+            return True, 0.0
+
+        def purge(self, now=None):
+            """Drop keys with no recent hits. Call it now and then, e.g. once a minute."""
+            if now is None:
+                now = monotonic()
+            cutoff = now - self.window_s
+            for key in [k for k, q in self.hits.items() if not q or q[-1] <= cutoff]:
+                del self.hits[key]
+
+
+    def handle(limiter, api_key, now=None):
+        """Return (status, headers, body)."""
+        ok, wait = limiter.check(api_key, now)
+        if ok:
+            return 200, {}, ""
+        retry = ceil(wait)
+        headers = {"Retry-After": str(retry), "Content-Type": "application/json"}
+        return 429, headers, dumps({"error": "rate_limited", "retry_after_s": retry})
+    ```
+
+    **Green Notes**
+    - **`deque` for the window** (reduces E): removing old hits with `popleft()` is O(1) and each key only stores the hits inside the window. A list with `pop(0)` or `insert(0, ...)` shifts every element on each call, and this code runs on every request.
+    - **Star imports left unchanged:** in Green Metrics Tool micro-benchmarks, `from x import *` and `import x` showed no measurable energy difference. Changing your header would only risk breaking the other modules that use it.
+    - **Cheap per-request path:** one dict lookup, a few `popleft()` calls and one `append()`. There is no sorting and no scan over all keys. `purge()` is a separate call so the cleanup cost stays out of the request path.
+
+    *Not applied:* shared storage such as Redis. The limiter keeps its state in each process, so with several workers each one counts separately. Add a shared store only if you need exact global limits.
+verify:
+  green_block: 0
+  test: |-
+    lim = SlidingWindowLimiter(2, 10)
+    assert lim.check("a", 0) == (True, 0.0)
+    assert lim.check("a", 1) == (True, 0.0)
+    assert lim.check("a", 2) == (False, 8.0)
+    assert lim.check("b", 2) == (True, 0.0)
+    assert lim.check("a", 10) == (True, 0.0)
+
+    lim2 = SlidingWindowLimiter(1, 10)
+    assert handle(lim2, "k", 0) == (200, {}, "")
+    status, headers, body = handle(lim2, "k", 3)
+    assert status == 429
+    assert headers["Retry-After"] == "7"
+    assert loads(body) == {"error": "rate_limited", "retry_after_s": 7}
+
+    lim2.purge(100)
+    assert "k" not in lim2.hits

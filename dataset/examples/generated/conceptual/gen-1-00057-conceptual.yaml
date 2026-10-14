@@ -1,0 +1,32 @@
+id: gen-1-00057-conceptual
+category: conceptual
+language: text
+patterns:
+- batch-db-writes
+- context-tradeoff
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    batching inserts for prediction logs worth it?
+- role: assistant
+  content: |-
+    It depends on how many rows you can put in one batch.
+
+    In Green Metrics Tool micro-benchmarks with PostgreSQL 16, 500,000 rows were written in batches with one commit per batch:
+    - **5,000 rows per batch:** one `execute()` per row used ~384 J ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=8e80b599-3332-432f-8c7e-1cfb93a3a354,8b4c205d-5fb1-40af-ab77-0427ca572f4e,adff4e53-2f1a-4d88-9c0d-dd681d02923f)). `executemany()` used ~139 J. `COPY ... FROM STDIN` used ~17 J, about 22× less than the loop.
+    - **100 rows per batch:** the loop used ~13 J, `executemany()` ~15 J, and `COPY` ~9.5 J ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=8e80b599-3332-432f-8c7e-1cfb93a3a354,8b4c205d-5fb1-40af-ab77-0427ca572f4e,adff4e53-2f1a-4d88-9c0d-dd681d02923f)). The differences were small, because per-batch overhead dominates.
+
+    So batching pays off when a batch holds hundreds to thousands of rows. It does little for a handful of rows.
+
+    For an inference service:
+    - **One log row per request:** do not hold the response while you wait for a full batch. Put the rows in an in-memory queue. A background writer flushes it on size (for example 1,000 rows) or on a timer, whichever comes first.
+    - **Batch scoring jobs** that produce many predictions at once: write them with `COPY` or one multi-row insert per chunk.
+    - **Low volume** (a few predictions per second or less): single inserts are fine. A buffer adds code and little saving.
+
+    Trade-offs:
+    - A buffered writer can lose its last rows on a crash. If the logs are audit data, keep them durable first, or flush more often.
+    - Logs are delayed until the flush. Anything that reads them live, like drift alerts, sees them late.
+
+    To check your own case, replay a realistic load once with each approach and compare CPU time (`perf stat` or `/usr/bin/time -v`), or use the Green Metrics Tool.

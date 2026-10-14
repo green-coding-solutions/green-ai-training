@@ -1,0 +1,133 @@
+id: gen-1-00096-generation
+category: generation
+language: go
+patterns:
+- memoize
+- regex-precompile
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    I'm building a Go ETL step that reads parsed access-log records from a channel and enriches each one with browser family, OS and device class, based on the User-Agent string. Requirements:
+
+    - Return a small struct `Info{Browser, OS, Device string}`.
+    - Rules are ordered regexes. First match wins, e.g. Edge before Chrome, because Edge's UA also contains "Chrome". Fall back to "other".
+    - It will be called from about 8 worker goroutines, so it must be safe for concurrent use.
+    - We process around 40 million rows per night, but I think there are only a few thousand distinct UA strings. Some days a bot sends random junk UAs, so memory must stay bounded.
+    - Keep the API simple: `NewClassifier(...)` and `Classify(ua string) Info`.
+
+    Can you write it?
+- role: assistant
+  content: |
+    ```go
+    package uaclass
+
+    import (
+        "regexp"
+        "sync"
+    )
+
+    type Info struct {
+        Browser, OS, Device string
+    }
+
+    type rule struct {
+        re   *regexp.Regexp
+        name string
+    }
+
+    // Compiled once at package init, never inside Classify.
+    var browserRules = []rule{
+        {regexp.MustCompile(`Edg(e|A|iOS)?/`), "edge"},
+        {regexp.MustCompile(`OPR/|Opera`), "opera"},
+        {regexp.MustCompile(`Firefox/|FxiOS/`), "firefox"},
+        {regexp.MustCompile(`Chrome/|CriOS/`), "chrome"},
+        {regexp.MustCompile(`Safari/`), "safari"},
+    }
+
+    var osRules = []rule{
+        {regexp.MustCompile(`Windows NT`), "windows"},
+        {regexp.MustCompile(`Android`), "android"},
+        {regexp.MustCompile(`iPhone|iPad|iPod`), "ios"},
+        {regexp.MustCompile(`Mac OS X`), "macos"},
+        {regexp.MustCompile(`Linux`), "linux"},
+    }
+
+    var (
+        botRe    = regexp.MustCompile(`(?i)bot|crawler|spider|curl/|python-requests`)
+        mobileRe = regexp.MustCompile(`Mobi|Android|iPhone|iPod`)
+        tabletRe = regexp.MustCompile(`iPad|Tablet`)
+    )
+
+    func firstMatch(rules []rule, s string) string {
+        for _, r := range rules {
+            if r.re.MatchString(s) {
+                return r.name
+            }
+        }
+        return "other"
+    }
+
+    // classify is a pure function of ua, so its result can be cached.
+    func classify(ua string) Info {
+        info := Info{Browser: firstMatch(browserRules, ua), OS: firstMatch(osRules, ua)}
+        switch {
+        case botRe.MatchString(ua):
+            info.Device = "bot"
+        case tabletRe.MatchString(ua):
+            info.Device = "tablet"
+        case mobileRe.MatchString(ua):
+            info.Device = "mobile"
+        default:
+            info.Device = "desktop"
+        }
+        return info
+    }
+
+    // Classifier is safe for concurrent use.
+    type Classifier struct {
+        mu    sync.RWMutex
+        cache map[string]Info
+        max   int
+    }
+
+    // NewClassifier keeps at most maxEntries results in memory.
+    func NewClassifier(maxEntries int) *Classifier {
+        if maxEntries < 1 {
+            maxEntries = 1
+        }
+        return &Classifier{cache: make(map[string]Info, maxEntries), max: maxEntries}
+    }
+
+    func (c *Classifier) Classify(ua string) Info {
+        c.mu.RLock()
+        info, ok := c.cache[ua]
+        c.mu.RUnlock()
+        if ok {
+            return info
+        }
+
+        info = classify(ua) // regex work happens outside the lock
+
+        c.mu.Lock()
+        if len(c.cache) >= c.max {
+            clear(c.cache) // junk-UA floods cannot grow memory
+        }
+        c.cache[ua] = info
+        c.mu.Unlock()
+        return info
+    }
+    ```
+
+    Create one `Classifier` at startup (for example `NewClassifier(10_000)`) and share it between all workers.
+
+    **Green Notes**
+    - **Memoize the pure classification** (reduces E): your data has few distinct UAs and millions of rows, so most rows become one map lookup instead of up to a dozen regex matches. In Green Metrics Tool micro-benchmarks, memoizing a computation over only 200 distinct inputs used about 9× less CPU energy than recomputing it each time ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=ddf98f50-15ee-48e2-ab38-cc89acc88142,808b9a2c-1abf-4af5-9b04-3a6ce700fcdb)). That figure does not transfer to your pipeline, so measure it on a real night's data.
+    - **Bounded cache** (reduces E and M): the map is capped at `maxEntries` and cleared when full, so a bot sending random UAs cannot grow memory. Clearing is simple and enough here. If the hit rate is low every day, the cache only adds overhead, so check the hit rate before keeping it.
+    - **Regexes compiled once at package level** (reduces E): the first cache miss for each UA no longer pays for compilation.
+    - **`RWMutex` with the regex work outside the lock** (reduces E): workers read in parallel, and two workers that miss on the same UA only compute it twice, which is harmless for a pure function.
+
+    *Not applied:* sharded maps and `sync.Map`. With 8 workers and mostly read hits, one `RWMutex` is simple and enough.
+verify:
+  static_only: Go code; the verifier has no Go toolchain, only python/javascript are executed

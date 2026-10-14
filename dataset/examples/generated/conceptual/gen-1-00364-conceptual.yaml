@@ -1,0 +1,36 @@
+id: gen-1-00364-conceptual
+category: conceptual
+language: text
+patterns:
+- avoid-exception-flow
+- context-tradeoff
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    Pricing service question. We look up SKU -> price in a dict and catch KeyError for unknown SKUs. Someone on the team wants to swap every try/except for .get() "for energy reasons". Is that worth a PR across the codebase? Short answer please, I only need to know where it matters.
+- role: assistant
+  content: |
+    Only where misses are common. The cost is in raising the exception, not in having a `try` block.
+
+    - **Misses are frequent** (for example, many unknown or retired SKUs in a feed): `dict.get` is the better choice. In Green Metrics Tool micro-benchmarks with millions of lookups where about half the keys were missing, `dict.get(key, default)` used ~67 J and `try/except KeyError` used ~76 J, about 12% less for `get` ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=4753302a-710f-4132-8001-9da3ba960d13,d7ded3f2-f9e7-4781-905e-9782a8305b8f,8f054455-adbc-402d-b593-0191d1061cd8)). An `if key in d` check behaved like `get`.
+    - **Misses are rare** (a hit is the normal case): `try/except` is cheap, because nothing is raised. Don't touch it.
+    - **Cold paths** (admin screens, one-off scripts): skip it. A repo-wide PR costs more review time than it saves.
+
+    So limit the change to hot loops with a high miss rate, such as bulk import, feed matching and cart repricing. Check the miss rate first, then change only those spots:
+
+    ```python
+    def price_for(sku, prices, default=None):
+        return prices.get(sku, default)
+    ```
+
+    **Green Notes**
+    - **Avoid exceptions for expected control flow** (reduces E): when a miss is a normal outcome, `get` or `in` avoids the raise cost on every miss.
+    - *Not applied:* a blanket rewrite. With few misses the gain is too small to justify the churn. To check your own case, measure with `perf stat` or a Green Metrics Tool usage scenario.
+verify:
+  green_block: 0
+  test: |-
+    assert price_for("A1", {"A1": 5}) == 5
+    assert price_for("B2", {"A1": 5}) is None
+    assert price_for("B2", {"A1": 5}, 0) == 0

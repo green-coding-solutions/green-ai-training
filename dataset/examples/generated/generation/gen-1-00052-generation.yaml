@@ -1,0 +1,107 @@
+id: gen-1-00052-generation
+category: generation
+language: javascript
+patterns:
+- modern-image-formats
+facts:
+- F-IMGENC
+messages:
+- role: user
+  content: |
+    ```js
+    import { readFile, writeFile, mkdir } from 'node:fs/promises';
+    import { createHash } from 'node:crypto';
+    import path from 'node:path';
+    import { parse } from 'csv-parse/sync';
+
+    const FEED = process.argv[2] ?? './feed/products.csv';
+    const OUT = './dist/images';
+
+    async function fetchImage(url) {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`${res.status} ${url}`);
+      return Buffer.from(await res.arrayBuffer());
+    }
+
+    async function processImage(sku, buf) {
+      // TODO: make web versions
+    }
+
+    async function main() {
+      await mkdir(OUT, { recursive: true });
+      const rows = parse(await readFile(FEED, 'utf8'), { columns: true });
+      const catalog = [];
+      for (const row of rows) {
+        const buf = await fetchImage(row.image_url);
+        const images = await processImage(row.sku, buf);
+        catalog.push({ sku: row.sku, name: row.name, price: Number(row.price), images });
+      }
+      await writeFile('./dist/catalog.json', JSON.stringify(catalog));
+    }
+
+    main();
+    ```
+
+    ?
+- role: assistant
+  content: |
+    Here is `processImage`. It makes WebP files at three widths and one JPEG fallback. Files that already exist are skipped, so a re-run only encodes new or changed images.
+
+    ```js
+    import sharp from 'sharp';
+    import { access } from 'node:fs/promises';
+
+    const WIDTHS = [400, 800, 1200];
+    const FALLBACK_WIDTH = 800;
+
+    async function exists(p) {
+      try {
+        await access(p);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    async function processImage(sku, buf) {
+      // The content hash in the name makes the file safe to cache and lets us skip unchanged images.
+      const hash = createHash('sha1').update(buf).digest('hex').slice(0, 10);
+      const base = `${sku}-${hash}`;
+
+      const src = sharp(buf).rotate(); // apply EXIF orientation; metadata is dropped on output
+      const { width: srcWidth } = await src.metadata();
+
+      // Never upscale. Tiny sources keep their own width.
+      const widths = WIDTHS.filter((w) => w <= srcWidth);
+      if (widths.length === 0) widths.push(srcWidth);
+
+      for (const w of widths) {
+        const file = path.join(OUT, `${base}-${w}.webp`);
+        if (!(await exists(file))) {
+          await src.clone().resize({ width: w }).webp({ quality: 78 }).toFile(file);
+        }
+      }
+
+      const fbWidth = Math.min(FALLBACK_WIDTH, srcWidth);
+      const fbName = `${base}-${fbWidth}.jpg`;
+      const fbFile = path.join(OUT, fbName);
+      if (!(await exists(fbFile))) {
+        await src.clone().resize({ width: fbWidth }).jpeg({ quality: 80, mozjpeg: true }).toFile(fbFile);
+      }
+
+      return {
+        srcset: widths.map((w) => ({ width: w, file: `${base}-${w}.webp` })),
+        fallback: fbName,
+      };
+    }
+    ```
+
+    In the page, use the `srcset` entries on a `<source type="image/webp">` and the `fallback` file on the `<img>`.
+
+    **Green Notes**
+    - **WebP, encoded once in the pipeline** (reduces network): every visitor gets a smaller file than the supplier's original. The encoding cost is paid once per image here, not once per request.
+    - **Three widths** (reduces network): phones get the 400 px file instead of a full-size photo. Nothing is upscaled.
+    - **Skip existing output** (reduces E): the hash in the file name means a nightly re-run does not re-encode unchanged images.
+    - *Not applied:* AVIF. In Green Metrics Tool micro-benchmarks, encoding AVIF cost about 7× JPG ([measurements](https://metrics.green-coding.io/stats.html?id=81a932bc-04da-443b-93cf-d4d8468de247)). For a large feed that is a lot of extra work in every run. Consider it only for a few hero images, or for a feed that rarely changes.
+verify:
+  static_only: needs the sharp package, network access and a CSV feed

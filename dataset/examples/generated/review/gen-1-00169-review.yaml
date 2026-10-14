@@ -1,0 +1,127 @@
+id: gen-1-00169-review
+category: review
+language: python
+patterns:
+- deque-or-append
+- vectorize-or-jit
+messages:
+- role: user
+  content: |
+    review? runs on every sensor sample before the model call
+
+    ```python
+    import math
+
+
+    class FeatureWindow:
+        def __init__(self, size=512):
+            self.size = size
+            self.samples = []
+
+        def push(self, x):
+            self.samples.insert(0, x)
+            if len(self.samples) > self.size:
+                self.samples.pop()
+
+        def normalized(self):
+            n = len(self.samples)
+            mean = sum(self.samples) / n
+            var = 0.0
+            for s in self.samples:
+                var += (s - mean) ** 2
+            std = math.sqrt(var / n)
+            out = []
+            for s in self.samples:
+                out.append((s - mean) / std)
+            return out
+    ```
+- role: assistant
+  content: |
+    **Workload:** machine learning inference (streaming preprocessing)
+
+    #### [Bug] Division by zero on an empty or flat window
+    - **Where:** `normalized()`
+    - **Issue:** with no samples, `sum(...) / n` raises `ZeroDivisionError`. If all samples are equal (a stuck sensor), `std` is 0 and `(s - mean) / std` raises too. Both can happen at startup or on a dead sensor.
+    - **Fix:** return an empty result for no samples and zeros for a flat window.
+
+    #### [High] Pure Python passes over the whole window on every call
+    - **Where:** the `sum`, variance loop and output loop in `normalized()`
+    - **Issue:** each call walks the window about three times in the interpreter and builds a new list element by element. This runs once per sample, so the cost repeats for every input.
+    - **Fix:** do the math in NumPy: one array, one `std`, one vector expression.
+    - **Impact:** reduces E per sample. The work moves from interpreter loops to compiled array code.
+
+    #### [Medium] `insert(0, x)` shifts the whole list
+    - **Where:** `push()`
+    - **Issue:** every front insert moves all existing elements, so a push is O(size). The `pop()` is fine, but the insert is not.
+    - **Fix:** use `deque(maxlen=size)` with `appendleft`. A push is O(1) and the oldest sample drops off by itself, so the size check goes away.
+    - **Impact:** reduces E per push. With a window of 512 the gain is bounded, but it grows with `size`.
+
+    ```python
+    from collections import deque
+
+    import numpy as np
+
+
+    class FeatureWindow:
+        def __init__(self, size=512):
+            self.size = size
+            self.samples = deque(maxlen=size)
+
+        def push(self, x):
+            # newest first, the oldest sample drops off the right end
+            self.samples.appendleft(x)
+
+        def normalized(self):
+            n = len(self.samples)
+            if n == 0:
+                return np.empty(0)
+            a = np.fromiter(self.samples, dtype=np.float64, count=n)
+            std = a.std()
+            if std == 0.0:
+                return np.zeros_like(a)
+            return (a - a.mean()) / std
+    ```
+
+    Behavior notes:
+    - The order is unchanged: newest sample first.
+    - `normalized()` now returns a NumPy array instead of a list. Use `.tolist()` if a caller needs a list. Most model APIs take the array directly.
+    - Results can differ from the old loop in the last floating-point digits, because the summation order is different.
+    - If the model does not need newest-first order, `append` is the simplest option. That changes the feature order, so only do it if you retrain or reorder.
+verify:
+  green_block: 0
+  test: |
+    w = FeatureWindow(size=4)
+    assert len(w.normalized()) == 0
+    for v in [5.0, 5.0, 5.0]:
+        w.push(v)
+    assert list(w.normalized()) == [0.0, 0.0, 0.0]
+    w = FeatureWindow(size=3)
+    for v in [1.0, 2.0, 3.0, 4.0]:
+        w.push(v)
+    assert list(w.samples) == [4.0, 3.0, 2.0]
+    out = w.normalized()
+    assert abs(float(out.mean())) < 1e-12
+    assert abs(float(out.std()) - 1.0) < 1e-12
+    assert out[0] > out[1] > out[2]
+  equivalence:
+    driver: |
+      import math
+      w = FeatureWindow(size=64)
+      for i in range(300):
+          w.push(math.sin(i / 7) * 3 + (i % 5))
+      out = w.normalized()
+      print(len(out))
+      print([round(float(v), 6) for v in out])
+  benchmark:
+    driver: |
+      import math
+      import time
+      w = FeatureWindow(size=4096)
+      t = time.process_time()
+      total = 0.0
+      for i in range(3000):
+          w.push(math.sin(i / 11) * 2 + (i % 7))
+          if i % 20 == 0:
+              total += float(sum(w.normalized()))
+      print("__CPU__", time.process_time() - t)
+    min_speedup: 3

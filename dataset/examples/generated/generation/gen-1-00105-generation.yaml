@@ -1,0 +1,188 @@
+id: gen-1-00105-generation
+category: generation
+language: python
+patterns:
+- text-compression
+- compress-transmitted
+facts:
+- F-COMPRESS
+messages:
+- role: user
+  content: |
+    We have a small internal REST service running as a plain WSGI app (no Flask, no framework, gunicorn behind a load balancer that does not compress). Responses are mostly JSON lists, a few KB up to maybe 500 KB, plus some CSV exports.
+
+    I need a WSGI middleware that gzips responses for clients that support it. Requirements:
+    - only if the client sends Accept-Encoding with gzip (respect q=0)
+    - only for text-like content types (JSON, CSV, HTML, JS, XML), not for images or zip downloads
+    - skip tiny responses
+    - don't touch responses that are already encoded, and don't break 204/304
+    - Content-Length must stay correct
+    - stdlib only please
+- role: assistant
+  content: |
+    ```python
+    import gzip
+
+    _TEXT_TYPES = {
+        "application/json",
+        "application/javascript",
+        "application/xml",
+        "image/svg+xml",
+        "text/csv",
+    }
+
+
+    def _is_compressible(content_type):
+        ctype = content_type.split(";")[0].strip().lower()
+        return (
+            ctype.startswith("text/")
+            or ctype in _TEXT_TYPES
+            or ctype.endswith("+json")
+            or ctype.endswith("+xml")
+        )
+
+
+    def _accepts_gzip(header):
+        star = False
+        for part in header.split(","):
+            name, _, params = part.partition(";")
+            name = name.strip().lower()
+            q = 1.0
+            params = params.strip().lower()
+            if params.startswith("q="):
+                try:
+                    q = float(params[2:])
+                except ValueError:
+                    q = 0.0
+            if name == "gzip":
+                return q > 0
+            if name == "*":
+                star = q > 0
+        return star
+
+
+    class GzipMiddleware:
+        def __init__(self, app, min_size=1024, level=5):
+            self.app = app
+            self.min_size = min_size
+            self.level = level
+
+        def __call__(self, environ, start_response):
+            captured = {}
+            chunks = []
+
+            def capture(status, headers, exc_info=None):
+                captured["status"] = status
+                captured["headers"] = list(headers)
+                return chunks.append
+
+            result = self.app(environ, capture)
+            try:
+                chunks.extend(result)
+            finally:
+                if hasattr(result, "close"):
+                    result.close()
+
+            body = b"".join(chunks)
+            status = captured["status"]
+            headers = [
+                (k, v) for k, v in captured["headers"] if k.lower() != "content-length"
+            ]
+            names = {k.lower(): v for k, v in headers}
+
+            if not _is_compressible(names.get("content-type", "")):
+                headers.append(("Content-Length", str(len(body))))
+                start_response(status, headers)
+                return [body]
+
+            # The response depends on Accept-Encoding, so caches must know.
+            vary = names.get("vary", "")
+            if "accept-encoding" not in vary.lower() and vary.strip() != "*":
+                headers = [(k, v) for k, v in headers if k.lower() != "vary"]
+                headers.append(("Vary", f"{vary}, Accept-Encoding" if vary else "Accept-Encoding"))
+
+            code = int(status[:3])
+            should_compress = (
+                "content-encoding" not in names
+                and code not in (204, 304)
+                and len(body) >= self.min_size
+                and _accepts_gzip(environ.get("HTTP_ACCEPT_ENCODING", ""))
+            )
+            if should_compress:
+                body = gzip.compress(body, compresslevel=self.level, mtime=0)
+                headers.append(("Content-Encoding", "gzip"))
+
+            headers.append(("Content-Length", str(len(body))))
+            start_response(status, headers)
+            return [body]
+    ```
+
+    Use it with `app = GzipMiddleware(app)`.
+
+    **Green Notes**
+    - **Compress text responses** (reduces network, adds some CPU): JSON and CSV shrink a lot, so every large response sends far fewer bytes. Images, zips and other binary types are skipped because they gain nothing.
+    - **Moderate gzip level (5), not the maximum:** this compresses on every request, so CPU cost matters. In Green Metrics Tool measurements on 100 MB of text, brotli at its CLI default (quality 11) used about 45× the energy of gzip ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=fb08d3c3-ba41-4f0f-85fd-0b6c34e6c39b,f1479db0-c453-4aaa-9116-e137621fad07,8e93a8d2-60b0-4831-905b-764b68257bc7)). Keep the expensive codecs for static files you compress once.
+    - **Minimum size of 1 KB:** tiny bodies save almost no bytes, so the CPU work is wasted. `Vary: Accept-Encoding` is added so shared caches don't serve gzip to a client that can't read it.
+    - *Not applied:* streaming. This middleware buffers the whole body to set `Content-Length`, which is fine for responses up to a few hundred KB. For large streamed exports, compress incrementally instead. If a proxy or CDN later compresses for you, remove this middleware so data is not compressed twice.
+verify:
+  test: |-
+    import gzip as _gz
+    import json as _json
+
+    def _run(app, accept=None):
+        env = {"REQUEST_METHOD": "GET"}
+        if accept is not None:
+            env["HTTP_ACCEPT_ENCODING"] = accept
+        out = {}
+
+        def sr(status, headers, exc_info=None):
+            out["status"] = status
+            out["headers"] = {k.lower(): v for k, v in headers}
+
+        body = b"".join(app(env, sr))
+        return out["status"], out["headers"], body
+
+    payload = _json.dumps([{"id": i, "name": "item-%d" % i} for i in range(1000)]).encode()
+
+    def make_app(ctype, data, status="200 OK", extra=None):
+        def app(environ, start_response):
+            hdrs = [("Content-Type", ctype), ("Content-Length", str(len(data)))]
+            hdrs += extra or []
+            start_response(status, hdrs)
+            return [data]
+        return app
+
+    mw = GzipMiddleware(make_app("application/json; charset=utf-8", payload))
+    st, h, b = _run(mw, "gzip, deflate")
+    assert h["content-encoding"] == "gzip"
+    assert _gz.decompress(b) == payload
+    assert int(h["content-length"]) == len(b) < len(payload)
+    assert "accept-encoding" in h["vary"].lower()
+
+    st, h, b = _run(mw, "br, gzip;q=0")
+    assert "content-encoding" not in h and b == payload
+    assert int(h["content-length"]) == len(payload)
+
+    st, h, b = _run(mw)
+    assert "content-encoding" not in h and b == payload
+
+    st, h, b = _run(mw, "*")
+    assert h["content-encoding"] == "gzip"
+
+    small = b'{"ok": true}'
+    st, h, b = _run(GzipMiddleware(make_app("application/json", small)), "gzip")
+    assert b == small and "content-encoding" not in h
+
+    png = bytes(range(256)) * 20
+    st, h, b = _run(GzipMiddleware(make_app("image/png", png)), "gzip")
+    assert b == png and "content-encoding" not in h
+
+    st, h, b = _run(GzipMiddleware(make_app("application/json", payload, extra=[("Content-Encoding", "br")])), "gzip")
+    assert h["content-encoding"] == "br" and b == payload
+
+    st, h, b = _run(GzipMiddleware(make_app("application/json", b"", status="204 No Content")), "gzip")
+    assert b == b"" and "content-encoding" not in h
+
+    csv = b"a,b,c\n" * 500
+    st, h, b = _run(GzipMiddleware(make_app("text/csv", csv, extra=[("Vary", "Cookie")])), "gzip")
+    assert _gz.decompress(b) == csv and h["vary"] == "Cookie, Accept-Encoding"

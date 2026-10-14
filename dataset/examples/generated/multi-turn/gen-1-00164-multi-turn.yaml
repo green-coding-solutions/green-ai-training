@@ -1,0 +1,104 @@
+id: gen-1-00164-multi-turn
+category: multi-turn
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    diff only. redact script for support log bundles, runs per-file over a few hundred MB of logs
+
+    ```python
+    import re
+    import sys
+
+    RULES = [
+        ("email", r"[\w.+-]+@[\w-]+\.[\w.]+"),
+        ("ipv4", r"\b\d{1,3}(?:\.\d{1,3}){3}\b"),
+        ("token", r"\bsk_[A-Za-z0-9]{8,}\b"),
+    ]
+
+    def redact_line(line):
+        for name, pat in RULES:
+            line = re.sub(pat, f"<{name}>", line)
+        return line
+
+    def main(path):
+        hits = 0
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                out = redact_line(line)
+                if out != line:
+                    hits += 1
+                sys.stdout.write(out)
+        print(f"redacted {hits} lines", file=sys.stderr)
+
+    if __name__ == "__main__":
+        main(sys.argv[1])
+    ```
+- role: assistant
+  content: |
+    ```python
+    COMPILED = [(name, re.compile(pat)) for name, pat in RULES]
+
+    def redact_line(line):
+        for name, rx in COMPILED:
+            line = rx.sub(f"<{name}>", line)
+        return line
+    ```
+
+    **Green Notes**
+    - **Compile regex once** (reduces E): the patterns are built at import time, not looked up per line and rule. Output is identical.
+    - With 3 static rules this is a small win. Python's `re` caches compiled patterns, so the old code was not recompiling every call. In Green Metrics Tool micro-benchmarks, a precompiled pattern used about 18% less CPU energy than inline `re.match` over 1,000,000 matches ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=3827c15a-4295-44a4-8025-a07e8653ab7e,b7a9f0bd-c9e0-4b95-9bda-e8a96f38020c,f3e0434d-744b-41a0-a0cc-9bf00d80500d)).
+- role: user
+  content: |
+    ok. product wants the rules in a rules.txt now, name<TAB>pattern, ~900 lines, ops edits it. same, diff only
+
+    does the cache thing matter then?
+- role: assistant
+  content: |
+    Yes, now it matters a lot. `re` keeps 512 compiled patterns. With ~900 rules applied to every line, the cache is cycled and most calls recompile. In the same micro-benchmarks, forcing a recompile on every call cost about 200× more per match ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=3827c15a-4295-44a4-8025-a07e8653ab7e,b7a9f0bd-c9e0-4b95-9bda-e8a96f38020c,f3e0434d-744b-41a0-a0cc-9bf00d80500d)).
+
+    ```python
+    def load_rules(path):
+        rules = []
+        with open(path, encoding="utf-8") as f:
+            for raw in f:
+                raw = raw.rstrip("\n")
+                if not raw or raw.startswith("#"):
+                    continue
+                name, pat = raw.split("\t", 1)
+                rules.append((name, re.compile(pat), f"<{name}>"))
+        return rules
+
+    def redact_line(line, rules):
+        for _name, rx, repl in rules:
+            line = rx.sub(repl, line)
+        return line
+    ```
+
+    In `main`, call `rules = load_rules(rules_path)` once before the loop and pass `rules` to `redact_line`.
+
+    **Green Notes**
+    - **Compile regex once** (reduces E): all ~900 patterns are compiled at startup and held in a list. This avoids the cache thrash, so the cost no longer depends on the 512 limit.
+    - A bad pattern in `rules.txt` now fails at startup, not halfway through a file.
+    - Blank lines and `#` comment lines are skipped, so ops can annotate the file.
+    - *Not applied:* merging all rules into one big alternation. It would change which rule wins on overlaps and make the replacement labels harder to keep.
+verify:
+  green_block: -1
+  test: |-
+    import os
+    import re
+    import tempfile
+
+    p = os.path.join(tempfile.mkdtemp(), "rules.txt")
+    with open(p, "w", encoding="utf-8") as fh:
+        fh.write("email\t[\\w.+-]+@[\\w-]+\\.[\\w.]+\n")
+        fh.write("# comment\n\n")
+        fh.write("ipv4\t\\b\\d{1,3}(?:\\.\\d{1,3}){3}\\b\n")
+    rules = load_rules(p)
+    assert len(rules) == 2
+    assert redact_line("a bob@x.io from 10.0.0.1", rules) == "a <email> from <ipv4>"
+    assert redact_line("nothing here", rules) == "nothing here"

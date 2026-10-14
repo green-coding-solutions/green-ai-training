@@ -1,0 +1,72 @@
+id: gen-1-00248-refactor
+category: refactor
+language: javascript
+patterns:
+- modern-image-formats
+facts:
+- F-IMGENC
+messages:
+- role: user
+  content: |
+    Run report page for our CFD jobs, people open it from the cluster portal. Figures are 1600x900 PNGs (residual plots, pressure fields) and the pages are heavy. Only the diff / changed function please.
+
+    ```js
+    const path = require('path');
+
+    function figureHtml(fig) {
+      const w = fig.width || 1600;
+      const h = fig.height || 900;
+      return '<figure>' +
+        '<img src="' + fig.file + '" width="' + w + '" height="' + h + '" alt="' + fig.caption + '">' +
+        '<figcaption>' + fig.caption + '</figcaption></figure>';
+    }
+
+    function renderRunReport(run) {
+      const parts = [];
+      parts.push('<h1>' + run.name + ' (' + run.nSteps + ' steps)</h1>');
+      parts.push('<p>Max residual: ' + run.maxResidual.toExponential(2) + '</p>');
+      for (const fig of run.figures) {
+        parts.push(figureHtml(fig));
+      }
+      parts.push('<p class="meta">' + path.basename(run.dir) + '</p>');
+      return parts.join('\n');
+    }
+
+    module.exports = { renderRunReport };
+    ```
+- role: assistant
+  content: |
+    Only `figureHtml` changes. `renderRunReport` stays as it is.
+
+    ```js
+    function figureHtml(fig) {
+      const w = fig.width || 1600;
+      const h = fig.height || 900;
+      const img = '<img src="' + fig.file + '" width="' + w + '" height="' + h + '" alt="' + fig.caption + '">';
+      const caption = '<figcaption>' + fig.caption + '</figcaption>';
+      if (!/\.png$/.test(fig.file)) {
+        return '<figure>' + img + caption + '</figure>';
+      }
+      const webp = fig.file.replace(/\.png$/, '.webp');
+      return '<figure><picture>' +
+        '<source type="image/webp" srcset="' + webp + '">' +
+        img + '</picture>' + caption + '</figure>';
+    }
+    ```
+
+    **Green Notes**
+    - **WebP with PNG fallback** (reduces network): the browser takes the `.webp` when it supports it and falls back to the PNG `src` otherwise. Fewer bytes per figure is the saving, and it repeats for every viewer. This assumes your job pipeline writes `<name>.webp` next to each `<name>.png`. If a `.webp` is missing, the browser will not fall back to the PNG, so check that in the pipeline.
+    - **Encode once, when the run finishes:** do not convert on request. In Green Metrics Tool micro-benchmarks AVIF encoding cost about 7× JPG encoding, so I left AVIF out ([measurements](https://metrics.green-coding.io/stats.html?id=81a932bc-04da-443b-93cf-d4d8468de247)). The extra decode cost on the client and the encode cost rarely pay off for a portal page. For line and residual plots with sharp edges and exact colors, use lossless WebP. For smooth pressure fields, lossy WebP is usually fine, but compare a few before you commit.
+    - **Not changed:** SVG figures (or anything not ending in `.png`) get the old markup. Vector plots are already small. `width` and `height` stay, so the layout does not jump.
+verify:
+  test: |-
+    const assert = require('assert');
+    const html = figureHtml({ file: 'out/run1/residual.png', caption: 'Residual' });
+    assert(html.includes('<picture>'));
+    assert(html.includes('<source type="image/webp" srcset="out/run1/residual.webp">'));
+    assert(html.includes('src="out/run1/residual.png"'));
+    assert(html.includes('width="1600" height="900"'));
+    assert(html.includes('<figcaption>Residual</figcaption>'));
+    const svg = figureHtml({ file: 'out/run1/mesh.svg', caption: 'Mesh', width: 800, height: 400 });
+    assert(!svg.includes('<picture>'));
+    assert(svg.includes('<img src="out/run1/mesh.svg" width="800" height="400" alt="Mesh">'));

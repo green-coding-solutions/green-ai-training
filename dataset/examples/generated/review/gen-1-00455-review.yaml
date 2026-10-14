@@ -1,0 +1,249 @@
+id: gen-1-00455-review
+category: review
+language: python
+patterns:
+- text-compression
+- simple-conditions
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import gzip
+    import os
+    from wsgiref.simple_server import make_server
+
+    STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+    PLANS = [
+        {"name": "Starter", "price": 9, "seats": 1},
+        {"name": "Team", "price": 29, "seats": 10},
+        {"name": "Business", "price": 99, "seats": 50},
+    ]
+
+
+    def render_home():
+        rows = "".join(
+            f"<li><h3>{p['name']}</h3><p>${p['price']}/mo, {p['seats']} seats</p></li>"
+            for p in PLANS
+        )
+        return (
+            "<!doctype html><html><head><title>Acme</title>"
+            "<link rel='stylesheet' href='/site.css'></head>"
+            f"<body><h1>Simple pricing</h1><ul>{rows}</ul>"
+            "<script src='/app.js'></script></body></html>"
+        )
+
+
+    def guess_type(path):
+        p = path.lower()
+        if p.endswith(".html") or p.endswith(".htm"):
+            return "text/html; charset=utf-8"
+        elif p.endswith(".css"):
+            return "text/css"
+        elif p.endswith(".js") or p.endswith(".mjs"):
+            return "text/javascript"
+        elif p.endswith(".json"):
+            return "application/json"
+        elif p.endswith(".svg"):
+            return "image/svg+xml"
+        elif p.endswith(".png"):
+            return "image/png"
+        elif p.endswith(".jpg") or p.endswith(".jpeg"):
+            return "image/jpeg"
+        elif p.endswith(".webp"):
+            return "image/webp"
+        elif p.endswith(".avif"):
+            return "image/avif"
+        elif p.endswith(".woff2"):
+            return "font/woff2"
+        else:
+            return "application/octet-stream"
+
+
+    def app(environ, start_response):
+        path = environ.get("PATH_INFO", "/")
+        if path == "/":
+            body = render_home().encode("utf-8")
+            name = "index.html"
+        else:
+            full = os.path.join(STATIC_DIR, path.lstrip("/"))
+            if not os.path.isfile(full):
+                start_response("404 Not Found", [("Content-Type", "text/plain")])
+                return [b"not found"]
+            with open(full, "rb") as f:
+                body = f.read()
+            name = full
+
+        headers = [("Content-Type", guess_type(name))]
+        if "gzip" in environ.get("HTTP_ACCEPT_ENCODING", ""):
+            body = gzip.compress(body, 9)
+            headers.append(("Content-Encoding", "gzip"))
+        headers.append(("Content-Length", str(len(body))))
+        start_response("200 OK", headers)
+        return [body]
+
+
+    if __name__ == "__main__":
+        make_server("0.0.0.0", 8000, app).serve_forever()
+    ```
+- role: assistant
+  content: |
+    **Workload:** web backend serving a landing page (per-request, every visitor)
+
+    #### [Security] Path traversal in static files
+    - **Where:** `full = os.path.join(STATIC_DIR, path.lstrip("/"))`
+    - **Issue:** a request like `/../app.py` resolves outside `static/`, and `isfile` is true, so the source file is served.
+    - **Fix:** resolve the real path and check that it stays inside `STATIC_DIR`.
+
+    #### [Bug] Missing `Vary: Accept-Encoding`
+    - **Where:** response headers
+    - **Issue:** the same URL returns gzip or plain bytes depending on the request header. Without `Vary`, a proxy or CDN can hand a gzip body to a client that did not ask for it.
+    - **Fix:** always send `Vary: Accept-Encoding`.
+
+    #### [High] Max-level gzip on every request, for every file type
+    - **Where:** `gzip.compress(body, 9)`
+    - **Issue:** three problems here.
+      - Level 9 is the slowest gzip setting and only gives slightly smaller output than the default level 6.
+      - The home page is built from the constant `PLANS`, so it is the same bytes for every visitor. It is rebuilt and recompressed on every hit.
+      - PNG, JPEG, WebP, AVIF and WOFF2 are already compressed. Gzip burns CPU on them and gains nothing.
+    - **Fix:** compress the home page once at startup. Compress only text types, at the default level, and skip tiny bodies. Static assets are best precompressed once at build time, where a stronger codec is fine.
+    - **Impact:** reduces E on the server for every request. Network bytes stay the same for text, and images no longer pay for useless work.
+
+    #### [Low] Long `endswith` chain
+    - **Where:** `guess_type`
+    - **Issue:** it lowercases and tests up to a dozen conditions in order, and `or` guards add more checks. A dict lookup on the extension is one step and easier to extend.
+    - **Impact:** small. Switching to `match` would not help, since there is no meaningful energy difference between `if/elif` and `match`. The gain comes from the single lookup.
+
+    ```python
+    import gzip
+    import os
+    from wsgiref.simple_server import make_server
+
+    STATIC_DIR = os.path.realpath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+    )
+
+    PLANS = [
+        {"name": "Starter", "price": 9, "seats": 1},
+        {"name": "Team", "price": 29, "seats": 10},
+        {"name": "Business", "price": 99, "seats": 50},
+    ]
+
+    TYPES = {
+        ".html": "text/html; charset=utf-8",
+        ".htm": "text/html; charset=utf-8",
+        ".css": "text/css",
+        ".js": "text/javascript",
+        ".mjs": "text/javascript",
+        ".json": "application/json",
+        ".svg": "image/svg+xml",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".avif": "image/avif",
+        ".woff2": "font/woff2",
+    }
+    COMPRESSIBLE = {".html", ".htm", ".css", ".js", ".mjs", ".json", ".svg"}
+
+
+    def render_home():
+        rows = "".join(
+            f"<li><h3>{p['name']}</h3><p>${p['price']}/mo, {p['seats']} seats</p></li>"
+            for p in PLANS
+        )
+        return (
+            "<!doctype html><html><head><title>Acme</title>"
+            "<link rel='stylesheet' href='/site.css'></head>"
+            f"<body><h1>Simple pricing</h1><ul>{rows}</ul>"
+            "<script src='/app.js'></script></body></html>"
+        )
+
+
+    HOME_HTML = render_home().encode("utf-8")
+    HOME_GZ = gzip.compress(HOME_HTML, 6)  # built once, same for all visitors
+
+
+    def _ext(path):
+        return os.path.splitext(path)[1].lower()
+
+
+    def guess_type(path):
+        return TYPES.get(_ext(path), "application/octet-stream")
+
+
+    def should_compress(path, body):
+        return len(body) > 256 and _ext(path) in COMPRESSIBLE
+
+
+    def app(environ, start_response):
+        path = environ.get("PATH_INFO", "/")
+        if path == "/":
+            name, body, gz = "index.html", HOME_HTML, HOME_GZ
+        else:
+            full = os.path.realpath(os.path.join(STATIC_DIR, path.lstrip("/")))
+            if os.path.commonpath([full, STATIC_DIR]) != STATIC_DIR or not os.path.isfile(full):
+                start_response("404 Not Found", [("Content-Type", "text/plain")])
+                return [b"not found"]
+            with open(full, "rb") as f:
+                body = f.read()
+            name, gz = full, None
+
+        headers = [("Content-Type", guess_type(name)), ("Vary", "Accept-Encoding")]
+        if "gzip" in environ.get("HTTP_ACCEPT_ENCODING", "") and should_compress(name, body):
+            if gz is None:
+                gz = gzip.compress(body, 6)
+            body = gz
+            headers.append(("Content-Encoding", "gzip"))
+        headers.append(("Content-Length", str(len(body))))
+        start_response("200 OK", headers)
+        return [body]
+
+
+    if __name__ == "__main__":
+        make_server("0.0.0.0", 8000, app).serve_forever()
+    ```
+
+    **Already good:** `Content-Length` matches the compressed body, and gzip is only used when the client sends `Accept-Encoding: gzip`.
+
+    If this page gets real traffic, put a CDN or nginx in front. Then they can serve the precompressed assets and this app only handles dynamic routes.
+verify:
+  module: true
+  test: |-
+    import gzip as _gz
+
+    assert guess_type("/a/Site.CSS") == "text/css"
+    assert guess_type("x.jpeg") == "image/jpeg"
+    assert guess_type("x.woff2") == "font/woff2"
+    assert guess_type("x.bin") == "application/octet-stream"
+    assert guess_type("noext") == "application/octet-stream"
+
+    def call(path, enc=""):
+        out = {}
+        def sr(status, headers):
+            out["status"] = status
+            out["headers"] = dict(headers)
+        body = b"".join(app({"PATH_INFO": path, "HTTP_ACCEPT_ENCODING": enc}, sr))
+        return out, body
+
+    r, b = call("/", "gzip, br")
+    assert r["status"].startswith("200")
+    assert r["headers"]["Content-Encoding"] == "gzip"
+    assert r["headers"]["Vary"] == "Accept-Encoding"
+    assert _gz.decompress(b) == HOME_HTML
+    assert int(r["headers"]["Content-Length"]) == len(b)
+
+    r, b = call("/", "")
+    assert "Content-Encoding" not in r["headers"]
+    assert b == HOME_HTML
+
+    r, b = call("/../" + os.path.basename(__file__) if "__file__" in globals() else "/../x.py", "gzip")
+    assert r["status"].startswith("404")
+    r, b = call("/missing.css", "gzip")
+    assert r["status"].startswith("404")
+
+    assert should_compress("a.css", b"x" * 1000)
+    assert not should_compress("a.png", b"x" * 1000)
+    assert not should_compress("a.css", b"x" * 10)

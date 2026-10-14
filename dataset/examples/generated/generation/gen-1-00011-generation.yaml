@@ -1,0 +1,42 @@
+id: gen-1-00011-generation
+category: generation
+language: python
+patterns:
+- torch-no-grad
+- context-tradeoff
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    FastAPI endpoint POST /score for checkout fraud risk. Model is a TorchScript MLP at models/fraud.pt, CPU only, 12 float features in, one logit out. Return the probability as JSON. Code only.
+- role: assistant
+  content: |
+    ```python
+    import torch
+    from fastapi import FastAPI
+    from pydantic import BaseModel, Field
+
+    app = FastAPI()
+
+    model = torch.jit.load("models/fraud.pt", map_location="cpu").eval()
+
+
+    class CheckoutFeatures(BaseModel):
+        features: list[float] = Field(min_length=12, max_length=12)
+
+
+    @app.post("/score")
+    def score(body: CheckoutFeatures):
+        x = torch.tensor(body.features, dtype=torch.float32).unsqueeze(0)
+        with torch.inference_mode():
+            prob = torch.sigmoid(model(x))
+        return {"fraud_probability": prob.item()}
+    ```
+
+    **Green Notes**
+    - **`inference_mode()` for the forward pass** (reduces E): no autograd graph is built for a request that never calls `backward()`. This runs on every checkout. In Green Metrics Tool micro-benchmarks, 100,000 PyTorch CPU inferences used about 14% less CPU energy with `torch.no_grad()` than without ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=42de8e68-4536-43f4-a9bd-427ec42affd1,7e6a3886-425a-4992-9f14-180bede2d841)). `inference_mode()` is the stricter variant, so treat that figure as the same kind of saving, not an exact one.
+    - **Model loaded once at import, `.eval()` set once** (reduces E): requests only pay for the forward pass, not for file reads or weight setup.
+    - *Not applied:* request batching. This is a real-time checkout path, and waiting to fill a batch would add latency.
+verify:
+  static_only: needs torch, fastapi and a saved TorchScript model file, which are not available in the stdlib test environment

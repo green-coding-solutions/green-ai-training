@@ -1,0 +1,101 @@
+id: gen-1-00284-review
+category: review
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    hi, im new to python and made this for a small ETL job. It reads a csv of web events (around 3 million rows) and counts events per session and distinct pages per session. It works but i think something is wrong with it, maybe the try except? can you look at it?
+
+    ```python
+    import csv
+
+    def load_events(path):
+        events = []
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                events.append(row)
+        return events
+
+    def summarize(events):
+        counts = {}
+        pages = {}
+        for e in events:
+            sid = e["session_id"]
+            try:
+                counts[sid] += 1
+            except:
+                counts[sid] = 1
+            try:
+                pages[sid].add(e["page"])
+            except:
+                pages[sid] = {e["page"]}
+        return counts, pages
+
+    def main(path):
+        events = load_events(path)
+        counts, pages = summarize(events)
+        for sid in sorted(counts):
+            print(sid, counts[sid], len(pages[sid]))
+    ```
+
+    Most sessions only have 1 or 2 events if that matters.
+- role: assistant
+  content: |
+    **Workload:** data pipeline (batch, millions of rows)
+
+    #### [Bug] Bare `except:` hides real errors
+    - **Where:** both `try/except` blocks in `summarize`
+    - **Issue:** a bare `except:` catches everything, including `KeyboardInterrupt` and typos. If something other than a missing key goes wrong, the code silently takes the "first time" branch and you get wrong counts instead of an error.
+    - **Fix:** don't use exceptions for this at all (see next point). If you ever do need one, catch only `KeyError`.
+
+    #### [High] A raised exception for every new session
+    - **Where:** `summarize`, the `try/except` around `counts[sid]` and `pages[sid]`
+    - **Issue:** you said most sessions have only 1 or 2 events. So for most rows the key is missing and Python raises and catches an exception, twice per row. Raising is the expensive part. In Green Metrics Tool micro-benchmarks, 10,000,000 dict lookups with about half of the keys missing used about 12% less CPU energy with `dict.get` than with `try/except KeyError` ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=4753302a-710f-4132-8001-9da3ba960d13,d7ded3f2-f9e7-4781-905e-9782a8305b8f,8f054455-adbc-402d-b593-0191d1061cd8)). Your miss rate is probably higher than that, and you pay it on two dicts.
+    - **Fix:** use `Counter` and `defaultdict(set)`. They handle "first time" without any exception.
+    - **Impact:** reduces E on every row. `try/except` is fine when misses are rare, but here they are the common case.
+
+    #### [Low] Rows are copied into a list first
+    - **Where:** `load_events`
+    - **Issue:** the loop only copies rows from the reader into a list, and then `summarize` loops over the list again. With 3 million rows that is extra memory for no benefit.
+    - **Fix:** `summarize` can read straight from the `csv.DictReader` and make one pass.
+
+    ```python
+    import csv
+    from collections import Counter, defaultdict
+
+    def summarize(path):
+        counts = Counter()
+        pages = defaultdict(set)
+        with open(path, newline="") as f:
+            for e in csv.DictReader(f):
+                sid = e["session_id"]
+                counts[sid] += 1
+                pages[sid].add(e["page"])
+        return counts, pages
+
+    def main(path):
+        counts, pages = summarize(path)
+        for sid in sorted(counts):
+            print(sid, counts[sid], len(pages[sid]))
+    ```
+
+    The output is the same as before. One thing to know about `defaultdict`: reading a missing key creates it. That is fine here, because you only read `pages[sid]` for sessions that exist in `counts`.
+
+    **Already good:** `newline=""` with the `csv` module, and sorting only once at the end.
+verify:
+  equivalence:
+    driver: |-
+      import os, tempfile, csv
+      p = os.path.join(tempfile.mkdtemp(), "events.csv")
+      with open(p, "w", newline="") as f:
+          w = csv.writer(f)
+          w.writerow(["session_id", "page"])
+          for i in range(50):
+              w.writerow([f"s{i % 7}", f"/p{i % 5}"])
+          for i in range(20):
+              w.writerow([f"u{i}", "/home"])
+      main(p)

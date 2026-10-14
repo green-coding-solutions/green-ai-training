@@ -1,0 +1,82 @@
+id: gen-1-00485-general
+category: general
+language: typescript
+patterns:
+- none
+messages:
+- role: user
+  content: |
+    We have a few small TypeScript helper scripts in `scripts/` that our GitHub Actions workflow runs (labeling PRs, checking the changelog, that kind of thing). Right now we run `tsc` into `dist/` and then `node dist/...`, which feels clumsy.
+
+    Requirements:
+    - Node 24 on the runner
+    - no extra runtime dependency like ts-node or tsx if we can avoid it
+    - we still want type errors to fail the PR check
+    - scripts import each other (`scripts/lib/github.ts` etc.)
+
+    Can we just run the `.ts` files directly? What do I need to change in the workflow and tsconfig?
+- role: assistant
+  content: |
+    Yes. Node 24 strips type annotations from `.ts` files by default, so you can run them directly. The catch is that Node does **not** type-check. It just erases the types. Keep `tsc --noEmit` as a separate step so type errors still fail the check.
+
+    Workflow:
+
+    ```yaml
+    jobs:
+      check:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+          - uses: actions/setup-node@v4
+            with:
+              node-version: 24
+          - run: npm ci
+          - run: npx tsc --noEmit
+          - run: node scripts/label-pr.ts
+    ```
+
+    `tsconfig.json`:
+
+    ```json
+    {
+      "compilerOptions": {
+        "target": "esnext",
+        "module": "nodenext",
+        "strict": true,
+        "noEmit": true,
+        "types": ["node"],
+        "allowImportingTsExtensions": true,
+        "verbatimModuleSyntax": true,
+        "erasableSyntaxOnly": true
+      },
+      "include": ["scripts"]
+    }
+    ```
+
+    What the last three options do:
+    - `allowImportingTsExtensions`: lets you write `import { getPr } from "./lib/github.ts"`. Node needs the real file extension, it will not guess it.
+    - `verbatimModuleSyntax`: forces `import type { Pr } from "./lib/github.ts"` for type-only imports. Node can't tell a type import from a value import, so this avoids runtime errors for missing exports.
+    - `erasableSyntaxOnly` (TypeScript 5.8+): errors on syntax that can't be erased by just removing types.
+
+    That last point is the main limit. These do not work with plain type stripping:
+    - `enum` (use a union of string literals or an `as const` object)
+    - `namespace` with runtime code
+    - constructor parameter properties (`constructor(private x: string)`)
+
+    Also check that your `package.json` has `"type": "module"`, or that the scripts use the `.mts` extension, so the `import` syntax is treated as ESM.
+
+    Example script that fits these rules:
+
+    ```typescript
+    import { getPr } from "./lib/github.ts";
+    import type { Pr } from "./lib/github.ts";
+
+    const labels = { docs: "documentation", src: "feature" } as const;
+
+    const pr: Pr = await getPr(process.env.GITHUB_REF_NAME ?? "");
+    console.log(pr.files.some((f) => f.startsWith("docs/")) ? labels.docs : labels.src);
+    ```
+
+    Type stripping also does not apply to files under `node_modules`. That only matters if you want to publish `.ts` files as a package.
+verify:
+  static_only: Needs GitHub Actions runner, Node 24 and the TypeScript toolchain; config and workflow advice only.

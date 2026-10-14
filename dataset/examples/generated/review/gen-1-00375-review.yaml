@@ -1,0 +1,182 @@
+id: gen-1-00375-review
+category: review
+language: python
+patterns:
+- avoid-exception-flow
+- builtin-functions
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    I wrote a small CLI that summarizes our nginx access logs (combined format). We run it from cron on the log server against the daily file, which is usually 5-10 GB, so a few tens of millions of lines. Many request paths carry query strings, so there are a lot of distinct paths.
+
+    Requirements: it must keep working with the same output format, because another script parses it. It must not crash on broken lines. It should stay stdlib only. Could you review it for correctness and efficiency?
+
+    ```python
+    #!/usr/bin/env python3
+    """logsum: summarize an nginx access log (combined format)."""
+    import argparse
+    import sys
+
+
+    def summarize(lines):
+        hits = {}
+        sizes = {}
+        classes = {}
+        bad = 0
+        for line in lines:
+            parts = line.split()
+            try:
+                path = parts[6]
+                status = int(parts[8])
+                size = int(parts[9])
+            except (IndexError, ValueError):
+                bad += 1
+                continue
+            try:
+                hits[path] += 1
+                sizes[path] += size
+            except KeyError:
+                hits[path] = 1
+                sizes[path] = size
+            key = status // 100
+            try:
+                classes[key] += 1
+            except KeyError:
+                classes[key] = 1
+        return hits, sizes, classes, bad
+
+
+    def main():
+        ap = argparse.ArgumentParser(description="Summarize an access log")
+        ap.add_argument("logfile")
+        ap.add_argument("--top", type=int, default=10)
+        args = ap.parse_args()
+
+        with open(args.logfile) as f:
+            lines = f.readlines()
+
+        hits, sizes, classes, bad = summarize(lines)
+
+        ranked = sorted(hits.items(), key=lambda kv: kv[1], reverse=True)
+        for path, n in ranked[:args.top]:
+            print(f"{n:8d} {sizes[path]:12d} {path}")
+        for key in sorted(classes):
+            print(f"{key}xx: {classes[key]}")
+        print(f"skipped: {bad}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (daily batch over tens of millions of lines)
+
+    #### [Bug] Invalid bytes in the log crash the run
+    - **Where:** `open(args.logfile)`
+    - **Issue:** the default decoding is strict. One request with raw non-UTF-8 bytes in a URL or user agent raises `UnicodeDecodeError`, and you lose the whole run. That breaks your "must not crash on broken lines" requirement.
+    - **Fix:** open with `errors="replace"`.
+
+    #### [Medium] `try/except KeyError` used for the normal "first time seen" case
+    - **Where:** the `hits[path] += 1` block in `summarize`
+    - **Issue:** with many distinct paths (query strings), a large share of lines hit a path for the first time. Each of those raises and catches a `KeyError`, and raising is the expensive part. In Green Metrics Tool micro-benchmarks with about half of the lookups missing, `dict.get(key, default)` used about 12% less CPU energy than `try/except KeyError` ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=4753302a-710f-4132-8001-9da3ba960d13,d7ded3f2-f9e7-4781-905e-9782a8305b8f,8f054455-adbc-402d-b593-0191d1061cd8)). When misses are rare, `try/except` is cheap, so this matters here because misses are common.
+    - **Fix:** `hits[path] = hits.get(path, 0) + 1`, and the same for `sizes`. The status class block only has a handful of keys, so it rarely misses. I switched it to `get` anyway so both blocks look the same.
+    - **Impact:** reduces E per line, on every line of the file.
+
+    #### [Medium] The whole file is read into memory
+    - **Where:** `f.readlines()`
+    - **Issue:** a 5-10 GB log becomes a huge list of strings before any work starts. That needs a lot of RAM, can trigger swapping, and does nothing for the result.
+    - **Fix:** pass the file object to `summarize`. It yields one line at a time.
+    - **Impact:** reduces E and memory pressure (M) on the log server.
+
+    #### [Low] Sorting every distinct path to print the top N
+    - **Where:** `ranked = sorted(...)[:args.top]`
+    - **Issue:** with millions of distinct paths, a full sort is wasted work. `heapq.nlargest` returns the same items in the same order, including ties.
+
+    **Already good:** the parse `try/except (IndexError, ValueError)` is fine. Broken lines are rare, so it costs almost nothing, and it is clearer than checking every field by hand. Output format is unchanged.
+
+    ```python
+    #!/usr/bin/env python3
+    """logsum: summarize an nginx access log (combined format)."""
+    import argparse
+    import heapq
+    import sys
+
+
+    def summarize(lines):
+        hits = {}
+        sizes = {}
+        classes = {}
+        bad = 0
+        for line in lines:
+            parts = line.split()
+            try:
+                path = parts[6]
+                status = int(parts[8])
+                size = int(parts[9])
+            except (IndexError, ValueError):
+                bad += 1
+                continue
+            hits[path] = hits.get(path, 0) + 1
+            sizes[path] = sizes.get(path, 0) + size
+            key = status // 100
+            classes[key] = classes.get(key, 0) + 1
+        return hits, sizes, classes, bad
+
+
+    def main():
+        ap = argparse.ArgumentParser(description="Summarize an access log")
+        ap.add_argument("logfile")
+        ap.add_argument("--top", type=int, default=10)
+        args = ap.parse_args()
+
+        with open(args.logfile, errors="replace") as f:
+            hits, sizes, classes, bad = summarize(f)
+
+        ranked = heapq.nlargest(args.top, hits.items(), key=lambda kv: kv[1])
+        for path, n in ranked:
+            print(f"{n:8d} {sizes[path]:12d} {path}")
+        for key in sorted(classes):
+            print(f"{key}xx: {classes[key]}")
+        print(f"skipped: {bad}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    The `--top 0` case still prints nothing for paths, as before.
+verify:
+  module: true
+  equivalence:
+    driver: |-
+      import os
+      import sys
+      import tempfile
+
+      rows = []
+      for i in range(600):
+          if i % 3 == 0:
+              path = f"/p/{i % 17}"
+          else:
+              path = f"/p/{i % 40}?q={i}"
+          status = 200 if i % 5 else (404 if i % 2 else 500)
+          rows.append(
+              f'10.0.0.{i % 7} - - [01/Oct/2026:10:00:00 +0000] "GET {path} HTTP/1.1" '
+              f'{status} {i * 3} "-" "curl/8.0"'
+          )
+      rows.insert(10, "garbage line")
+      rows.insert(50, '10.0.0.1 - - [x] "GET /a HTTP/1.1" abc 12 "-" "ua"')
+
+      with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as tmp:
+          tmp.write("\n".join(rows) + "\n")
+          name = tmp.name
+
+      try:
+          for top in ("5", "25"):
+              sys.argv = ["logsum", name, "--top", top]
+              main()
+      finally:
+          os.unlink(name)

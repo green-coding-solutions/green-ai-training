@@ -1,0 +1,69 @@
+id: gen-1-00368-no-change
+category: no-change
+language: python
+patterns:
+- torch-no-grad
+- context-tradeoff
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    hi, im new to pytorch and CI. my teammate put this smoke test in our gitlab pipeline, it runs before we deploy the recommender model. he said "maybe look at the torch part, something might be wasteful" but I dont see what is wrong. can you check? Im not sure what to look for
+
+    ```python
+    import sys
+
+    import torch
+
+    from recsys.model import build_model
+
+    EXPECTED_SHAPE = (8, 3)
+
+
+    def main() -> int:
+        torch.manual_seed(0)
+        model = build_model()
+        state = torch.load("artifacts/model.pt", map_location="cpu")
+        model.load_state_dict(state)
+        model.eval()
+
+        x = torch.randn(8, 16)
+
+        with torch.inference_mode():
+            out = model(x)
+
+        if tuple(out.shape) != EXPECTED_SHAPE:
+            print(f"bad output shape: {tuple(out.shape)}")
+            return 1
+        if not torch.isfinite(out).all():
+            print("output has NaN or inf")
+            return 1
+
+        # make sure the model can still be trained
+        model.train()
+        loss = model(x).sum()
+        loss.backward()
+        missing = [n for n, p in model.named_parameters() if p.grad is None]
+        if missing:
+            print(f"no gradient for: {missing}")
+            return 1
+
+        print("smoke test ok")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+- role: assistant
+  content: |
+    I don't see anything wasteful. The torch part is already done the efficient way.
+
+    - **Inference part:** `model.eval()` plus `torch.inference_mode()` is the right setup. It stops PyTorch from building the autograd graph, and it is slightly stricter than `torch.no_grad()`. In Green Metrics Tool micro-benchmarks, 100,000 CPU inferences used about 14% less CPU energy with `torch.no_grad()` than without ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=42de8e68-4536-43f4-a9bd-427ec42affd1,7e6a3886-425a-4992-9f14-180bede2d841)). You already have this.
+    - **Gradient part:** the last block needs gradients, because it checks that every parameter gets a `.grad`. Do not wrap it in `no_grad` or `inference_mode`. The check would then fail or crash.
+    - **Size:** the test runs one batch of 8 rows, twice. Whatever you change here saves almost nothing next to loading the Python environment and the model file.
+
+    Leave the file as it is. If your teammate meant something specific, ask him which line he means. If he points to a real problem, send it to me.
+verify:
+  static_only: needs torch and a project-specific recsys module and artifact file

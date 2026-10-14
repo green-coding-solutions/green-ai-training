@@ -1,0 +1,139 @@
+id: gen-1-00090-generation
+category: generation
+language: javascript
+patterns:
+- remove-unused-css
+messages:
+- role: user
+  content: |
+    hi, i have small static site in folder `dist/` (html files and some js files) and one big css file `dist/css/main.css`. Inside is many old styles from old design, i think most is not used anymore. Can you write me node script what read all html and js in the folder and make new css file with only rules what are still used? I want run it from terminal like `node purge-css.js dist dist/css/main.css dist/css/main.clean.css`. No npm packages please, only node.
+- role: assistant
+  content: |
+    This script collects every word from the `.html` and `.js` files. It keeps a CSS rule only if all of its class and id names appear in those words. Rules with only tag selectors, `@font-face` and `@keyframes` are always kept.
+
+    ```javascript
+    #!/usr/bin/env node
+    const fs = require("node:fs");
+    const path = require("node:path");
+
+    function walk(dir, exts, out = []) {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) walk(full, exts, out);
+        else if (exts.includes(path.extname(entry.name))) out.push(full);
+      }
+      return out;
+    }
+
+    function collectTokens(text, used = new Set()) {
+      for (const m of text.matchAll(/[A-Za-z_][\w-]*/g)) used.add(m[0]);
+      return used;
+    }
+
+    // Split CSS into top-level blocks: "a{...}", "@media ...{...}", "@import ...;"
+    function splitBlocks(css) {
+      const blocks = [];
+      let depth = 0;
+      let start = 0;
+      for (let i = 0; i < css.length; i++) {
+        const c = css[i];
+        if (c === "{") {
+          depth++;
+        } else if (c === "}") {
+          depth--;
+          if (depth === 0) {
+            blocks.push(css.slice(start, i + 1).trim());
+            start = i + 1;
+          }
+        } else if (c === ";" && depth === 0) {
+          blocks.push(css.slice(start, i + 1).trim());
+          start = i + 1;
+        }
+      }
+      return blocks.filter(Boolean);
+    }
+
+    function selectorUsed(selector, used) {
+      const plain = selector
+        .replace(/\[[^\]]*\]/g, "")
+        .replace(/:not\([^)]*\)/g, "");
+      for (const m of plain.matchAll(/[.#]([A-Za-z_][\w-]*)/g)) {
+        if (!used.has(m[1])) return false;
+      }
+      return true;
+    }
+
+    function pruneBlock(block, used) {
+      const open = block.indexOf("{");
+      if (open === -1) return block; // @import, @charset
+      const head = block.slice(0, open).trim();
+      const body = block.slice(open + 1, block.lastIndexOf("}"));
+
+      if (head.startsWith("@media") || head.startsWith("@supports")) {
+        const inner = splitBlocks(body)
+          .map((b) => pruneBlock(b, used))
+          .filter(Boolean);
+        return inner.length ? `${head}{${inner.join("")}}` : "";
+      }
+      if (head.startsWith("@")) return block; // @font-face, @keyframes, ...
+
+      const kept = head
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => selectorUsed(s, used));
+      return kept.length ? `${kept.join(",")}{${body}}` : "";
+    }
+
+    function purgeCss(css, used) {
+      const clean = css.replace(/\/\*[\s\S]*?\*\//g, "");
+      return splitBlocks(clean)
+        .map((b) => pruneBlock(b, used))
+        .filter(Boolean)
+        .join("\n");
+    }
+
+    function main() {
+      const args = process.argv.slice(2);
+      const keepIdx = args.indexOf("--keep");
+      const keep = keepIdx === -1 ? [] : args.splice(keepIdx, 2)[1].split(",");
+      const [siteDir, cssIn, cssOut] = args;
+      if (!siteDir || !cssIn || !cssOut) {
+        console.error("usage: node purge-css.js <siteDir> <in.css> <out.css> [--keep a,b,c]");
+        process.exit(1);
+      }
+
+      const used = new Set(keep);
+      for (const file of walk(siteDir, [".html", ".js"])) {
+        collectTokens(fs.readFileSync(file, "utf8"), used);
+      }
+
+      const before = fs.readFileSync(cssIn, "utf8");
+      const after = purgeCss(before, used);
+      fs.writeFileSync(cssOut, after);
+      console.log(`${cssIn}: ${before.length} -> ${after.length} characters`);
+    }
+
+    module.exports = { purgeCss, collectTokens };
+    if (require.main === module) main();
+    ```
+
+    Check the new file in a browser before you replace the old one. If JavaScript builds class names from pieces (`"btn-" + type`), the script cannot see them. Add them by hand with `--keep btn-primary,btn-danger`.
+
+    **Green Notes**
+    - **Remove unused CSS** (reduces network and client E): the stylesheet is smaller, so every visitor downloads and parses less. Run the script once at build time, not on each request.
+      https://patterns.greensoftware.foundation/development/media-and-code-efficiency/remove-unused-css
+    - **One pass over the files:** the script reads each file once and collects the words in a `Set`, so each class check is one lookup.
+    - *Not applied:* a full CSS parser. This simple version is enough for a small site. For a big site or a framework, a tested tool like PurgeCSS handles more edge cases, for example selectors inside `:is(a, b)`.
+verify:
+  module: true
+  test: |-
+    const assert = require("node:assert");
+    const used = collectTokens('<div class="btn card">x</div>');
+    assert.ok(used.has("btn") && used.has("card"));
+    const css = ".btn{color:red}.unused{color:blue}.btn,.old{margin:0}@media (min-width:600px){.card{padding:1px}.gone{padding:2px}}@font-face{font-family:x}a{color:green}.btn.is-open{top:0}/* .btn{x:y} */";
+    const out = purgeCss(css, used).replace(/\n/g, "");
+    assert.strictEqual(
+      out,
+      ".btn{color:red}.btn{margin:0}@media (min-width:600px){.card{padding:1px}}@font-face{font-family:x}a{color:green}"
+    );
+    assert.strictEqual(purgeCss("@media print{.gone{a:b}}", used), "");

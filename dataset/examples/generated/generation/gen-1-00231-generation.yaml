@@ -1,0 +1,73 @@
+id: gen-1-00231-generation
+category: generation
+language: javascript
+patterns:
+- builtin-functions
+messages:
+- role: user
+  content: |
+    hi, im new to node. i have a text file where every line is one number (temperature readings from a sensor, can be a few million lines). i want a small script i run like `node stats.js readings.txt` that prints how many readings, the sum, min, max, average and median. i tried before with Math.max but it crashed on the big file and i dont know why
+- role: assistant
+  content: |
+    `Math.max(...array)` passes every number as a separate function argument. With millions of values that goes over the engine's argument limit, which is why it crashed. This script avoids it:
+
+    ```javascript
+    #!/usr/bin/env node
+    const fs = require("fs");
+
+    function summarize(text) {
+      const lines = text.split("\n").map((l) => l.trim()).filter((l) => l !== "");
+      const values = Float64Array.from(lines, Number);
+      if (values.some(Number.isNaN)) {
+        throw new Error("input contains a line that is not a number");
+      }
+      if (values.length === 0) {
+        throw new Error("input has no numbers");
+      }
+
+      const count = values.length;
+      const sum = values.reduce((a, b) => a + b, 0);
+
+      // Typed arrays sort numerically by default, no comparator needed.
+      values.sort();
+      const min = values[0];
+      const max = values[count - 1];
+      const mid = count >> 1;
+      const median = count % 2 === 1 ? values[mid] : (values[mid - 1] + values[mid]) / 2;
+
+      return { count, sum, min, max, mean: sum / count, median };
+    }
+
+    if (require.main === module) {
+      const file = process.argv[2];
+      if (!file) {
+        console.error("usage: node stats.js <file>");
+        process.exit(1);
+      }
+      const stats = summarize(fs.readFileSync(file, "utf8"));
+      for (const [name, value] of Object.entries(stats)) {
+        console.log(`${name}: ${value}`);
+      }
+    }
+
+    module.exports = { summarize };
+    ```
+
+    **Green Notes**
+    - **Built-in numeric sort on a `Float64Array`** (reduces E): the engine sorts the numbers natively, with no JavaScript comparator call for every comparison. A normal array needs `sort((a, b) => a - b)`, because plain `sort()` would sort the numbers as text.
+    - **No spread into `Math.max` / `Math.min`:** after sorting, min and max are just the first and last item. This also removes the crash.
+    - **One pass to read, one sort:** the file is read once, and the median reuses the sorted array. Nothing is sorted twice.
+    - The typed array stores 8 bytes per number, which is much smaller than a normal array of boxed numbers.
+    - *Not applied:* streaming line by line. A few million readings fit in memory, so the simple version is easier to read. Use a streaming approach only if the file grows to hundreds of millions of lines.
+verify:
+  module: true
+  test: |-
+    const assert = require("assert");
+    const r = summarize("3\n1\n2\n4\n");
+    assert.deepStrictEqual(r, { count: 4, sum: 10, min: 1, max: 4, mean: 2.5, median: 2.5 });
+    const r2 = summarize("5\n\n -1 \n9\n");
+    assert.strictEqual(r2.median, 5);
+    assert.strictEqual(r2.min, -1);
+    assert.strictEqual(r2.max, 9);
+    assert.throws(() => summarize("1\nabc\n"));
+    assert.throws(() => summarize("\n\n"));

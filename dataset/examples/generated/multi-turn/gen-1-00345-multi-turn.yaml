@@ -1,0 +1,143 @@
+id: gen-1-00345-multi-turn
+category: multi-turn
+language: javascript
+patterns:
+- async-concurrent-io
+messages:
+- role: user
+  content: |
+    fix this, marketplace sync is slow
+
+    ```javascript
+    const API = process.env.MARKET_API || 'https://api.marketplace.example/v2';
+
+    async function syncListings(products) {
+      const results = [];
+      for (const p of products) {
+        const res = await fetch(`${API}/listings/${p.sku}`, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${process.env.MARKET_TOKEN}`,
+          },
+          body: JSON.stringify({ title: p.title, price: p.price, qty: p.stock }),
+        });
+        if (!res.ok) {
+          results.push({ sku: p.sku, ok: false, status: res.status });
+          continue;
+        }
+        results.push({ sku: p.sku, ok: true });
+      }
+      return results;
+    }
+    ```
+- role: assistant
+  content: |
+    The requests are independent, but the loop waits for each one before it sends the next. Start them together instead:
+
+    ```javascript
+    const API = process.env.MARKET_API || 'https://api.marketplace.example/v2';
+
+    async function syncOne(p) {
+      const res = await fetch(`${API}/listings/${p.sku}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${process.env.MARKET_TOKEN}`,
+        },
+        body: JSON.stringify({ title: p.title, price: p.price, qty: p.stock }),
+      });
+      return res.ok ? { sku: p.sku, ok: true } : { sku: p.sku, ok: false, status: res.status };
+    }
+
+    function syncListings(products) {
+      return Promise.all(products.map(syncOne));
+    }
+    ```
+
+    **Green Notes**
+    - **Concurrent requests instead of a sequential `await` loop** (reduces E): the process no longer sits idle for one round trip per product. The total work is the same. The gain is mostly shorter wall time and shorter time holding connections and memory open.
+    - Result order is unchanged, because `Promise.all` keeps input order.
+    - This starts every request at once. That is fine for tens of products. For hundreds or thousands you need a concurrency limit, and most marketplace APIs have rate limits.
+- role: user
+  content: |
+    we have 3000 products and they rate limit us, max 5 at same time. also one failed request should not stop the rest
+
+    ```javascript
+    ```
+- role: assistant
+  content: |
+    Use a small worker pool: 5 workers pull from a shared index. Each product catches its own errors, so one failure never stops the rest.
+
+    ```javascript
+    const API = process.env.MARKET_API || 'https://api.marketplace.example/v2';
+    const MAX_PARALLEL = 5;
+
+    async function syncOne(p) {
+      try {
+        const res = await fetch(`${API}/listings/${p.sku}`, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${process.env.MARKET_TOKEN}`,
+          },
+          body: JSON.stringify({ title: p.title, price: p.price, qty: p.stock }),
+        });
+        return res.ok ? { sku: p.sku, ok: true } : { sku: p.sku, ok: false, status: res.status };
+      } catch (err) {
+        return { sku: p.sku, ok: false, error: err.message };
+      }
+    }
+
+    async function syncListings(products, limit = MAX_PARALLEL) {
+      const results = new Array(products.length);
+      let next = 0;
+
+      async function worker() {
+        while (next < products.length) {
+          const i = next++;
+          results[i] = await syncOne(products[i]);
+        }
+      }
+
+      const workers = Array.from({ length: Math.min(limit, products.length) }, worker);
+      await Promise.all(workers);
+      return results;
+    }
+    ```
+
+    **Green Notes**
+    - **Bounded concurrency** (reduces E): at most 5 requests are in flight. You keep most of the wall-time gain and stay inside the rate limit. Requests that get throttled and retried would waste energy.
+    - **Behavior change:** a network error used to throw and stop the sync. Now it becomes `{ ok: false, error }` in the results. Check the results for failures afterwards.
+    - Results are still in input order.
+    - *Not applied:* retries. If the API returns 429, add a retry with a small cap and a delay, and only for 429 and 5xx responses.
+verify:
+  lang: javascript
+  test: |-
+    (async () => {
+      const assert = (c, m) => { if (!c) throw new Error(m); };
+      let inflight = 0;
+      let peak = 0;
+      globalThis.fetch = async (url) => {
+        inflight++;
+        peak = Math.max(peak, inflight);
+        await new Promise((r) => setTimeout(r, 5));
+        inflight--;
+        if (url.endsWith('/s3')) return { ok: false, status: 500 };
+        if (url.endsWith('/s4')) throw new Error('boom');
+        return { ok: true, status: 200 };
+      };
+      const products = Array.from({ length: 12 }, (_, i) => ({
+        sku: 's' + i, title: 't', price: 1, stock: 2,
+      }));
+      const r = await syncListings(products);
+      assert(r.length === 12, 'length');
+      assert(r.every((x, i) => x.sku === 's' + i), 'order');
+      assert(r[3].ok === false && r[3].status === 500, 'http failure');
+      assert(r[4].ok === false && r[4].error === 'boom', 'network failure');
+      assert(r.filter((x) => x.ok).length === 10, 'successes');
+      assert(peak <= 5, 'limit respected');
+      assert(peak > 1, 'runs concurrently');
+      const empty = await syncListings([]);
+      assert(Array.isArray(empty) && empty.length === 0, 'empty');
+    })();

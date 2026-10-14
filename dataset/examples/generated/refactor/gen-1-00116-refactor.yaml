@@ -1,0 +1,100 @@
+id: gen-1-00116-refactor
+category: refactor
+language: python
+patterns:
+- string-join
+- keep-star-imports
+facts:
+- F-STRCAT
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    from struct import *
+    from math import *
+
+    # frame: sensor id, sequence, temperature in 0.01 C, battery in mV
+    FRAME_FMT = "<HHhH"
+    FRAME_SIZE = calcsize(FRAME_FMT)
+
+
+    def parse_frames(blob):
+        frames = []
+        for off in range(0, len(blob) - FRAME_SIZE + 1, FRAME_SIZE):
+            sid, seq, temp, batt = unpack_from(FRAME_FMT, blob, off)
+            frames.append((sid, seq, temp / 100.0, batt))
+        return frames
+
+
+    def build_payload(frames):
+        out = ""
+        for sid, seq, temp, batt in frames:
+            out += str(sid) + "," + str(seq) + "," + str(round(temp, 2)) + "," + str(batt) + "\n"
+        return out
+
+
+    def rms_temp(frames):
+        total = 0
+        for f in frames:
+            total += f[2] ** 2
+        return sqrt(total / len(frames))
+    ```
+- role: assistant
+  content: |
+    ```python
+    from struct import *
+    from math import *
+
+    # frame: sensor id, sequence, temperature in 0.01 C, battery in mV
+    FRAME_FMT = "<HHhH"
+    FRAME_SIZE = calcsize(FRAME_FMT)
+
+
+    def parse_frames(blob):
+        frames = []
+        for off in range(0, len(blob) - FRAME_SIZE + 1, FRAME_SIZE):
+            sid, seq, temp, batt = unpack_from(FRAME_FMT, blob, off)
+            frames.append((sid, seq, temp / 100.0, batt))
+        return frames
+
+
+    def build_payload(frames):
+        return "".join(
+            f"{sid},{seq},{round(temp, 2)},{batt}\n"
+            for sid, seq, temp, batt in frames
+        )
+
+
+    def rms_temp(frames):
+        total = 0
+        for f in frames:
+            total += f[2] ** 2
+        return sqrt(total / len(frames))
+    ```
+
+    **Green Notes**
+    - **`join` instead of `+=` in `build_payload`** (reduces E): the old loop built a new string for every concatenation and every line. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces with `+=` used ~469 J of CPU energy, and `"".join()` used ~1.8 J (roughly 260× less) ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=732b88b3-e081-409d-a987-d1a929b357e4,527c0154-dbb1-4c82-b98f-838f994af603,2fca8771-9ad9-4ec0-b51f-2ee78ee20865)). A gateway batch is much smaller than that, so expect a smaller gain. It still runs on every upload, and the f-string version is shorter. The output is byte-for-byte the same.
+    - **Star imports left as they are:** in the same micro-benchmarks, `from x import *` and `import x` showed no measurable energy difference. Changing them would not save anything, so I did not touch them. If your team wants explicit imports for readability, that is a style choice and not an energy one.
+    - `parse_frames` and `rms_temp` are already linear and do no repeated work, so I left them alone.
+
+    To check the real effect on your device, time `build_payload` on a typical batch with `time` or `perf stat` before and after.
+verify:
+  equivalence:
+    driver: |-
+      import random
+      import struct
+      random.seed(11)
+      blob = b"".join(
+          struct.pack("<HHhH", random.randint(0, 50), i, random.randint(-2000, 4500), random.randint(2800, 4200))
+          for i in range(300)
+      )
+      blob += b"\x01\x02"
+      frames = parse_frames(blob)
+      payload = build_payload(frames)
+      print(len(frames))
+      print(payload)
+      print(round(rms_temp(frames), 6))
+      print(repr(build_payload([])))

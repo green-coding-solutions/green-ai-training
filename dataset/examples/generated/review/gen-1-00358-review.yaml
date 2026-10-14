@@ -1,0 +1,83 @@
+id: gen-1-00358-review
+category: review
+language: bash
+patterns:
+- bash-quoting
+- bash-builtins
+facts:
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    hi, I wrote this to collect the last line of each frame file from my MD simulation runs into one results file. it works on my small test but my full run has about 50000 frames and it feels slow. also sometimes it prints weird errors. im not sure what is wrong, can you look?
+
+    ```bash
+    #!/bin/bash
+    # collect results from MD frames
+    OUT=$1
+    RESULTS=$2
+
+    rm -f $RESULTS
+    for f in $OUT/frame_*.dat; do
+        name=$(basename $f .dat)
+        lines=$(cat $f | wc -l)
+        if [ $lines -lt 2 ]; then
+            echo "skipping $name, frame is empty" >&2
+            continue
+        fi
+        echo "# Columns: step time_ps temp_K pressure_bar epot_kJ_mol ekin_kJ_mol etot_kJ_mol volume_nm3 density_kg_m3" >> $RESULTS
+        echo "# Units: time in picoseconds, temperature in Kelvin, pressure in bar, energies in kJ/mol, volume in nm3" >> $RESULTS
+        echo "# Source: $name" >> $RESULTS
+        tail -n 1 $f >> $RESULTS
+    done
+    echo "done, $(wc -l < $RESULTS) lines written"
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (batch post-processing, 50k iterations)
+
+    #### [Bug] Unquoted variables and an unchecked glob
+    - **Where:** `$RESULTS`, `$OUT`, `$f` everywhere, and the `for f in $OUT/frame_*.dat` line
+    - **Issue:** if a path contains a space, bash splits it into several words and you get the "weird errors". If no `frame_*.dat` file exists, the loop runs once with the literal text `frame_*.dat` and `cat` fails.
+    - **Fix:** quote every variable that holds a path, and skip the loop when the glob matches nothing.
+
+    #### [Medium] Extra processes and file opens in every iteration
+    - **Where:** `basename`, `cat | wc -l`, and the four `>> $RESULTS` redirections
+    - **Issue:** each frame starts three extra processes (`basename`, `cat`, `wc`). It also opens and closes the results file four times. With 50000 frames that is a lot of process startups for work bash can do itself.
+    - **Fix:** use parameter expansion instead of `basename`, `wc -l < "$f"` instead of `cat | wc`, and redirect the whole loop once.
+    - **Impact:** reduces E: roughly 150000 process starts shrink to 100000, and 200000 file opens become 1.
+
+    #### [Low] Double quotes on literals that need no expansion
+    - **Where:** the `# Columns:` and `# Units:` lines
+    - **Issue:** bash scans double-quoted text for `$`, backticks and backslashes. These two strings contain none of them, so single quotes are enough.
+    - **Impact:** small. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal in a loop used about 24% less CPU energy with single quotes ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=dd9bbb4e-b056-4067-8ad2-7b1818a86f10,b265ef9b-adb9-4b56-a14b-ae34fdaa7247,28d92c15-79d7-44ca-8f43-a733fe2e265a,a9533378-71f0-49df-bd5f-1e5f27cda9c2)). Your strings are much shorter, and the loop mostly pays for forks and file opens, so expect only a tiny gain. It is still free and safe to do.
+    - Keep double quotes where you need `$name`. Never remove quotes around variables.
+
+    ```bash
+    #!/bin/bash
+    # collect results from MD frames
+    out_dir=$1
+    results=$2
+
+    for f in "$out_dir"/frame_*.dat; do
+        [ -e "$f" ] || continue
+        name=${f##*/}
+        name=${name%.dat}
+        lines=$(wc -l < "$f")
+        if [ "$lines" -lt 2 ]; then
+            echo "skipping $name, frame is empty" >&2
+            continue
+        fi
+        echo '# Columns: step time_ps temp_K pressure_bar epot_kJ_mol ekin_kJ_mol etot_kJ_mol volume_nm3 density_kg_m3'
+        echo '# Units: time in picoseconds, temperature in Kelvin, pressure in bar, energies in kJ/mol, volume in nm3'
+        echo "# Source: $name"
+        tail -n 1 "$f"
+    done > "$results"
+    echo "done, $(wc -l < "$results") lines written"
+    ```
+
+    `> "$results"` after `done` also replaces `rm -f`, because it empties the file at the start. The skip messages go to stderr, so they do not end up in the results. The output is the same as before.
+
+    **Already good:** you skip empty frames, and you send the warnings to stderr.
+verify:
+  static_only: bash script that depends on a directory of simulation frame files

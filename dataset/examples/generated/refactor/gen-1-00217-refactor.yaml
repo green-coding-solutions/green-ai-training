@@ -1,0 +1,101 @@
+id: gen-1-00217-refactor
+category: refactor
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    hello, i have script what send our customer reviews to the sentiment model server and save the labels. every night it have around 400 reviews and it take very long, like the server is idle most of time. can you make it better pls? sorry for my english
+
+    ```python
+    import json
+    import time
+    import requests
+
+    SERVER = "http://ml-gateway.internal:8080/v1/classify"
+
+
+    def classify_all(texts, out_path):
+        results = []
+        for t in texts:
+            label = None
+            for attempt in range(3):
+                try:
+                    r = requests.post(SERVER, json={"text": t}, timeout=10)
+                    r.raise_for_status()
+                    label = r.json()["label"]
+                    break
+                except requests.RequestException:
+                    time.sleep(1)
+            results.append(label)
+
+        with open(out_path, "w") as f:
+            json.dump(results, f)
+        return results
+
+
+    if __name__ == "__main__":
+        with open("reviews.json") as f:
+            reviews = json.load(f)
+        labels = classify_all([r["text"] for r in reviews], "labels.json")
+        print(len(labels), "done")
+    ```
+- role: assistant
+  content: |
+    The script waits for each answer before it sends the next review. Most of the run time is waiting on the network. The calls do not depend on each other, so they can run together with a small limit.
+
+    ```python
+    import asyncio
+    import json
+
+    import httpx
+
+    SERVER = "http://ml-gateway.internal:8080/v1/classify"
+    MAX_CONCURRENT = 8
+
+
+    async def classify_one(client, sem, text):
+        async with sem:
+            for attempt in range(3):
+                try:
+                    r = await client.post(SERVER, json={"text": text})
+                    r.raise_for_status()
+                    return r.json()["label"]
+                except httpx.HTTPError:
+                    if attempt < 2:
+                        await asyncio.sleep(1)
+        return None
+
+
+    async def _classify_all(texts):
+        sem = asyncio.Semaphore(MAX_CONCURRENT)
+        async with httpx.AsyncClient(timeout=10) as client:
+            return await asyncio.gather(*(classify_one(client, sem, t) for t in texts))
+
+
+    def classify_all(texts, out_path):
+        results = asyncio.run(_classify_all(texts))
+
+        with open(out_path, "w") as f:
+            json.dump(results, f)
+        return results
+
+
+    if __name__ == "__main__":
+        with open("reviews.json") as f:
+            reviews = json.load(f)
+        labels = classify_all([r["text"] for r in reviews], "labels.json")
+        print(len(labels), "done")
+    ```
+
+    **Green Notes**
+    - **Concurrent requests with `httpx.AsyncClient`** (reduces E and run time): the process no longer sits idle for 400 round trips one after another. One client also reuses its connections. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib` ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=97acc9a0-3856-4bbb-b816-2b64030fba98,6415cccb-ad1a-4d87-ae46-92740c5e285b)). For you the main gain is wall time, because the CPU energy gain is modest.
+    - **`Semaphore(8)` limits the load:** the model server never gets more than 8 requests at once. Raise or lower the number to match what the server can handle.
+    - **Same behavior:** `gather` keeps the output in input order, so `labels.json` matches the old file. Failed reviews still become `None` after 3 tries. The only change is that the code no longer sleeps after the last failed try.
+    - *Not applied:* if the server has a batch endpoint that takes many texts in one request, use that instead. It removes most of the requests. This is a bigger change, so check the server API first.
+    - For a script that sends only a few requests, async would not be worth the extra code.
+verify:
+  static_only: needs a running inference server and the httpx and requests packages

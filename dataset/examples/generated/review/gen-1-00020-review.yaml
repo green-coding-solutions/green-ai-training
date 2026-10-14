@@ -1,0 +1,124 @@
+id: gen-1-00020-review
+category: review
+language: javascript
+patterns:
+- regex-precompile
+messages:
+- role: user
+  content: |
+    review pls
+
+    ```javascript
+    const fs = require('fs');
+    const readline = require('readline');
+
+    const LEVELS = ['DEBUG', 'INFO', 'WARN', 'ERROR'];
+
+    // counts how many log lines mention each service, at or above minLevel
+    async function scan(file, services, minLevel) {
+      const counts = {};
+      for (const s of services) counts[s] = 0;
+      let bad = 0;
+
+      const rl = readline.createInterface({ input: fs.createReadStream(file) });
+      for await (const line of rl) {
+        const m = line.match(
+          new RegExp('^(\\S+) (' + LEVELS.join('|') + ') \\[(\\w+)\\] (.*)$')
+        );
+        if (!m) {
+          bad++;
+          continue;
+        }
+        if (LEVELS.indexOf(m[2]) < LEVELS.indexOf(minLevel)) continue;
+
+        for (const svc of services) {
+          if (new RegExp('\\b' + svc + '\\b', 'i').test(m[4])) {
+            counts[svc]++;
+          }
+        }
+      }
+      return { counts, bad };
+    }
+
+    module.exports = { scan };
+    ```
+- role: assistant
+  content: |
+    **Workload:** script / log processing (runs per line of a large file)
+
+    #### [Bug] Service names are pasted into the regex unescaped
+    - **Where:** `new RegExp('\\b' + svc + '\\b', 'i')`
+    - **Issue:** a name like `api.v2` also matches `apiXv2`. A name like `cache(` or `c++` throws a `SyntaxError` in the middle of a long run.
+    - **Fix:** escape the name once before you build the pattern.
+
+    #### [High] Regexes are rebuilt for every log line
+    - **Where:** the `line.match(new RegExp(...))` call, and the `new RegExp(...)` inside the `services` loop
+    - **Issue:** the line pattern never changes, yet it is parsed again for every line. The service patterns depend only on `services`, yet they are built again for every line and every service. With millions of lines and several services, that is millions of regex objects created and thrown away. V8 caches compiled patterns, so the gain is less than the raw count suggests. You still skip the string concatenation, the lookup and the allocation each time.
+    - **Fix:** build all patterns once before the loop. Do not add the `g` flag to them: with `.test()` a shared global regex keeps `lastIndex` between calls and skips matches.
+    - **Impact:** reduces E (CPU) per line, and the saving grows with file size and service count.
+
+    #### [Low] Minimum level looked up per line
+    - **Where:** `LEVELS.indexOf(minLevel)` in the loop
+    - **Issue:** the value is the same on every line. It is a small cost, but it is free to move out.
+
+    ```javascript
+    const fs = require('fs');
+    const readline = require('readline');
+
+    const LEVELS = ['DEBUG', 'INFO', 'WARN', 'ERROR'];
+    const LINE_RE = new RegExp('^(\\S+) (' + LEVELS.join('|') + ') \\[(\\w+)\\] (.*)$');
+    const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    // counts how many log lines mention each service, at or above minLevel
+    async function scan(file, services, minLevel) {
+      const minIdx = LEVELS.indexOf(minLevel);
+      const counts = {};
+      const matchers = services.map((svc) => {
+        counts[svc] = 0;
+        return [svc, new RegExp('\\b' + escapeRe(svc) + '\\b', 'i')];
+      });
+      let bad = 0;
+
+      const rl = readline.createInterface({ input: fs.createReadStream(file) });
+      for await (const line of rl) {
+        const m = LINE_RE.exec(line);
+        if (!m) {
+          bad++;
+          continue;
+        }
+        if (LEVELS.indexOf(m[2]) < minIdx) continue;
+
+        for (const [svc, re] of matchers) {
+          if (re.test(m[4])) counts[svc]++;
+        }
+      }
+      return { counts, bad };
+    }
+
+    module.exports = { scan };
+    ```
+
+    Output is the same for normal service names. Names with regex characters now match literally instead of failing or matching too much.
+
+    **Already good:** the file is streamed line by line, so memory stays flat on large logs.
+verify:
+  equivalence:
+    driver: |-
+      const os = require('os');
+      const path = require('path');
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scan-'));
+      const file = path.join(dir, 'app.log');
+      fs.writeFileSync(file, [
+        '2026-10-09T10:00:00Z INFO [web] request to auth ok',
+        '2026-10-09T10:00:01Z DEBUG [web] cache warm for billing',
+        '2026-10-09T10:00:02Z ERROR [job] billing failed, auth token expired',
+        '2026-10-09T10:00:03Z WARN [job] AUTH retry for billing',
+        'garbage line without header',
+        '2026-10-09T10:00:04Z INFO [web] nothing to see',
+        '2026-10-09T10:00:05Z ERROR [db] authentication service down',
+        ''
+      ].join('\n'));
+      scan(file, ['auth', 'billing', 'cache'], 'INFO').then((r) => {
+        console.log(JSON.stringify(r));
+        fs.rmSync(dir, { recursive: true, force: true });
+      });

@@ -1,0 +1,35 @@
+id: gen-1-00168-conceptual
+category: conceptual
+language: text
+patterns:
+- batch-db-writes
+- context-tradeoff
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    Hi, we have a REST API in Flask with Postgres. Many endpoints do INSERT one by one in a loop, and my teamlead say we must change all of them to bulk insert or COPY because its more efficent. But I am not shure it is always true? When is it worth, and when not? Sorry for my english.
+- role: assistant
+  content: |-
+    You are right to ask. It is not always worth it. The gain depends on **how many rows go in per batch**.
+
+    **When it pays off**
+    - Import jobs, nightly syncs, CSV uploads: thousands of rows per batch.
+    - In Green Metrics Tool micro-benchmarks (PostgreSQL 16, 500,000 rows in batches of 5,000 rows), `COPY` used about 22× less CPU energy than one `execute()` per row, and `executemany()` about 2.8× less ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=8e80b599-3332-432f-8c7e-1cfb93a3a354,8b4c205d-5fb1-40af-ab77-0427ca572f4e,adff4e53-2f1a-4d88-9c0d-dd681d02923f)). `COPY` was about 8× less than `executemany()`.
+    - With batches of 1,000 rows, `COPY` was still about 5× less than the loop ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=8e80b599-3332-432f-8c7e-1cfb93a3a354,8b4c205d-5fb1-40af-ab77-0427ca572f4e,adff4e53-2f1a-4d88-9c0d-dd681d02923f)).
+
+    **When it does not matter**
+    - Normal request handlers that write a few rows, for example 1-30 order lines. The same benchmark with batches of only 100 rows showed small differences, because the fixed cost per batch dominates.
+    - For these, a simple `executemany()` or one multi-row `INSERT` is enough. `COPY` adds complexity (different API, error handling, data formatting) for almost no gain.
+
+    **What to check, whatever the size**
+    - Commit once per request or per batch, not once per row. A commit per row is often the real cost.
+    - Use one transaction, so a failure does not leave half the rows written.
+    - If rows are many, send them in chunks (for example a few thousand), not all in one huge statement.
+
+    **A simple rule for your team**
+    - Few rows per request: keep it simple, one transaction, `executemany()`.
+    - Bulk paths (imports, syncs, backfills): use `COPY` or large batches.
+
+    Do not rewrite all endpoints. Find the ones that write many rows, and measure those first. You can use the Green Metrics Tool with a usage scenario, or at least compare CPU time with `time` before and after.

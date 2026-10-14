@@ -1,0 +1,85 @@
+id: gen-1-00115-generation
+category: generation
+language: bash
+patterns:
+- bash-quoting
+- bash-builtins
+facts:
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    I need a bash script for our log folder. Requirements:
+
+    - Takes a directory as the first argument and reads every `*.log` file in it. An optional second argument is the output file (default: stdout).
+    - Lines look like `2026-10-09T12:00:01Z service=api level=ERROR msg="db timeout"`. The fields can come in any order after the timestamp.
+    - Output a tab-separated table: service, errors, warnings, fatal. Sort by errors, highest first.
+    - Exit with code 2 if the directory is missing or has no log files. Exit with code 1 if any FATAL line was seen (still write the table).
+    - Should run with `set -euo pipefail` and be OK with filenames that have spaces.
+
+    The folders can be a few hundred MB, and it runs from cron every 10 minutes.
+- role: assistant
+  content: |
+    One `awk` pass over all files does the counting. The shell only handles arguments and the exit code:
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    if [[ $# -lt 1 || ! -d $1 ]]; then
+      echo 'Usage: log-summary.sh LOG_DIR [OUT_FILE]' >&2
+      exit 2
+    fi
+
+    log_dir=$1
+    out_file=${2:-/dev/stdout}
+
+    shopt -s nullglob
+    files=("$log_dir"/*.log)
+    if (( ${#files[@]} == 0 )); then
+      echo "No .log files found in $log_dir" >&2
+      exit 2
+    fi
+
+    rc=0
+    {
+      printf '%s\t%s\t%s\t%s\n' service errors warnings fatal
+      awk '
+        {
+          svc = "-"; lvl = ""
+          for (i = 2; i <= NF; i++) {
+            if (index($i, "service=") == 1)    svc = substr($i, 9)
+            else if (index($i, "level=") == 1) lvl = substr($i, 7)
+          }
+          seen[svc] = 1
+          if (lvl == "ERROR")      err[svc]++
+          else if (lvl == "WARN")  warn[svc]++
+          else if (lvl == "FATAL") { fatal[svc]++; any_fatal = 1 }
+        }
+        END {
+          for (s in seen) printf "%s\t%d\t%d\t%d\n", s, err[s], warn[s], fatal[s]
+          if (any_fatal) exit 3
+        }
+      ' "${files[@]}" | sort -t $'\t' -k2,2nr -k1,1
+    } >"$out_file" || rc=$?
+
+    if (( rc == 3 )); then
+      echo 'FATAL lines found' >&2
+      exit 1
+    fi
+    exit "$rc"
+    ```
+
+    Notes on the behavior:
+
+    - The table is written before the exit code is decided, so you get the output even when the exit code is 1.
+    - Ties in the error count are sorted by service name, so the output is stable between runs.
+    - Lines without `service=` are counted under `-`.
+    - Files with spaces work because the glob result is stored in an array and always expanded as `"${files[@]}"`.
+
+    **Green Notes**
+    - **Single quotes for literals without expansion** (reduces E): the `awk` program, the `printf` formats, the usage text and the other fixed strings use single quotes. Bash does not scan them for `$`, backticks or backslashes. In Green Metrics Tool micro-benchmarks, a long literal assigned in a loop used about 24% less CPU energy with single quotes than with double quotes ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=dd9bbb4e-b056-4067-8ad2-7b1818a86f10,b265ef9b-adb9-4b56-a14b-ae34fdaa7247,28d92c15-79d7-44ca-8f43-a733fe2e265a,a9533378-71f0-49df-bd5f-1e5f27cda9c2)). Here the saving is tiny, because each string is parsed once. Double quotes stay only where a variable must expand (`"No .log files found in $log_dir"`), and every variable stays quoted.
+    - **One `awk` pass instead of a shell loop** (reduces E): a `while read` loop with `grep`/`cut` per line starts new processes for every line. Here the files are read once, by one process.
+    - **Single quotes also protect the awk code:** `$i` and `$NF`-style fields must reach `awk` unchanged, so double quotes would be a bug there.
+verify:
+  static_only: bash script with awk over a log directory; checked for syntax only

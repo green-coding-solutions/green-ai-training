@@ -1,0 +1,140 @@
+id: gen-1-00131-review
+category: review
+language: python
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    hi, i wrote this script that pushes our sensor readings from a local sqlite file to the ingest API every few minutes. it works most of the time but sometimes the API gives 400 and i dont know why. can you review it? im not sure what is wrong with it
+
+    ```python
+    import json
+    import lzma
+    import sqlite3
+
+    import requests
+
+    INGEST_URL = "https://ingest.example.com/v1/events"
+    COLUMNS = ("id", "device", "ts", "value")
+
+
+    def fetch_batches(conn, size=500):
+        cur = conn.execute(
+            "SELECT id, device, ts, value FROM readings WHERE sent = 0 ORDER BY id"
+        )
+        while True:
+            rows = cur.fetchmany(size)
+            if not rows:
+                break
+            yield rows
+
+
+    def push(conn):
+        for rows in fetch_batches(conn):
+            payload = json.dumps([dict(zip(COLUMNS, r)) for r in rows], indent=2)
+            body = lzma.compress(payload.encode("utf-8"), preset=9 | lzma.PRESET_EXTREME)
+            resp = requests.post(
+                INGEST_URL,
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Encoding": "gzip",
+                },
+            )
+            print(resp.status_code)
+            conn.execute("UPDATE readings SET sent = 1 WHERE id <= ?", (rows[-1][0],))
+            conn.commit()
+
+
+    if __name__ == "__main__":
+        push(sqlite3.connect("readings.db"))
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (small batches, runs every few minutes)
+
+    #### [Bug] Header says gzip, body is xz
+    - **Where:** `lzma.compress(...)` and `"Content-Encoding": "gzip"`
+    - **Issue:** `lzma` writes the xz format, not gzip. The server tries to gunzip the body and fails. This is very likely your 400.
+    - **Fix:** compress with `gzip` so the header is true.
+
+    #### [Bug] Failed batches are marked as sent
+    - **Where:** `conn.execute("UPDATE ... sent = 1 ...")` after `print(resp.status_code)`
+    - **Issue:** the code never checks the response. A 400 or 500 still marks the rows as sent, so those readings are lost silently.
+    - **Fix:** call `resp.raise_for_status()` before the `UPDATE`. A failed batch then stays unsent and is retried on the next run.
+
+    #### [Bug] No timeout
+    - **Where:** `requests.post(...)`
+    - **Issue:** `requests` waits forever by default. One hung connection blocks every later run.
+    - **Fix:** pass `timeout=(5, 30)`.
+
+    #### [High] Maximum xz compression for data that is compressed every few minutes
+    - **Where:** `preset=9 | lzma.PRESET_EXTREME`
+    - **Issue:** this is the most expensive xz setting, and it runs on every batch, all day. The data is only needed in transit, so a stronger ratio buys very little.
+    - **Fix:** use gzip at a moderate level (6). If your endpoint also accepts `zstd`, that is cheaper still.
+    - **Impact:** reduces E on the sender. In Green Metrics Tool micro-benchmarks, compressing 100 MB of English text with default settings used about 458 J with xz, about 67 J with gzip and about 16 J with zstd ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=2584305c-7a1e-47e2-b6cc-26276962035e,addc5f5e-55da-47f8-956d-240d06304e4e,fb08d3c3-ba41-4f0f-85fd-0b6c34e6c39b,f1479db0-c453-4aaa-9116-e137621fad07,7b3bb87d-3b43-4f82-be99-0327405205b8,905bd408-6b31-4237-a4da-14b8fad90613,7f213a20-8028-4080-9583-6e465c217bb5,8e93a8d2-60b0-4831-905b-764b68257bc7)). This compares energy only, not compression ratio. xz usually makes smaller files, but the extra savings don't matter for short-lived data.
+
+    #### [Medium] `indent=2` inflates the JSON
+    - **Where:** `json.dumps(..., indent=2)`
+    - **Issue:** the whitespace is extra bytes to build and to compress, and nobody reads this payload.
+    - **Fix:** use compact separators.
+
+    Fixed version:
+
+    ```python
+    import gzip
+    import json
+    import sqlite3
+
+    import requests
+
+    INGEST_URL = "https://ingest.example.com/v1/events"
+    COLUMNS = ("id", "device", "ts", "value")
+
+
+    def fetch_batches(conn, size=500):
+        cur = conn.execute(
+            "SELECT id, device, ts, value FROM readings WHERE sent = 0 ORDER BY id"
+        )
+        while True:
+            rows = cur.fetchmany(size)
+            if not rows:
+                break
+            yield rows
+
+
+    def push(conn):
+        with requests.Session() as session:
+            for rows in fetch_batches(conn):
+                payload = json.dumps(
+                    [dict(zip(COLUMNS, r)) for r in rows], separators=(",", ":")
+                )
+                body = gzip.compress(payload.encode("utf-8"), compresslevel=6)
+                resp = session.post(
+                    INGEST_URL,
+                    data=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Content-Encoding": "gzip",
+                    },
+                    timeout=(5, 30),
+                )
+                resp.raise_for_status()
+                conn.execute(
+                    "UPDATE readings SET sent = 1 WHERE id <= ?", (rows[-1][0],)
+                )
+                conn.commit()
+
+
+    if __name__ == "__main__":
+        push(sqlite3.connect("readings.db"))
+    ```
+
+    Compression itself is a good idea here. Readings repeat the same keys in every row, so JSON like this shrinks a lot. The `Session` also reuses one connection for all batches.
+
+    **Already good:** batches are read with `fetchmany`, so the whole table is never in memory. The commit comes after each batch.
+verify:
+  static_only: needs network (requests) and an ingest endpoint

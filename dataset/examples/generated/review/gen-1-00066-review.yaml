@@ -1,0 +1,95 @@
+id: gen-1-00066-review
+category: review
+language: python
+patterns:
+- vectorize-or-jit
+- deque-or-append
+facts:
+- F-NUMBA
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    Review, diff only please. Post-processing for MD trajectories, runs on every finished simulation (pos is around 20k frames x 5k atoms).
+
+    ```python
+    import numpy as np
+
+    def analyse_trajectory(pos, masses, dt):
+        """pos: (n_frames, n_atoms, 3), masses: (n_atoms,). Returns newest frame first."""
+        n_frames = pos.shape[0]
+        n_atoms = pos.shape[1]
+        results = []
+        for f in range(1, n_frames):
+            ke = 0.0
+            msd = 0.0
+            for a in range(n_atoms):
+                vx = (pos[f, a, 0] - pos[f - 1, a, 0]) / dt
+                vy = (pos[f, a, 1] - pos[f - 1, a, 1]) / dt
+                vz = (pos[f, a, 2] - pos[f - 1, a, 2]) / dt
+                ke += 0.5 * masses[a] * (vx * vx + vy * vy + vz * vz)
+                dx = pos[f, a, 0] - pos[0, a, 0]
+                dy = pos[f, a, 1] - pos[0, a, 1]
+                dz = pos[f, a, 2] - pos[0, a, 2]
+                msd += dx * dx + dy * dy + dz * dz
+            msd /= n_atoms
+            results.insert(0, (f * dt, ke, msd))
+        return results
+    ```
+- role: assistant
+  content: |
+    **Workload:** scientific computing (batch post-processing, runs on every finished simulation)
+
+    #### [High] Python loop over every atom in every frame
+    - **Where:** inner `for a in range(n_atoms)` loop
+    - **Issue:** about 100 million iterations for your sizes, each doing nine scalar NumPy indexings. Each indexing creates a NumPy scalar object, which is slow and wasteful. The math is plain array arithmetic.
+    - **Fix:** use whole-array operations over frames and atoms (diff below).
+    - **Impact:** reduces E by moving the loop into compiled NumPy code. In Green Metrics Tool micro-benchmarks, a pure Python numeric loop over 10,000,000 samples used about 4× more CPU energy than a compiled Numba version ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=dc2ed71b-e8ed-48d5-be04-0dd9dfe1443f,2b9e7f88-4aad-42ee-a9e6-25ff4e6ea712)). NumPy vectorization removes the interpreter loop in the same way.
+
+    #### [Medium] `results.insert(0, ...)` in the frame loop
+    - **Where:** last line of the outer loop
+    - **Issue:** every front insert shifts the whole list, so building it is O(n²) in frames. In Green Metrics Tool micro-benchmarks, 1,000,000 front inserts used over 1000× the CPU energy of 1,000,000 appends ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=1da9c13d-364b-4f71-b23f-785bf1caeac8,75a7d151-3a7b-4575-b3e1-de125ce00d00)).
+    - **Fix:** build in order and reverse once. The vectorized version does this with `[::-1]`.
+
+    #### [Low] No guard for `n_atoms == 0`
+    - **Where:** `msd /= n_atoms`
+    - **Issue:** raises `ZeroDivisionError` on an empty system. The vectorized version gives `nan` for MSD instead. Add an explicit check if you want an error.
+
+    ```python
+    import numpy as np
+
+    def analyse_trajectory(pos, masses, dt):
+        """pos: (n_frames, n_atoms, 3), masses: (n_atoms,). Returns newest frame first."""
+        vel = np.diff(pos, axis=0) / dt                        # (n_frames-1, n_atoms, 3)
+        ke = 0.5 * (masses * np.einsum("fax,fax->fa", vel, vel)).sum(axis=1)
+        disp = pos[1:] - pos[0]
+        msd = np.einsum("fax,fax->fa", disp, disp).mean(axis=1)
+        t = np.arange(1, pos.shape[0]) * dt
+        return list(zip(t.tolist(), ke.tolist(), msd.tolist()))[::-1]
+    ```
+
+    Behavior notes:
+    - The output order and values are unchanged. Summation order differs, so results can differ in the last floating-point bits.
+    - `np.diff` and `disp` allocate one array the size of the trajectory. If memory is tight, process frames in chunks of a few thousand.
+    - If callers don't need newest-first, drop the `[::-1]`.
+verify:
+  green_block: 0
+  equivalence:
+    driver: |
+      rng = np.random.default_rng(42)
+      pos = rng.normal(size=(30, 12, 3)).cumsum(axis=0)
+      masses = rng.uniform(1.0, 16.0, size=12)
+      res = analyse_trajectory(pos, masses, 0.002)
+      print(len(res))
+      for t, ke, msd in res:
+          print(f"{t:.6f} {ke:.4f} {msd:.4f}")
+  test: |-
+    import numpy as np
+    pos = np.zeros((3, 2, 3))
+    pos[1, :, 0] = 1.0
+    pos[2, :, 0] = 2.0
+    r = analyse_trajectory(pos, np.array([2.0, 4.0]), 1.0)
+    assert len(r) == 2
+    assert r[0][0] == 2.0 and r[1][0] == 1.0
+    assert abs(r[0][1] - 3.0) < 1e-12
+    assert abs(r[0][2] - 4.0) < 1e-12

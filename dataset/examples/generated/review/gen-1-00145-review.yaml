@@ -1,0 +1,165 @@
+id: gen-1-00145-review
+category: review
+language: yaml
+patterns:
+- minimize-environments
+messages:
+- role: user
+  content: |
+    Can you review our preview setup for the marketing landing page? Requirements: every change should be viewable by the designers before merge, previews must use the same chart as prod so they look identical, and the workflow should stay simple. Lately the cluster is full of old stuff and the cloud bill went up, and I can't see why.
+
+    `.github/workflows/preview.yml`
+    ```yaml
+    name: preview
+    on:
+      push:
+        branches: ['**']
+
+    env:
+      REGISTRY: ghcr.io/acme
+
+    jobs:
+      deploy:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+          - uses: docker/login-action@v3
+            with:
+              registry: ghcr.io
+              username: ${{ github.actor }}
+              password: ${{ secrets.GITHUB_TOKEN }}
+          - name: Build image
+            run: |
+              docker build -t $REGISTRY/landing:${{ github.sha }} .
+              docker push $REGISTRY/landing:${{ github.sha }}
+          - name: Deploy preview
+            run: |
+              echo "Deploying: ${{ github.event.head_commit.message }}"
+              helm upgrade --install landing-${{ github.ref_name }} ./chart \
+                -n previews --create-namespace \
+                -f chart/values-prod.yaml \
+                --set image.tag=${{ github.sha }} \
+                --set ingress.host=${{ github.ref_name }}.preview.acme.dev
+    ```
+
+    `chart/values-prod.yaml`
+    ```yaml
+    replicaCount: 3
+    resources:
+      requests: {cpu: 500m, memory: 1Gi}
+      limits: {cpu: "1", memory: 2Gi}
+    cms:
+      enabled: true
+      replicas: 2
+    postgres:
+      enabled: true
+      storage: 50Gi
+    autoscaling:
+      enabled: true
+      minReplicas: 3
+      maxReplicas: 10
+    ```
+- role: assistant
+  content: |
+    **Workload:** CI/CD and infrastructure for a static-ish landing page
+
+    #### [Security] Commit message is pasted into a shell script
+    - **Where:** `echo "Deploying: ${{ github.event.head_commit.message }}"`
+    - **Issue:** GitHub expands the expression before the shell runs. A commit message with `"; curl ... | sh; "` runs as code on the runner, which has registry and cluster credentials. The same is true for `github.ref_name`, because branch names can contain shell characters.
+    - **Fix:** pass values through `env:` and use them as quoted shell variables, or drop the echo.
+
+    #### [Bug] Branch name is used as the Helm release name and host
+    - **Where:** `landing-${{ github.ref_name }}` and `${{ github.ref_name }}.preview.acme.dev`
+    - **Issue:** a branch like `feature/new-hero` has a slash, which is invalid in a release name and a hostname. Long names also exceed Helm's release name limit. Those deploys fail, or you get odd collisions after sanitizing.
+    - **Fix:** use the PR number: `pr-12`. It is short, unique and valid.
+
+    #### [High] Previews are never removed
+    - **Where:** the workflow has no teardown, and `on: push` for every branch
+    - **Issue:** each new branch creates a release that stays after the branch is merged or deleted. Nothing deletes it, so the cluster only grows. This is the likely reason for your bill. Idle environments still hold their reserved CPU, memory and disks.
+    - **Fix:** deploy on `pull_request` and uninstall when the PR is closed (see below). As a safety net, add a scheduled job that removes releases for PRs that no longer exist.
+    - **Impact:** reduces E and M. Hardware is reserved only while someone can actually review the change.
+    - **Pattern:** https://patterns.greensoftware.foundation/development/minimizing-deployed-environments
+
+    #### [High] Every preview is a full prod-sized stack
+    - **Where:** `-f chart/values-prod.yaml`
+    - **Issue:** each preview gets 3 replicas with an autoscaler that starts at 3, a CMS with 2 replicas, and its own Postgres with a 50Gi volume. A designer looking at a page needs none of this. The cost is multiplied by the number of open branches.
+    - **Fix:** keep the same chart, so the pages look the same, but use a small `values-preview.yaml`: one replica, small requests, no autoscaler, and no own database. Build the page content into the image, or point to one shared read-only CMS.
+    - **Impact:** reduces E and M per environment, and the saving multiplies with every open PR.
+
+    #### [Medium] Overlapping deploys for the same branch
+    - **Where:** no `concurrency` setting
+    - **Issue:** two quick pushes start two builds and two Helm upgrades. The older one can finish last and leave the older version live. All the work of the older run is wasted.
+    - **Fix:** a concurrency group per PR with `cancel-in-progress: true`.
+
+    Here is a revised setup:
+
+    ```yaml
+    name: preview
+    on:
+      pull_request:
+        types: [opened, synchronize, reopened, closed]
+
+    concurrency:
+      group: preview-${{ github.event.number }}
+      cancel-in-progress: true
+
+    env:
+      REGISTRY: ghcr.io/acme
+      RELEASE: landing-pr-${{ github.event.number }}
+
+    jobs:
+      deploy:
+        if: github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+          - uses: docker/login-action@v3
+            with:
+              registry: ghcr.io
+              username: ${{ github.actor }}
+              password: ${{ secrets.GITHUB_TOKEN }}
+          - name: Build image
+            run: |
+              docker build -t "$REGISTRY/landing:$GITHUB_SHA" .
+              docker push "$REGISTRY/landing:$GITHUB_SHA"
+          - name: Deploy preview
+            env:
+              PR: ${{ github.event.number }}
+            run: |
+              helm upgrade --install "$RELEASE" ./chart \
+                -n previews --create-namespace \
+                -f chart/values-preview.yaml \
+                --set image.tag="$GITHUB_SHA" \
+                --set ingress.host="pr-$PR.preview.acme.dev"
+
+      teardown:
+        if: github.event.action == 'closed'
+        runs-on: ubuntu-latest
+        steps:
+          - name: Remove preview
+            run: helm uninstall "$RELEASE" -n previews --ignore-not-found
+    ```
+
+    ```yaml
+    # chart/values-preview.yaml
+    replicaCount: 1
+    resources:
+      requests: {cpu: 50m, memory: 64Mi}
+      limits: {cpu: 200m, memory: 128Mi}
+    cms:
+      enabled: false
+    postgres:
+      enabled: false
+    autoscaling:
+      enabled: false
+    ```
+
+    Things to check on your side:
+    - The `teardown` job needs cluster credentials like the deploy job. Add the same kubeconfig step to both.
+    - Removing a release does not always delete its volumes. Check that old PVCs from earlier previews are gone, and delete them once.
+    - Clean up the releases that exist today by hand, or with one script, before the scheduled sweep takes over.
+    - If a designer needs a preview for a longer time, that is fine. Add a label like `keep-preview` and skip the sweep for it. The goal is to avoid forgotten environments, not to forbid previews.
+
+    **Already good:** previews use the same chart as prod, images are tagged with the commit SHA, and the namespace is separate from prod.
+verify:
+  static_only: GitHub Actions workflow and Helm values, needs CI and a Kubernetes cluster

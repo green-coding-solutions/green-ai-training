@@ -1,0 +1,72 @@
+id: gen-1-00239-generation
+category: generation
+language: javascript
+patterns:
+- remove-unused-css
+messages:
+- role: user
+  content: |
+    ```javascript
+    // scripts/build-css.js
+    // builds the css for the classifier demo page (onnxruntime-web, src/index.html + src/js/*)
+    const fs = require("fs");
+    const path = require("path");
+
+    const bootstrap = fs.readFileSync(
+      path.join("node_modules", "bootstrap", "dist", "css", "bootstrap.min.css"),
+      "utf8"
+    );
+    const own = fs.readFileSync(path.join("src", "styles", "demo.css"), "utf8");
+
+    fs.mkdirSync("dist", { recursive: true });
+    fs.writeFileSync(path.join("dist", "app.css"), bootstrap + "\n" + own);
+
+    console.log("css written:", ((bootstrap.length + own.length) / 1024).toFixed(1), "KB");
+
+    // TODO
+    ```
+
+    ?
+- role: assistant
+  content: |
+    This script ships all of Bootstrap, but the demo page uses a small part of it. A purge step in the build removes the rest:
+
+    ```javascript
+    // scripts/build-css.js
+    const fs = require("fs");
+    const path = require("path");
+    const { PurgeCSS } = require("purgecss");
+
+    const bootstrapPath = path.join("node_modules", "bootstrap", "dist", "css", "bootstrap.min.css");
+    const ownPath = path.join("src", "styles", "demo.css");
+
+    async function main() {
+      const results = await new PurgeCSS().purge({
+        content: ["src/**/*.html", "src/**/*.js"],
+        css: [bootstrapPath, ownPath],
+        safelist: {
+          // classes that are built at runtime, e.g. `text-bg-${level}` for confidence badges
+          standard: [/^text-bg-(success|warning|danger)$/, "show", "fade", "collapsing"],
+        },
+      });
+
+      const css = results.map((r) => r.css).join("\n");
+      fs.mkdirSync("dist", { recursive: true });
+      fs.writeFileSync(path.join("dist", "app.css"), css);
+
+      console.log("css written:", (Buffer.byteLength(css) / 1024).toFixed(1), "KB");
+    }
+
+    main().catch((err) => {
+      console.error(err);
+      process.exit(1);
+    });
+    ```
+
+    **Green Notes**
+    - **Remove unused CSS** (reduces network): PurgeCSS scans your HTML and JS and keeps only the selectors that appear there. Every visitor downloads and parses a much smaller stylesheet. Your own `demo.css` goes through the same pass, so dead rules there are dropped too.
+    - **Runtime class names need a safelist.** PurgeCSS only sees class names written out in full. If your JS builds one like `` `text-bg-${level}` ``, the scanner never sees it and removes the rule. That is why the safelist lists those names. Add any other class your code assembles or toggles at runtime. Then check the page in a browser once, especially the result states.
+    - *Not applied:* no minify step. `bootstrap.min.css` is already minified, and PurgeCSS keeps that format.
+    - If you also use Bootstrap's own JS (modals, collapse), keep the classes it toggles in the safelist, as above.
+verify:
+  static_only: needs the purgecss and bootstrap npm packages and a project layout

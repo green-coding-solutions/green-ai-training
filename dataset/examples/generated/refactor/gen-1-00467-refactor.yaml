@@ -1,0 +1,150 @@
+id: gen-1-00467-refactor
+category: refactor
+language: typescript
+patterns:
+- async-concurrent-io
+- regex-precompile
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    hi, im new to typescript. this function check the new orders from our shop before we send them to the warehouse. it run every 10 minutes with about 150 orders. it work but it take very long time and i dont know why. can you make it better?
+
+    ```ts
+    type Order = {
+      id: string;
+      country: string;
+      postalCode: string;
+      email: string;
+      total: number;
+    };
+
+    const POSTAL_RULES: Record<string, string> = {
+      DE: "^\\d{5}$",
+      NL: "^\\d{4}\\s?[A-Z]{2}$",
+      GB: "^[A-Z]{1,2}\\d[A-Z\\d]?\\s?\\d[A-Z]{2}$",
+      US: "^\\d{5}(-\\d{4})?$",
+    };
+
+    async function getFraudScore(order: Order): Promise<number> {
+      const url =
+        "https://fraud.example-shop.com/score?email=" +
+        encodeURIComponent(order.email) +
+        "&total=" +
+        order.total;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`fraud api ${res.status}`);
+      const data = await res.json();
+      return data.score;
+    }
+
+    export async function checkNewOrders(orders: Order[]) {
+      const accepted: Order[] = [];
+      const rejected: { id: string; reason: string }[] = [];
+
+      for (const order of orders) {
+        const rule = POSTAL_RULES[order.country];
+        if (rule) {
+          const re = new RegExp(rule, "i");
+          if (!re.test(order.postalCode.trim())) {
+            rejected.push({ id: order.id, reason: "bad postal code" });
+            continue;
+          }
+        }
+
+        const score = await getFraudScore(order);
+        if (score > 0.8) {
+          rejected.push({ id: order.id, reason: "fraud score" });
+          continue;
+        }
+
+        accepted.push(order);
+      }
+
+      return { accepted, rejected };
+    }
+    ```
+- role: assistant
+  content: |
+    The slow part is the `await getFraudScore(order)` inside the `for` loop. Each order waits for the previous API call to finish, so 150 orders mean 150 calls one after another. The calls do not depend on each other, so they can run in groups.
+
+    ```ts
+    type Order = {
+      id: string;
+      country: string;
+      postalCode: string;
+      email: string;
+      total: number;
+    };
+
+    const POSTAL_RULES: Record<string, string> = {
+      DE: "^\\d{5}$",
+      NL: "^\\d{4}\\s?[A-Z]{2}$",
+      GB: "^[A-Z]{1,2}\\d[A-Z\\d]?\\s?\\d[A-Z]{2}$",
+      US: "^\\d{5}(-\\d{4})?$",
+    };
+
+    // Built once when the module loads. No "g" flag, so .test() has no hidden state.
+    const POSTAL_PATTERNS = new Map<string, RegExp>();
+    for (const [country, rule] of Object.entries(POSTAL_RULES)) {
+      POSTAL_PATTERNS.set(country, new RegExp(rule, "i"));
+    }
+
+    const MAX_PARALLEL = 10;
+
+    async function getFraudScore(order: Order): Promise<number> {
+      const url =
+        "https://fraud.example-shop.com/score?email=" +
+        encodeURIComponent(order.email) +
+        "&total=" +
+        order.total;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`fraud api ${res.status}`);
+      const data = await res.json();
+      return data.score;
+    }
+
+    // Scores come back in the same order as the input orders.
+    async function getFraudScores(orders: Order[]): Promise<number[]> {
+      const scores: number[] = [];
+      for (let i = 0; i < orders.length; i += MAX_PARALLEL) {
+        const group = orders.slice(i, i + MAX_PARALLEL);
+        scores.push(...(await Promise.all(group.map(getFraudScore))));
+      }
+      return scores;
+    }
+
+    export async function checkNewOrders(orders: Order[]) {
+      // Step 1: cheap postal check for every order, no network.
+      const reasons: (string | null)[] = orders.map((order) => {
+        const re = POSTAL_PATTERNS.get(order.country);
+        return re && !re.test(order.postalCode.trim()) ? "bad postal code" : null;
+      });
+
+      // Step 2: fraud score only for orders that passed step 1, in parallel groups.
+      const toScore = orders.filter((_, i) => reasons[i] === null);
+      const scores = await getFraudScores(toScore);
+
+      // Step 3: build the result in the original order.
+      const accepted: Order[] = [];
+      const rejected: { id: string; reason: string }[] = [];
+      let next = 0; // position in `scores`, only moves for orders that were scored
+      orders.forEach((order, i) => {
+        let reason = reasons[i];
+        if (reason === null && scores[next++] > 0.8) reason = "fraud score";
+        if (reason === null) accepted.push(order);
+        else rejected.push({ id: order.id, reason });
+      });
+
+      return { accepted, rejected };
+    }
+    ```
+
+    **Green Notes**
+    - **Parallel fraud calls with `Promise.all`** (reduces E, network wait): the loop held the function open for 150 round trips in a row. Now at most 10 are in flight at once. In Green Metrics Tool micro-benchmarks (Python, 10 HTTP requests), async used about 7% less CPU energy and about 17% less wall time than sync, so for a small batch the gain is mostly time, not energy ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=97acc9a0-3856-4bbb-b816-2b64030fba98,6415cccb-ad1a-4d87-ae46-92740c5e285b)). The cap of 10 keeps you friendly to the fraud API's rate limit. Raise it only if the API allows it.
+    - **Regex built once** (reduces E): `new RegExp(rule, "i")` ran for every order, but the rules never change. They are now compiled when the file loads. The gain is small, because JavaScript engines cache compiled patterns. It costs nothing, and it matters more if the rules ever get built from changing input.
+    - **Same results as before:** `accepted` and `rejected` keep the order of the input, and orders with a bad postal code still skip the API call. One difference: if the fraud API fails, the function still throws, but requests of the current group of 10 may already be in flight.
+    - *Not applied:* no batch endpoint or caching of scores. A fraud score depends on email and total, so I would not reuse old scores without knowing how the API treats them.
+verify:
+  static_only: TypeScript code that calls fetch against a network API; not runnable with stdlib-only checks

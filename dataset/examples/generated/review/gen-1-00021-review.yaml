@@ -1,0 +1,137 @@
+id: gen-1-00021-review
+category: review
+language: python
+patterns:
+- builtin-functions
+- set-membership
+messages:
+- role: user
+  content: |
+    Review of this please, diff only. It's the summary behind our order dashboard, called on every page load with the last few thousand orders.
+
+    ```python
+    def order_report(orders):
+        """orders: [{"id", "status", "lines": [{"sku", "qty", "unit_cents", "category"}]}]"""
+        revenue = 0
+        for o in orders:
+            for line in o["lines"]:
+                revenue = revenue + line["qty"] * line["unit_cents"]
+
+        has_backorder = False
+        for o in orders:
+            if o["status"] == "backorder":
+                has_backorder = True
+                break
+
+        per_category = {}
+        for o in orders:
+            for line in o["lines"]:
+                c = line["category"]
+                if c in per_category:
+                    per_category[c] = per_category[c] + line["qty"]
+                else:
+                    per_category[c] = line["qty"]
+
+        biggest = None
+        for o in orders:
+            t = 0
+            for line in o["lines"]:
+                t += line["qty"] * line["unit_cents"]
+            if biggest is None or t > biggest[1]:
+                biggest = (o["id"], t)
+
+        skus = []
+        for o in orders:
+            for line in o["lines"]:
+                if line["sku"] not in skus:
+                    skus.append(line["sku"])
+
+        return {
+            "revenue_cents": revenue,
+            "has_backorder": has_backorder,
+            "units_by_category": per_category,
+            "biggest_order": biggest,
+            "skus": skus,
+        }
+    ```
+- role: assistant
+  content: |
+    **Workload:** web backend
+
+    #### [High] Quadratic SKU de-duplication
+    - **Where:** the `skus` loop
+    - **Issue:** `line["sku"] not in skus` scans a list for every line. Work grows with lines × distinct SKUs, and it runs on every page load.
+    - **Fix:** `dict.fromkeys(...)` de-duplicates in one pass, keeps first-seen order, and gives the same list.
+    - **Impact:** reduces E on every request. Per-line cost drops from a list scan to a hash lookup.
+
+    #### [Medium] Five passes over the orders, line totals computed twice
+    - **Where:** `revenue` and `biggest` loops
+    - **Issue:** both multiply `qty * unit_cents` for every line. The `backorder` check and the category count walk the orders again.
+    - **Fix:** compute each order total once, then derive `revenue` and `biggest` from those totals. Money is in integer cents, so summing per order gives the same result.
+    - **Impact:** reduces E per request, roughly halves the line arithmetic.
+
+    #### [Low] Hand-written `any`, `sum`, `max` and counting
+    - **Where:** `has_backorder`, `per_category`, `biggest`
+    - **Issue:** the loops do what `any`, `sum`, `max` and `Counter` already do, and the built-ins run the loop in C. They are also shorter.
+    - **Fix:** see the replacement below. `max` keeps the first order on ties, same as the strict `>` before.
+
+    ```python
+    from collections import Counter
+
+    def order_report(orders):
+        order_totals = [
+            (o["id"], sum(line["qty"] * line["unit_cents"] for line in o["lines"]))
+            for o in orders
+        ]
+
+        units_by_category = Counter()
+        for o in orders:
+            for line in o["lines"]:
+                units_by_category[line["category"]] += line["qty"]
+
+        return {
+            "revenue_cents": sum(t for _, t in order_totals),
+            "has_backorder": any(o["status"] == "backorder" for o in orders),
+            "units_by_category": dict(units_by_category),
+            "biggest_order": max(order_totals, key=lambda p: p[1], default=None),
+            "skus": list(dict.fromkeys(
+                line["sku"] for o in orders for line in o["lines"]
+            )),
+        }
+    ```
+
+    Output is identical, including SKU order and category key order. I did not touch the data shape.
+verify:
+  equivalence:
+    driver: |
+      orders = [
+          {"id": "A1", "status": "paid", "lines": [
+              {"sku": "S-1", "qty": 2, "unit_cents": 1999, "category": "shoes"},
+              {"sku": "S-2", "qty": 1, "unit_cents": 4500, "category": "bags"},
+          ]},
+          {"id": "A2", "status": "backorder", "lines": [
+              {"sku": "S-1", "qty": 3, "unit_cents": 1999, "category": "shoes"},
+              {"sku": "S-3", "qty": 1, "unit_cents": 999, "category": "socks"},
+          ]},
+          {"id": "A3", "status": "paid", "lines": [
+              {"sku": "S-3", "qty": 4, "unit_cents": 999, "category": "socks"},
+              {"sku": "S-2", "qty": 2, "unit_cents": 4500, "category": "bags"},
+          ]},
+          {"id": "A4", "status": "paid", "lines": []},
+          {"id": "A5", "status": "paid", "lines": [
+              {"sku": "S-4", "qty": 1, "unit_cents": 8998, "category": "shoes"},
+          ]},
+      ]
+      print(order_report(orders))
+      print(order_report(orders[:1]))
+      print(order_report([]))
+  test: |-
+    r = order_report([
+        {"id": "X", "status": "paid", "lines": [{"sku": "a", "qty": 1, "unit_cents": 100, "category": "c"}]},
+        {"id": "Y", "status": "backorder", "lines": [{"sku": "a", "qty": 2, "unit_cents": 50, "category": "c"}]},
+    ])
+    assert r["biggest_order"] == ("X", 100)
+    assert r["skus"] == ["a"]
+    assert r["has_backorder"] is True
+    assert r["units_by_category"] == {"c": 3}
+    assert order_report([])["biggest_order"] is None

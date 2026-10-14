@@ -1,0 +1,60 @@
+id: gen-1-00289-no-change
+category: no-change
+language: python
+patterns:
+- memoize
+- context-tradeoff
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    fix this, too slow on big logs. lru_cache somewhere?
+
+    ```python
+    import re
+    import sys
+    from collections import Counter
+
+    LINE_RE = re.compile(r'^(\S+) \S+ \S+ \[([^\]]+)\] "(\w+) (\S+)[^"]*" (\d{3}) (\d+|-)')
+
+
+    def summarize(path):
+        status = Counter()
+        bytes_out = 0
+        error_urls = Counter()
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = LINE_RE.match(line)
+                if not m:
+                    continue
+                ip, ts, method, url, code, size = m.groups()
+                status[code] += 1
+                if size != "-":
+                    bytes_out += int(size)
+                if code.startswith("5"):
+                    error_urls[url] += 1
+        return status, bytes_out, error_urls
+
+
+    if __name__ == "__main__":
+        status, total, errors = summarize(sys.argv[1])
+        print(dict(status))
+        print(total)
+        print(errors.most_common(10))
+    ```
+- role: assistant
+  content: |
+    I would not change this, and `lru_cache` would not help.
+
+    - **One pass, streaming.** The file is read line by line, so memory stays flat. Each line is handled once.
+    - **Regex compiled once** at module level, and `Counter` does the counting.
+    - **No repeated work to cache.** Each log line is different, and the work per line is a regex match and a few increments. A cache needs repeated inputs to pay off. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over only 200 distinct values used about 43 J uncached and about 4.7 J with `lru_cache` (about 9× less) ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=ddf98f50-15ee-48e2-ab38-cc89acc88142,808b9a2c-1abf-4af5-9b04-3a6ce700fcdb)). With mostly unique inputs, like whole lines or timestamps, the cache would only add hashing and memory cost.
+
+    On big logs the time goes to disk reads, decoding and the regex match. All of that is needed once per line. Run `python -m cProfile -s cumtime script.py big.log` to confirm.
+
+    If it is still too slow, these help more than caching:
+    - Run it on rotated files in parallel, one process per file.
+    - Filter early. If you only need 5xx lines, a cheap check like `' 5' in line` before the regex skips most matches. Test it on your format first.
+verify:
+  static_only: No code changed in the answer; the answer explains why memoization does not apply.

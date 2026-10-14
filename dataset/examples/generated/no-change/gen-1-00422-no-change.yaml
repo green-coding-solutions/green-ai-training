@@ -1,0 +1,57 @@
+id: gen-1-00422-no-change
+category: no-change
+language: python
+patterns:
+- regex-precompile
+- context-tradeoff
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    Nightly ETL, we ingest ~200 partner CSV drops. Diff only please: should the regexes in `check_drop` be precompiled? Reviewer asked.
+
+    ```python
+    import csv
+    import re
+    from datetime import date
+
+    _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+    def check_drop(path, partner):
+        name = path.rsplit("/", 1)[-1]
+        if not re.fullmatch(rf"{partner}_\d{{8}}\.csv", name):
+            raise ValueError(f"unexpected file name: {name}")
+
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            header = next(reader)
+            if not re.match(r"^id,sku,qty,shipped_on", ",".join(header)):
+                raise ValueError(f"bad header in {name}")
+
+            rows = []
+            for line in reader:
+                if not _ISO_DATE.match(line[3]):
+                    continue
+                y, m, d = map(int, line[3].split("-"))
+                rows.append((line[0], line[1], int(line[2]), date(y, m, d)))
+        return rows
+    ```
+- role: assistant
+  content: |
+    No diff. Leave it as is.
+
+    The two inline regexes run once per file, so about 200 times a night. The per-row regex, the one that matters, is already compiled at module level.
+
+    In Green Metrics Tool micro-benchmarks, 1,000,000 matches took ~21 J with inline `re.match(pattern, s)` and ~18 J with a precompiled pattern, about 18% less ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=3827c15a-4295-44a4-8025-a07e8653ab7e,b7a9f0bd-c9e0-4b95-9bda-e8a96f38020c,f3e0434d-744b-41a0-a0cc-9bf00d80500d)). Python's `re` caches compiled patterns, so the inline call only pays the compile once per distinct pattern. At 200 calls the difference is far below anything you could measure, and the file read and CSV parsing dominate.
+
+    The f-string pattern with `partner` is the only one worth a thought. It is a new pattern per partner, but the cache holds 512 patterns, so a few dozen partners fit easily. Compile explicitly only if the distinct partner count could grow past that, because then the cache starts to thrash and every call recompiles.
+
+    Precompiling the other two would only move the pattern strings to module level and make the function harder to read.
+
+    **Green Notes**
+    - *Not applied:* **regex-precompile** — the calls are per file, not per row, and `re` caches the patterns.
+    - **Already good:** the per-row date check uses a precompiled pattern, and the loop does one pass over the file.
+verify:
+  static_only: Answer contains no code block; no diff proposed.

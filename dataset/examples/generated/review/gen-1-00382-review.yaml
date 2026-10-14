@@ -1,0 +1,78 @@
+id: gen-1-00382-review
+category: review
+language: go
+patterns:
+- compress-transmitted
+- modern-image-formats
+facts:
+- F-COMPRESS-CODECS
+- F-IMGENC
+messages:
+- role: user
+  content: "hi, i am quite new to Go. I made a small web page for our team to look at errors from our app logs. It shows a\
+    \ list of recent errors and a chart of errors per minute. It works but I think something is not good, the server CPU is\
+    \ high when 5-6 people have the page open (it refreshes by itself). Can you look at it? I dont know what is wrong.\n\n\
+    ```go\npackage main\n\nimport (\n\t\"compress/gzip\"\n\t\"encoding/json\"\n\t\"image\"\n\t\"image/color\"\n\t\"image/draw\"\
+    \n\t\"image/png\"\n\t\"net/http\"\n\t\"strconv\"\n\t\"time\"\n)\n\n// loadEntries and countPerMinute are in store.go\n\
+    \ntype gzipWriter struct {\n\thttp.ResponseWriter\n\tgz *gzip.Writer\n}\n\nfunc (g gzipWriter) Write(b []byte) (int, error)\
+    \ { return g.gz.Write(b) }\n\nfunc withGzip(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter,\
+    \ r *http.Request) {\n\t\tw.Header().Set(\"Content-Encoding\", \"gzip\")\n\t\tgz, _ := gzip.NewWriterLevel(w, gzip.BestCompression)\n\
+    \t\tdefer gz.Close()\n\t\tnext.ServeHTTP(gzipWriter{w, gz}, r)\n\t})\n}\n\nfunc errorsHandler(w http.ResponseWriter, r\
+    \ *http.Request) {\n\thours, _ := strconv.Atoi(r.URL.Query().Get(\"hours\"))\n\tentries := loadEntries(time.Now().Add(-time.Duration(hours)\
+    \ * time.Hour))\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(entries)\n}\n\n\
+    func chartHandler(w http.ResponseWriter, r *http.Request) {\n\tcounts := countPerMinute(time.Now().Add(-time.Hour)) //\
+    \ 60 ints\n\timg := image.NewRGBA(image.Rect(0, 0, 1200, 400))\n\tdraw.Draw(img, img.Bounds(), image.White, image.Point{},\
+    \ draw.Src)\n\tred := color.RGBA{200, 40, 40, 255}\n\tfor i, c := range counts {\n\t\tif c > 400 {\n\t\t\tc = 400\n\t\t\
+    }\n\t\tfor x := i * 20; x < i*20+18; x++ {\n\t\t\tfor y := 400 - c; y < 400; y++ {\n\t\t\t\timg.Set(x, y, red)\n\t\t\t\
+    }\n\t\t}\n\t}\n\tw.Header().Set(\"Content-Type\", \"image/png\")\n\tpng.Encode(w, img)\n}\n\nfunc main() {\n\tmux := http.NewServeMux()\n\
+    \tmux.HandleFunc(\"/api/errors\", errorsHandler)\n\tmux.HandleFunc(\"/chart.png\", chartHandler)\n\tmux.Handle(\"/snapshots/\"\
+    , http.StripPrefix(\"/snapshots/\", http.FileServer(http.Dir(\"./snapshots\"))))\n\thttp.ListenAndServe(\":8080\", withGzip(mux))\n\
+    }\n```\n"
+- role: assistant
+  content: "**Workload:** cloud backend (small internal tool, but the page refreshes itself, so every handler runs again and\
+    \ again)\n\n#### [Bug] gzip is applied to everything, and without asking the client\n- **Where:** `withGzip` wrapped around\
+    \ the whole mux\n- **Issue:** it always sets `Content-Encoding: gzip`, even if the client did not send `Accept-Encoding:\
+    \ gzip`. It also gzips the PNG chart and the files in `/snapshots/`. Those are already compressed, so the CPU work gives\
+    \ nothing. The `Content-Length` that `FileServer` sets is also wrong after compression. There is no `Vary: Accept-Encoding`\
+    \ header, so a cache could hand compressed bytes to a client that can't read them.\n- **Fix:** compress only the JSON\
+    \ endpoint, only when the client accepts gzip, and send `Vary`.\n\n#### [High] Maximum gzip level on every refresh\n-\
+    \ **Where:** `gzip.BestCompression` in `withGzip`\n- **Issue:** this response is made fresh on every request, so the compression\
+    \ cost is paid every time. Max level spends a lot more CPU for a slightly smaller file. In Green Metrics Tool micro-benchmarks\
+    \ on text, zstd at its default level used about 4× less energy than gzip at its default level, and slower codecs cost\
+    \ much more. The benchmarks measure energy only, not file size. For per-request responses, use the default gzip level,\
+    \ or zstd if your clients support it.\n- **Impact:** E (CPU), paid on every request. This is probably most of your high\
+    \ CPU.\n\n#### [High] Chart is drawn and PNG-encoded on every request\n- **Where:** `chartHandler`\n- **Issue:** PNG is\
+    \ the right format for a flat-color chart. JPEG would blur the edges. AVIF is not a good fit either: in the same benchmarks,\
+    \ AVIF encoding cost about 7× JPEG, and you would pay that on every refresh. So keep PNG. The cost is in the per-pixel\
+    \ `img.Set` calls and in the encoder at its default level.\n- **Fix:** use `png.Encoder` with `BestSpeed`. Fill the bars\
+    \ with `draw.Draw` on a rectangle instead of setting pixels one by one. If the page does not need a new picture every\
+    \ few seconds, a longer refresh interval on the page also helps.\n- **Impact:** E (CPU), per request.\n\n#### [Security]\
+    \ `hours` is not checked\n- **Where:** `errorsHandler`\n- **Issue:** `Atoi` errors are ignored, so a missing value means\
+    \ 0 hours. A huge value like `hours=100000` makes the server load and send all logs. Negative values give strange ranges.\n\
+    - **Fix:** use a default, and cap the value. This also keeps the JSON smaller.\n\nHere is the changed code:\n\n```go\n\
+    package main\n\nimport (\n\t\"compress/gzip\"\n\t\"encoding/json\"\n\t\"image\"\n\t\"image/color\"\n\t\"image/draw\"\n\
+    \t\"image/png\"\n\t\"net/http\"\n\t\"strconv\"\n\t\"strings\"\n\t\"sync\"\n\t\"time\"\n)\n\n// loadEntries and countPerMinute\
+    \ are in store.go\n\nvar gzPool = sync.Pool{New: func() any {\n\tw, _ := gzip.NewWriterLevel(nil, gzip.DefaultCompression)\n\
+    \treturn w\n}}\n\ntype gzipWriter struct {\n\thttp.ResponseWriter\n\tgz *gzip.Writer\n}\n\nfunc (g gzipWriter) Write(b\
+    \ []byte) (int, error) { return g.gz.Write(b) }\n\n// withGzip is only for text responses that are built per request.\n\
+    func withGzip(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request)\
+    \ {\n\t\tw.Header().Add(\"Vary\", \"Accept-Encoding\")\n\t\tif !strings.Contains(r.Header.Get(\"Accept-Encoding\"), \"\
+    gzip\") {\n\t\t\tnext.ServeHTTP(w, r)\n\t\t\treturn\n\t\t}\n\t\tw.Header().Set(\"Content-Encoding\", \"gzip\")\n\t\tw.Header().Del(\"\
+    Content-Length\")\n\t\tgz := gzPool.Get().(*gzip.Writer)\n\t\tgz.Reset(w)\n\t\tdefer func() {\n\t\t\tgz.Close()\n\t\t\t\
+    gzPool.Put(gz)\n\t\t}()\n\t\tnext.ServeHTTP(gzipWriter{w, gz}, r)\n\t})\n}\n\nfunc errorsHandler(w http.ResponseWriter,\
+    \ r *http.Request) {\n\thours, err := strconv.Atoi(r.URL.Query().Get(\"hours\"))\n\tif err != nil || hours < 1 {\n\t\t\
+    hours = 1\n\t}\n\tif hours > 48 {\n\t\thours = 48\n\t}\n\tentries := loadEntries(time.Now().Add(-time.Duration(hours)\
+    \ * time.Hour))\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(entries)\n}\n\n\
+    var chartEncoder = png.Encoder{CompressionLevel: png.BestSpeed}\n\nfunc chartHandler(w http.ResponseWriter, r *http.Request)\
+    \ {\n\tcounts := countPerMinute(time.Now().Add(-time.Hour)) // 60 ints\n\timg := image.NewRGBA(image.Rect(0, 0, 1200,\
+    \ 400))\n\tdraw.Draw(img, img.Bounds(), image.White, image.Point{}, draw.Src)\n\tred := &image.Uniform{color.RGBA{200,\
+    \ 40, 40, 255}}\n\tfor i, c := range counts {\n\t\tif c > 400 {\n\t\t\tc = 400\n\t\t}\n\t\tbar := image.Rect(i*20, 400-c,\
+    \ i*20+18, 400)\n\t\tdraw.Draw(img, bar, red, image.Point{}, draw.Src)\n\t}\n\tw.Header().Set(\"Content-Type\", \"image/png\"\
+    )\n\tchartEncoder.Encode(w, img)\n}\n\nfunc main() {\n\tmux := http.NewServeMux()\n\tmux.Handle(\"/api/errors\", withGzip(http.HandlerFunc(errorsHandler)))\n\
+    \tmux.HandleFunc(\"/chart.png\", chartHandler)\n\tmux.Handle(\"/snapshots/\", http.StripPrefix(\"/snapshots/\", http.FileServer(http.Dir(\"\
+    ./snapshots\"))))\n\thttp.ListenAndServe(\":8080\", mux)\n}\n```\n\nBehavior changes: clients without gzip support now\
+    \ get plain JSON, and `hours` is limited to 1-48 with a default of 1. Ask your team if they need a longer range. The chart\
+    \ output is the same picture.\n\n**Already good:** `Content-Type` is set on both handlers, and the JSON is streamed with\
+    \ `json.NewEncoder` instead of being built in memory first.\n"
+verify:
+  static_only: Go HTTP service; needs the Go toolchain and store.go helpers, not run in the Python/JS verifier

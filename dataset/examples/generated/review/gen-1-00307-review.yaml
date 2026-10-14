@@ -1,0 +1,143 @@
+id: gen-1-00307-review
+category: review
+language: python
+patterns:
+- torch-no-grad
+- batch-db-writes
+facts:
+- F-NOGRAD
+- F-PG-INSERT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import logging
+    import psycopg
+    import torch
+
+    from triage.text import encode_batch
+
+    log = logging.getLogger("triage")
+
+    LABELS = ["billing", "bug", "feature", "other"]
+    BATCH = 64
+
+    model = torch.jit.load("models/triage.pt")
+
+
+    def run_once(dsn):
+        conn = psycopg.connect(dsn)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, subject, body FROM tickets "
+            "WHERE triaged = false ORDER BY id LIMIT 5000"
+        )
+        rows = cur.fetchall()
+        log.info("triaging %d tickets", len(rows))
+
+        for i in range(0, len(rows), BATCH):
+            chunk = rows[i:i + BATCH]
+            x = encode_batch([r[1] + " " + r[2] for r in chunk])
+            logits = model(x)
+            probs = torch.softmax(logits, dim=1)
+
+            for r, p in zip(chunk, probs):
+                label = LABELS[int(p.argmax())]
+                conf = float(p.max())
+                cur.execute(
+                    "INSERT INTO ticket_labels (ticket_id, label, confidence) "
+                    "VALUES (%s, %s, %s)",
+                    (r[0], label, conf),
+                )
+                cur.execute("UPDATE tickets SET triaged = true WHERE id = %s", (r[0],))
+                conn.commit()
+
+        conn.close()
+    ```
+- role: assistant
+  content: |
+    **Workload:** AI/ML (batch inference worker with database writes)
+
+    #### [Bug] Insert and flag update are not atomic
+    - **Where:** the two `execute()` calls followed by `conn.commit()` for each row
+    - **Issue:** if you fix the commit placement carelessly, or the worker dies between the two statements, a ticket can be labeled but stay `triaged = false`. The next run labels it again and writes a duplicate row.
+    - **Fix:** write the labels and set the flags in one transaction per chunk, as shown below.
+
+    #### [Bug] Model may still be in training mode
+    - **Where:** `model = torch.jit.load(...)` with no `eval()`
+    - **Issue:** a scripted module keeps the mode it was saved in. If it was saved in training mode, dropout stays active and predictions change from run to run.
+    - **Fix:** call `model.eval()` once after loading.
+
+    #### [High] Inference runs with autograd enabled
+    - **Where:** `logits = model(x)`
+    - **Issue:** PyTorch records a graph for backward on every forward pass, and you never call backward. That is wasted work and memory for every ticket.
+    - **Fix:** wrap the forward pass in `torch.inference_mode()`.
+    - **Impact:** reduces E per inference. In Green Metrics Tool micro-benchmarks with 100,000 CPU inferences, running without `torch.no_grad()` used about 14% more CPU energy than with it ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=42de8e68-4536-43f4-a9bd-427ec42affd1,7e6a3886-425a-4992-9f14-180bede2d841)). `inference_mode()` is the stricter variant of the same idea.
+
+    #### [High] One commit per row, two statements per row
+    - **Where:** the inner `for r, p in zip(chunk, probs)` loop
+    - **Issue:** every ticket costs two round trips and one commit, which means one WAL flush. With up to 5,000 tickets per run, that is about 10,000 statements and 5,000 commits.
+    - **Fix:** collect the rows for the chunk, use one `executemany` for the labels, one `UPDATE ... WHERE id = ANY(...)` for the flags, and commit once per chunk.
+    - **Impact:** reduces E on the database and removes round trips. Per-chunk batches are small (64 rows). In Green Metrics Tool PostgreSQL benchmarks, batches of 100 rows showed only small differences between a plain loop and `executemany`, while 5,000-row batches showed large ones. So most of your gain here comes from the removed commits and the second statement per row, not from `executemany` itself. If you want larger batches, collect results for several chunks before writing.
+
+    #### [Low] Connection is not closed on errors
+    - **Where:** `conn.close()` at the end
+    - **Issue:** an exception in the loop leaves the connection open.
+    - **Fix:** use `with psycopg.connect(dsn) as conn:`.
+
+    ```python
+    import logging
+    import psycopg
+    import torch
+
+    from triage.text import encode_batch
+
+    log = logging.getLogger("triage")
+
+    LABELS = ["billing", "bug", "feature", "other"]
+    BATCH = 64
+
+    model = torch.jit.load("models/triage.pt")
+    model.eval()
+
+
+    def run_once(dsn):
+        with psycopg.connect(dsn) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, subject, body FROM tickets "
+                "WHERE triaged = false ORDER BY id LIMIT 5000"
+            )
+            rows = cur.fetchall()
+            log.info("triaging %d tickets", len(rows))
+
+            for i in range(0, len(rows), BATCH):
+                chunk = rows[i:i + BATCH]
+                x = encode_batch([r[1] + " " + r[2] for r in chunk])
+
+                with torch.inference_mode():
+                    probs = torch.softmax(model(x), dim=1)
+                    conf, idx = probs.max(dim=1)
+
+                labels = [
+                    (r[0], LABELS[k], c)
+                    for r, k, c in zip(chunk, idx.tolist(), conf.tolist())
+                ]
+                cur.executemany(
+                    "INSERT INTO ticket_labels (ticket_id, label, confidence) "
+                    "VALUES (%s, %s, %s)",
+                    labels,
+                )
+                cur.execute(
+                    "UPDATE tickets SET triaged = true WHERE id = ANY(%s)",
+                    ([r[0] for r in chunk],),
+                )
+                conn.commit()
+    ```
+
+    **Already good:** tickets are encoded and scored in batches of 64, and the query selects only the three columns it needs.
+verify:
+  static_only: needs torch, psycopg and a PostgreSQL server

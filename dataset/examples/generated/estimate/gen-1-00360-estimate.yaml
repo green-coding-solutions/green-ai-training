@@ -1,0 +1,82 @@
+id: gen-1-00360-estimate
+category: estimate
+language: yaml
+patterns:
+- minimize-environments
+- context-tradeoff
+messages:
+- role: user
+  content: |
+    Hello, we are research group for fluid simulation and we have small MPI solver. For tests we keep 4 node test cluster always on, in our cloud project. Tests run only when someone merge to main, around 3 times per day on working days, each run is 40 minutes. Now I want to create cluster only for the test run and delete after. Can you tell me how many kWh or CO2 we will save per year? My boss want one number for report.
+
+    This is our workflow now:
+
+    ```yaml
+    name: solver-tests
+    on:
+      push:
+        branches: [main]
+
+    jobs:
+      mpi-tests:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+          - name: Run solver tests on test cluster
+            run: |
+              ./ci/submit.sh --cluster solver-test --nodes 4 --np 64
+            env:
+              CLUSTER_TOKEN: ${{ secrets.CLUSTER_TOKEN }}
+    ```
+- role: assistant
+  content: |
+    I can't give you a trustworthy kWh or CO2 number from this information. Nobody can without knowing the node type, the cloud region and the idle power of your nodes. I won't invent one for your report. I can show you the direction and how to get a real number.
+
+    **What drives the saving:** the cluster is on for 168 hours a week, but your tests need about 13 of them (15 runs × 40 minutes, plus some startup time). Idle nodes still draw a large part of their full power, and they also hold hardware that others could use. So the saving is roughly the idle node-hours you remove, times what an idle node draws. The direction is clear: much less energy for the same tests.
+
+    **How to get your own number:**
+    1. Count node-hours now: 4 nodes × 168 h per week. Get the real value from your cloud billing or usage export.
+    2. Count node-hours after the change: 4 nodes × (run time + startup time) × runs per week. Measure startup time in the first few runs.
+    3. Convert the difference to energy with a tool that fits your setup, such as Cloud Carbon Footprint or Kepler. These use the node type and region. Report the result as an estimate with the assumptions written next to it.
+
+    I have no measured figure for idle cluster power, so I won't quote one.
+
+    Here is the workflow with an on-demand cluster. The `if: always()` step matters. Without it, a failed test leaves the cluster running.
+
+    ```yaml
+    name: solver-tests
+    on:
+      push:
+        branches: [main]
+
+    concurrency:
+      group: solver-test-cluster
+      cancel-in-progress: false
+
+    jobs:
+      mpi-tests:
+        runs-on: ubuntu-latest
+        timeout-minutes: 90
+        steps:
+          - uses: actions/checkout@v4
+          - name: Create cluster
+            run: ./ci/cluster.sh up --name solver-test-${{ github.run_id }} --nodes 4
+            env:
+              CLUSTER_TOKEN: ${{ secrets.CLUSTER_TOKEN }}
+          - name: Run solver tests
+            run: ./ci/submit.sh --cluster solver-test-${{ github.run_id }} --nodes 4 --np 64
+            env:
+              CLUSTER_TOKEN: ${{ secrets.CLUSTER_TOKEN }}
+          - name: Delete cluster
+            if: always()
+            run: ./ci/cluster.sh down --name solver-test-${{ github.run_id }}
+            env:
+              CLUSTER_TOKEN: ${{ secrets.CLUSTER_TOKEN }}
+    ```
+
+    **Green Notes**
+    - **Minimize deployed environments** (reduces E and M): the test cluster now exists only while tests run, so idle node-hours go away. https://patterns.greensoftware.foundation/development/minimizing-deployed-environments
+    - *Trade-off:* each run now waits for the cluster to start, and caches or test data on the nodes are lost. If startup takes too long, use a shared image and keep input data in object storage. If you do tests more than a few times per hour, a cluster that stops after some idle time can be better than create and delete on every run.
+    - `concurrency` makes sure two merges do not create two clusters at the same time.
+verify:
+  static_only: Needs a cloud cluster, GitHub Actions and custom ci scripts; YAML workflow cannot be run locally.

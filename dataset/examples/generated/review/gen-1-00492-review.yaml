@@ -1,0 +1,179 @@
+id: gen-1-00492-review
+category: review
+language: javascript
+patterns:
+- regex-precompile
+- dom-size
+messages:
+- role: user
+  content: |
+    Hi, can you check my code pls? Is for the dashboard of our image classifier, we log every prediction and show it in a table. The page is very slow when I type in the search box, we have around 20000 rows. I dont know why.
+
+    ```javascript
+    // predictions.js
+    const tbody = document.querySelector('#pred-body');
+    const searchInput = document.querySelector('#search');
+    let allPredictions = [];
+
+    async function loadPredictions() {
+      const res = await fetch('/api/predictions?limit=20000');
+      allPredictions = await res.json();
+      render(allPredictions, '');
+    }
+
+    function highlight(text, term) {
+      if (!term) return text;
+      const re = new RegExp('(' + term + ')', 'gi');
+      return text.replace(re, '<mark>$1</mark>');
+    }
+
+    function render(rows, term) {
+      tbody.innerHTML = '';
+      rows.forEach(r => {
+        tbody.innerHTML += `<tr>
+          <td>${r.id}</td>
+          <td>${highlight(r.filename, term)}</td>
+          <td>${highlight(r.label, term)}</td>
+          <td>${(r.confidence * 100).toFixed(1)}%</td>
+          <td>${r.latencyMs} ms</td>
+        </tr>`;
+      });
+    }
+
+    searchInput.addEventListener('input', () => {
+      const term = searchInput.value.trim();
+      const filtered = allPredictions.filter(r => {
+        const re = new RegExp(term, 'i');
+        return re.test(r.filename) || re.test(r.label);
+      });
+      render(filtered, term);
+    });
+
+    loadPredictions();
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (browser-side dashboard, runs on every keystroke)
+
+    #### [Bug] Search term is used as a raw regex
+    - **Where:** `highlight` and the `input` handler
+    - **Issue:** if someone types `(` or `[`, `new RegExp` throws a `SyntaxError` and the table stops updating. A `.` matches every character, so the filter shows wrong rows.
+    - **Fix:** escape the term before you build the regex (see `escapeRegExp` below).
+
+    #### [Security] Prediction data goes into `innerHTML`
+    - **Where:** `render`
+    - **Issue:** `filename` and `label` are inserted as HTML. A file name like `<img src=x onerror=...>` runs script in the page of everyone who opens the dashboard.
+    - **Fix:** build cells with `textContent` and create `<mark>` elements instead of HTML strings.
+
+    #### [High] All 20000 rows are in the DOM, and the table is rebuilt with `+=`
+    - **Where:** `render`
+    - **Issue:** `tbody.innerHTML += ...` serializes the whole table and parses it again for every row. The work grows with the square of the row count. The browser also keeps tens of thousands of nodes alive, and the user can only see about 30 of them.
+    - **Fix:** show one page of rows (for example 100) and add a "Show more" button. Create the rows in a `DocumentFragment` and append them once.
+    - **Impact:** reduces E on the client per keystroke, because layout and style work follow the number of DOM nodes. It also lowers memory use.
+
+    #### [High] Regex is built again for every row
+    - **Where:** the `filter` callback (once per row) and `highlight` (twice per row)
+    - **Issue:** the term does not change during one keystroke, but the code builds the same pattern about 60000 times for 20000 rows.
+    - **Fix:** build one regex per keystroke and pass it to the filter and to the highlighter. Use one regex with the `i` flag and one capture group. Without the `g` flag, `.test()` has no `lastIndex` state, so it is safe to reuse. `split` with a capture group gives the matches at odd positions.
+    - **Impact:** reduces E per keystroke, from one regex build per row to one in total.
+
+    #### [Medium] No debounce on the `input` event
+    - **Where:** `searchInput` listener
+    - **Issue:** every key press filters 20000 rows and re-renders, even when the user types fast.
+    - **Fix:** wait about 150 ms after the last key press. This changes timing a little: the table updates when typing pauses.
+
+    Fixed version (add `<button id="more" hidden>Show more</button>` below the table):
+
+    ```javascript
+    // predictions.js
+    const PAGE_SIZE = 100;
+    const tbody = document.querySelector('#pred-body');
+    const searchInput = document.querySelector('#search');
+    const moreBtn = document.querySelector('#more');
+
+    let allPredictions = [];
+    let currentRows = [];
+    let currentRe = null;
+    let shown = 0;
+    let timer;
+
+    function escapeRegExp(s) {
+      return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+
+    function makeMatcher(term) {
+      return term ? new RegExp('(' + escapeRegExp(term) + ')', 'i') : null;
+    }
+
+    function setCellText(cell, text, re) {
+      if (!re) {
+        cell.textContent = text;
+        return;
+      }
+      text.split(re).forEach((part, i) => {
+        if (i % 2 === 1) {
+          const mark = document.createElement('mark');
+          mark.textContent = part;
+          cell.append(mark);
+        } else if (part) {
+          cell.append(part);
+        }
+      });
+    }
+
+    function createRow(r, re) {
+      const tr = document.createElement('tr');
+      const values = [
+        r.id,
+        r.filename,
+        r.label,
+        `${(r.confidence * 100).toFixed(1)}%`,
+        `${r.latencyMs} ms`,
+      ];
+      values.forEach((v, i) => {
+        const td = document.createElement('td');
+        if (i === 1 || i === 2) setCellText(td, String(v), re);
+        else td.textContent = v;
+        tr.append(td);
+      });
+      return tr;
+    }
+
+    function renderMore() {
+      const frag = document.createDocumentFragment();
+      const end = Math.min(shown + PAGE_SIZE, currentRows.length);
+      for (; shown < end; shown++) {
+        frag.append(createRow(currentRows[shown], currentRe));
+      }
+      tbody.append(frag);
+      moreBtn.hidden = shown >= currentRows.length;
+    }
+
+    function applyFilter(term) {
+      currentRe = makeMatcher(term);
+      currentRows = currentRe
+        ? allPredictions.filter(r => currentRe.test(r.filename) || currentRe.test(r.label))
+        : allPredictions;
+      shown = 0;
+      tbody.replaceChildren();
+      renderMore();
+    }
+
+    async function loadPredictions() {
+      const res = await fetch('/api/predictions?limit=20000');
+      allPredictions = await res.json();
+      applyFilter('');
+    }
+
+    searchInput.addEventListener('input', () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => applyFilter(searchInput.value.trim()), 150);
+    });
+    moreBtn.addEventListener('click', renderMore);
+
+    loadPredictions();
+    ```
+
+    **Already good:** the data is fetched once and filtered in memory, so typing does not cause network requests.
+verify:
+  static_only: 'browser-only code: needs document, fetch and a DOM'

@@ -1,0 +1,44 @@
+id: gen-1-00374-conceptual
+category: conceptual
+language: text
+patterns:
+- batch-db-writes
+- context-tradeoff
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    We run a marketing landing page for a product launch. It has a waitlist form, and every submit does one INSERT into a Postgres `waitlist` table (email, name, referrer). A colleague wants to change this so the backend collects signups in memory and writes them in one bulk insert every few seconds, because "batching is greener".
+
+    Our requirements:
+    - No signup may be lost, even if a server restarts.
+    - The visitor must see the confirmation right after submitting.
+    - We expect a traffic spike for a few hours after the launch announcement.
+
+    Is the batching idea worth it for us? When does batching writes actually help, and when doesn't it?
+- role: assistant
+  content: |-
+    For this form, probably not. Batching helps when many rows share one write, and a waitlist form usually does not give you that.
+
+    **When batching pays off**
+    - You write many rows in one go: imports, nightly loads, log or event flushes.
+    - In Green Metrics Tool micro-benchmarks with PostgreSQL 16, loading 500,000 rows in batches of 5,000 rows used about 22× less CPU energy with `COPY` than with one `INSERT` per row ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=8e80b599-3332-432f-8c7e-1cfb93a3a354,8b4c205d-5fb1-40af-ab77-0427ca572f4e,adff4e53-2f1a-4d88-9c0d-dd681d02923f)).
+    - The saving comes from less per-statement and per-round-trip overhead.
+
+    **When it does not**
+    - In the same benchmark, with batches of only 100 rows, the differences were small. Per-batch overhead dominates.
+    - A form submit is one row per request. A single `INSERT` is already cheap. Even in a spike, the rows arrive one at a time from different visitors.
+
+    **What it costs you here**
+    - **Lost signups:** rows held in memory disappear on a restart or crash. That breaks your first requirement. Fixing it needs a durable buffer, which is more code and more moving parts than the problem needs.
+    - **Late visibility:** duplicate checks and "already signed up" messages get harder if the row is not in the table yet.
+    - **Complexity:** flush timers, shutdown handling and retry logic are new places for bugs.
+
+    **What to do instead**
+    - Keep one `INSERT` per signup, committed before you confirm.
+    - Use a connection pool and a unique index on the email, so repeated submits do not create duplicate rows.
+    - Keep the handler small, so the spike stays cheap per request.
+    - If you import an existing list later, for example from a spreadsheet, use `COPY` or a multi-row insert for that one-off load. That is a case with many rows per batch.
+
+    **If the spike grows a lot:** measure first. Check database CPU and connection wait time during a load test. Only add a durable write buffer if the single inserts become the bottleneck. To see the energy effect, run a Green Metrics Tool usage scenario that replays the submits against both variants.

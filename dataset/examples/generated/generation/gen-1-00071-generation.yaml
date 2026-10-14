@@ -1,0 +1,56 @@
+id: gen-1-00071-generation
+category: generation
+language: dockerfile
+patterns:
+- small-container-images
+messages:
+- role: user
+  content: |
+    hi, i wrote a small rust program that renames photos by date (cargo project, binary is called photo-renamer, uses clap and walkdir). i want to run it in docker so my friends dont have to install rust. i tried and the image was like 2GB and it rebuilds everything when i change one line. i dont know what i am doing wrong. can you write me a Dockerfile?
+- role: assistant
+  content: |
+    The big image happens when you run the program inside the Rust build image. That image contains the compiler and all build files. Use a multi-stage build: compile in one stage, and copy only the finished binary into a small image.
+
+    ```dockerfile
+    # ---- build stage ----
+    FROM rust:1-slim-bookworm AS build
+    WORKDIR /app
+
+    # Build dependencies first. This layer is reused until Cargo.toml/Cargo.lock change.
+    COPY Cargo.toml Cargo.lock ./
+    RUN mkdir src && echo 'fn main() {}' > src/main.rs \
+        && cargo build --release --locked \
+        && rm -rf src
+
+    # Now build your real code
+    COPY src ./src
+    RUN touch src/main.rs && cargo build --release --locked
+
+    # ---- runtime stage ----
+    FROM gcr.io/distroless/cc-debian12:nonroot
+    COPY --from=build /app/target/release/photo-renamer /usr/local/bin/photo-renamer
+    ENTRYPOINT ["/usr/local/bin/photo-renamer"]
+    ```
+
+    Add a `.dockerignore` next to it, so the local `target/` folder (often very large) is not sent to Docker:
+
+    ```text
+    target
+    .git
+    ```
+
+    Build and run it like this:
+
+    ```bash
+    docker build -t photo-renamer .
+    docker run --rm -v "$PWD":/photos photo-renamer /photos
+    ```
+
+    **Green Notes**
+    - **Multi-stage build** (reduces M and network): the final image holds only the binary and the C runtime libraries, not the Rust toolchain. Smaller images use less registry storage and less transfer on every pull.
+    - **Dependency layer first** (reduces E): after you change one line in `src/`, Docker reuses the cached dependency build and only recompiles your own code.
+    - **`.dockerignore`**: keeps `target/` and `.git` out of the build context, so each build uploads and hashes less.
+    - The runtime image has no shell and runs as a non-root user. If you need to debug inside it, use `debian:bookworm-slim` as the last stage instead.
+    - *Not applied:* a fully static musl build with `FROM scratch`. It is a little smaller, but it needs extra target setup that is not worth it for a small tool like this.
+verify:
+  static_only: Dockerfile needs a Docker daemon and a Rust project; syntax checked by review

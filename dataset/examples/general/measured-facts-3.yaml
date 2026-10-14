@@ -1,0 +1,343 @@
+id: review-bash-region-revenue-subprocess-001
+category: review
+language: bash
+patterns: [bash-builtins]
+facts: [F-BASH-SUBPROC]
+messages:
+  - role: user
+    content: |
+      This runs every night over orders.csv (about 200k lines) and takes almost an hour. Can you review it?
+
+      ```bash
+      #!/usr/bin/env bash
+      # orders.csv: region,sku,qty,unit_price (no header)
+      total=0
+      while read line; do
+          region=$(echo "$line" | cut -d, -f1)
+          qty=$(echo "$line" | cut -d, -f3)
+          price=$(echo "$line" | cut -d, -f4)
+          amount=$(expr $qty \* $price)
+          total=$(expr $total + $amount)
+          echo "$region $amount" >> /tmp/region_amounts.txt
+      done < orders.csv
+      awk '{ s[$1] += $2 } END { for (r in s) print r, s[r] }' /tmp/region_amounts.txt
+      echo "Total: $total"
+      ```
+  - role: assistant
+    content: |
+      **Workload:** script (nightly batch, 200k lines)
+
+      #### [Bug] Results grow every night
+      - **Where:** `>> /tmp/region_amounts.txt`
+      - **Issue:** the file is appended to and never cleared, so each run adds its amounts to all previous runs. The per-region sums are wrong from the second night on.
+      - **Fix:** don't write an intermediate file at all (see below).
+
+      #### [High] Seven processes per line
+      - **Where:** the `while read` loop
+      - **Issue:** every line starts three `echo | cut` pipelines and two `expr` calls, around seven process starts per line, more than a million per night. Starting processes is what takes the hour, not the arithmetic. In Green Metrics Tool micro-benchmarks summarizing a 20,000-line log, a loop with `$(echo | cut)` and `$(expr)` per field used ~1302 J, one `awk` pass ~1.0 J, over 1000× less ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=7ee92e8c-fd9e-46c5-8dba-2fa40de231c2,5813c30d-d074-4da0-84fc-46ab5801eaf1,b05a26a4-1f41-40ed-9cc6-9f900dee6aed)).
+      - **Fix:** one `awk` pass computes both the per-region sums and the total:
+        ```bash
+        #!/usr/bin/env bash
+        # orders.csv: region,sku,qty,unit_price (no header)
+        awk -F, '{ a = $3 * $4; sum[$1] += a; total += a } END { for (r in sum) print r, sum[r]; print "Total: " total }' orders.csv
+        ```
+      - **Impact:** E, the run should drop from about an hour to seconds. Output is the same as a correct run of the old script: one line per region (in no fixed order, as before), then the total.
+
+      #### [Low] `read` without `-r`
+      - **Where:** `while read line`
+      - **Issue:** backslashes in the input are swallowed. The `awk` version doesn't have this problem. If you keep a `while` loop elsewhere, use `while IFS=, read -r region sku qty price` and `$(( ))` arithmetic, so no field needs a subprocess.
+verify:
+  static_only: "needs orders.csv; the awk one-liner is syntax checked"
+---
+id: conceptual-lazy-loading-scroll-001
+category: conceptual
+language: html
+patterns: [lazy-load-images, context-tradeoff]
+facts: [F-LAZY-IMG]
+messages:
+  - role: user
+    content: |
+      Should I just put loading="lazy" on every image of our blog? Does it actually save energy, or only bandwidth?
+  - role: assistant
+    content: |
+      Put it on the images below the fold, not on every image.
+
+      - **It saves when readers don't scroll.** In Green Metrics Tool browser benchmarks with an article of 15 photos, page loads without scrolling used about 12% less CPU energy with `loading="lazy"` on the images below the fold ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=877945eb-dd8a-48d6-9f1a-2b29980b3e31,5da76021-294f-4e78-a41e-fd3b1fcb247d)). The images that are never seen are never downloaded or decoded.
+      - **It saves nothing when they read to the end.** When the same page was scrolled to the bottom, lazy and eager loading were within noise. Every image gets loaded either way.
+      - **Never on the image above the fold.** Lazy-loading the hero or first image delays your largest paint. Load it eagerly, optionally with `fetchpriority="high"`.
+
+      ```html
+      <img src="hero.jpg" width="1200" height="600" alt="..." fetchpriority="high">
+      <!-- below the fold -->
+      <img src="step-1.jpg" width="800" height="500" alt="..." loading="lazy">
+      ```
+
+      Keep `width` and `height` on every image so the layout doesn't jump when lazy images arrive. For a blog, where many readers leave after the first screen, the saving in bytes and client work is real. On a page where everyone scrolls through a short gallery, it makes little difference.
+verify:
+  static_only: "HTML snippet"
+---
+id: review-js-orders-table-dom-001
+category: review
+language: javascript
+patterns: [dom-size]
+facts: [F-DOM-SIZE]
+messages:
+  - role: user
+    content: |
+      Our admin page shows all orders (currently ~8,000) in one table. It's sluggish. Any review notes?
+
+      ```javascript
+      async function renderOrders() {
+        const orders = await fetch('/api/orders').then((r) => r.json());
+        const list = document.getElementById('orders');
+        for (const o of orders) {
+          const row = document.createElement('div');
+          row.className = 'row';
+          for (const value of [o.id, o.customer, o.total, o.status, o.created]) {
+            const cell = document.createElement('div');
+            cell.className = 'cell';
+            const inner = document.createElement('span');
+            inner.textContent = value;
+            cell.appendChild(inner);
+            row.appendChild(cell);
+          }
+          list.appendChild(row);
+        }
+      }
+      ```
+  - role: assistant
+    content: |
+      **Workload:** web (admin page)
+
+      #### [High] All 8,000 orders rendered at once
+      - **Where:** the loop over `orders`
+      - **Issue:** about 88,000 elements end up in the DOM, and each one is appended to the live document. Layout and style work grow with the element count, on every load. In Green Metrics Tool browser benchmarks, a 10,000-row table with wrapper elements used ~1036 J for 30 page loads. Paginated to 100 rows as a plain `<table>` built in a `DocumentFragment`, it used ~457 J, about 56% less ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=fbe5f432-7318-4937-856c-60c414f0208e,608ed039-7dfb-4e27-ac7e-f091e7ca39c8)).
+      - **Fix:** fetch one page from the server and render it into a table off-DOM:
+        ```javascript
+        async function renderOrders(page = 1, pageSize = 100) {
+          const orders = await fetch(`/api/orders?page=${page}&page_size=${pageSize}`).then((r) => r.json());
+          const frag = document.createDocumentFragment();
+          for (const o of orders) {
+            const tr = document.createElement('tr');
+            for (const value of [o.id, o.customer, o.total, o.status, o.created]) {
+              const td = document.createElement('td');
+              td.textContent = value;
+              tr.appendChild(td);
+            }
+            frag.appendChild(tr);
+          }
+          document.querySelector('#orders tbody').replaceChildren(frag);
+        }
+        ```
+      - **Impact:** E on the client per page view, and network, because the API sends 100 orders instead of all of them. The endpoint needs `page` and `page_size` support (`LIMIT`/`OFFSET` or keyset pagination).
+
+      #### [Medium] Two wrapper elements per cell
+      - **Where:** `div.cell > span`
+      - **Issue:** a `div` plus a `span` per value doubles the element count without adding anything. A `<td>` per value is enough, and the table also gives you column alignment for free.
+verify:
+  static_only: "browser DOM code"
+---
+id: gen-css-docs-system-fonts-001
+category: generation
+language: css
+patterns: [system-fonts-and-deps]
+facts: [F-FONTS]
+messages:
+  - role: user
+    content: |
+      Write the base typography CSS for our internal docs site. Body text, headings and code. Our designer said "something clean", no specific font.
+  - role: assistant
+    content: |
+      ```css
+      :root {
+        --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      }
+
+      body {
+        font-family: var(--font-sans);
+        font-size: 1rem;
+        line-height: 1.6;
+        color: #1f2328;
+        max-width: 72ch;
+        margin: 0 auto;
+        padding: 0 1rem;
+      }
+
+      h1, h2, h3 {
+        line-height: 1.25;
+        font-weight: 600;
+        margin: 2rem 0 0.75rem;
+      }
+
+      h1 { font-size: 2rem; }
+      h2 { font-size: 1.5rem; }
+      h3 { font-size: 1.25rem; }
+
+      code, pre {
+        font-family: var(--font-mono);
+        font-size: 0.9em;
+      }
+
+      pre {
+        padding: 0.75rem 1rem;
+        overflow-x: auto;
+        background: #f6f8fa;
+        border-radius: 6px;
+      }
+      ```
+
+      **Green Notes**
+      - **System font stack** (reduces network, E): no font files to download, and text renders immediately without a font swap. In Green Metrics Tool browser benchmarks, the system font stack used about 26% less CPU energy on cold page loads than a set of six TTF files, and about 16% less than two WOFF2 subsets ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=4b6e426b-ab8c-42b4-bfc5-a5e99e0c5c72,c0ffd5b6-6782-45f8-9fef-b56cc3ee45b9,856d1223-52a2-4f0a-96cf-ea17485aac39)).
+      - *Not applied:* a web font. If the designer later wants a brand font, use one or two WOFF2 files subset to Latin, not a full TTF family.
+verify:
+  static_only: "CSS"
+---
+id: conceptual-purgecss-minify-small-site-001
+category: conceptual
+language: css
+patterns: [remove-unused-css, minify-assets, context-tradeoff]
+facts: [F-UNUSED-CSS, F-MINIFY]
+messages:
+  - role: user
+    content: |
+      Our marketing site has a 14 KB stylesheet and about 30 KB of JavaScript. A ticket says "add PurgeCSS and minification to reduce energy consumption". Worth it?
+  - role: assistant
+    content: |
+      Worth it as a cheap build step, but don't expect a measurable change in energy on the visitor's device.
+
+      - **Client CPU barely changes at this size.** In Green Metrics Tool browser benchmarks on a fast local network, purging and minifying a 16 KB stylesheet changed CPU energy by about 2%, which was within measurement noise ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=ec8629e6-9d04-4ca8-9da1-0e911b1faf08,bbdb2d8e-de20-445d-9a54-62aa23c45f19)). Minifying the JS and CSS of a small page also came out at about 2%, within noise ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=917d30aa-e469-4564-b413-5445847106aa,252b61b0-4e3c-4a46-96cd-5af519486361)).
+      - **The saving is bytes.** Fewer bytes per visit matter on mobile networks and for CDN egress, and they add up with traffic. Make sure the server already sends these files compressed. That removes most of the transfer size on its own.
+      - **What to do:** add minification to the existing build (esbuild or your bundler can do it in one flag). Add PurgeCSS only if it doesn't break classes generated at runtime. Then close the ticket as a page-weight improvement, not an energy one.
+
+      If the page feels heavy, look at images, fonts and third-party scripts first. They are usually much larger than 44 KB of CSS and JS.
+---
+id: gen-nginx-static-assets-gzip-001
+category: generation
+language: nginx
+patterns: [text-compression]
+facts: [F-TEXT-COMPRESS]
+messages:
+  - role: user
+    content: |
+      Write an nginx server block that serves our built single-page app from /srv/app/dist (index.html, JS, CSS, a few JSON files). Assets have hashed file names.
+  - role: assistant
+    content: |
+      ```nginx
+      server {
+          listen 80;
+          server_name app.example.com;
+          root /srv/app/dist;
+
+          # serve the .gz files created at build time, fall back to compressing on the fly
+          gzip_static on;
+          gzip on;
+          gzip_comp_level 5;
+          gzip_min_length 1024;
+          gzip_types text/css application/javascript application/json image/svg+xml;
+          gzip_vary on;
+
+          location /assets/ {
+              expires 1y;
+              add_header Cache-Control "public, immutable";
+              try_files $uri =404;
+          }
+
+          location / {
+              add_header Cache-Control "no-cache";
+              try_files $uri /index.html;
+          }
+      }
+      ```
+
+      Create the `.gz` files in the build, next to the originals:
+
+      ```bash
+      find /srv/app/dist -type f \( -name '*.js' -o -name '*.css' -o -name '*.json' -o -name '*.html' -o -name '*.svg' \) \
+          -exec gzip -k -9 {} +
+      ```
+
+      **Green Notes**
+      - **Precompressed assets** (reduces E, network): each file is compressed once at build time instead of on every request. In Green Metrics Tool measurements of nginx serving text assets, compression sent about 10× fewer bytes, and compressing on every request cost about 4× the CPU energy of serving precompressed files ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=bac759ec-b604-4da6-b70b-3637b85f5bf4,dc5154c9-be62-4675-ba94-cecd7390807d,42f23e15-0726-4287-90c9-b242e71feb0b)). Level 9 is fine here because it runs once per build.
+      - **Long caching for hashed assets** (reduces network): `immutable` lets browsers skip revalidation, while `index.html` is always revalidated so new deploys show up.
+verify:
+  static_only: "nginx config"
+---
+id: refactor-dockerfile-fastapi-slim-001
+category: refactor
+language: dockerfile
+patterns: [small-container-images]
+facts: [F-CONTAINER-IMAGE]
+messages:
+  - role: user
+    content: |
+      Our CI builds this image on every push to every branch. Can you make it better?
+
+      ```dockerfile
+      FROM python:3.12
+      RUN apt-get update && apt-get install -y gcc make htop nano wget
+      COPY . /srv
+      WORKDIR /srv
+      RUN pip install -r requirements.txt
+      RUN pip install ruff pytest coverage
+      CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+      ```
+  - role: assistant
+    content: |
+      ```dockerfile
+      FROM python:3.12-slim
+
+      ENV PYTHONDONTWRITEBYTECODE=1 \
+          PYTHONUNBUFFERED=1
+
+      WORKDIR /srv
+
+      # dependencies first: this layer is reused until requirements.txt changes
+      COPY requirements.txt .
+      RUN pip install --no-cache-dir -r requirements.txt
+
+      COPY . .
+
+      USER nobody
+      EXPOSE 8080
+      CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+      ```
+
+      Add a `.dockerignore` so `.git`, virtualenvs and test data don't end up in the image:
+
+      ```text
+      .git
+      .venv
+      __pycache__
+      tests/data
+      ```
+
+      **Green Notes**
+      - **Slim base, runtime dependencies only** (reduces E, storage, network): `gcc`, `make`, `htop`, `nano`, `wget` and the test tools are gone from the production image. Run ruff and pytest in a CI job or a separate test stage instead. If a dependency needs a compiler, use a build stage and copy only the installed packages. In Green Metrics Tool measurements of a similar change for a small Flask app, the image build used about 7× less energy, while serving requests cost the same ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=c9afc162-b9c1-4839-a5b5-1bba26f57d48,3403d83a-d61d-40aa-8dd0-8db3d62856c1)).
+      - **Dependency layer before the source** (reduces E): a code-only push reuses the cached `pip install` layer instead of reinstalling everything. With a build on every push, this repeats many times a day.
+      - **No pip cache** (reduces storage): `--no-cache-dir` keeps downloaded wheels out of the image.
+verify:
+  static_only: "Dockerfile"
+---
+id: estimate-preview-environments-idle-001
+category: estimate
+language: yaml
+patterns: [minimize-environments]
+facts: [F-PREVIEW-ENV]
+messages:
+  - role: user
+    content: |
+      Every branch gets a preview environment with 3 API replicas, Postgres, Redis and a worker. They stay up until someone deletes them by hand, usually weeks. If we cut them down to 1 replica and Postgres, how much energy do we save?
+  - role: assistant
+    content: |
+      Less than you might think from trimming services, and a lot from deleting environments sooner.
+
+      - **Trimming services:** in Green Metrics Tool measurements of a preview environment idling for a minute, going from 3 replicas, Postgres, Redis and a worker down to 1 replica and Postgres used about 3% less CPU energy, and machine energy differed by less than 1% ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=d4a966f2-45c7-4980-b0c5-d7b8b4602102,1e82610c-494d-4686-8238-9f744f84630c)). Idle containers use little CPU. The bigger effect of fewer services is reserved memory: fewer pods means fewer nodes in the cluster.
+      - **Lifetime is the main lever.** An environment that exists for weeks costs its idle power for every hour of those weeks. One that is deleted on merge and scaled to zero outside working hours costs nothing for most of them. That saving is proportional to the hours removed, which you can count from your cluster today.
+
+      What I'd do:
+      - Delete the environment automatically when the branch is merged or closed.
+      - Scale previews to zero at night and on weekends, or start them on demand.
+      - Then trim services: drop Redis and the worker where the feature under review doesn't need them.
+
+      To put a number on it for your setup, sum up environment-hours per week before and after, and measure one idling environment with the Green Metrics Tool or your cluster's power metrics. Don't multiply my figure by your hours, it comes from one machine and one stack.

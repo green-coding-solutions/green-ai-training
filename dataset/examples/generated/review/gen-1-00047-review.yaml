@@ -1,0 +1,93 @@
+id: gen-1-00047-review
+category: review
+language: python
+patterns:
+- set-membership
+- string-join
+- keep-star-imports
+facts:
+- F-STRCAT
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    Hi, I'm new to Python and I wrote this for our shop's nightly invoice export. It works, but it feels slow when there are a lot of orders (around 300k order lines a night). I'm not sure what is wrong. Could you review it? A colleague also said the `import *` lines look bad, not sure if that matters.
+
+    ```python
+    from decimal import *
+    from datetime import *
+
+    # SKUs that are on promotion (about 6,000 entries, filled from the promo table)
+    DISCOUNT_SKUS = ["SKU-%05d" % n for n in range(0, 42000, 7)]
+
+    def build_invoice_csv(order_lines):
+        out = "order_id,sku,qty,total,date\n"
+        today = date.today().isoformat()
+        for line in order_lines:
+            price = Decimal(line["price"])
+            total = price * int(line["qty"])
+            if line["sku"] in DISCOUNT_SKUS:
+                total = total * Decimal("0.90")
+            total = total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            out += line["order_id"] + "," + line["sku"] + "," + str(line["qty"]) + "," + str(total) + "," + today + "\n"
+        return out
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly batch)
+
+    #### [High] Membership test on a list, once per order line
+    - **Where:** `if line["sku"] in DISCOUNT_SKUS`
+    - **Issue:** `DISCOUNT_SKUS` is a list with about 6,000 entries. Each check can scan the whole list, so the work grows as order lines × promo SKUs. A set answers the same question in O(1).
+    - **Fix:** make it a set: `DISCOUNT_SKUS = {...}`. It is built once and then looked up 300k times, so the one-time cost is worth it. For a single lookup, a list would be fine.
+    - **Impact:** reduces E for every order line. This is the biggest cost in the function.
+
+    #### [Medium] Growing a string with `+=` in a loop
+    - **Where:** the `out += ...` line
+    - **Issue:** every line adds to one long string. In Python this can copy the growing text again and again. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces used about 469 J with `+=` and about 1.8 J with `"".join()`, roughly 260× less CPU energy ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=732b88b3-e081-409d-a987-d1a929b357e4,527c0154-dbb1-4c82-b98f-838f994af603,2fca8771-9ad9-4ec0-b51f-2ee78ee20865)).
+    - **Fix:** collect the rows in a list and join once at the end.
+    - **Impact:** reduces E, and the gap grows with the number of lines.
+
+    #### About the `import *` lines
+    This is not a problem for energy. In Green Metrics Tool micro-benchmarks, `from x import *` and `import x` used the same energy within measurement noise. I left them as they are. If your team prefers explicit imports for readability, that is a style choice, not a speed fix.
+
+    ```python
+    from decimal import *
+    from datetime import *
+
+    # SKUs that are on promotion (about 6,000 entries, filled from the promo table)
+    DISCOUNT_SKUS = {"SKU-%05d" % n for n in range(0, 42000, 7)}
+
+    def build_invoice_csv(order_lines):
+        rows = ["order_id,sku,qty,total,date"]
+        today = date.today().isoformat()
+        for line in order_lines:
+            price = Decimal(line["price"])
+            total = price * int(line["qty"])
+            if line["sku"] in DISCOUNT_SKUS:
+                total = total * Decimal("0.90")
+            total = total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            rows.append(f'{line["order_id"]},{line["sku"]},{line["qty"]},{total},{today}')
+        return "\n".join(rows) + "\n"
+    ```
+
+    The output is identical to your version.
+
+    **Already good:** you use `Decimal` for money instead of floats, and you round with an explicit mode.
+verify:
+  green_block: 0
+  equivalence:
+    driver: |-
+      import random
+      random.seed(11)
+      skus = ["SKU-00007", "SKU-00014", "SKU-00008", "SKU-41993", "SKU-12345", "SKU-00000"]
+      lines = [
+          {
+              "order_id": "O%05d" % i,
+              "sku": random.choice(skus),
+              "qty": random.randint(1, 9),
+              "price": "%d.%02d" % (random.randint(1, 200), random.randint(0, 99)),
+          }
+          for i in range(3000)
+      ]
+      print(build_invoice_csv(lines).replace(date.today().isoformat(), "D"))

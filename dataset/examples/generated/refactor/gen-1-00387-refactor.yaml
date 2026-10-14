@@ -1,0 +1,78 @@
+id: gen-1-00387-refactor
+category: refactor
+language: bash
+patterns:
+- compress-stored
+- simple-conditions
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # nightly rotate for the model server logs (cron 03:10)
+    LOG_DIR="/var/log/modelserver"
+    KEEP_DAYS=14
+    now=$(date +%s)
+
+    cd "$LOG_DIR" || exit 1
+
+    for f in *; do
+        [ -f "$f" ] || continue
+        mtime=$(stat -c %Y "$f")
+        age_h=$(( (now - mtime) / 3600 ))
+        ext="${f##*.}"
+
+        if [ "$ext" = "xz" ] && [ "$age_h" -ge $((KEEP_DAYS * 24)) ]; then
+            rm -f "$f"
+        elif [ "$age_h" -ge 24 ] && { [ "$ext" = "jsonl" ] || [ "$ext" = "log" ] || [ "$ext" = "csv" ]; }; then
+            xz -9e -T0 "$f"
+        elif [ "$age_h" -ge 24 ] && [ "$ext" != "xz" ] && [ "$ext" != "gz" ] && [ "$ext" != "jpg" ] && [ "$ext" != "png" ] && [ "$ext" != "zip" ]; then
+            xz -9e -T0 "$f"
+        fi
+    done
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # nightly rotate for the model server logs (cron 03:10)
+    LOG_DIR='/var/log/modelserver'
+    KEEP_DAYS=14
+    printf -v now '%(%s)T' -1
+    compress_after=$(( 24 * 3600 ))
+    delete_after=$(( KEEP_DAYS * 24 * 3600 ))
+
+    cd "$LOG_DIR" || exit 1
+
+    for f in *; do
+        [[ -f $f ]] || continue
+        age=$(( now - $(stat -c %Y "$f") ))
+
+        case $f in
+            *.xz|*.zst)
+                # old archives: delete after retention
+                (( age >= delete_after )) && rm -f "$f"
+                ;;
+            *.gz|*.jpg|*.png|*.zip)
+                # already compressed, leave alone
+                ;;
+            *)
+                # logs, csv, jsonl and any other file: compress once it is a day old
+                (( age >= compress_after )) && zstd -q --rm -T0 "$f"
+                ;;
+        esac
+    done
+    ```
+
+    **Green Notes**
+    - **zstd instead of `xz -9e`** (reduces E): this job compresses new files every night, and the archives are only kept for 14 days. In Green Metrics Tool micro-benchmarks on 100 MB of text with default settings, compressing used ~16 J with zstd and ~458 J with xz, about 29× more ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=2584305c-7a1e-47e2-b6cc-26276962035e,addc5f5e-55da-47f8-956d-240d06304e4e,fb08d3c3-ba41-4f0f-85fd-0b6c34e6c39b,f1479db0-c453-4aaa-9116-e137621fad07,7b3bb87d-3b43-4f82-be99-0327405205b8,905bd408-6b31-4237-a4da-14b8fad90613,7f213a20-8028-4080-9583-6e465c217bb5,8e93a8d2-60b0-4831-905b-764b68257bc7)). `-9e` is slower than xz's default, so the gap here is probably larger. Those figures compare energy only, not file size. xz usually gives smaller files, so if disk space gets tight, raise the zstd level (for example `-9`) before going back to xz.
+    - **One `case` instead of repeated `[ ... ]` tests** (reduces E): the extension is matched once per file, and the three branches that repeated the same age and extension checks are gone. The behavior is the same. The age check in seconds equals your `age_h >= 24` check, and unknown extensions are still compressed.
+    - **Retention handles both `.xz` and `.zst`.** Old `.xz` files from before this change still get deleted on schedule, and new `.zst` files are cleaned up the same way.
+    - `printf -v now '%(%s)T' -1` is a bash builtin, so it saves one process start (`date`) per run.
+    - *Not applied:* files younger than 24 hours are still left alone. They may still be written, and data that short-lived is not worth compressing.
+verify:
+  static_only: script operates on /var/log and needs the zstd and xz binaries; the codec change alters the produced files

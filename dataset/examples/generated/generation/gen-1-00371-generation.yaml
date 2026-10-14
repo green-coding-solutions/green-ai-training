@@ -1,0 +1,106 @@
+id: gen-1-00371-generation
+category: generation
+language: java
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    We need a small Java tool for our release pipeline. Before the deploy stage starts, it must check that all artifacts of the release exist in our internal Maven repository.
+
+    Requirements:
+    - Java 17, only the JDK, no extra libraries (the CI image is minimal)
+    - args: base URL of the repo and a path to a text file with one artifact path per line, like `com/acme/billing/billing-core/2.4.1/billing-core-2.4.1.jar`. Usually 40-80 lines. Skip empty lines and lines starting with `#`.
+    - the repo needs a bearer token, it is in the env var `REPO_TOKEN` (can be missing for the public mirror)
+    - a request must not hang the pipeline, so 5 second timeout each
+    - print every problem (missing or error) sorted by path, then a summary line
+    - exit code 0 if everything exists, 1 otherwise
+    - the repo admins asked us to never have more than 16 requests open at once
+
+    Please write the whole class.
+- role: assistant
+  content: |
+    ```java
+    import java.net.URI;
+    import java.net.http.HttpClient;
+    import java.net.http.HttpRequest;
+    import java.net.http.HttpResponse;
+    import java.nio.file.Files;
+    import java.nio.file.Path;
+    import java.time.Duration;
+    import java.util.ArrayList;
+    import java.util.List;
+    import java.util.Map;
+    import java.util.concurrent.CompletableFuture;
+    import java.util.concurrent.ConcurrentSkipListMap;
+    import java.util.concurrent.Semaphore;
+
+    public final class ArtifactGate {
+        private static final int MAX_IN_FLIGHT = 16;
+        private static final Duration TIMEOUT = Duration.ofSeconds(5);
+
+        public static void main(String[] args) throws Exception {
+            if (args.length != 2) {
+                System.err.println("usage: ArtifactGate <repo-base-url> <artifact-list-file>");
+                System.exit(2);
+            }
+            String baseUrl = args[0].replaceAll("/+$", "");
+            List<String> paths = Files.readAllLines(Path.of(args[1])).stream()
+                    .map(String::trim)
+                    .filter(line -> !line.isEmpty() && !line.startsWith("#"))
+                    .toList();
+            String token = System.getenv("REPO_TOKEN");
+
+            HttpClient client = HttpClient.newBuilder()
+                    .connectTimeout(TIMEOUT)
+                    .followRedirects(HttpClient.Redirect.NORMAL)
+                    .build();
+
+            Map<String, String> problems = new ConcurrentSkipListMap<>();
+            Semaphore slots = new Semaphore(MAX_IN_FLIGHT);
+            List<CompletableFuture<Void>> pending = new ArrayList<>();
+
+            for (String path : paths) {
+                HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(baseUrl + "/" + path))
+                        .method("HEAD", HttpRequest.BodyPublishers.noBody())
+                        .timeout(TIMEOUT);
+                if (token != null && !token.isBlank()) {
+                    builder.header("Authorization", "Bearer " + token);
+                }
+
+                slots.acquire(); // waits here when 16 requests are already open
+                pending.add(client.sendAsync(builder.build(), HttpResponse.BodyHandlers.discarding())
+                        .handle((response, error) -> {
+                            if (error != null) {
+                                Throwable cause = error.getCause() != null ? error.getCause() : error;
+                                problems.put(path, "ERROR " + cause.getClass().getSimpleName());
+                            } else if (response.statusCode() == 404) {
+                                problems.put(path, "MISSING");
+                            } else if (response.statusCode() != 200) {
+                                problems.put(path, "HTTP " + response.statusCode());
+                            }
+                            return (Void) null;
+                        })
+                        .whenComplete((ignored, e) -> slots.release()));
+            }
+
+            CompletableFuture.allOf(pending.toArray(new CompletableFuture[0])).join();
+
+            problems.forEach((path, problem) -> System.out.println(problem + "  " + path));
+            System.out.printf("%d checked, %d problems%n", paths.size(), problems.size());
+            System.exit(problems.isEmpty() ? 0 : 1);
+        }
+    }
+    ```
+
+    Notes on behavior: a redirect to a mirror is followed. Any status other than 200 or 404 (for example 401 or 503) is reported as `HTTP <code>`, so a bad token does not look like a missing artifact. Timeouts and connection errors show up as `ERROR <ExceptionName>`.
+
+    **Green Notes**
+    - **Async requests with a bound** (reduces E): `sendAsync` plus a `Semaphore` keeps up to 16 HEAD requests open instead of waiting for each answer in turn. The job holds the CI runner for roughly the slowest answers instead of the sum of all round trips. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async used about 7% less CPU energy and about 17% less wall time than sync ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=97acc9a0-3856-4bbb-b816-2b64030fba98,6415cccb-ad1a-4d87-ae46-92740c5e285b)). At this size the gain is mostly wall time. https://patterns.greensoftware.foundation/development/use-async-instead-of-sync
+    - **HEAD with a discarding body handler** (reduces network): you only need to know that the file exists, so no jar is downloaded.
+    - **One shared `HttpClient`** (reduces E): connections are reused, so there are fewer TLS handshakes.
+    - *Not applied:* thread pools, reactive libraries or retries. The JDK client already does the concurrency here, and a retry loop would add requests to a gate that should be fast and strict.
+verify:
+  static_only: Needs a JDK and a reachable Maven repository over the network; no Java runner in the verifier.

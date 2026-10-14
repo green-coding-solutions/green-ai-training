@@ -1,0 +1,44 @@
+id: gen-1-00350-conceptual
+category: conceptual
+language: text
+patterns:
+- modern-image-formats
+- context-tradeoff
+facts:
+- F-IMGENC
+- F-IMGRENDER
+messages:
+- role: user
+  content: |
+    We run the docs site for our SDK. Hugo build in GitHub Actions, about 2,000 screenshots and diagrams in the repo (mostly PNG, some JPG). Every PR triggers a full build plus a preview deploy, and merges to main deploy to the CDN.
+
+    Our frontend lead wants to convert all images to AVIF inside the pipeline so the site is "greener". My requirements:
+    - readers on old browsers must still see images
+    - CI time should not explode
+    - I don't want a new paid service
+
+    Is "encode everything to AVIF in CI on every build" a good idea? Where should the conversion happen, and when does it not make sense at all?
+- role: assistant
+  content: |-
+    Converting is fine. Doing it on every build is not.
+
+    The saving comes from fewer bytes sent to readers. The cost is the encoding, and AVIF is the expensive one. In Green Metrics Tool micro-benchmarks, encoding 50 BMP images took about 658 J as AVIF and about 89 J as JPG, roughly 7× more ([measurements](https://metrics.green-coding.io/stats.html?id=81a932bc-04da-443b-93cf-d4d8468de247)). So the question is how often you pay that cost.
+
+    **What I would do**
+    - **Encode once per image, not once per build.** Key the output by content hash. Cache the generated files (Hugo's `resources/_gen` cache, or `actions/cache`). A PR that touches 3 screenshots should encode 3 images.
+    - **Let the preview builds skip it.** Previews are viewed by a few reviewers. Keep the originals there, or use a cheap format like WebP. Run the full conversion only on merges to main.
+    - **Use Hugo's built-in image processing** (`.Resize`, `.Process "webp"`) or a build step you already have. That needs no new service.
+    - **Keep a fallback.** Output a `<picture>` element with AVIF, then WebP, then the original PNG or JPG as the `<img>`. Old browsers use the last one.
+    - **Resize first.** Serving a 2400 px screenshot in an 800 px column wastes more bytes than the format choice saves.
+
+    **When it does not make sense**
+    - **SVG diagrams:** they are already small and scale well. Keep them as SVG.
+    - **Small icons:** the gain is tiny, and SVG or a sprite is simpler.
+    - **Low-traffic docs:** if few people read the site, the encoding energy may be bigger than the transfer savings. Pick WebP, which is cheaper to encode, and stop there.
+    - **Screenshots with sharp text:** check the output by eye. Lossy settings can blur small text. Use lossless WebP if it does.
+
+    **Client side:** decoding AVIF costs a bit more than JPG. In the same benchmarks, 50 page loads used about 159 J with AVIF and about 134 J with JPG, so about 19% more ([measurements](https://metrics.green-coding.io/stats.html?id=b31ca361-1745-4fac-8e6b-a97ec99bf476)). That is small next to the bytes saved on a page with large images, but it is why "AVIF everywhere" is not free.
+
+    To check your own case, compare CI minutes before and after, and compare page weight on a few representative pages. Use `perf stat` or the Green Metrics Tool if you want an energy proxy for the build step.
+
+    More: https://patterns.greensoftware.foundation/development/media-and-code-efficiency/serve-images-in-modern-formats

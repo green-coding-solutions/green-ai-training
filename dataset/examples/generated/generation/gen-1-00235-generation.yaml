@@ -1,0 +1,58 @@
+id: gen-1-00235-generation
+category: generation
+language: sql
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    ```sql
+    CREATE TABLE webhook_deliveries (
+        id            bigserial PRIMARY KEY,
+        endpoint_id   int NOT NULL,
+        event_type    text NOT NULL,
+        request_body  text NOT NULL,   -- raw JSON we send, 5-50 KB
+        response_body text,            -- whatever the customer server returns
+        status_code   int,
+        created_at    timestamptz NOT NULL DEFAULT now()
+    );
+    -- keep 90 days, support page lists last deliveries per endpoint
+    ```
+
+    ?
+- role: assistant
+  content: |
+    I read this as a request to finish the table for the support page. Here is a Postgres 14+ version with the lookup index and a retention query.
+
+    ```sql
+    CREATE TABLE webhook_deliveries (
+        id            bigserial PRIMARY KEY,
+        endpoint_id   int NOT NULL,
+        event_type    text NOT NULL,
+        request_body  text NOT NULL COMPRESSION lz4,
+        response_body text COMPRESSION lz4,
+        status_code   smallint,
+        created_at    timestamptz NOT NULL DEFAULT now()
+    );
+
+    -- support page: last deliveries per endpoint
+    CREATE INDEX webhook_deliveries_endpoint_created_idx
+        ON webhook_deliveries (endpoint_id, created_at DESC);
+
+    -- retention job, run daily
+    DELETE FROM webhook_deliveries
+    WHERE created_at < now() - interval '90 days';
+    ```
+
+    For an existing table, `ALTER TABLE webhook_deliveries ALTER COLUMN request_body SET COMPRESSION lz4;` only affects new rows. Old rows keep their old compression until they are rewritten.
+
+    **Green Notes**
+    - **Compress stored data with a fast codec** (reduces E, storage): Postgres compresses large text values automatically (TOAST, values above about 2 KB). `COMPRESSION lz4` picks a cheap codec for bodies that are written on every delivery and read rarely. In Green Metrics Tool CLI benchmarks on 100 MB of English text, compressing used about 6 J with lz4, about 16 J with zstd and about 67 J with gzip ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=2584305c-7a1e-47e2-b6cc-26276962035e,addc5f5e-55da-47f8-956d-240d06304e4e,fb08d3c3-ba41-4f0f-85fd-0b6c34e6c39b,f1479db0-c453-4aaa-9116-e137621fad07,7b3bb87d-3b43-4f82-be99-0327405205b8,905bd408-6b31-4237-a4da-14b8fad90613,7f213a20-8028-4080-9583-6e465c217bb5,8e93a8d2-60b0-4831-905b-764b68257bc7)). Those are command-line tools, not Postgres, and they compare energy, not compression ratio. https://patterns.greensoftware.foundation/development/data-handling/compress-stored-data
+    - **Narrow types** (reduces storage): `smallint` fits any HTTP status code.
+    - **Index matches the query:** `(endpoint_id, created_at DESC)` serves the "last deliveries per endpoint" page without a sort.
+    - *Not applied:* no gzip or xz in the app before insert. It would add CPU on every write, make the bodies unsearchable in SQL, and the database already compresses them. This needs a server built with lz4 support. Check it with `SHOW default_toast_compression;` or just try the `ALTER`.
+verify:
+  static_only: Postgres-specific DDL (COMPRESSION lz4, Postgres 14+), not runnable in SQLite

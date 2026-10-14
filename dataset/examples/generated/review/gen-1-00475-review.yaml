@@ -1,0 +1,102 @@
+id: gen-1-00475-review
+category: review
+language: dockerfile
+patterns:
+- small-container-images
+messages:
+- role: user
+  content: |
+    hi, i made this Dockerfile for my flask api (bookings for a small gym, uses postgres). it works on my laptop and on the server but i dont know if something is wrong with it. can you look?
+
+    ```dockerfile
+    FROM ubuntu:22.04
+
+    RUN apt-get update
+    RUN apt-get install -y python3 python3-pip build-essential libpq-dev git curl vim
+
+    WORKDIR /app
+    COPY . .
+    RUN pip3 install -r requirements.txt
+
+    EXPOSE 5000
+    CMD ["python3", "app.py"]
+    ```
+- role: assistant
+  content: |
+    **Workload:** web backend (containerized REST API)
+
+    #### [Bug] Flask development server in the container
+    - **Where:** `CMD ["python3", "app.py"]`
+    - **Issue:** if `app.py` ends with `app.run(...)`, you are serving real traffic with Flask's built-in dev server. It is single-purpose tooling, not made for load, and with `debug=True` it exposes an interactive debugger.
+    - **Fix:** run a WSGI server such as gunicorn (add `gunicorn` to `requirements.txt`).
+
+    #### [Security] Runs as root
+    - **Where:** no `USER` line
+    - **Issue:** if someone breaks into the app, they are root inside the container.
+    - **Fix:** create a normal user and switch to it.
+
+    #### [High] Full Ubuntu image with build tools, git, curl and vim
+    - **Where:** `FROM ubuntu:22.04` and the `apt-get install` line
+    - **Issue:** the compiler, `git`, `curl` and `vim` are only needed to build or debug, but they stay in the image you run. A bigger image means more bytes pulled on every deploy and every new node, and more storage in the registry.
+    - **Fix:** use a multi-stage build. Compile in a builder stage, and copy only the result into a `python:3.12-slim` runtime stage.
+    - **Impact:** reduces network and storage (M) on every pull and deploy. The saving repeats for every server that runs the image.
+
+    #### [High] `COPY . .` comes before `pip install`
+    - **Where:** `COPY . .` followed by `RUN pip3 install ...`
+    - **Issue:** any change to any file (even a typo in a comment) invalidates the layer cache, so all dependencies are downloaded and installed again on every build. It also copies `.git`, `__pycache__`, local virtualenvs and `.env` files into the image.
+    - **Fix:** copy `requirements.txt` first and install, then copy the code. Add a `.dockerignore`.
+    - **Impact:** reduces E and network on every CI build, because the dependency layer is reused when only code changed.
+
+    #### [Medium] `apt-get update` in its own `RUN`, no cleanup
+    - **Where:** the two `RUN apt-get ...` lines
+    - **Issue:** the package lists stay in the layer, and recommended extra packages get installed too. A separate `update` layer can also go stale in the cache.
+    - **Fix:** one `RUN` with `--no-install-recommends` and `rm -rf /var/lib/apt/lists/*`.
+
+    #### [Low] pip cache kept in the image
+    - **Where:** `pip3 install -r requirements.txt`
+    - **Fix:** `--no-cache-dir`.
+
+    ```dockerfile
+    # syntax=docker/dockerfile:1
+    FROM python:3.12-slim AS builder
+    RUN apt-get update \
+        && apt-get install -y --no-install-recommends build-essential libpq-dev \
+        && rm -rf /var/lib/apt/lists/*
+    RUN python -m venv /opt/venv
+    ENV PATH="/opt/venv/bin:$PATH"
+    WORKDIR /build
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    FROM python:3.12-slim
+    RUN apt-get update \
+        && apt-get install -y --no-install-recommends libpq5 \
+        && rm -rf /var/lib/apt/lists/* \
+        && useradd --create-home app
+    COPY --from=builder /opt/venv /opt/venv
+    ENV PATH="/opt/venv/bin:$PATH" \
+        PYTHONUNBUFFERED=1
+    WORKDIR /app
+    COPY --chown=app:app . .
+    USER app
+
+    EXPOSE 5000
+    CMD ["gunicorn", "--bind", "0.0.0.0:5000", "app:app"]
+    ```
+
+    `.dockerignore`:
+
+    ```text
+    .git
+    __pycache__/
+    *.pyc
+    .venv/
+    .env
+    tests/
+    ```
+
+    I assumed your Flask object is called `app` inside `app.py`. Change `app:app` if it is named differently. If you use `psycopg2-binary` in `requirements.txt`, you can drop the builder's compiler packages and `libpq5` too.
+
+    **Already good:** `WORKDIR` is set and the port is documented with `EXPOSE`.
+verify:
+  static_only: Dockerfile review, needs a Docker daemon to build

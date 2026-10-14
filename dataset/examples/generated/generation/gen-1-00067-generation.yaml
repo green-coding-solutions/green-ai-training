@@ -1,0 +1,60 @@
+id: gen-1-00067-generation
+category: generation
+language: javascript
+patterns:
+- simple-conditions
+messages:
+- role: user
+  content: |
+    hi, im new to javascript. in our github actions deploy script i need to turn the job status into a slack message. the statuses are success, failure, cancelled, skipped and timed_out. each one needs an emoji, a color and a yes/no for pinging the oncall team. i started with a long if / else if thing but my colleague said it looks messy and maybe i am doing it wrong. can you write it the right way?
+- role: assistant
+  content: |
+    Your colleague is right. When every branch only compares one value for equality, a lookup table is simpler than an `if` chain. Here it is:
+
+    ```javascript
+    const STATUS_INFO = new Map([
+      ['success',   { emoji: ':white_check_mark:', color: '#2eb886', pingOncall: false }],
+      ['failure',   { emoji: ':x:',                color: '#e01e5a', pingOncall: true  }],
+      ['timed_out', { emoji: ':hourglass:',        color: '#e01e5a', pingOncall: true  }],
+      ['cancelled', { emoji: ':no_entry_sign:',    color: '#999999', pingOncall: false }],
+      ['skipped',   { emoji: ':fast_forward:',     color: '#999999', pingOncall: false }],
+    ]);
+
+    const UNKNOWN = { emoji: ':question:', color: '#cccccc', pingOncall: false };
+
+    function describeStatus(status) {
+      return STATUS_INFO.get(status) ?? UNKNOWN;
+    }
+
+    function buildSlackMessage(jobName, status) {
+      const { emoji, color, pingOncall } = describeStatus(status);
+      const ping = pingOncall ? '<!subteam^ONCALL> ' : '';
+      return {
+        text: `${ping}${emoji} ${jobName}: ${status}`,
+        attachments: [{ color }],
+      };
+    }
+
+    module.exports = { describeStatus, buildSlackMessage };
+    ```
+
+    Replace `ONCALL` with your real Slack user group ID. To add a status, add one line to the table.
+
+    **Green Notes**
+    - **Simple equality dispatch** (reduces E): each status is one hash lookup. It does not walk a chain of comparisons, and the table is built once at load time, not on every call.
+    - I used a `Map` and not a plain object on purpose. With `{}`, a status like `"constructor"` or `"toString"` would find a function from the prototype and not fall back to `UNKNOWN`.
+    - *Not applied:* anything heavier. This runs once per job, so the energy difference is tiny. The real gain here is code that is shorter and easier to change.
+verify:
+  test: |-
+    const assert = require('assert');
+    assert.strictEqual(describeStatus('failure').pingOncall, true);
+    assert.strictEqual(describeStatus('timed_out').pingOncall, true);
+    assert.strictEqual(describeStatus('success').pingOncall, false);
+    assert.strictEqual(describeStatus('skipped').color, '#999999');
+    assert.strictEqual(describeStatus('constructor').emoji, ':question:');
+    assert.strictEqual(describeStatus(undefined).color, '#cccccc');
+    const ok = buildSlackMessage('deploy', 'success');
+    assert.strictEqual(ok.text, ':white_check_mark: deploy: success');
+    assert.deepStrictEqual(ok.attachments, [{ color: '#2eb886' }]);
+    const bad = buildSlackMessage('deploy', 'failure');
+    assert.strictEqual(bad.text, '<!subteam^ONCALL> :x: deploy: failure');

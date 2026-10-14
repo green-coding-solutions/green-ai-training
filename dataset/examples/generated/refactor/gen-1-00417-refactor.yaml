@@ -1,0 +1,172 @@
+id: gen-1-00417-refactor
+category: refactor
+language: python
+patterns:
+- simple-conditions
+- regex-precompile
+facts:
+- F-COND
+- F-REGEX
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import re
+    import sys
+    from collections import defaultdict
+
+    FLAKY_HINTS = [
+        "ECONNRESET",
+        "ETIMEDOUT",
+        "Temporary failure in name resolution",
+        "429 Too Many Requests",
+    ]
+
+
+    def classify(code):
+        if code == 0:
+            return "ok"
+        elif code >= 1 and code <= 2:
+            return "failed"
+        elif code == 124:
+            return "timeout"
+        elif code >= 126 and code <= 127:
+            return "not_found"
+        elif code > 128 and code < 160 and (code - 128) in (9, 15):
+            return "killed"
+        elif code > 128 and code < 160 and (code - 128) == 2:
+            return "interrupted"
+        elif code > 128:
+            return "signal"
+        else:
+            return "failed"
+
+
+    def is_flaky(msg):
+        for hint in FLAKY_HINTS:
+            if re.search(re.escape(hint), msg, re.IGNORECASE):
+                return True
+        return False
+
+
+    def summarize(lines):
+        counts = defaultdict(int)
+        flaky = 0
+        for line in lines:
+            m = re.match(r"^(\S+) \[(\w+)\] exit=(\d+) (.*)$", line.rstrip("\n"))
+            if not m:
+                continue
+            ts, stage, code, msg = m.groups()
+            kind = classify(int(code))
+            counts[(stage, kind)] += 1
+            if kind != "ok" and is_flaky(msg):
+                flaky += 1
+        return dict(sorted(counts.items())), flaky
+
+
+    if __name__ == "__main__":
+        result, flaky = summarize(sys.stdin)
+        for (stage, kind), n in result.items():
+            print(f"{stage:10} {kind:12} {n}")
+        print("flaky:", flaky)
+    ```
+- role: assistant
+  content: |
+    ```python
+    import re
+    import sys
+    from collections import defaultdict
+
+    FLAKY_HINTS = [
+        "ECONNRESET",
+        "ETIMEDOUT",
+        "Temporary failure in name resolution",
+        "429 Too Many Requests",
+    ]
+
+    LINE_RE = re.compile(r"^(\S+) \[(\w+)\] exit=(\d+) (.*)$")
+    FLAKY_RE = re.compile("|".join(re.escape(h) for h in FLAKY_HINTS), re.IGNORECASE)
+
+    EXIT_KINDS = {
+        0: "ok",
+        1: "failed",
+        2: "failed",
+        124: "timeout",
+        126: "not_found",
+        127: "not_found",
+        130: "interrupted",  # 128 + SIGINT
+        137: "killed",       # 128 + SIGKILL
+        143: "killed",       # 128 + SIGTERM
+    }
+
+
+    def classify(code):
+        kind = EXIT_KINDS.get(code)
+        if kind is None:
+            kind = "signal" if code > 128 else "failed"
+        return kind
+
+
+    def is_flaky(msg):
+        return FLAKY_RE.search(msg) is not None
+
+
+    def summarize(lines):
+        counts = defaultdict(int)
+        flaky = 0
+        for line in lines:
+            m = LINE_RE.match(line.rstrip("\n"))
+            if not m:
+                continue
+            ts, stage, code, msg = m.groups()
+            kind = classify(int(code))
+            counts[(stage, kind)] += 1
+            if kind != "ok" and is_flaky(msg):
+                flaky += 1
+        return dict(sorted(counts.items())), flaky
+
+
+    if __name__ == "__main__":
+        result, flaky = summarize(sys.stdin)
+        for (stage, kind), n in result.items():
+            print(f"{stage:10} {kind:12} {n}")
+        print("flaky:", flaky)
+    ```
+
+    Same output as before. The exit-code rules are unchanged, only written as a table.
+
+    **Green Notes**
+    - **Dict lookup instead of a range/modulo `elif` chain** (reduces E): `classify` runs once per log line. Plain equality or lookup is cheaper than guards like `code > 128 and code < 160 and (code - 128) in (9, 15)`. In Green Metrics Tool micro-benchmarks (10,000,000 classifications), simple equality branches used about 16% less CPU energy than complex range/modulo conditions ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=123676d7-2121-4b9d-b78e-e065836fc608,a7780e2a-2934-4d26-b2a9-2cda7848adc1)). The table is also easier to read and extend.
+    - **Regexes compiled once** (reduces E): the line pattern was passed to `re.match` on every line. In Green Metrics Tool micro-benchmarks (1,000,000 matches), a precompiled pattern used about 18% less CPU energy than inline `re.match` ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=3827c15a-4295-44a4-8025-a07e8653ab7e,b7a9f0bd-c9e0-4b95-9bda-e8a96f38020c,f3e0434d-744b-41a0-a0cc-9bf00d80500d)). This is a small win, because Python caches compiled patterns.
+    - **One combined flaky regex** (reduces E): the old `is_flaky` built and looked up up to four escaped patterns per failed line and scanned the message up to four times. Now it is one scan with one pattern. `search` on the alternation returns `True` exactly when any hint matches, so the result does not change.
+    - *Not applied:* `match`/`case` for the exit codes. It makes no meaningful energy difference compared with `if`/`elif`.
+verify:
+  module: true
+  equivalence:
+    driver: |-
+      lines = [
+          "2026-10-08T12:00:01Z [build] exit=0 npm run build",
+          "2026-10-08T12:00:02Z [build] exit=1 npm ERR! ECONNRESET while fetching",
+          "2026-10-08T12:00:03Z [test] exit=124 pytest timed out",
+          "2026-10-08T12:00:04Z [test] exit=137 oom killed",
+          "2026-10-08T12:00:05Z [test] exit=143 terminated",
+          "2026-10-08T12:00:06Z [deploy] exit=127 kubectl: command not found",
+          "2026-10-08T12:00:07Z [deploy] exit=126 permission denied",
+          "2026-10-08T12:00:08Z [deploy] exit=130 interrupted",
+          "2026-10-08T12:00:09Z [deploy] exit=139 segfault",
+          "2026-10-08T12:00:10Z [deploy] exit=129 hangup",
+          "2026-10-08T12:00:11Z [lint] exit=200 weird code",
+          "2026-10-08T12:00:12Z [lint] exit=3 etimedout on registry",
+          "2026-10-08T12:00:13Z [lint] exit=2 429 too many requests",
+          "2026-10-08T12:00:14Z [lint] exit=0 temporary failure in name resolution",
+          "2026-10-08T12:00:15Z [lint] exit=1 Temporary Failure In Name Resolution",
+          "garbage line without format",
+          "2026-10-08T12:00:16Z [lint] exit=x bad",
+          "2026-10-08T12:00:17Z [build] exit=4 ",
+          "",
+      ]
+      lines = [l + "\n" for l in lines] + lines[:3]
+      print(summarize(lines))
+      print(summarize(iter([])))

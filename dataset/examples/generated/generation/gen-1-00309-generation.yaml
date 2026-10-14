@@ -1,0 +1,128 @@
+id: gen-1-00309-generation
+category: generation
+language: html
+patterns:
+- system-fonts-and-deps
+messages:
+- role: user
+  content: |
+    We have a nightly ETL job that loads about a dozen tables from our ERP export into the warehouse. At the end it writes a static HTML report that the data team opens from a shared drive (file://, and the server has no internet access). Can you write the HTML template?
+
+    Requirements:
+    - Header with job name, run date, duration and overall status (success / warnings / failed)
+    - Table with one row per target table: name, rows read, rows loaded, rows rejected, rejected as % of read, status
+    - A small horizontal bar in the "rejected %" cell so problem tables stand out
+    - Below that, a list of the first few rejection reasons per table (collapsible if possible)
+    - Readable on a laptop and when printed to PDF
+    - Single file, the pipeline fills in the values with Jinja2, so use `{{ }}` placeholders
+- role: assistant
+  content: |
+    One self-contained file. It has no web fonts, no CSS framework and no JavaScript. The bars are plain CSS and the collapsible lists use `<details>`.
+
+    ```html
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>{{ job_name }} – {{ run_date }}</title>
+      <style>
+        :root {
+          --ok: #1a7f37;
+          --warn: #9a6700;
+          --fail: #cf222e;
+          --line: #d0d7de;
+          --muted: #57606a;
+        }
+        body {
+          font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+          max-width: 1000px;
+          margin: 2rem auto;
+          padding: 0 1rem;
+          color: #1f2328;
+        }
+        h1 { font-size: 1.5rem; margin-bottom: 0.25rem; }
+        .meta { color: var(--muted); margin: 0 0 1.5rem; }
+        .status { font-weight: 600; }
+        .status.success { color: var(--ok); }
+        .status.warnings { color: var(--warn); }
+        .status.failed { color: var(--fail); }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--line); text-align: right; }
+        th:first-child, td:first-child { text-align: left; }
+        th:last-child, td:last-child { text-align: left; }
+        td.num { font-variant-numeric: tabular-nums; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+        .bar { display: inline-block; width: 80px; height: 0.6rem; background: #eaeef2; vertical-align: middle; margin-left: 0.5rem; }
+        .bar > i { display: block; height: 100%; background: var(--warn); }
+        .bar.bad > i { background: var(--fail); }
+        details { margin: 0.5rem 0; }
+        summary { cursor: pointer; font-weight: 600; }
+        ul.reasons { margin: 0.25rem 0 0.75rem; color: var(--muted); }
+        @media print {
+          body { margin: 0; max-width: none; }
+          details { open: true; }
+          .bar { border: 1px solid #999; }
+        }
+      </style>
+    </head>
+    <body>
+      <h1>{{ job_name }}</h1>
+      <p class="meta">
+        Run {{ run_date }} · Duration {{ duration }} ·
+        <span class="status {{ overall_status }}">{{ overall_status | capitalize }}</span>
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Table</th>
+            <th>Read</th>
+            <th>Loaded</th>
+            <th>Rejected</th>
+            <th>Rejected %</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for t in tables %}
+          <tr>
+            <td>{{ t.name }}</td>
+            <td class="num">{{ t.read }}</td>
+            <td class="num">{{ t.loaded }}</td>
+            <td class="num">{{ t.rejected }}</td>
+            <td class="num">
+              {{ "%.2f"|format(t.rejected_pct) }}
+              <span class="bar{{ ' bad' if t.rejected_pct >= 5 else '' }}"
+                    title="{{ '%.2f'|format(t.rejected_pct) }}% rejected">
+                <i style="width: {{ [t.rejected_pct, 100]|min }}%"></i>
+              </span>
+            </td>
+            <td class="status {{ t.status }}">{{ t.status | capitalize }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+
+      <h2>Rejection reasons</h2>
+      {% for t in tables if t.reasons %}
+      <details {{ 'open' if t.status == 'failed' else '' }}>
+        <summary>{{ t.name }} ({{ t.rejected }})</summary>
+        <ul class="reasons">
+          {% for r in t.reasons[:5] %}
+          <li>{{ r.count }} × {{ r.message }}</li>
+          {% endfor %}
+        </ul>
+      </details>
+      {% endfor %}
+    </body>
+    </html>
+    ```
+
+    **Green Notes**
+    - **System font stack instead of a web font** (reduces network and E): `system-ui, "Segoe UI", Roboto, sans-serif` uses fonts already on the machine. There are no font files to download, parse or render. It also works on your offline server. A monospace stack handles the numbers.
+    - **No chart library or CSS framework** (reduces network and E): the "chart" is a 12-row table with CSS bars, so a charting library or framework would only add code to load and run. `<details>` gives you the collapsible lists without JavaScript.
+    - *Not applied:* minification and bundling. It is one small file, opened a few times a day by a few people, so readability of the template matters more.
+
+    If you later need sortable columns, a few lines of vanilla JS will do. You still would not need a library for 12 rows.
+verify:
+  static_only: HTML/Jinja2 template, no executable code to test

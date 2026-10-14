@@ -1,0 +1,179 @@
+id: refactor-py-star-import-history-001
+category: refactor
+language: python
+patterns: [deque-or-append, keep-star-imports]
+facts: [F-IMPORT]
+messages:
+  - role: user
+    content: |
+      This keeps the last 500 temperature readings for our dashboard and computes stats. It gets called for every reading (several per second). Can you optimize it?
+
+      ```python
+      from statistics import *
+
+      readings = []
+
+      def add_reading(value):
+          readings.insert(0, value)
+          if len(readings) > 500:
+              readings.pop()
+          return {"mean": round(mean(readings), 2), "median": median(readings)}
+      ```
+  - role: assistant
+    content: |
+      ```python
+      from statistics import *
+      from collections import deque
+
+      readings = deque(maxlen=500)
+
+      def add_reading(value):
+          readings.appendleft(value)
+          return {"mean": round(mean(readings), 2), "median": median(readings)}
+      ```
+
+      **Green Notes**
+      - **`deque(maxlen=500)` instead of `list.insert(0, ...)`** (reduces E): every front insert shifted all 500 stored values. `appendleft` is O(1), and the deque drops the oldest value by itself, so the extra `pop()` and length check are gone.
+      - **Star import left unchanged:** `from statistics import *` stays as it is. Replacing it with `import statistics` or explicit names makes no measurable energy difference.
+      - `mean` and `median` still look at all 500 values on every call. That is fine at a few calls per second. If it ever runs much more often, keep a running sum for the mean.
+verify:
+  equivalence:
+    driver: |
+      import random
+      random.seed(2)
+      out = None
+      for _ in range(2000):
+          out = add_reading(round(random.uniform(15, 30), 1))
+      print(out, len(readings), list(readings)[:5])
+---
+id: review-py-star-import-dedupe-001
+category: review
+language: python
+patterns: [efficient-algorithm, keep-star-imports]
+facts: [F-IMPORT]
+messages:
+  - role: user
+    content: |
+      Review please. It merges contact lists from our CRM export (~50k contacts per run).
+
+      ```python
+      from crm_helpers import *
+
+      def merge_contacts(a, b):
+          merged = list(a)
+          for contact in b:
+              if not any(normalize_email(c["email"]) == normalize_email(contact["email"]) for c in merged):
+                  merged.append(contact)
+          return merged
+      ```
+  - role: assistant
+    content: |
+      **Workload:** data pipeline
+
+      #### [High] Quadratic duplicate check
+      - **Where:** `any(... for c in merged)` inside the loop
+      - **Issue:** every contact from `b` is compared with every contact merged so far, and both emails are normalized again for each comparison. With 50k contacts per list that is in the order of billions of `normalize_email` calls.
+      - **Fix:** keep a set of normalized emails and check membership in O(1).
+      - **Impact:** reduces E from O(n·m) to O(n + m).
+
+      ```python
+      from crm_helpers import *
+
+      def merge_contacts(a, b):
+          merged = list(a)
+          seen = {normalize_email(c["email"]) for c in merged}
+          for contact in b:
+              key = normalize_email(contact["email"])
+              if key not in seen:
+                  seen.add(key)
+                  merged.append(contact)
+          return merged
+      ```
+
+      The result is the same list in the same order. One small difference: duplicates *within* `b` were already filtered by the old code too, because each appended contact became part of `merged`. The `seen.add` keeps that behavior.
+
+      **Checked, no change:** `from crm_helpers import *` stays as it is. Changing star imports makes no measurable energy difference.
+verify:
+  green_block: 0
+  setup: |
+    import sys, types
+    sys.modules["crm_helpers"] = types.SimpleNamespace(normalize_email=lambda e: e.strip().lower())
+    sys.modules["crm_helpers"].__all__ = ["normalize_email"]
+    def normalize_email(e):
+        return e.strip().lower()
+  original_code: |
+    def merge_contacts(a, b):
+        merged = list(a)
+        for contact in b:
+            if not any(normalize_email(c["email"]) == normalize_email(contact["email"]) for c in merged):
+                merged.append(contact)
+        return merged
+  green_code: |
+    def merge_contacts(a, b):
+        merged = list(a)
+        seen = {normalize_email(c["email"]) for c in merged}
+        for contact in b:
+            key = normalize_email(contact["email"])
+            if key not in seen:
+                seen.add(key)
+                merged.append(contact)
+        return merged
+  equivalence:
+    driver: |
+      a = [{"email": f"User{i}@x.io", "id": i} for i in range(200)]
+      b = [{"email": f" user{i}@X.io ", "id": 1000 + i} for i in range(150, 400)] + [{"email": "new@x.io", "id": 1}, {"email": "NEW@x.io", "id": 2}]
+      print(merge_contacts(a, b))
+---
+id: multiturn-py-star-import-ask-001
+category: multi-turn
+language: python
+patterns: [regex-precompile, keep-star-imports]
+facts: [F-IMPORT, F-REGEX]
+messages:
+  - role: user
+    content: |
+      speed this up? it validates SKUs in big product feeds
+
+      ```python
+      from re import *
+
+      def valid_skus(skus, prefix):
+          return [s for s in skus if match(prefix + r"-\d{6}$", s)]
+      ```
+  - role: assistant
+    content: |
+      ```python
+      from re import *
+
+      def valid_skus(skus, prefix):
+          pattern = compile(escape(prefix) + r"-\d{6}$")
+          return [s for s in skus if pattern.match(s)]
+      ```
+
+      **Green Notes**
+      - **Compile the pattern once per call** (reduces E): the old version built the pattern string again for every SKU and looked it up in `re`'s internal cache each time. Now it is compiled once and reused for the whole feed.
+      - **`escape(prefix)`:** a prefix containing regex characters like `.` or `+` could match the wrong SKUs before. This is a correctness fix, and it changes the result only for such prefixes.
+  - role: user
+    content: |
+      shouldn't we also replace the `from re import *` while we're at it? feels cleaner
+  - role: assistant
+    content: |
+      I'd leave it. Swapping a star import for `import re` or explicit names makes no measurable energy difference. In Green Metrics Tool micro-benchmarks, star and namespace imports used the same energy, because the module is loaded exactly once either way.
+
+      So the import stays as it is, and the change that actually matters here is the precompiled pattern from my previous answer.
+verify:
+  original_code: |
+    from re import *
+
+    def valid_skus(skus, prefix):
+        return [s for s in skus if match(prefix + r"-\d{6}$", s)]
+  green_code: |
+    from re import *
+
+    def valid_skus(skus, prefix):
+        pattern = compile(escape(prefix) + r"-\d{6}$")
+        return [s for s in skus if pattern.match(s)]
+  equivalence:
+    driver: |
+      skus = [f"AB-{i:06d}" for i in range(0, 3000, 7)] + ["AB-12", "XY-000001", "AB-0000011", "ab-000001"]
+      print(valid_skus(skus, "AB"))

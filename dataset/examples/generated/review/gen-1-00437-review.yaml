@@ -1,0 +1,137 @@
+id: gen-1-00437-review
+category: review
+language: yaml
+patterns:
+- text-compression
+- compress-stored
+- context-tradeoff
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    Vector config on our app hosts. Ships JSON logs to the central aggregator in another region and archives to S3 (90 days retention). Debug tail files get deleted by cron after 2h. Review, diff only please.
+
+    ```yaml
+    sources:
+      app_logs:
+        type: file
+        include: [/var/log/app/*.log]
+        read_from: end
+
+    transforms:
+      parse:
+        type: remap
+        inputs: [app_logs]
+        source: |
+          . = parse_json!(.message)
+          .host = get_hostname!()
+
+    sinks:
+      central:
+        type: http
+        inputs: [parse]
+        uri: https://logs-agg.eu-west.internal.example.com/ingest
+        encoding:
+          codec: json
+        compression: none
+        auth:
+          strategy: bearer
+          token: "lg_live_9f2c41d7a8b34e0c"
+        batch:
+          max_bytes: 8192
+          timeout_secs: 1
+
+      archive:
+        type: aws_s3
+        inputs: [parse]
+        bucket: acme-app-log-archive
+        region: eu-west-1
+        key_prefix: "app/%Y/%m/%d/"
+        encoding:
+          codec: json
+        compression: none
+        batch:
+          max_bytes: 10485760
+          timeout_secs: 300
+
+      debug_tail:
+        type: file
+        inputs: [parse]
+        path: /var/log/vector-debug/%Y-%m-%d-%H.log.gz
+        encoding:
+          codec: json
+        compression: gzip
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (log shipping)
+
+    #### [Security] Bearer token in the config file
+    - **Where:** `sinks.central.auth.token`
+    - **Issue:** a live token sits in a file that is probably in git and readable on every host.
+    - **Fix:** use `${LOGS_AGG_TOKEN}` and set it from the service environment or a secret store. Rotate the current token.
+
+    #### [High] Cross-region sink sends uncompressed JSON
+    - **Where:** `central` → `compression: none`
+    - **Issue:** JSON logs are repetitive text and shrink a lot. Every event now crosses the inter-region link at full size, on every host, all day.
+    - **Fix:** set `compression: zstd`. If the aggregator cannot decode `Content-Encoding: zstd`, use `gzip`. Logs are compressed continuously, so choose a fast codec. In Green Metrics Tool measurements on 100 MB of English text, zstd at its default level used about 16 J to compress and gzip about 67 J (about 4× less) ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=2584305c-7a1e-47e2-b6cc-26276962035e,addc5f5e-55da-47f8-956d-240d06304e4e,fb08d3c3-ba41-4f0f-85fd-0b6c34e6c39b,f1479db0-c453-4aaa-9116-e137621fad07,7b3bb87d-3b43-4f82-be99-0327405205b8,905bd408-6b31-4237-a4da-14b8fad90613,7f213a20-8028-4080-9583-6e465c217bb5,8e93a8d2-60b0-4831-905b-764b68257bc7)). That compares energy only, not output size.
+    - **Impact:** reduces network bytes per event. CPU cost is small with a fast codec.
+
+    #### [Medium] Batches too small to compress well
+    - **Where:** `central.batch` → `max_bytes: 8192`, `timeout_secs: 1`
+    - **Issue:** an 8 KB batch gives the compressor little to work with and means many small requests with headers.
+    - **Fix:** use about 1 MB and 5 s. The trade-off is up to 5 s extra delivery delay. Keep the small batch if you alert on this stream in near real time.
+
+    #### [Medium] 90-day archive is stored uncompressed
+    - **Where:** `archive` → `compression: none`
+    - **Issue:** the data is written once and kept for months. Raw JSON takes much more storage than needed, and it is also uploaded at full size.
+    - **Fix:** `compression: zstd`. Batches are already large, so it compresses well. A higher zstd level only makes sense if you keep data much longer, and then measure the CPU cost first.
+
+    #### [Low] Debug files are compressed for no reason
+    - **Where:** `debug_tail` → `compression: gzip`, path ending in `.gz`
+    - **Issue:** these files live 2 hours and are read by hand. Compression costs CPU and gives no storage benefit for such short-lived data.
+    - **Fix:** write plain `.log` files and drop `compression`.
+
+    ```yaml
+    sinks:
+      central:
+        type: http
+        inputs: [parse]
+        uri: https://logs-agg.eu-west.internal.example.com/ingest
+        encoding:
+          codec: json
+        compression: zstd
+        auth:
+          strategy: bearer
+          token: "${LOGS_AGG_TOKEN}"
+        batch:
+          max_bytes: 1048576
+          timeout_secs: 5
+
+      archive:
+        type: aws_s3
+        inputs: [parse]
+        bucket: acme-app-log-archive
+        region: eu-west-1
+        key_prefix: "app/%Y/%m/%d/"
+        encoding:
+          codec: json
+        compression: zstd
+        batch:
+          max_bytes: 10485760
+          timeout_secs: 300
+
+      debug_tail:
+        type: file
+        inputs: [parse]
+        path: /var/log/vector-debug/%Y-%m-%d-%H.log
+        encoding:
+          codec: json
+    ```
+
+    Check that your cron cleanup matches `*.log` now, not `*.log.gz`.
+
+    **Already good:** the archive batch size is large, and `read_from: end` avoids re-shipping old logs on first start.
+verify:
+  static_only: Vector YAML config, needs Vector, network and S3

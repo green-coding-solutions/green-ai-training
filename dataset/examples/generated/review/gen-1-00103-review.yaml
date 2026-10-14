@@ -1,0 +1,85 @@
+id: gen-1-00103-review
+category: review
+language: bash
+patterns:
+- compress-stored
+- bash-quoting
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    review?
+
+    ```bash
+    #!/bin/bash
+    # snapshot of app state, cron every 15 min
+    SRC=/var/lib/appstate
+    DEST=/var/backups/appstate
+    KEEP=8
+    STAMP=$(date +%Y%m%d-%H%M)
+
+    mkdir -p $DEST
+    echo "starting snapshot"
+    tar -cf - $SRC | xz -9e > $DEST/snap-$STAMP.tar.xz
+
+    for f in $(ls -t $DEST/snap-*.tar.xz | tail -n +$((KEEP+1))); do
+      echo "removing old snapshot"
+      rm $f
+    done
+
+    echo "done"
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (cron, every 15 minutes)
+
+    #### [Bug] A failed `tar` still deletes the good snapshots
+    - **Where:** `tar ... | xz ... > file`, then the cleanup loop
+    - **Issue:** there is no `set -e` or `pipefail`. If `tar` fails (disk full, a file vanishes, wrong path), `xz` still writes a truncated file. The script goes on and rotates away the older good snapshots. Variables are also unquoted (`$DEST`, `$SRC`, `$f`), and `tar` warns about the leading `/`.
+    - **Fix:** `set -euo pipefail`, quote the variables, write to a temp name and `mv` it into place only when the write succeeded.
+
+    #### [High] `xz -9e` on data that lives for two hours
+    - **Where:** the `xz -9e` stage
+    - **Issue:** this runs 96 times a day, and each snapshot is deleted after 8 rounds (2 hours). Compressing short-lived data rarely pays back. In Green Metrics Tool micro-benchmarks on 100 MB of English text, `xz` at its default level used about 29× more CPU energy than `zstd` at its default level ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=2584305c-7a1e-47e2-b6cc-26276962035e,addc5f5e-55da-47f8-956d-240d06304e4e,fb08d3c3-ba41-4f0f-85fd-0b6c34e6c39b,f1479db0-c453-4aaa-9116-e137621fad07,7b3bb87d-3b43-4f82-be99-0327405205b8,905bd408-6b31-4237-a4da-14b8fad90613,7f213a20-8028-4080-9583-6e465c217bb5,8e93a8d2-60b0-4831-905b-764b68257bc7)). `-9e` is slower still. The energy cost of storing data is small for 2 hours. A rough estimate puts the break-even for cheap `zstd` at about 0.15 days of storage, and for `xz` at about 7 days. Treat both as lower bounds.
+    - **Fix:** write a plain `.tar`. If the disk is tight, use a fast codec such as `zstd -1`. Keep `xz` for data you store for a long time. The measurements compare energy only, not compression ratio, so check your own size needs.
+    - **Impact:** E, every run, on a recurring schedule.
+    - **Pattern:** https://patterns.greensoftware.foundation/development/data-handling/compress-stored-data
+
+    #### [Medium] Parsing `ls` output
+    - **Where:** `for f in $(ls -t ...)`
+    - **Issue:** word splitting breaks on odd file names. It is safe with your own names, but fragile.
+    - **Fix:** pipe into `while IFS= read -r`.
+
+    #### [Low] Double quotes on literals without expansion
+    - **Where:** `echo "starting snapshot"`, `echo "removing old snapshot"`, `echo "done"`
+    - **Issue:** Bash scans double-quoted text for `$`, backticks and backslashes. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal 1,000,000 times used about 24% less CPU energy with single quotes ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=dd9bbb4e-b056-4067-8ad2-7b1818a86f10,b265ef9b-adb9-4b56-a14b-ae34fdaa7247,28d92c15-79d7-44ca-8f43-a733fe2e265a,a9533378-71f0-49df-bd5f-1e5f27cda9c2)). For three short strings once per run, the saving is not measurable. Switch anyway, since it costs nothing.
+    - **Fix:** single quotes. Keep the double quotes around variables.
+
+    ```bash
+    #!/bin/bash
+    set -euo pipefail
+
+    SRC=/var/lib/appstate
+    DEST=/var/backups/appstate
+    KEEP=8
+    STAMP=$(date +%Y%m%d-%H%M)
+
+    mkdir -p "$DEST"
+    echo 'starting snapshot'
+    tar -C "$(dirname "$SRC")" -cf "$DEST/snap-$STAMP.tar.tmp" "$(basename "$SRC")"
+    mv "$DEST/snap-$STAMP.tar.tmp" "$DEST/snap-$STAMP.tar"
+
+    ls -t "$DEST"/snap-*.tar | tail -n +$((KEEP + 1)) | while IFS= read -r f; do
+      echo 'removing old snapshot'
+      rm -- "$f"
+    done
+
+    echo 'done'
+    ```
+
+    Remove the old `snap-*.tar.xz` files once. If you switch to `zstd -1`, pipe `tar` into `zstd -1 -o "$DEST/snap-$STAMP.tar.zst.tmp"`, rename the glob, and keep `pipefail`.
+verify:
+  static_only: bash cron script that works on /var/lib and /var/backups with tar, xz and cron-style rotation

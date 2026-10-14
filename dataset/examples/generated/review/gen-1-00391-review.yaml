@@ -1,0 +1,137 @@
+id: gen-1-00391-review
+category: review
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    Can you review this small CLI? It's a `tac`-like tool our support team uses to look at the newest lines of exported application logs first. Requirements: it must work on files of a few hundred MB (some exports are over a million lines), `--skip-blank` should drop empty and whitespace-only lines, and `--limit N` should show only the N newest lines. Output must stay exactly as it is now, because other scripts parse it. I care about speed and memory, but I don't want anything too clever.
+
+    ```python
+    #!/usr/bin/env python3
+    """newest-first: print a log file from the last line to the first."""
+    import argparse
+    import sys
+
+
+    def newest_first(path, skip_blank=False, limit=0):
+        lines = []
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if skip_blank and not line.strip():
+                    continue
+                lines.insert(0, line)
+        if limit:
+            lines = lines[:limit]
+        return lines
+
+
+    def main():
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("path")
+        parser.add_argument("--skip-blank", action="store_true")
+        parser.add_argument("--limit", type=int, default=0,
+                            help="show only the N newest lines")
+        args = parser.parse_args()
+
+        try:
+            lines = newest_first(args.path, args.skip_blank, args.limit)
+        except OSError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
+        for line in lines:
+            print(line)
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (CLI, run on large files)
+
+    #### [High] Front insertion for every line
+    - **Where:** `lines.insert(0, line)` in `newest_first`
+    - **Issue:** every insert at index 0 shifts all items already in the list. For a file with n lines that is O(n²) work, so a million-line export does a huge amount of memory copying just to reverse the order.
+    - **Fix:** append in file order and reverse once at the end. `append` is O(1), the reverse is a single O(n) pass.
+    - **Impact:** reduces E and run time, and the gap grows with file size. In Green Metrics Tool micro-benchmarks, 1,000,000 `list.insert(0, x)` calls used about 1515 J of CPU energy, and 1,000,000 `list.append(x)` calls used about 1.2 J ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=1da9c13d-364b-4f71-b23f-785bf1caeac8,75a7d151-3a7b-4575-b3e1-de125ce00d00)).
+
+    #### [Medium] Whole file kept in memory when `--limit` is set
+    - **Where:** `lines[:limit]` after the loop
+    - **Issue:** with `--limit 50` the tool still stores every line of a file that can be hundreds of MB, then throws almost all of it away.
+    - **Fix:** keep only the newest N lines while reading, using `collections.deque(maxlen=limit)`. Old lines drop out automatically. This gives the same result as before. A `deque(maxlen=None)` is unbounded, so the no-limit case works with the same code.
+    - **Impact:** reduces memory and avoids holding data you never print. The file is still read once from start to end, because the newest lines are at the end.
+
+    #### [Bug] Negative `--limit` gives a surprising result
+    - **Where:** `if limit: lines = lines[:limit]`
+    - **Issue:** `--limit -3` is truthy, so it silently drops the last three lines of the reversed output instead of failing.
+    - **Fix:** reject negative values in `main`. `deque` would raise `ValueError` for them anyway.
+
+    ```python
+    #!/usr/bin/env python3
+    """newest-first: print a log file from the last line to the first."""
+    import argparse
+    import sys
+    from collections import deque
+
+
+    def newest_first(path, skip_blank=False, limit=0):
+        kept = deque(maxlen=limit or None)
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if skip_blank and not line.strip():
+                    continue
+                kept.append(line)
+        return list(reversed(kept))
+
+
+    def main():
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("path")
+        parser.add_argument("--skip-blank", action="store_true")
+        parser.add_argument("--limit", type=int, default=0,
+                            help="show only the N newest lines")
+        args = parser.parse_args()
+        if args.limit < 0:
+            parser.error("--limit must be 0 or larger")
+
+        try:
+            lines = newest_first(args.path, args.skip_blank, args.limit)
+        except OSError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
+        for line in lines:
+            print(line)
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+
+    Output is identical for valid inputs: same lines, same order, same blank-line handling.
+
+    **Already good:** the file is read lazily line by line, so there is no `readlines()` copy. The `OSError` handling and exit codes are sensible.
+verify:
+  module: true
+  equivalence:
+    driver: |-
+      import os
+      import tempfile
+
+      text = "a\n\nb\n  \nc\nd"
+      with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+          f.write(text)
+          p = f.name
+      for sb in (False, True):
+          for lim in (0, 1, 2, 3, 10):
+              print(sb, lim, newest_first(p, sb, lim))
+      os.unlink(p)

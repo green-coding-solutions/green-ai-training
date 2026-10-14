@@ -1,0 +1,138 @@
+id: gen-1-00227-generation
+category: generation
+language: javascript
+patterns:
+- dom-size
+- builtin-functions
+messages:
+- role: user
+  content: |
+    I need a small log viewer for a internal tool, plain JavaScript, no framework. The user picks a .log file from disk and I already read it into an array of strings with FileReader, one string per line. Files are usually 100k to 300k lines. Format of a line is like `2026-10-09T10:00:01Z ERROR payment-service timeout after 3000ms`.
+
+    Requirements:
+    - show the lines in a scrollable box, monospace, one line per row, no wrapping
+    - filter by level (a set like ERROR and WARN) and by a text search, case insensitive
+    - filter must be quick when I type in the search field
+    - scrolling must stay smooth
+
+    Please write the function `createLogViewer(container, lines)` and the filter helper.
+- role: assistant
+  content: |
+    Only the rows in view are rendered. The scroll box gets one tall spacer for the scrollbar, and about 30 row elements are swapped as you scroll. Filtering works on the string array, not on the DOM.
+
+    ```javascript
+    const ROW_HEIGHT = 20; // must match .log-row height in CSS
+    const OVERSCAN = 10;   // extra rows above and below the view
+
+    function getVisibleRange(scrollTop, viewportHeight, total, rowHeight = ROW_HEIGHT, overscan = OVERSCAN) {
+      const first = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
+      const last = Math.min(total, Math.ceil((scrollTop + viewportHeight) / rowHeight) + overscan);
+      return { first, last };
+    }
+
+    // levels: Set of level names, empty set = all levels
+    function makeFilter(levels, text) {
+      const needle = text.trim().toLowerCase();
+      return (line) => {
+        if (levels.size > 0) {
+          const start = line.indexOf(' ') + 1;
+          const end = line.indexOf(' ', start);
+          if (!levels.has(line.slice(start, end))) return false;
+        }
+        return needle === '' || line.toLowerCase().includes(needle);
+      };
+    }
+
+    function createLogViewer(container, allLines) {
+      let lines = allLines;
+      let frame = 0;
+
+      container.style.overflowY = 'auto';
+      container.style.position = 'relative';
+
+      const spacer = document.createElement('div');
+      const rows = document.createElement('div');
+      rows.style.position = 'absolute';
+      rows.style.top = '0';
+      rows.style.left = '0';
+      rows.style.right = '0';
+      container.append(spacer, rows);
+
+      function render() {
+        frame = 0;
+        const { first, last } = getVisibleRange(container.scrollTop, container.clientHeight, lines.length);
+        const fragment = document.createDocumentFragment();
+        for (let i = first; i < last; i++) {
+          const row = document.createElement('div');
+          row.className = 'log-row';
+          row.textContent = lines[i];
+          fragment.appendChild(row);
+        }
+        rows.style.transform = `translateY(${first * ROW_HEIGHT}px)`;
+        rows.replaceChildren(fragment);
+      }
+
+      function schedule() {
+        if (!frame) frame = requestAnimationFrame(render);
+      }
+
+      function setFilter(predicate) {
+        lines = allLines.filter(predicate);
+        spacer.style.height = `${lines.length * ROW_HEIGHT}px`;
+        container.scrollTop = 0;
+        render();
+      }
+
+      container.addEventListener('scroll', schedule, { passive: true });
+      setFilter(() => true);
+
+      return { setFilter, get count() { return lines.length; } };
+    }
+    ```
+
+    ```css
+    .log-row {
+      height: 20px;
+      line-height: 20px;
+      font-family: ui-monospace, monospace;
+      white-space: pre;
+      overflow: hidden;
+    }
+    ```
+
+    Usage:
+
+    ```javascript
+    const viewer = createLogViewer(document.querySelector('#log-box'), lines);
+    const levels = new Set(['ERROR', 'WARN']);
+    searchInput.addEventListener('input', () => {
+      viewer.setFilter(makeFilter(levels, searchInput.value));
+    });
+    ```
+
+    **Green Notes**
+    - **Virtualized list** (reduces E): the DOM holds roughly one screen of rows, not 100k to 300k nodes. Style, layout and memory work stay constant, whatever the file size. [Avoid excessive DOM size](https://patterns.greensoftware.foundation/development/web-performance/avoid-excessive-dom-size)
+    - **Filter the data, not the DOM:** `Array.prototype.filter` on strings creates no elements. The lowercase search text is computed once, not once per line.
+    - **One render per frame:** scroll events are coalesced with `requestAnimationFrame`, and `replaceChildren` swaps all rows in one DOM update.
+    - *Trade-off:* the browser's Ctrl+F only finds rows that are on screen. Use the search field for the rest. For files of a few hundred lines a plain list is simpler, so skip this there. Rows need a fixed height, so wrapped lines are not supported.
+verify:
+  green_block: 0
+  test: |-
+    assert.deepStrictEqual(getVisibleRange(0, 400, 100000), { first: 0, last: 30 });
+    assert.deepStrictEqual(getVisibleRange(2000, 400, 100000), { first: 90, last: 130 });
+    assert.deepStrictEqual(getVisibleRange(980, 400, 50), { first: 39, last: 50 });
+    assert.deepStrictEqual(getVisibleRange(0, 400, 5), { first: 0, last: 5 });
+
+    const lines = [
+      '2026-10-09T10:00:01Z ERROR payment-service timeout after 3000ms',
+      '2026-10-09T10:00:02Z INFO api request ok',
+      '2026-10-09T10:00:03Z WARN payment-service retry 1',
+      '2026-10-09T10:00:04Z ERROR api Connection Refused',
+    ];
+    const f1 = makeFilter(new Set(['ERROR']), '');
+    assert.deepStrictEqual(lines.filter(f1), [lines[0], lines[3]]);
+    const f2 = makeFilter(new Set(), 'PAYMENT');
+    assert.deepStrictEqual(lines.filter(f2), [lines[0], lines[2]]);
+    const f3 = makeFilter(new Set(['ERROR', 'WARN']), 'refused');
+    assert.deepStrictEqual(lines.filter(f3), [lines[3]]);
+    assert.strictEqual(lines.filter(makeFilter(new Set(), '  ')).length, 4);

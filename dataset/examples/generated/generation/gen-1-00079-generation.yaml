@@ -1,0 +1,88 @@
+id: gen-1-00079-generation
+category: generation
+language: bash
+patterns:
+- bash-quoting
+- bash-builtins
+facts:
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # gen-pipelines.sh - write one pipeline stub per service
+    set -euo pipefail
+
+    SERVICES_FILE="${1:?usage: gen-pipelines.sh services.txt outdir}"
+    OUT_DIR="${2:?usage: gen-pipelines.sh services.txt outdir}"
+
+    mkdir -p "$OUT_DIR"
+
+    # TODO: for each service in the file, write $OUT_DIR/<service>.yml
+    # every stub has the same triggers, permissions, concurrency, runner
+    # labels and cache step. only "name:" and the make build line differ.
+    # skip empty lines and lines starting with #
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # gen-pipelines.sh - write one pipeline stub per service
+    set -euo pipefail
+
+    SERVICES_FILE="${1:?usage: gen-pipelines.sh services.txt outdir}"
+    OUT_DIR="${2:?usage: gen-pipelines.sh services.txt outdir}"
+
+    mkdir -p "$OUT_DIR"
+
+    NAME_RE='^[a-z0-9][a-z0-9._-]*$'
+
+    # Same for every service. Built once, no expansion wanted, so single quotes.
+    BODY='on:
+      push:
+        branches: [main]
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+    jobs:
+      build:
+        runs-on: [self-hosted, linux, x64]
+        steps:
+          - uses: actions/checkout@v4
+          - uses: actions/cache@v4
+            with:
+              path: ~/.cache/build
+              key: build-${{ runner.os }}-${{ hashFiles('"'"'**/lockfile'"'"') }}
+    '
+
+    while IFS= read -r service || [[ -n $service ]]; do
+      [[ -z $service || $service == \#* ]] && continue
+
+      if [[ ! $service =~ $NAME_RE ]]; then
+        printf 'invalid service name: %s\n' "$service" >&2
+        exit 1
+      fi
+
+      {
+        printf 'name: %s\n' "$service"
+        printf '%s' "$BODY"
+        printf '      - run: make build SERVICE=%s\n' "$service"
+      } > "$OUT_DIR/$service.yml"
+    done < "$SERVICES_FILE"
+    ```
+
+    **Green Notes**
+    - **Single quotes for literals** (reduces E): the pipeline text and the regex have no variables, so bash takes them as is and does not scan them for `$`, backticks or backslashes. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal in a loop used about 24% less CPU energy with single quotes (1,000,000 iterations) ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=dd9bbb4e-b056-4067-8ad2-7b1818a86f10,b265ef9b-adb9-4b56-a14b-ae34fdaa7247,28d92c15-79d7-44ca-8f43-a733fe2e265a,a9533378-71f0-49df-bd5f-1e5f27cda9c2)). For a script that runs once with a short header the absolute saving is tiny. Here it is also needed for correctness: with double quotes, `${{ github.ref }}` would fail as a bad substitution.
+    - **Static text built once, outside the loop** (reduces E): the loop only fills in the service name. The shared body is never rebuilt per service.
+    - **Builtins only** (reduces E): `read`, `printf` and `[[ ]]` run inside the shell. There is no `sed`, `cat` or `echo | ...` process forked per service.
+    - Double quotes are kept around every variable (`"$service"`, `"$OUT_DIR/..."`), so names are never word-split or globbed.
+
+    *Not applied:* parallel generation with `xargs -P`. One small file per service is fast enough in a single pass, and parallelism would add complexity for no gain.
+verify:
+  static_only: bash script that writes files and takes file arguments

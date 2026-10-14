@@ -1,0 +1,81 @@
+id: gen-1-00244-generation
+category: generation
+language: bash
+patterns:
+- bash-quoting
+- bash-builtins
+facts:
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    hello, i need bash script for our jenkins pipline. we have text file from test runner, every line is like `test_name status seconds`, status is pass, fail or skip. Somtimes it have 40-50 thousand lines. I want make JUnit xml from it so jenkins can show the result. input file and output file are arguments. Thank you
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    input=${1:?usage: junit.sh results.txt report.xml}
+    output=${2:?usage: junit.sh results.txt report.xml}
+
+    # Escapes XML characters in $1 and returns the result in $REPLY.
+    # Uses parameter expansion only, so there is no fork per line.
+    xml_escape() {
+      local s=$1
+      s=${s//'&'/'&amp;'}
+      s=${s//'<'/'&lt;'}
+      s=${s//'>'/'&gt;'}
+      s=${s//'"'/'&quot;'}
+      REPLY=$s
+    }
+
+    tmp=$(mktemp)
+    trap 'rm -f "$tmp"' EXIT
+
+    tests=0 failures=0 skipped=0 lineno=0
+
+    # One redirect for the whole loop: the file is opened once, not once per line.
+    {
+      while read -r name status secs; do
+        lineno=$((lineno + 1))
+        [[ -z $name ]] && continue
+        xml_escape "$name"
+        tests=$((tests + 1))
+        case $status in
+          pass)
+            printf '  <testcase name="%s" time="%s"/>\n' "$REPLY" "$secs"
+            ;;
+          fail)
+            failures=$((failures + 1))
+            printf '  <testcase name="%s" time="%s">\n    <failure message="test failed"/>\n  </testcase>\n' "$REPLY" "$secs"
+            ;;
+          skip)
+            skipped=$((skipped + 1))
+            printf '  <testcase name="%s" time="%s">\n    <skipped/>\n  </testcase>\n' "$REPLY" "$secs"
+            ;;
+          *)
+            echo "line $lineno: unknown status '$status'" >&2
+            exit 1
+            ;;
+        esac
+      done < "$input"
+    } > "$tmp"
+
+    {
+      printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+      printf '<testsuite name="ci" tests="%d" failures="%d" skipped="%d">\n' \
+        "$tests" "$failures" "$skipped"
+      cat "$tmp"
+      printf '</testsuite>\n'
+    } > "$output"
+    ```
+
+    Test names are XML-escaped, so a name like `a<b&c` will not break the report. An unknown status stops the script with a clear message instead of writing a wrong report.
+
+    **Green Notes**
+    - **Single quotes for literals without expansion** (reduces E): the XML templates and the escape patterns use `'...'`. Double quotes are only used where a variable must expand, and every variable stays quoted. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal 1,000,000 times used about 24% less CPU energy with single quotes ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=dd9bbb4e-b056-4067-8ad2-7b1818a86f10,b265ef9b-adb9-4b56-a14b-ae34fdaa7247,28d92c15-79d7-44ca-8f43-a733fe2e265a,a9533378-71f0-49df-bd5f-1e5f27cda9c2)). Your literals are short, so the absolute saving here is small. It costs nothing and it is the right habit.
+    - **Builtins instead of forks** (reduces E): `xml_escape` uses `${s//.../...}` and `printf`, so there is no `sed` or `echo | tr` process for each of the 40-50 thousand lines.
+    - **One redirect per block**: the output is opened once and not once per line.
+verify:
+  static_only: bash script that reads files and writes a report; checked by reading, not by the Python verifier

@@ -1,0 +1,63 @@
+id: gen-1-00076-no-change
+category: no-change
+language: python
+patterns:
+- vectorize-or-jit
+- context-tradeoff
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    We have a nightly ETL step in our warehouse system that calculates reorder points per SKU. It reads an export of about 800 SKUs, each with 14 days of demand, and writes a small CSV that the purchasing dashboard picks up at 06:00.
+
+    Requirements from our side: it runs in a slim Docker image on a small VM, the whole job must stay under a few minutes (it takes about a second now), and we don't want to add heavy dependencies. Still, a colleague says the loop is "slow Python" and we should put `@numba.njit` on it to be safe and save energy. Is that a good idea?
+
+    ```python
+    import csv
+    import math
+
+    SERVICE_Z = 1.65
+
+    def reorder_points(path):
+        out = []
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                sku = row["sku"].strip().upper()
+                daily = [float(x) for x in row["daily_demand_14d"].split(";")]
+                mean = sum(daily) / len(daily)
+                var = sum((d - mean) ** 2 for d in daily) / (len(daily) - 1)
+                lead = int(row["lead_time_days"])
+                safety = SERVICE_Z * math.sqrt(var * lead)
+                rop = mean * lead + safety
+                out.append((sku, round(rop, 1)))
+        return out
+
+    def main():
+        rows = reorder_points("/data/export/stock_demand.csv")
+        with open("/data/out/reorder_points.csv", "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["sku", "reorder_point"])
+            w.writerows(rows)
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    No, leave it as it is. Numba would not pay off here, for three reasons:
+
+    - **The loop is tiny.** 800 rows with 14 numbers each is about 11,000 floats per night. The job runs once and finishes in about a second. JIT compilation happens at startup and can take as long as the whole job.
+    - **Numba can't speed up most of this code.** The time goes into CSV parsing, `strip().upper()` and `split(";")`. These are string and dict operations, and Numba doesn't accelerate them. You would have to move the maths into a separate array function, which makes the code longer and harder to read.
+    - **It adds weight.** Numba pulls in LLVM and NumPy, which makes your slim image much bigger. Bigger images cost more storage and transfer on every pull.
+
+    JIT does help in the right case. In Green Metrics Tool micro-benchmarks, a pure Python loop over 10,000,000 samples used about 4× more CPU energy than the same loop with Numba `@njit` ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=dc2ed71b-e8ed-48d5-be04-0dd9dfe1443f,2b9e7f88-4aad-42ee-a9e6-25ff4e6ea712)). That is a tight numeric loop with millions of iterations, not 800 rows, and it ran many times.
+
+    Revisit this if the export grows to hundreds of thousands of SKUs, or if the step runs many times a day. Then use this order:
+
+    1. Parse once with `numpy` or `pandas` and compute mean and variance as array operations. This is often enough and needs no JIT.
+    2. Only if profiling still shows a hot numeric loop, add Numba.
+
+    One small correctness point: `len(daily) - 1` is zero if a row ever has a single value, and the job would crash with `ZeroDivisionError`. If the export can contain such rows, skip them or set the variance to 0 for them.
+verify:
+  static_only: Answer contains no code; it declines the Numba change and explains why.

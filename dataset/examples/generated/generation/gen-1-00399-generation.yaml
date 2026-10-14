@@ -1,0 +1,52 @@
+id: gen-1-00399-generation
+category: generation
+language: javascript
+patterns:
+- simple-conditions
+messages:
+- role: user
+  content: |
+    hi, i am new to javascript and i dont know the best way to do this. in our CI pipeline a build step ends with an exit code (like 0, 1, 127, 137, 143). i want a function that gives me a short reason text and tells me if the step is worth running again. i started with lots of if but it looks messy, maybe i do it wrong? can you write it?
+- role: assistant
+  content: |
+    A lookup table is the clean way to do this. Each code is a plain equality match, so there are no long `if` chains:
+
+    ```javascript
+    const EXIT_INFO = new Map([
+      [0,   { reason: "success", retry: false }],
+      [1,   { reason: "general error", retry: false }],
+      [2,   { reason: "misuse of shell command", retry: false }],
+      [126, { reason: "command not executable", retry: false }],
+      [127, { reason: "command not found", retry: false }],
+      [130, { reason: "interrupted (SIGINT)", retry: false }],
+      [137, { reason: "killed, often out of memory (SIGKILL)", retry: true }],
+      [143, { reason: "terminated (SIGTERM), runner may have been stopped", retry: true }],
+    ]);
+
+    const UNKNOWN_EXIT = { reason: "unknown exit code", retry: false };
+
+    function describeExit(code) {
+      return EXIT_INFO.get(code) ?? UNKNOWN_EXIT;
+    }
+
+    // Example
+    const { reason, retry } = describeExit(137);
+    console.log(`Step failed: ${reason}. Retry: ${retry}`);
+    ```
+
+    Unknown codes get a safe default: no retry. To support a new code, add one line to the table.
+
+    **Green Notes**
+    - **Table lookup instead of an `if`/`else if` chain** (reduces E): one `Map.get` replaces up to eight comparisons. The cost does not grow as you add codes. Equality checks are also cheaper than range or modulo conditions.
+    - **Tables built once at module load:** the objects are not recreated on each call, so a pipeline that calls this for many steps allocates nothing per call.
+    - *Not applied:* retry logic. Keep the number of retries low (for example 2 or 3). Every rerun repeats the whole build.
+verify:
+  test: |-
+    const assert = require("assert");
+    assert.strictEqual(describeExit(0).reason, "success");
+    assert.strictEqual(describeExit(0).retry, false);
+    assert.strictEqual(describeExit(127).retry, false);
+    assert.strictEqual(describeExit(137).retry, true);
+    assert.strictEqual(describeExit(143).retry, true);
+    assert.strictEqual(describeExit(999).reason, "unknown exit code");
+    assert.strictEqual(describeExit(999).retry, false);

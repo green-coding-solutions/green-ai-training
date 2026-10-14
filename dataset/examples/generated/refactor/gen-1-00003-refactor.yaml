@@ -1,0 +1,66 @@
+id: gen-1-00003-refactor
+category: refactor
+language: python
+patterns:
+- builtin-functions
+- hoist-invariants
+- keep-star-imports
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```python
+    from math import *
+
+    def sample_signal(n, freq, rate):
+        out = []
+        for i in range(n):
+            t = i / rate
+            out.append(sin(2 * pi * freq * t) + 0.5 * sin(2 * pi * 3 * freq * t))
+        return out
+
+    def rms(xs):
+        total = 0.0
+        for x in xs:
+            total += x * x
+        return sqrt(total / len(xs))
+
+    def peak(xs):
+        best = 0.0
+        for x in xs:
+            if abs(x) > best:
+                best = abs(x)
+        return best
+    ```
+- role: assistant
+  content: |
+    ```python
+    from math import *
+
+    def sample_signal(n, freq, rate):
+        w1 = 2 * pi * freq
+        w3 = 2 * pi * 3 * freq
+        return [sin(w1 * t) + 0.5 * sin(w3 * t) for t in (i / rate for i in range(n))]
+
+    def rms(xs):
+        return sqrt(sum(x * x for x in xs) / len(xs))
+
+    def peak(xs):
+        return max(map(abs, xs), default=0.0)
+    ```
+
+    **Green Notes**
+    - **Built-ins instead of hand-written loops** (reduces E): `sum` and `max` run the loop inside the interpreter, not in Python bytecode. `peak` also no longer calls `abs(x)` twice per sample.
+    - **Constants hoisted out of the loop:** `2 * pi * freq` and `2 * pi * 3 * freq` are now computed once, not once per sample. The list comprehension replaces the `append` calls.
+    - **Star import left unchanged:** `from math import *` stays as it is. In Green Metrics Tool micro-benchmarks, `from x import *` and `import x` showed no measurable energy difference, so changing it would only be churn.
+    - Behavior is the same. On Python 3.12+, `sum` adds floats with compensation, so `rms` can differ from the old loop in the last digits.
+verify:
+  equivalence:
+    driver: |-
+      sig = sample_signal(10000, 50, 8000)
+      print(len(sig), round(rms(sig), 9), round(peak(sig), 9))
+      print([round(v, 9) for v in sig[:5]])
+      print(peak([]))

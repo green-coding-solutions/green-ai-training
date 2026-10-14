@@ -1,0 +1,122 @@
+id: gen-1-00242-review
+category: review
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    hi, i wrote this decoder for our speech tagging model (it runs after the neural net, on the emission scores). the results are correct but it feels slow on long audio files and i dont really know what is wrong. can you check it?
+
+    ```python
+    def viterbi_decode(emissions, transitions, labels):
+        # emissions: list of T lists, one log-score per label
+        # transitions: n x n log-scores, transitions[i][j] = from i to j
+        n = len(labels)
+        T = len(emissions)
+
+        score = list(emissions[0])
+        back = []
+        for t in range(1, T):
+            new_score = []
+            ptrs = []
+            for j in range(n):
+                best_i = 0
+                best = score[0] + transitions[0][j]
+                for i in range(1, n):
+                    s = score[i] + transitions[i][j]
+                    if s > best:
+                        best = s
+                        best_i = i
+                new_score.append(best + emissions[t][j])
+                ptrs.append(best_i)
+            score = new_score
+            back.append(ptrs)
+
+        last = max(range(n), key=lambda k: score[k])
+        idx = last
+        path = [labels[last]]
+        for ptrs in reversed(back):
+            idx = ptrs[idx]
+            path.insert(0, labels[idx])
+        return path
+    ```
+- role: assistant
+  content: |
+    **Workload:** machine learning inference (post-processing)
+
+    #### [Bug] Crashes on empty input
+    - **Where:** `score = list(emissions[0])`
+    - **Issue:** if the audio gives zero frames, `emissions` is empty and this raises `IndexError`.
+    - **Fix:** return an empty path early (see code below).
+
+    #### [Medium] Inserting at the front of a list in the backtrace
+    - **Where:** `path.insert(0, labels[idx])`
+    - **Issue:** `insert(0, ...)` moves every item already in the list one step to the right. The list grows by one each step, so the work per step grows too. For a long file with many frames, the total work is quadratic in the number of frames, for something that should be linear.
+    - **Fix:** `append` each label (cheap), then call `path.reverse()` once at the end. The result is the same.
+    - **Impact:** reduces E on every decode. In Green Metrics Tool micro-benchmarks, 1,000,000 `list.insert(0, x)` calls used about 1515 J of CPU energy, and 1,000,000 `list.append(x)` calls used about 1.2 J ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=1da9c13d-364b-4f71-b23f-785bf1caeac8,75a7d151-3a7b-4575-b3e1-de125ce00d00)). Your lists are shorter, so the gap will be smaller, but it grows with the number of frames.
+
+    ```python
+    def viterbi_decode(emissions, transitions, labels):
+        # emissions: list of T lists, one log-score per label
+        # transitions: n x n log-scores, transitions[i][j] = from i to j
+        if not emissions:
+            return []
+
+        n = len(labels)
+        T = len(emissions)
+
+        score = list(emissions[0])
+        back = []
+        for t in range(1, T):
+            new_score = []
+            ptrs = []
+            for j in range(n):
+                best_i = 0
+                best = score[0] + transitions[0][j]
+                for i in range(1, n):
+                    s = score[i] + transitions[i][j]
+                    if s > best:
+                        best = s
+                        best_i = i
+                new_score.append(best + emissions[t][j])
+                ptrs.append(best_i)
+            score = new_score
+            back.append(ptrs)
+
+        idx = max(range(n), key=lambda k: score[k])
+        path = [labels[idx]]
+        for ptrs in reversed(back):
+            idx = ptrs[idx]
+            path.append(labels[idx])
+        path.reverse()
+        return path
+    ```
+
+    #### [Low] Pure Python inner loops
+    - **Where:** the `for j` / `for i` loops
+    - **Issue:** this is `T × n × n` steps in plain Python. It is fine for a small label set. If you have many labels or very long files, `numpy` can do the inner step as one array operation per frame.
+    - **Impact:** only worth it if profiling shows decoding is a real share of your request time.
+
+    **Already good:** the forward pass is linear in the number of frames, and you store only back-pointers, not full score tables.
+verify:
+  module: false
+  green_block: 0
+  test: |
+    labels = ["A", "B", "C"]
+    trans = [[0.0, -1.0, -2.0], [-1.0, 0.0, -1.0], [-2.0, -1.0, 0.0]]
+    assert viterbi_decode([], trans, labels) == []
+    em = [[0.0, -5.0, -5.0], [-5.0, 0.0, -5.0], [-5.0, -5.0, 0.0]]
+    assert viterbi_decode(em, trans, labels) == ["A", "B", "C"]
+  equivalence:
+    driver: |-
+      import random
+      random.seed(7)
+      labels = ["O", "B-PER", "I-PER", "B-LOC", "I-LOC"]
+      n = len(labels)
+      trans = [[round(random.uniform(-3, 0), 3) for _ in range(n)] for _ in range(n)]
+      for T in (1, 2, 50, 400):
+          em = [[round(random.uniform(-4, 0), 3) for _ in range(n)] for _ in range(T)]
+          print(T, viterbi_decode(em, trans, labels))

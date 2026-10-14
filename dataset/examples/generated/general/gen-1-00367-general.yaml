@@ -1,0 +1,83 @@
+id: gen-1-00367-general
+category: general
+language: python
+patterns:
+- none
+messages:
+- role: user
+  content: |
+    ```python
+    import numpy as np
+
+    CLASSES = ["cat", "dog", "bird"]
+
+
+    def softmax(logits):
+        e = np.exp(logits - logits.max())
+        return e / e.sum()
+
+
+    def predict_batch(logits):
+        """logits: array of shape (batch, n_classes)"""
+        probs = softmax(logits)
+        top = probs.argmax(axis=1)
+        return [(CLASSES[i], float(probs[n, i])) for n, i in enumerate(top)]
+
+
+    if __name__ == "__main__":
+        batch = np.array([[2.0, 1.0, 0.1],
+                          [0.5, 3.0, 0.2]])
+        print(predict_batch(batch))
+    ```
+
+    ?
+- role: assistant
+  content: |
+    I guess you ask why the confidences look too low. The `softmax` works on the whole batch, not on each row.
+
+    - `logits.max()` is one number for the entire array.
+    - `e.sum()` is also one number, so all probabilities in the batch add up to 1, not each row.
+
+    With two samples, every row sums to about 0.5 and the confidences are wrong. The class picked by `argmax` is still right, but the reported scores are not. A row with much smaller logits than the others can also underflow to 0.
+
+    Take the max and the sum per row:
+
+    ```python
+    import numpy as np
+
+    CLASSES = ["cat", "dog", "bird"]
+
+
+    def softmax(logits):
+        logits = np.asarray(logits, dtype=float)
+        shifted = logits - logits.max(axis=-1, keepdims=True)
+        e = np.exp(shifted)
+        return e / e.sum(axis=-1, keepdims=True)
+
+
+    def predict_batch(logits):
+        """logits: array of shape (batch, n_classes)"""
+        probs = softmax(logits)
+        top = probs.argmax(axis=1)
+        return [(CLASSES[i], float(probs[n, i])) for n, i in enumerate(top)]
+
+
+    if __name__ == "__main__":
+        batch = np.array([[2.0, 1.0, 0.1],
+                          [0.5, 3.0, 0.2]])
+        print(predict_batch(batch))
+    ```
+
+    `axis=-1` makes it work for one sample of shape `(n_classes,)` and for a batch. `keepdims=True` keeps the shape so the division broadcasts per row. Each row now sums to 1.
+verify:
+  module: true
+  test: |-
+    s = softmax(np.array([[1.0, 2.0, 3.0], [1000.0, 1000.0, 1000.0]]))
+    assert np.allclose(s.sum(axis=1), 1.0)
+    assert np.allclose(s[1], 1 / 3)
+    one = softmax(np.array([1.0, 2.0, 3.0]))
+    assert np.allclose(one, s[0])
+    res = predict_batch(np.array([[2.0, 1.0, 0.1], [0.5, 3.0, 0.2], [0.0, 0.0, 50.0]]))
+    assert [r[0] for r in res] == ["cat", "dog", "bird"]
+    assert all(0.0 < r[1] <= 1.0 for r in res)
+    assert abs(res[2][1] - 1.0) < 1e-6

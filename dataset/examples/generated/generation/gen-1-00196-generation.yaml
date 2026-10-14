@@ -1,0 +1,49 @@
+id: gen-1-00196-generation
+category: generation
+language: bash
+patterns:
+- compress-stored
+- bash-quoting
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    bash script for the hourly cron that runs right after the product feed build. Feed is /srv/shop/feeds/products.xml (merchant XML, ~300 MB). Keep a history dir with the last 7 days of snapshots so we can diff/roll back. Args: feed path, history dir, days (default 7). Script only.
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    usage='usage: snapshot-feed.sh <feed.xml> <history-dir> [keep-days]'
+    feed="${1:?$usage}"
+    hist="${2:?$usage}"
+    days="${3:-7}"
+    latest="$hist/latest.xml"
+
+    mkdir -p -- "$hist"
+
+    # the previous snapshot is now history: compress it, keep its mtime
+    if [[ -e $latest ]]; then
+        stamp="$(date -u -r "$latest" +%Y%m%dT%H%M%SZ)"
+        out="$hist/products-$stamp.xml.zst"
+        zstd -q -3 -f -- "$latest" -o "$out"
+        touch -r "$latest" -- "$out"
+    fi
+
+    # newest snapshot stays plain XML, atomically replaced
+    cp -- "$feed" "$latest.tmp"
+    mv -- "$latest.tmp" "$latest"
+
+    find "$hist" -maxdepth 1 -name 'products-*.xml.zst' -mtime "+$days" -delete
+    ```
+
+    Diff the new feed against the last one with `diff "$hist/latest.xml" <new>`. For older ones use `zstdcat "$hist/products-<stamp>.xml.zst" | diff - <new>`.
+
+    **Green Notes**
+    - **zstd at its default level for hourly snapshots** (reduces E and storage): XML compresses well, and 7 days of hourly copies is 168 files that would otherwise sit uncompressed. In Green Metrics Tool micro-benchmarks on 100 MB of English text, zstd used about 4× less CPU energy than gzip, and xz used about 29× more than zstd ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=2584305c-7a1e-47e2-b6cc-26276962035e,addc5f5e-55da-47f8-956d-240d06304e4e,fb08d3c3-ba41-4f0f-85fd-0b6c34e6c39b,f1479db0-c453-4aaa-9116-e137621fad07,7b3bb87d-3b43-4f82-be99-0327405205b8,905bd408-6b31-4237-a4da-14b8fad90613,7f213a20-8028-4080-9583-6e465c217bb5,8e93a8d2-60b0-4831-905b-764b68257bc7)). That comparison covers energy only. xz makes smaller files, but that gain is not worth the CPU cost for data you delete after a week and compress every hour.
+    - **Newest snapshot left uncompressed** (reduces E): you diff against it within the hour, so compressing it now and decompressing it soon would be wasted work. It is compressed only when the next run replaces it.
+    - **Single quotes for fixed text** (reduces E): `$usage` and the `find` glob need no expansion, so they are single-quoted. Variables stay double-quoted, so paths with spaces work.
+verify:
+  static_only: needs the zstd binary and GNU date/find; not available in the stdlib-only sandbox

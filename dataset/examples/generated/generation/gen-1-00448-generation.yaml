@@ -1,0 +1,119 @@
+id: gen-1-00448-generation
+category: generation
+language: java
+patterns:
+- hoist-invariants
+- regex-precompile
+messages:
+- role: user
+  content: |
+    I need a Java class for our nightly ETL step that converts smart-meter exports into a clean CSV for the warehouse loader. Requirements:
+
+    - Input is a semicolon-separated file with a header line and about 50 million data lines. Columns: `meter_id;timestamp;value;unit`
+    - `meter_id` must match two capital letters plus 8 digits (e.g. `DE12345678`), otherwise the line is bad
+    - `timestamp` looks like `31.03.2026 14:15` and is local time in Europe/Berlin. Output must be UTC ISO-8601
+    - `value` uses a German number format, e.g. `1.234,56`. `unit` is either `kWh` or `Wh`. Output is always kWh
+    - Output header: `meter_id,timestamp_utc,kwh`
+    - Bad lines are skipped and counted, the job must not crash on them
+    - Must stream, the file does not fit into memory
+
+    Java 17, no external libraries please.
+- role: assistant
+  content: |
+    ```java
+    import java.io.BufferedReader;
+    import java.io.BufferedWriter;
+    import java.io.IOException;
+    import java.math.BigDecimal;
+    import java.nio.charset.StandardCharsets;
+    import java.nio.file.Files;
+    import java.nio.file.Path;
+    import java.time.Instant;
+    import java.time.LocalDateTime;
+    import java.time.ZoneId;
+    import java.time.format.DateTimeFormatter;
+    import java.time.format.DateTimeParseException;
+    import java.util.regex.Matcher;
+    import java.util.regex.Pattern;
+
+    public final class MeterExportConverter {
+
+        private static final DateTimeFormatter LOCAL_TS =
+                DateTimeFormatter.ofPattern("dd.MM.uuuu HH:mm");
+        private static final ZoneId SOURCE_ZONE = ZoneId.of("Europe/Berlin");
+        private static final Pattern METER_ID = Pattern.compile("[A-Z]{2}\\d{8}");
+
+        public record Result(long converted, long skipped) {}
+
+        public static Result convert(Path in, Path out) throws IOException {
+            long converted = 0;
+            long skipped = 0;
+
+            // created once, reused for every line
+            Matcher idMatcher = METER_ID.matcher("");
+            StringBuilder row = new StringBuilder(64);
+
+            try (BufferedReader reader = Files.newBufferedReader(in, StandardCharsets.UTF_8);
+                 BufferedWriter writer = Files.newBufferedWriter(out, StandardCharsets.UTF_8)) {
+
+                writer.write("meter_id,timestamp_utc,kwh\n");
+                reader.readLine(); // skip input header
+
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    row.setLength(0);
+                    if (convertLine(line, idMatcher, row)) {
+                        writer.append(row);
+                        converted++;
+                    } else {
+                        skipped++;
+                    }
+                }
+            }
+            return new Result(converted, skipped);
+        }
+
+        private static boolean convertLine(String line, Matcher idMatcher, StringBuilder row) {
+            String[] f = line.split(";", -1);
+            if (f.length != 4) {
+                return false;
+            }
+            String id = f[0].trim();
+            if (!idMatcher.reset(id).matches()) {
+                return false;
+            }
+            try {
+                Instant ts = LocalDateTime.parse(f[1].trim(), LOCAL_TS)
+                        .atZone(SOURCE_ZONE)
+                        .toInstant();
+                BigDecimal value = new BigDecimal(f[2].trim().replace(".", "").replace(',', '.'));
+                String unit = f[3].trim();
+                if (unit.equals("Wh")) {
+                    value = value.movePointLeft(3);
+                } else if (!unit.equals("kWh")) {
+                    return false;
+                }
+                row.append(id).append(',').append(ts).append(',')
+                   .append(value.toPlainString()).append('\n');
+                return true;
+            } catch (DateTimeParseException | NumberFormatException e) {
+                return false;
+            }
+        }
+
+        public static void main(String[] args) throws IOException {
+            Result r = convert(Path.of(args[0]), Path.of(args[1]));
+            System.err.println("converted=" + r.converted() + " skipped=" + r.skipped());
+        }
+    }
+    ```
+
+    Local times in the repeated hour at the end of daylight saving time are ambiguous. `atZone` picks the earlier offset. If your meters can report that hour, add an offset column to the export.
+
+    **Green Notes**
+    - **Loop-invariant objects built once** (reduces E): the `DateTimeFormatter`, the `ZoneId` and the compiled `Pattern` are `static final`. The `Matcher` and the `StringBuilder` are created before the loop and reset per line. With 50 million lines this removes tens of millions of small allocations and regex compilations.
+    - **No regex for simple replacements:** `String.replace` is used for the number format, not `replaceAll`. `replaceAll` compiles a new pattern on every call.
+    - **Streaming with buffered I/O** (reduces E): one pass, one line in memory at a time, and the output is written directly without building a list of results.
+    - *Not applied:* parallel streams. The work is mostly I/O and line parsing, and parallel processing would also change the output order.
+verify:
+  static_only: Java toolchain is not available in the verifier

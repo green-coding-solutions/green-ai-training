@@ -1,0 +1,56 @@
+id: gen-1-00000-generation
+category: generation
+language: dockerfile
+patterns:
+- small-container-images
+messages:
+- role: user
+  content: |
+    dockerfile for fastapi onnx model server. app/main.py, model.onnx, requirements.txt, port 8000
+- role: assistant
+  content: |
+    ```dockerfile
+    # syntax=docker/dockerfile:1
+    FROM python:3.12-slim AS builder
+    ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+    RUN python -m venv /opt/venv
+    ENV PATH="/opt/venv/bin:$PATH"
+    COPY requirements.txt .
+    RUN pip install -r requirements.txt
+
+    FROM python:3.12-slim
+    ENV PYTHONUNBUFFERED=1 \
+        PYTHONDONTWRITEBYTECODE=1 \
+        PATH="/opt/venv/bin:$PATH"
+    RUN useradd --system --no-create-home app
+    COPY --from=builder /opt/venv /opt/venv
+    WORKDIR /srv
+    COPY model.onnx .
+    COPY app ./app
+    USER app
+    EXPOSE 8000
+    CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ```
+
+    Add a `.dockerignore` so the build context stays small:
+
+    ```text
+    .git
+    __pycache__
+    *.pyc
+    .venv
+    tests
+    notebooks
+    data
+    *.ipynb
+    ```
+
+    **Green Notes**
+    - **Slim base, multi-stage build** (reduces network and M): the final image has the Python runtime and the venv only. Pip caches and build tools stay in the builder stage. Every node that pulls the image downloads and stores less.
+    - **Layer order:** `requirements.txt` is copied first, then the model, then the code. A code change rebuilds only the last layer. A dependency or model change does not re-run the unrelated steps.
+    - **CPU runtime only:** keep `onnxruntime` (not `onnxruntime-gpu`) in `requirements.txt` if you serve on CPU. The GPU package pulls in large CUDA libraries you would never use.
+    - **`.dockerignore`:** notebooks, data and git history don't enter the build context or the image.
+
+    *Not applied:* alpine. It uses musl, and many numeric wheels (numpy, onnxruntime) have no musl build. You would compile them from source, which makes the build heavier and the image not clearly smaller. The model file also dominates the size, so a smaller base saves little here.
+verify:
+  static_only: Dockerfile content, needs a container runtime and network to build

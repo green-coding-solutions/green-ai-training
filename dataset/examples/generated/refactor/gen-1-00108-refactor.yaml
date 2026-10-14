@@ -1,0 +1,114 @@
+id: gen-1-00108-refactor
+category: refactor
+language: python
+patterns:
+- string-join
+- keep-star-imports
+facts:
+- F-STRCAT
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    from csv import *
+    from collections import *
+    from datetime import *
+    import sys
+
+    CUTOFF_DAYS = 30
+
+    def load_orders(path, today):
+        totals = defaultdict(float)
+        counts = Counter()
+        limit = today - timedelta(days=CUTOFF_DAYS)
+        with open(path, newline="") as f:
+            for row in DictReader(f):
+                created = datetime.strptime(row["created"], "%Y-%m-%d").date()
+                if created < limit:
+                    continue
+                totals[row["customer"]] += float(row["amount"])
+                counts[row["customer"]] += 1
+        return totals, counts
+
+    def build_report(totals, counts):
+        report = "customer,orders,total\n"
+        for cust in sorted(totals):
+            report += cust + "," + str(counts[cust]) + "," + "%.2f" % totals[cust] + "\n"
+        return report
+
+    def main():
+        totals, counts = load_orders(sys.argv[1], date.today())
+        sys.stdout.write(build_report(totals, counts))
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    ```python
+    from csv import *
+    from collections import *
+    from datetime import *
+    import sys
+
+    CUTOFF_DAYS = 30
+
+    def load_orders(path, today):
+        totals = defaultdict(float)
+        counts = Counter()
+        limit = today - timedelta(days=CUTOFF_DAYS)
+        with open(path, newline="") as f:
+            for row in DictReader(f):
+                created = datetime.strptime(row["created"], "%Y-%m-%d").date()
+                if created < limit:
+                    continue
+                totals[row["customer"]] += float(row["amount"])
+                counts[row["customer"]] += 1
+        return totals, counts
+
+    def build_report(totals, counts):
+        lines = ["customer,orders,total"]
+        for cust in sorted(totals):
+            lines.append(f"{cust},{counts[cust]},{totals[cust]:.2f}")
+        return "\n".join(lines) + "\n"
+
+    def main():
+        totals, counts = load_orders(sys.argv[1], date.today())
+        sys.stdout.write(build_report(totals, counts))
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **`join` instead of `+=` for the report** (reduces E): the old loop built the report with `+=` and four concatenations per customer. Now each line is built once and joined once. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces with `+=` used roughly 260× more CPU energy than `"".join()` ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=732b88b3-e081-409d-a987-d1a929b357e4,527c0154-dbb1-4c82-b98f-838f994af603,2fca8771-9ad9-4ec0-b51f-2ee78ee20865)). Your report has one line per customer, so the real gain here is much smaller. It grows with the number of customers.
+    - **Star imports left unchanged:** `from csv import *`, `from collections import *` and `from datetime import *` stay as they are. In Green Metrics Tool micro-benchmarks, star imports and namespace imports showed no measurable energy difference, so changing them gains nothing.
+    - The output is identical. `"%.2f"` and `:.2f` format the numbers the same way.
+verify:
+  module: true
+  test: |
+    import os as _os, tempfile as _tf
+    from datetime import date as _d
+    _p = _os.path.join(_tf.mkdtemp(), "o.csv")
+    with open(_p, "w", newline="") as _f:
+        _f.write("customer,created,amount\n")
+        _f.write("a,2026-09-20,10.5\n")
+        _f.write("a,2026-09-25,2.25\n")
+        _f.write("b,2026-09-26,3\n")
+        _f.write("old,2025-01-01,99\n")
+    _t, _c = load_orders(_p, _d(2026, 10, 1))
+    assert build_report(_t, _c) == "customer,orders,total\na,2,12.75\nb,1,3.00\n"
+  equivalence:
+    driver: |-
+      import os, tempfile
+      from datetime import date as _d
+      p = os.path.join(tempfile.mkdtemp(), "o.csv")
+      with open(p, "w", newline="") as f:
+          f.write("customer,created,amount\n")
+          for i in range(200):
+              f.write(f"c{i % 13},2026-09-{1 + i % 28:02d},{i * 1.25}\n")
+      t, c = load_orders(p, _d(2026, 10, 1))
+      print(build_report(t, c))

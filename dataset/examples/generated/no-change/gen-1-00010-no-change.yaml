@@ -1,0 +1,43 @@
+id: gen-1-00010-no-change
+category: no-change
+language: bash
+patterns:
+- bash-builtins
+- context-tradeoff
+messages:
+- role: user
+  content: |
+    hello, I have script for our shop, it make daily report of revenue by country from the orders export (csv, around 300k lines, runs one time at night from cron). My colleague say it is not good because I use external commands like awk and sort and date, and I should use only bash builtin to be faster. Is he right? I'am not sure what to change.
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    export_file="$1"
+    out_dir="${2:-/var/reports}"
+    day=$(date +%F)
+
+    # columns: id,date,country,amount_cents,status
+    awk -F',' 'NR > 1 && $5 == "paid" { n[$3]++; sum[$3] += $4 }
+      END { for (c in n) printf "%s,%d,%.2f\n", c, n[c], sum[c] / 100 }' "$export_file" \
+      | sort -t',' -k3,3nr > "$out_dir/revenue_by_country_$day.csv"
+
+    echo "report written: $out_dir/revenue_by_country_$day.csv"
+    ```
+- role: assistant
+  content: |
+    No, your colleague is wrong here. Leave the script as it is.
+
+    - **The heavy work is one `awk` process.** It reads the 300k lines once and does the grouping in memory. A pure-bash `while read` loop would be slower. It would split every line in bash and keep the sums in an associative array, all in a much slower interpreter.
+    - **Builtins matter when a command is forked many times in a loop.** Your script starts `date`, `awk` and `sort` once each per run. That is three process starts for the whole night job. Replacing `date +%F` with `printf '%(%F)T'` would save one fork, which is too little to measure.
+    - **`sort` only sees one line per country.** The input is tiny, so its cost is close to zero.
+    - **Your quoting is already right.** Single quotes are used for the awk program, and double quotes only where a variable must expand.
+
+    Two small checks on correctness, not on efficiency:
+    - `-F','` breaks if a field can contain a quoted comma, for example an address or a product name. The columns you use (country, amount, status) are probably safe, but check the export format.
+    - `sort -k3,3nr` sorts by revenue, descending. If you want a fixed order for equal revenue, add `-k1,1` after it.
+
+    If this script ever runs per order, for example on each webhook, then fork count starts to matter. For a nightly batch it does not.
+verify:
+  static_only: bash script reads a file path argument and writes to /var/reports; answer keeps the code unchanged, no rewritten
+    code to test

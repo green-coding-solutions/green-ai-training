@@ -1,0 +1,59 @@
+id: gen-1-00483-no-change
+category: no-change
+language: python
+patterns:
+- torch-no-grad
+- context-tradeoff
+messages:
+- role: user
+  content: |
+    fix this? its the slowest test in our torch ci job
+
+    ```python
+    import torch
+    from torch import nn
+
+    from app.models import ChurnNet
+
+
+    def test_can_overfit_one_batch():
+        torch.manual_seed(0)
+        model = ChurnNet(n_features=16)
+        x = torch.randn(8, 16)
+        y = torch.randint(0, 2, (8,)).float()
+        opt = torch.optim.Adam(model.parameters(), lr=1e-2)
+        loss_fn = nn.BCEWithLogitsLoss()
+
+        first = None
+        for step in range(30):
+            opt.zero_grad()
+            loss = loss_fn(model(x).squeeze(1), y)
+            loss.backward()
+            opt.step()
+            if first is None:
+                first = loss.item()
+
+        with torch.no_grad():
+            final = loss_fn(model(x).squeeze(1), y).item()
+        assert final < first * 0.5
+    ```
+- role: assistant
+  content: |
+    There is nothing to fix in the test body. It is already small and correct for what it checks.
+
+    - **It needs gradients.** The loop calls `loss.backward()` and `opt.step()`. Wrapping it in `torch.no_grad()` or `torch.inference_mode()` would break the test, because there would be no graph to differentiate. Those modes are only for pure inference.
+    - **The final check is already right.** The last loss is computed under `torch.no_grad()`, so no graph is built there.
+    - **The workload is tiny.** It is 30 steps on 8 samples with a fixed seed. Making it smaller would only make the test weaker.
+
+    If this test still feels slow, the time is probably not in the loop. It is more likely in `import torch` and `import app.models`, which every test process pays once. Check where the time goes:
+
+    ```bash
+    pytest --durations=10 -q
+    ```
+
+    If the import and startup time dominates, the lever is how often the job runs, not this code. For example, run the torch tests only when `app/models/` or the training code changes.
+
+    **Green Notes**
+    - *Not applied:* `torch.no_grad()` / `torch.inference_mode()`. This test trains, so it needs gradients. The one inference step at the end already uses `no_grad`.
+verify:
+  static_only: needs PyTorch and the app.models package, which are not available in the stdlib-only sandbox

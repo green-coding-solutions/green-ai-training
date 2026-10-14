@@ -1,0 +1,70 @@
+id: gen-1-00398-no-change
+category: no-change
+language: javascript
+patterns:
+- compress-transmitted
+- context-tradeoff
+facts:
+- F-COMPRESS
+messages:
+- role: user
+  content: |
+    hello, I have express API for our internal order tool, about 40 people use it. Yesterday colegue say I must change the compresion to brotli with max quality, because "its smaller and more green". I am not sure. Can you check my setup if it is ok or I must change something?
+
+    ```javascript
+    const express = require('express');
+    const compression = require('compression');
+    const { listOrders, getOrder } = require('./db');
+
+    const app = express();
+
+    app.use(compression({ level: 4, threshold: 1024 }));
+    app.use(express.json({ limit: '100kb' }));
+
+    app.get('/health', (req, res) => {
+      res.json({ status: 'ok' });
+    });
+
+    app.get('/api/v1/orders', async (req, res, next) => {
+      try {
+        const page = Number(req.query.page) || 1;
+        const rows = await listOrders({ page, pageSize: 50 });
+        res.json({ page, items: rows });
+      } catch (err) {
+        next(err);
+      }
+    });
+
+    app.get('/api/v1/orders/:id', async (req, res, next) => {
+      try {
+        const order = await getOrder(req.params.id);
+        if (!order) return res.status(404).json({ error: 'not found' });
+        res.json(order);
+      } catch (err) {
+        next(err);
+      }
+    });
+
+    // monthly export files (zip), made by a nightly job
+    app.use('/downloads', express.static('exports'));
+
+    app.listen(3000);
+    ```
+- role: assistant
+  content: |
+    Your setup is fine. Don't switch to brotli at max quality.
+
+    Why the current setup is already a good choice:
+    - **Moderate gzip level (`level: 4`).** The JSON is compressed again on every request. A cheap level keeps the CPU cost per response low. Most of the size gain of gzip comes from the first levels.
+    - **`threshold: 1024`.** Small bodies like `/health` and 404 errors are sent as they are. Compressing them would cost CPU and could even make them bigger.
+    - **Paginated responses (`pageSize: 50`).** You already send less data. That helps more than any codec.
+    - **The zip downloads are not recompressed.** The middleware only compresses compressible content types, and zip is not one. Compressing it again gives nothing.
+    - **The middleware sets `Vary: Accept-Encoding`**, so caches and proxies stay correct.
+
+    About brotli: in Green Metrics Tool measurements on a 100 MB text corpus, brotli with the CLI default (quality 11) used about 3019 J to compress, and gzip at its default level used about 67 J ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=fb08d3c3-ba41-4f0f-85fd-0b6c34e6c39b,f1479db0-c453-4aaa-9116-e137621fad07,8e93a8d2-60b0-4831-905b-764b68257bc7)). These figures compare energy only, not file size. Max-quality brotli gives smaller files, but you would pay that cost on every API response. For 40 users the saved bytes are tiny, so it would add energy rather than save it.
+
+    Brotli at a high quality makes sense for static files that are compressed once and then served many times. Your monthly zip exports are not that case, because they are already compressed. If you later add a big JS bundle or CSS, compress it once at build time and serve the precompressed file.
+
+    One thing to check outside this code: if nginx or a load balancer in front of the app also compresses, turn on compression in only one place.
+verify:
+  static_only: Needs the express and compression npm packages and a database module; the answer contains no new code.

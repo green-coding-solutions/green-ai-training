@@ -1,0 +1,135 @@
+id: gen-1-00263-review
+category: review
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    review? runs on every request of our products API
+
+    ```python
+    SUPPORTED = ["en", "de", "fr", "es"]
+
+    PRODUCTS = {
+        "en": [{"sku": "A1", "name": "Desk lamp"}],
+        "de": [{"sku": "A1", "name": "Schreibtischlampe"}],
+        "fr": [{"sku": "A1", "name": "Lampe de bureau"}],
+        "es": [{"sku": "A1", "name": "Lámpara de escritorio"}],
+    }
+
+
+    def parse_accept_language(header):
+        langs = []
+        for part in header.split(","):
+            bits = part.strip().split(";")
+            code = bits[0].strip().lower()
+            q = 1.0
+            if len(bits) > 1 and bits[1].strip().startswith("q="):
+                q = float(bits[1].strip()[2:])
+            langs.append((code, q))
+        langs.sort(key=lambda x: -x[1])
+        return langs
+
+
+    def pick_language(header):
+        for code, q in parse_accept_language(header):
+            base = code.split("-")[0]
+            if base in SUPPORTED and q > 0:
+                return base
+        return "en"
+
+
+    def list_products(headers):
+        lang = pick_language(headers.get("Accept-Language", ""))
+        return {"lang": lang, "items": PRODUCTS[lang]}
+    ```
+- role: assistant
+  content: |
+    **Workload:** web backend (per-request work)
+
+    #### [Bug] Malformed `q` value crashes the request
+    - **Where:** `float(bits[1].strip()[2:])` in `parse_accept_language`
+    - **Issue:** a header like `en;q=abc` raises `ValueError`. The header is client-controlled, so anyone can trigger a 500.
+    - **Fix:** skip entries with an invalid `q`.
+
+    #### [Medium] Same header parsed again on every request
+    - **Where:** `pick_language(...)` called from `list_products`
+    - **Issue:** `pick_language` is a pure function of one short string. Real clients send only a small set of distinct `Accept-Language` values (browser defaults), so the split, parse and sort are repeated for the same input all day.
+    - **Fix:** memoize `pick_language` with a bounded `functools.lru_cache`. Keep `maxsize` set, because clients control the keys and an unbounded cache would grow without limit. The function returns a `str`, so a cached result cannot be mutated by a caller. Do not cache `parse_accept_language`, because it returns a list.
+    - **Impact:** reduces E per request on a hot path. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated calls drawn from 200 distinct inputs used about 9× less CPU energy with `lru_cache` ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=ddf98f50-15ee-48e2-ab38-cc89acc88142,808b9a2c-1abf-4af5-9b04-3a6ce700fcdb)). That only holds with repeated inputs. If your headers were mostly unique, the cache would only add overhead. Check `pick_language.cache_info()` in production to see the hit rate.
+
+    ```python
+    from functools import lru_cache
+
+    SUPPORTED = ["en", "de", "fr", "es"]
+
+    PRODUCTS = {
+        "en": [{"sku": "A1", "name": "Desk lamp"}],
+        "de": [{"sku": "A1", "name": "Schreibtischlampe"}],
+        "fr": [{"sku": "A1", "name": "Lampe de bureau"}],
+        "es": [{"sku": "A1", "name": "Lámpara de escritorio"}],
+    }
+
+
+    def parse_accept_language(header):
+        langs = []
+        for part in header.split(","):
+            bits = part.strip().split(";")
+            code = bits[0].strip().lower()
+            q = 1.0
+            if len(bits) > 1 and bits[1].strip().startswith("q="):
+                try:
+                    q = float(bits[1].strip()[2:])
+                except ValueError:
+                    continue
+            langs.append((code, q))
+        langs.sort(key=lambda x: -x[1])
+        return langs
+
+
+    @lru_cache(maxsize=512)
+    def pick_language(header):
+        for code, q in parse_accept_language(header):
+            base = code.split("-")[0]
+            if base in SUPPORTED and q > 0:
+                return base
+        return "en"
+
+
+    def list_products(headers):
+        lang = pick_language(headers.get("Accept-Language", ""))
+        return {"lang": lang, "items": PRODUCTS[lang]}
+    ```
+
+    #### [Low] Shared product lists
+    - **Where:** `"items": PRODUCTS[lang]`
+    - **Issue:** every response points at the same list object. That is fine while you only serialize it. Do not mutate it in a handler.
+
+    **Already good:** the supported languages are tiny, so a list lookup is fine here. A set would not help.
+verify:
+  green_block: 0
+  test: |
+    assert pick_language("de-DE,de;q=0.9,en;q=0.8") == "de"
+    assert pick_language("en;q=abc, fr") == "fr"
+    assert pick_language("") == "en"
+    assert pick_language("xx") == "en"
+    assert list_products({"Accept-Language": "fr-CH, fr;q=0.9"})["lang"] == "fr"
+    pick_language("de-DE,de;q=0.9,en;q=0.8")
+    assert pick_language.cache_info().hits >= 1
+  equivalence:
+    driver: |-
+      headers = [
+          "",
+          "en",
+          "de-DE,de;q=0.9,en;q=0.8",
+          "fr-CH, fr;q=0.9, en;q=0.8, de;q=0.7, *;q=0.5",
+          "es;q=0, fr;q=0.4",
+          "ja,zh;q=0.9",
+          "EN-us , DE;q=0.95",
+      ]
+      for h in headers * 3:
+          print(h, list_products({"Accept-Language": h}))
+      print(list_products({}))

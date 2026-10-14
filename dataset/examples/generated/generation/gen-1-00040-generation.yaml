@@ -1,0 +1,90 @@
+id: gen-1-00040-generation
+category: generation
+language: javascript
+patterns:
+- lazy-load-images
+messages:
+- role: user
+  content: |
+    node script: read results.json (list of jobs with id, name, status, rows, chart png path) and write report.html with the chart for every job. ~800 jobs
+- role: assistant
+  content: |
+    ```javascript
+    const { readFile, writeFile } = require('node:fs/promises');
+
+    const ABOVE_FOLD = 4;
+
+    const esc = (value) =>
+      String(value).replace(/[&<>"']/g, (c) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+      }[c]));
+
+    function renderReport(jobs) {
+      const cards = jobs.map((job, i) => {
+        const loading = i < ABOVE_FOLD ? 'eager' : 'lazy';
+        return [
+          '<article class="job">',
+          `  <h2>${esc(job.name)} <small>#${esc(job.id)}</small></h2>`,
+          `  <p>${esc(job.status)} · ${esc(job.rows)} rows</p>`,
+          `  <img src="${esc(job.chart)}" alt="Chart for ${esc(job.name)}"`,
+          `       width="480" height="270" loading="${loading}" decoding="async">`,
+          '</article>',
+        ].join('\n');
+      });
+
+      return [
+        '<!doctype html>',
+        '<html lang="en">',
+        '<head>',
+        '<meta charset="utf-8">',
+        '<title>Pipeline report</title>',
+        '<style>',
+        '.job { margin: 0 0 2rem; }',
+        '.job img { display: block; max-width: 100%; height: auto; }',
+        '</style>',
+        '</head>',
+        '<body>',
+        cards.join('\n'),
+        '</body>',
+        '</html>',
+      ].join('\n');
+    }
+
+    async function main() {
+      const [input = 'results.json', output = 'report.html'] = process.argv.slice(2);
+      const jobs = JSON.parse(await readFile(input, 'utf8'));
+      await writeFile(output, renderReport(jobs));
+      console.log(`wrote ${output} with ${jobs.length} jobs`);
+    }
+
+    module.exports = { renderReport };
+
+    if (require.main === module) {
+      main().catch((err) => {
+        console.error(err);
+        process.exit(1);
+      });
+    }
+    ```
+
+    **Green Notes**
+    - **Lazy-load offscreen images** (reduces E and network): with ~800 charts, the browser only fetches the ones the reader scrolls to. The first 4 stay `eager` because they are visible on load.
+      https://patterns.greensoftware.foundation/development/media-and-code-efficiency/defer-offscreen-images
+    - **`width` and `height` are set:** the browser reserves the space, so the page doesn't jump while charts load. `decoding="async"` keeps decoding off the main thread.
+    - **Values are escaped**, so a job name with `<` or `&` can't break the page.
+    - *Not applied:* if you print this report or render it to PDF with a headless browser, lazy images may not load. In that case, set `loading` to `eager` for that run. For 800 charts on one page, paginating the report would be the next step.
+verify:
+  module: true
+  test: |-
+    const assert = require('node:assert');
+    const jobs = Array.from({ length: 10 }, (_, i) => ({
+      id: i, name: i === 5 ? 'a<b>&"c"' : `job${i}`, status: 'ok', rows: 100 + i, chart: `charts/${i}.png`,
+    }));
+    const html = renderReport(jobs);
+    assert.strictEqual((html.match(/loading="lazy"/g) || []).length, 6);
+    assert.strictEqual((html.match(/loading="eager"/g) || []).length, 4);
+    assert.strictEqual((html.match(/<img /g) || []).length, 10);
+    assert.ok(html.includes('a&lt;b&gt;&amp;&quot;c&quot;'));
+    assert.ok(!html.includes('a<b>'));
+    assert.ok(html.includes('width="480" height="270"'));
+    assert.strictEqual((renderReport([]).match(/<img /g) || []).length, 0);

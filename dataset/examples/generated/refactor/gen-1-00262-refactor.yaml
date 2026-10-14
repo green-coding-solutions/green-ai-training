@@ -1,0 +1,97 @@
+id: gen-1-00262-refactor
+category: refactor
+language: python
+patterns:
+- keep-star-imports
+- regex-precompile
+- string-join
+- set-membership
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    from collections import *
+    from os.path import *
+    import re
+
+    NOISY = ["healthcheck", "ping", "metrics", "heartbeat"]
+
+    def summarize(path):
+        if not exists(path):
+            return "no such file: " + basename(path)
+        counts = Counter()
+        report = ""
+        with open(path) as f:
+            for line in f:
+                m = re.match(r"(\S+) (\S+) (ERROR|WARN|INFO) (\S+): (.*)", line)
+                if not m:
+                    continue
+                day, clock, level, svc, msg = m.groups()
+                if svc in NOISY:
+                    continue
+                counts[level] += 1
+                if level != "INFO":
+                    report += day + " " + clock + " " + svc + " " + msg + "\n"
+        report += "ERROR=%d WARN=%d INFO=%d\n" % (counts["ERROR"], counts["WARN"], counts["INFO"])
+        return report
+    ```
+- role: assistant
+  content: |
+    ```python
+    from collections import *
+    from os.path import *
+    import re
+
+    NOISY = frozenset(["healthcheck", "ping", "metrics", "heartbeat"])
+    LINE = re.compile(r"(\S+) (\S+) (ERROR|WARN|INFO) (\S+): (.*)")
+
+    def summarize(path):
+        if not exists(path):
+            return "no such file: " + basename(path)
+        counts = Counter()
+        out = []
+        with open(path) as f:
+            for line in f:
+                m = LINE.match(line)
+                if not m:
+                    continue
+                day, clock, level, svc, msg = m.groups()
+                if svc in NOISY:
+                    continue
+                counts[level] += 1
+                if level != "INFO":
+                    out.append(f"{day} {clock} {svc} {msg}\n")
+        out.append("ERROR=%d WARN=%d INFO=%d\n" % (counts["ERROR"], counts["WARN"], counts["INFO"]))
+        return "".join(out)
+    ```
+
+    **Green Notes**
+    - **Build the report with a list and `"".join()`** (reduces E): the old code grew one big string with `+=` for every warning and error line. A list plus one `join` avoids repeated copying of a report that can get large.
+    - **Compile the pattern once** (reduces E): the regex now lives at module level. In Python this is a small win because `re` caches patterns, but it removes a cache lookup for every log line.
+    - **`frozenset` for `NOISY`** (reduces E): the check runs for every line, so it is a repeated lookup. A set makes each one O(1) instead of a scan of the list.
+    - **Star imports left as they are:** `from collections import *` and `from os.path import *` cost the same as explicit imports. In Green Metrics Tool micro-benchmarks, `from sympy import *` and `import sympy` used about the same energy over 1,000 process starts. Changing them would not save anything.
+    - Same output: same lines, same order, same summary line.
+verify:
+  equivalence:
+    driver: |-
+      import tempfile, os
+      lines = [
+          "2026-10-06 10:00:01 INFO api: started",
+          "2026-10-06 10:00:02 WARN api: slow query",
+          "2026-10-06 10:00:03 ERROR db: connection lost",
+          "2026-10-06 10:00:04 INFO healthcheck: ok",
+          "garbage line",
+          "2026-10-06 10:00:05 ERROR ping: timeout",
+          "2026-10-06 10:00:06 INFO worker: job done",
+          "2026-10-06 10:00:07 WARN metrics: late",
+          "2026-10-06 10:00:08 ERROR worker: job failed: retry",
+      ]
+      with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as t:
+          t.write("\n".join(lines) + "\n")
+      print(summarize(t.name))
+      print(summarize("/nonexistent/x.log"))
+      os.remove(t.name)

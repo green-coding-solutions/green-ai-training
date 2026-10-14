@@ -1,0 +1,338 @@
+id: gen-py-log-report-001
+category: generation
+language: python
+patterns: [string-join]
+messages:
+  - role: user
+    content: |
+      I need a python function that takes a list of log entries (dicts with ts, level, msg) and returns one string, one line per entry, formatted like `[ts] LEVEL: msg`. Only WARNING and ERROR entries should be included.
+  - role: assistant
+    content: |
+      ```python
+      def build_report(entries):
+          wanted = ("WARNING", "ERROR")
+          return "\n".join(
+              f"[{e['ts']}] {e['level']}: {e['msg']}"
+              for e in entries
+              if e["level"] in wanted
+          )
+      ```
+
+      Example:
+
+      ```python
+      logs = [
+          {"ts": "10:00:01", "level": "INFO", "msg": "started"},
+          {"ts": "10:00:02", "level": "WARNING", "msg": "disk 85% full"},
+          {"ts": "10:00:03", "level": "ERROR", "msg": "write failed"},
+      ]
+      print(build_report(logs))
+      # [10:00:02] WARNING: disk 85% full
+      # [10:00:03] ERROR: write failed
+      ```
+
+      **Green Notes**
+      - **`str.join` instead of `+=`** (reduces E): the result string is built once. Appending to a growing string in a loop can copy it again for every line, which turns quadratic on large logs.
+verify:
+  green_block: 0
+  test: |
+    logs = [
+        {"ts": "1", "level": "INFO", "msg": "a"},
+        {"ts": "2", "level": "WARNING", "msg": "b"},
+        {"ts": "3", "level": "ERROR", "msg": "c"},
+    ]
+    assert build_report(logs) == "[2] WARNING: b\n[3] ERROR: c"
+    assert build_report([]) == ""
+---
+id: refactor-py-new-customers-001
+category: refactor
+language: python
+patterns: [set-membership]
+messages:
+  - role: user
+    content: |
+      this gets really slow now that we have ~200k known customers. can you speed it up?
+
+      ```python
+      def find_new_customers(todays_ids, known_ids):
+          new = []
+          for cid in todays_ids:
+              if cid not in known_ids and cid not in new:
+                  new.append(cid)
+          return new
+      ```
+  - role: assistant
+    content: |
+      ```python
+      def find_new_customers(todays_ids, known_ids):
+          known = set(known_ids)
+          seen = set()
+          new = []
+          for cid in todays_ids:
+              if cid not in known and cid not in seen:
+                  seen.add(cid)
+                  new.append(cid)
+          return new
+      ```
+
+      **Green Notes**
+      - **Set for repeated membership tests** (reduces E): `cid not in known_ids` scanned all ~200k known IDs for every ID of the day. Building the set once is O(n), after that each lookup is O(1). This pays off because you look up many IDs, not just one.
+      - **Separate `seen` set** (reduces E): `cid not in new` was a second linear scan that got slower as the result grew. The list is still kept so the output order stays exactly the same as before.
+
+      If `known_ids` is loaded once and reused across calls, pass it in as a set directly and skip the conversion on every call.
+verify:
+  equivalence:
+    driver: |
+      import random
+      random.seed(1)
+      known = [random.randint(0, 50000) for _ in range(20000)]
+      today = [random.randint(0, 60000) for _ in range(3000)]
+      print(find_new_customers(today, known))
+  benchmark:
+    driver: |
+      import random
+      random.seed(1)
+      known = [random.randint(0, 50000) for _ in range(20000)]
+      today = [random.randint(0, 60000) for _ in range(3000)]
+      find_new_customers(today, known)
+    min_speedup: 3
+---
+id: review-py-event-buffer-001
+category: review
+language: python
+patterns: [deque-or-append]
+facts: [F-LISTINS]
+messages:
+  - role: user
+    content: |
+      Can you review this? It's called for every incoming websocket message in our dashboard backend.
+
+      ```python
+      class EventBuffer:
+          def __init__(self, limit=1000):
+              self.events = []
+              self.limit = limit
+
+          def add(self, event):
+              self.events.insert(0, event)
+              if len(self.events) > self.limit:
+                  self.events = self.events[:self.limit]
+
+          def latest(self, n=10):
+              return self.events[:n]
+      ```
+  - role: assistant
+    content: |
+      **Workload:** cloud backend (hot path, runs per message)
+
+      #### [High] Front insertion and re-slicing on every message
+      - **Where:** `EventBuffer.add`
+      - **Issue:** `insert(0, ...)` shifts all stored events by one slot. Once the buffer is full, `self.events[:self.limit]` also copies the whole list into a new one. Both are O(limit) work for every single message.
+      - **Fix:** use `collections.deque` with `maxlen`. `appendleft` is O(1) and the deque drops the oldest item by itself.
+      - **Impact:** reduces E per message from a full-list shift plus copy to constant work. In Green Metrics Tool micro-benchmarks, front insertion into a list cost over 1000× more energy than appending, so this is the dominant cost of the class ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=1da9c13d-364b-4f71-b23f-785bf1caeac8,75a7d151-3a7b-4575-b3e1-de125ce00d00)).
+
+      ```python
+      from collections import deque
+      from itertools import islice
+
+      class EventBuffer:
+          def __init__(self, limit=1000):
+              self.events = deque(maxlen=limit)
+
+          def add(self, event):
+              self.events.appendleft(event)
+
+          def latest(self, n=10):
+              return list(islice(self.events, n))
+      ```
+
+      **Already good:** the buffer is bounded, so memory can't grow without limit.
+verify:
+  green_block: 0
+  equivalence:
+    driver: |
+      buf = EventBuffer(limit=50)
+      for i in range(5000):
+          buf.add({"id": i})
+      print(buf.latest(10))
+      print(buf.latest(100)[-1])
+---
+id: nochange-py-admin-lookup-001
+category: no-change
+language: python
+patterns: [set-membership, context-tradeoff]
+facts: [F-MEMB]
+messages:
+  - role: user
+    content: |
+      Should I convert `admins` to a set here for performance? The list has about 50 ids.
+
+      ```python
+      def is_admin(user_id):
+          admins = load_admin_ids()  # reads a list of ids from config.yaml
+          return user_id in admins
+      ```
+  - role: assistant
+    content: |
+      No. Converting to a set doesn't help here. You do exactly one lookup per call, and building a set is itself a full pass over the list plus hashing every element. In Green Metrics Tool micro-benchmarks, converting a list to a set for a single lookup used about 50% more energy than just scanning the list ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=70871c0f-e630-4755-a459-b98e5d4031f2,722fea72-6f69-4acb-8ce7-632caeb444f4)).
+
+      The actual cost in this function is `load_admin_ids()`: it reads and parses `config.yaml` on every call. If the admin list only changes on deploy, load it once:
+
+      ```python
+      ADMIN_IDS = frozenset(load_admin_ids())
+
+      def is_admin(user_id):
+          return user_id in ADMIN_IDS
+      ```
+
+      Now the set is worth it, because it is built once and used for every call. If admins can change at runtime, keep the per-call load or add a reload hook, and don't cache it blindly.
+---
+id: gen-py-top-words-001
+category: generation
+language: python
+patterns: [builtin-functions, regex-precompile]
+messages:
+  - role: user
+    content: |
+      Write a script that prints the 10 most common words in a text file. The files can be several GB.
+  - role: assistant
+    content: |
+      ```python
+      import re
+      import sys
+      from collections import Counter
+
+      WORD_RE = re.compile(r"[a-z']+")
+
+      def top_words(path, n=10):
+          counts = Counter()
+          with open(path, encoding="utf-8", errors="replace") as f:
+              for line in f:
+                  counts.update(WORD_RE.findall(line.lower()))
+          return counts.most_common(n)
+
+      if __name__ == "__main__":
+          for word, count in top_words(sys.argv[1]):
+              print(f"{count:>10}  {word}")
+      ```
+
+      Run it with `python top_words.py big.txt`.
+
+      **Green Notes**
+      - **`Counter` and `most_common(n)`** (reduces E): counting runs in C, and `most_common(10)` uses a heap instead of sorting the full vocabulary.
+      - **Regex compiled once** at module level and reused for every line.
+verify:
+  module: true
+  test: |
+    import os, tempfile
+    with tempfile.NamedTemporaryFile("w", delete=False, suffix=".txt") as f:
+        f.write("the cat and the dog\nThe end. dog's toy\n")
+    try:
+        assert top_words(f.name, 2) == [("the", 3), ("cat", 1)]
+    finally:
+        os.unlink(f.name)
+---
+id: refactor-py-html-table-001
+category: refactor
+language: python
+patterns: [string-join]
+messages:
+  - role: user
+    content: |
+      clean this up pls, it renders the order table for our admin export
+
+      ```python
+      def render_orders(orders):
+          html = "<table>"
+          html += "<tr><th>ID</th><th>Customer</th><th>Total</th></tr>"
+          for o in orders:
+              html += "<tr>"
+              html += "<td>" + str(o["id"]) + "</td>"
+              html += "<td>" + o["customer"] + "</td>"
+              html += "<td>" + "%.2f" % o["total"] + "</td>"
+              html += "</tr>"
+          html += "</table>"
+          return html
+      ```
+  - role: assistant
+    content: |
+      ```python
+      from html import escape
+
+      def render_orders(orders):
+          rows = "".join(
+              f"<tr><td>{o['id']}</td><td>{escape(o['customer'])}</td><td>{o['total']:.2f}</td></tr>"
+              for o in orders
+          )
+          return f"<table><tr><th>ID</th><th>Customer</th><th>Total</th></tr>{rows}</table>"
+      ```
+
+      **Green Notes**
+      - **Join instead of repeated `+=`** (reduces E): the old version extended the growing HTML string five times per order. With a large export, that means the string can get copied over and over. Now every row is formatted once and joined in one pass.
+      - **Bug fix:** customer names are now HTML-escaped. Before, a name like `<script>` or `Smith & Sons` was injected into the page unescaped. Output only changes for names that contain `<`, `>`, `&` or quotes.
+verify:
+  equivalence:
+    driver: |
+      orders = [{"id": i, "customer": f"Customer {i}", "total": i * 1.5} for i in range(200)]
+      print(render_orders(orders))
+---
+id: review-py-config-lookup-001
+category: review
+language: python
+patterns: [avoid-exception-flow, hoist-invariants]
+facts: [F-EXC]
+messages:
+  - role: user
+    content: |
+      Quick review? This maps product codes to tax rates while importing a CSV with a few million rows. Around half of the codes are not in the table and fall back to the default rate.
+
+      ```python
+      TAX_RATES = {"BOOK": 0.07, "FOOD": 0.07, "ELEC": 0.19}
+
+      def tax_for_rows(rows):
+          result = []
+          for row in rows:
+              try:
+                  rate = TAX_RATES[row["code"].strip().upper()]
+              except KeyError:
+                  rate = 0.19
+              result.append(round(row["net"] * rate, 2))
+          return result
+      ```
+  - role: assistant
+    content: |
+      **Workload:** data pipeline
+
+      #### [Medium] Exceptions used for an expected case
+      - **Where:** the `try/except KeyError` in the loop
+      - **Issue:** with about half of the codes missing, a `KeyError` is raised and caught for millions of rows. Raising is the expensive part of exceptions.
+      - **Fix:** `rate = TAX_RATES.get(code, DEFAULT_RATE)`
+      - **Impact:** reduces E per row. In Green Metrics Tool micro-benchmarks with about half of the keys missing, `dict.get` used about 12% less CPU energy than `try/except KeyError` ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=4753302a-710f-4132-8001-9da3ba960d13,d7ded3f2-f9e7-4781-905e-9782a8305b8f,8f054455-adbc-402d-b593-0191d1061cd8)). If misses were rare, the `try` version would be fine.
+
+      #### [Low] Magic default rate
+      - **Where:** `rate = 0.19`
+      - **Issue:** the fallback duplicates the `ELEC` value and is easy to miss when rates change.
+      - **Fix:** name it `DEFAULT_RATE`.
+
+      ```python
+      TAX_RATES = {"BOOK": 0.07, "FOOD": 0.07, "ELEC": 0.19}
+      DEFAULT_RATE = 0.19
+
+      def tax_for_rows(rows):
+          get_rate = TAX_RATES.get
+          return [
+              round(row["net"] * get_rate(row["code"].strip().upper(), DEFAULT_RATE), 2)
+              for row in rows
+          ]
+      ```
+
+      **Already good:** the lookup table is a dict, so every lookup is O(1).
+verify:
+  green_block: 0
+  equivalence:
+    driver: |
+      import random
+      random.seed(3)
+      codes = ["BOOK", " food", "ELEC", "TOYS", "misc ", "GARDEN"]
+      rows = [{"code": random.choice(codes), "net": random.randint(1, 10000) / 100} for _ in range(5000)]
+      print(tax_for_rows(rows))

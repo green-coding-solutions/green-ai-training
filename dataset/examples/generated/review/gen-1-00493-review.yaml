@@ -1,0 +1,123 @@
+id: gen-1-00493-review
+category: review
+language: java
+patterns:
+- deque-or-append
+- string-join
+messages:
+- role: user
+  content: |
+    Please review this class from our protocol gateway (Java 17, runs on a small ARM box next to the machines, 1 GB RAM). Requirements:
+
+    - It keeps the last 2000 alarm events from the field devices, newest first.
+    - `add()` is called by the MQTT thread for every alarm. In a bad hour we get a few thousand alarms.
+    - `render()` is called by the HTTP thread every time a technician's tablet polls `/status`. The tablets poll every 2 seconds, and `limit` is normally 500.
+    - Output format must stay the same, because the tablet app parses it.
+
+    The box gets slow and warm when many alarms come in. I don't know why. Any problems you see?
+
+    ```java
+    import java.util.ArrayList;
+    import java.util.List;
+
+    public class AlarmLog {
+        private static final int MAX_EVENTS = 2000;
+
+        public record AlarmEvent(long ts, String device, String code, String text) {}
+
+        private final List<AlarmEvent> events = new ArrayList<>();
+
+        // called from the MQTT thread
+        public void add(AlarmEvent e) {
+            events.add(0, e);
+            while (events.size() > MAX_EVENTS) {
+                events.remove(events.size() - 1);
+            }
+        }
+
+        // called from the HTTP thread
+        public String render(int limit) {
+            String out = "";
+            int n = Math.min(limit, events.size());
+            for (int i = 0; i < n; i++) {
+                AlarmEvent e = events.get(i);
+                out += e.ts() + ";" + e.device() + ";" + e.code() + ";" + e.text() + "\n";
+            }
+            return out;
+        }
+
+        public int size() {
+            return events.size();
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    **Workload:** IoT gateway (one writer thread, one polling reader thread)
+
+    #### [Bug] Shared `ArrayList` without synchronization
+    - **Where:** `add()` and `render()`
+    - **Issue:** the MQTT thread changes the list while the HTTP thread reads it. `render()` can see a half-updated list and throw `IndexOutOfBoundsException`, or return a mix of old and new events.
+    - **Fix:** make `add`, `render` and `size` `synchronized`. The critical sections are short, so a plain lock is enough.
+
+    #### [High] Front insert into an `ArrayList`
+    - **Where:** `events.add(0, e)`
+    - **Issue:** every insert at index 0 shifts all existing elements by one. With a full log, that is about 2000 element moves per alarm. During an alarm burst this is pure CPU and memory-bandwidth work.
+    - **Fix:** use an `ArrayDeque` with `addFirst` and `pollLast`. Both are O(1). Iterating from the head still gives newest first, so the output order does not change.
+    - **Impact:** reduces E: about 2000 element moves per alarm become one pointer update.
+
+    #### [High] `String +=` in the render loop
+    - **Where:** `out += ...` in `render()`
+    - **Issue:** each `+=` creates a new string and copies everything built so far. For 500 lines the total copying grows with the square of the output size. This runs on every poll, so it is paid again every 2 seconds per tablet, even when nothing changed.
+    - **Fix:** one `StringBuilder`, appended in the loop, converted to a string once.
+    - **Impact:** reduces E: copying work becomes linear in the output size.
+
+    ```java
+    import java.util.ArrayDeque;
+
+    public class AlarmLog {
+        private static final int MAX_EVENTS = 2000;
+
+        public record AlarmEvent(long ts, String device, String code, String text) {}
+
+        private final ArrayDeque<AlarmEvent> events = new ArrayDeque<>();
+
+        // called from the MQTT thread
+        public synchronized void add(AlarmEvent e) {
+            events.addFirst(e);
+            if (events.size() > MAX_EVENTS) {
+                events.pollLast();
+            }
+        }
+
+        // called from the HTTP thread
+        public synchronized String render(int limit) {
+            StringBuilder out = new StringBuilder();
+            int count = 0;
+            for (AlarmEvent e : events) {
+                if (count >= limit) {
+                    break;
+                }
+                out.append(e.ts()).append(';')
+                   .append(e.device()).append(';')
+                   .append(e.code()).append(';')
+                   .append(e.text()).append('\n');
+                count++;
+            }
+            return out.toString();
+        }
+
+        public synchronized int size() {
+            return events.size();
+        }
+    }
+    ```
+
+    The output is identical: same fields, same separators, newest first, at most `limit` lines. `add` removes at most one event per call because it adds only one, so `if` is enough instead of `while`.
+
+    #### [Low] Render on every poll
+    - **Issue:** if alarms arrive rarely, most polls build the same text again. You could keep the last rendered string and rebuild it only after `add()` was called. Only do this if profiling shows `render()` is still a hot spot, because it adds state to keep correct.
+
+    **Already good:** the size cap on the log, the immutable `record`, and the `limit` parameter that keeps responses small.
+verify:
+  static_only: Java code; no Java toolchain in the verifier, so the answer is checked by review only

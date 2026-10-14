@@ -1,0 +1,144 @@
+id: gen-1-00077-multi-turn
+category: multi-turn
+language: yaml
+patterns:
+- minimize-environments
+- context-tradeoff
+messages:
+- role: user
+  content: |
+    fix this, dev is eating our GPU quota
+
+    ```yaml
+    # values-dev.yaml
+    image:
+      repository: registry.example.com/ml/sentiment-api
+      tag: 2.4.1
+      pullPolicy: IfNotPresent
+
+    replicaCount: 4
+
+    resources:
+      requests:
+        cpu: "4"
+        memory: 16Gi
+      limits:
+        cpu: "4"
+        memory: 16Gi
+        nvidia.com/gpu: 1
+
+    autoscaling:
+      enabled: true
+      minReplicas: 4
+      maxReplicas: 12
+      targetCPUUtilizationPercentage: 60
+
+    podDisruptionBudget:
+      enabled: true
+      minAvailable: 3
+
+    affinity:
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: sentiment-api
+            topologyKey: kubernetes.io/hostname
+
+    model:
+      name: sentiment-distilbert
+      precision: fp16
+      maxBatchSize: 32
+
+    env:
+      LOG_LEVEL: debug
+      MODEL_CACHE: /models
+    ```
+- role: assistant
+  content: |
+    Dev is built like prod: 4 replicas, each with its own GPU, autoscaling up to 12, and a hard anti-affinity rule. That is up to 12 GPUs for a few developers. Here is a dev-sized version:
+
+    ```yaml
+    # values-dev.yaml
+    image:
+      repository: registry.example.com/ml/sentiment-api
+      tag: 2.4.1
+      pullPolicy: IfNotPresent
+
+    replicaCount: 1
+
+    resources:
+      requests:
+        cpu: "1"
+        memory: 4Gi
+      limits:
+        cpu: "2"
+        memory: 8Gi
+
+    autoscaling:
+      enabled: false
+
+    podDisruptionBudget:
+      enabled: false
+
+    model:
+      name: sentiment-distilbert
+      precision: fp32
+      maxBatchSize: 8
+      device: cpu
+
+    env:
+      LOG_LEVEL: debug
+      MODEL_CACHE: /models
+    ```
+
+    **Green Notes**
+    - **Fewer, smaller dev replicas** (reduces E and M): one replica, no autoscaling, no PDB and no anti-affinity. Dev has no availability target, so these only reserve hardware that sits idle.
+    - **No GPU in dev** (reduces M): the GPU is the scarcest and most expensive part. I switched the model to CPU with `fp32`, so output can differ slightly from the `fp16` GPU path.
+    - **Smaller requests:** the CPU and memory numbers are a guess. Check them with `kubectl top pod` and adjust.
+    - Prod keeps its replicas, PDB and GPUs. Test those in staging.
+- role: user
+  content: |
+    no we need the gpu in dev, fp16 on cpu gives different scores and our regression tests fail
+- role: assistant
+  content: |-
+    Then keep the GPU. The CPU switch changes the numerics, so it is the wrong trade for your tests. Keep one replica with one GPU and `fp16`, and cut the rest:
+
+    ```yaml
+    # values-dev.yaml
+    image:
+      repository: registry.example.com/ml/sentiment-api
+      tag: 2.4.1
+      pullPolicy: IfNotPresent
+
+    replicaCount: 1
+
+    resources:
+      requests:
+        cpu: "2"
+        memory: 8Gi
+      limits:
+        cpu: "4"
+        memory: 16Gi
+        nvidia.com/gpu: 1
+
+    autoscaling:
+      enabled: false
+
+    podDisruptionBudget:
+      enabled: false
+
+    model:
+      name: sentiment-distilbert
+      precision: fp16
+      maxBatchSize: 32
+
+    env:
+      LOG_LEVEL: debug
+      MODEL_CACHE: /models
+    ```
+
+    **Green Notes**
+    - **One GPU instead of up to twelve** (reduces M and E): the model and precision match prod, so the regression tests stay valid. Dev needs one copy of the model, not capacity.
+    - **No autoscaling, PDB or anti-affinity:** these only matter for availability and load. Dev has neither requirement.
+    - *Not applied:* turning the GPU off or scaling dev to zero. Your tests need the GPU path, and you did not say dev is idle at night. If it is, a nightly scale-down is the next step.

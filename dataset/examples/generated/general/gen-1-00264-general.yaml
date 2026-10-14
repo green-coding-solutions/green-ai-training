@@ -1,0 +1,90 @@
+id: gen-1-00264-general
+category: general
+language: rust
+patterns:
+- none
+messages:
+- role: user
+  content: |
+    ```rust
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::io::{BufRead, BufReader, Write};
+
+    struct Reading {
+        sensor: String,
+        value: f64,
+    }
+
+    fn parse_line(line: &str) -> Option<Reading> {
+        let mut parts = line.split(',');
+        let _ts = parts.next()?;
+        let sensor = parts.next()?.trim().to_string();
+        let value = parts.next()?.trim().parse::<f64>().ok()?;
+        Some(Reading { sensor, value })
+    }
+
+    fn main() {
+        let file = File::open("readings.csv")?;
+        let reader = BufReader::new(file);
+
+        let mut totals: HashMap<String, (f64, u32)> = HashMap::new();
+        for line in reader.lines() {
+            let line = line?;
+            if let Some(r) = parse_line(&line) {
+                let entry = totals.entry(r.sensor).or_insert((0.0, 0));
+                entry.0 += r.value;
+                entry.1 += 1;
+            }
+        }
+
+        let mut out = File::create("averages.csv")?;
+        for (sensor, (sum, n)) in &totals {
+            writeln!(out, "{},{:.3}", sensor, sum / *n as f64)?;
+        }
+    }
+    ```
+
+    ?
+- role: assistant
+  content: |-
+    I assume you mean the compile error. The code does not build because `main` returns `()`, but you use the `?` operator in it:
+
+    ```text
+    error[E0277]: the `?` operator can only be used in a function that returns `Result` or `Option`
+    ```
+
+    `?` returns early with the error, so the function needs a return type that can hold an error. `parse_line` is fine: it returns `Option`, and `?` works there on `Option` values.
+
+    Make `main` return a `Result` and end with `Ok(())`:
+
+    ```rust
+    use std::error::Error;
+
+    fn main() -> Result<(), Box<dyn Error>> {
+        let file = File::open("readings.csv")?;
+        let reader = BufReader::new(file);
+
+        let mut totals: HashMap<String, (f64, u32)> = HashMap::new();
+        for line in reader.lines() {
+            let line = line?;
+            if let Some(r) = parse_line(&line) {
+                let entry = totals.entry(r.sensor).or_insert((0.0, 0));
+                entry.0 += r.value;
+                entry.1 += 1;
+            }
+        }
+
+        let mut out = File::create("averages.csv")?;
+        for (sensor, (sum, n)) in &totals {
+            writeln!(out, "{},{:.3}", sensor, sum / *n as f64)?;
+        }
+        Ok(())
+    }
+    ```
+
+    Notes:
+    - `Box<dyn Error>` accepts `io::Error` and any other error type through `From`, so each `?` converts automatically.
+    - If `main` returns `Err`, the program prints the error with `Debug` formatting and exits with code 1.
+    - `HashMap` iterates in random order, so the lines in `averages.csv` can differ between runs. If you need a stable file, collect the entries into a `Vec` and sort by sensor name before writing.
+    - Lines that fail to parse are skipped silently. If bad rows should be reported, have `parse_line` return a `Result` and log the errors.

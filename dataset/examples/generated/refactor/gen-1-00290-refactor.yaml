@@ -1,0 +1,135 @@
+id: gen-1-00290-refactor
+category: refactor
+language: html
+patterns:
+- css-animations
+facts:
+- F-ANIM
+messages:
+- role: user
+  content: |
+    Our webshop has a scrolling promo bar at the top of every page (free shipping, returns, discount code). It runs all the time while the customer browses. I want to clean it up and make it cheaper to run, but these things must stay the same:
+
+    - the text scrolls from right to left without a visible jump
+    - it pauses when the mouse is over it
+    - marketing can still change the three messages in the HTML
+    - no new libraries
+
+    ```html
+    <div class="promo-bar" id="promoBar">
+      <div class="promo-track" id="promoTrack">
+        <span>Free shipping over €50</span>
+        <span>30-day returns</span>
+        <span>Code SPRING10: 10% off your first order</span>
+      </div>
+    </div>
+
+    <style>
+      .promo-bar {
+        position: relative;
+        overflow: hidden;
+        height: 36px;
+        background: #1f2937;
+        color: #fff;
+        font: 14px/36px system-ui, sans-serif;
+      }
+      .promo-track {
+        position: absolute;
+        top: 0;
+        left: 0;
+        display: flex;
+        gap: 48px;
+        padding-right: 48px;
+        white-space: nowrap;
+      }
+    </style>
+
+    <script>
+      const bar = document.getElementById("promoBar");
+      const track = document.getElementById("promoTrack");
+      track.innerHTML += track.innerHTML; // second copy for the seamless loop
+
+      let x = 0;
+      let paused = false;
+      bar.addEventListener("mouseenter", () => { paused = true; });
+      bar.addEventListener("mouseleave", () => { paused = false; });
+
+      function step() {
+        if (!paused) {
+          x -= 1;
+          if (-x >= track.scrollWidth / 2) x = 0;
+          track.style.left = x + "px";
+        }
+        requestAnimationFrame(step);
+      }
+      requestAnimationFrame(step);
+    </script>
+    ```
+- role: assistant
+  content: |
+    ```html
+    <div class="promo-bar">
+      <div class="promo-track">
+        <div class="promo-group">
+          <span>Free shipping over €50</span>
+          <span>30-day returns</span>
+          <span>Code SPRING10: 10% off your first order</span>
+        </div>
+        <!-- identical copy for the seamless loop -->
+        <div class="promo-group" aria-hidden="true">
+          <span>Free shipping over €50</span>
+          <span>30-day returns</span>
+          <span>Code SPRING10: 10% off your first order</span>
+        </div>
+      </div>
+    </div>
+
+    <style>
+      .promo-bar {
+        overflow: hidden;
+        height: 36px;
+        background: #1f2937;
+        color: #fff;
+        font: 14px/36px system-ui, sans-serif;
+      }
+      .promo-track {
+        display: flex;
+        width: max-content;
+        white-space: nowrap;
+        animation: promo-scroll 30s linear infinite;
+      }
+      .promo-group {
+        display: flex;
+        gap: 48px;
+        padding-right: 48px;
+      }
+      .promo-bar:hover .promo-track {
+        animation-play-state: paused;
+      }
+
+      /* moves exactly one group width, then restarts: no visible jump */
+      @keyframes promo-scroll {
+        from { transform: translateX(0); }
+        to   { transform: translateX(-50%); }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .promo-track { animation: none; }
+      }
+    </style>
+    ```
+
+    The script is gone. The loop and the hover pause are now CSS only.
+
+    Behavior changes to check:
+    - The second copy is now in the HTML, not created by JS. Marketing has to edit both groups. If you want one place to edit, render the group twice in your template.
+    - Speed is now time-based (one loop per 30 s), not 1 px per frame. It no longer runs faster on 120 Hz screens. Change `30s` to tune it. A longer message list needs a longer duration to keep the same speed.
+    - The copy has `aria-hidden="true"`, so screen readers read each message once.
+    - Users with reduced-motion settings now see static text. Make sure all three messages fit, or let the bar wrap.
+
+    **Green Notes**
+    - **CSS animation instead of a `requestAnimationFrame` loop** (reduces E): the bar is on every page for the whole visit. No script runs on each frame now, and the browser can animate `transform` on the compositor. In Green Metrics Tool measurements of a 20-second animation, CSS `@keyframes` used about 10% less CPU energy than the same animation driven by JavaScript ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=4a2085fd-6f43-4f26-a3ee-2a6fcd7db594,58ee50a2-7110-4418-beea-df6ffba5425a)).
+    - **`transform` instead of `left`:** writing `left` every frame forced layout. A transform does not.
+    - **Pause is free:** `animation-play-state: paused` stops the work. The old loop kept calling `requestAnimationFrame` even while paused.
+verify:
+  static_only: browser CSS and DOM animation, needs a real browser

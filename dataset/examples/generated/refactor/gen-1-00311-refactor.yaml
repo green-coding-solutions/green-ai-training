@@ -1,0 +1,120 @@
+id: gen-1-00311-refactor
+category: refactor
+language: java
+patterns:
+- avoid-exception-flow
+messages:
+- role: user
+  content: |
+    hello, i have a servlet class for our landing page and my lead say it is slow in the logs when we have much traffic from ads. can you make it better? i dont understand what is wrong, sorry for my english
+
+    ```java
+    import jakarta.servlet.http.HttpServletRequest;
+    import java.util.EnumMap;
+    import java.util.Locale;
+    import java.util.Map;
+
+    public class LandingTracker {
+
+        public enum Source { GOOGLE, FACEBOOK, NEWSLETTER, TWITTER, LINKEDIN, PARTNER, DIRECT }
+
+        private final Map<Source, Integer> visits = new EnumMap<>(Source.class);
+
+        public Source detectSource(HttpServletRequest req) {
+            String raw = req.getParameter("utm_source");
+            if (raw == null) {
+                return Source.DIRECT;
+            }
+            try {
+                return Source.valueOf(raw.trim().toUpperCase(Locale.ROOT));
+            } catch (IllegalArgumentException e) {
+                // unknown source, for example bing, reddit, some-blog
+                return Source.DIRECT;
+            }
+        }
+
+        public void recordVisit(HttpServletRequest req) {
+            Source s = detectSource(req);
+            Integer old = visits.get(s);
+            visits.put(s, old == null ? 1 : old + 1);
+        }
+
+        public String heroTitle(Source s) {
+            switch (s) {
+                case NEWSLETTER: return "Welcome back, reader!";
+                case PARTNER:    return "Hello from our partner network";
+                default:         return "Try it free for 30 days";
+            }
+        }
+
+        public Map<Source, Integer> snapshot() {
+            return new EnumMap<>(visits);
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    The slow part is `Source.valueOf(...)`. It throws an exception for every unknown value, and many ad links come from sources that are not in your enum (bing, reddit, blogs). Throwing builds a stack trace each time, and a servlet stack is deep. This is normal input, not an error, so it should not use an exception.
+
+    ```java
+    import jakarta.servlet.http.HttpServletRequest;
+    import java.util.EnumMap;
+    import java.util.HashMap;
+    import java.util.Locale;
+    import java.util.Map;
+    import java.util.concurrent.atomic.LongAdder;
+
+    public class LandingTracker {
+
+        public enum Source { GOOGLE, FACEBOOK, NEWSLETTER, TWITTER, LINKEDIN, PARTNER, DIRECT }
+
+        private static final Map<String, Source> BY_NAME = new HashMap<>();
+        static {
+            for (Source s : Source.values()) {
+                BY_NAME.put(s.name(), s);
+            }
+        }
+
+        private final Map<Source, LongAdder> visits = new EnumMap<>(Source.class);
+
+        public LandingTracker() {
+            for (Source s : Source.values()) {
+                visits.put(s, new LongAdder());
+            }
+        }
+
+        public Source detectSource(HttpServletRequest req) {
+            String raw = req.getParameter("utm_source");
+            if (raw == null) {
+                return Source.DIRECT;
+            }
+            return BY_NAME.getOrDefault(raw.trim().toUpperCase(Locale.ROOT), Source.DIRECT);
+        }
+
+        public void recordVisit(HttpServletRequest req) {
+            visits.get(detectSource(req)).increment();
+        }
+
+        public String heroTitle(Source s) {
+            switch (s) {
+                case NEWSLETTER: return "Welcome back, reader!";
+                case PARTNER:    return "Hello from our partner network";
+                default:         return "Try it free for 30 days";
+            }
+        }
+
+        public Map<Source, Long> snapshot() {
+            Map<Source, Long> copy = new EnumMap<>(Source.class);
+            visits.forEach((s, n) -> copy.put(s, n.sum()));
+            return copy;
+        }
+    }
+    ```
+
+    **Green Notes**
+    - **No exception for expected input** (reduces E): unknown `utm_source` values now cost one hash lookup instead of a thrown and caught `IllegalArgumentException` with a full stack trace. The more ad traffic comes from unlisted sources, the more this saves, and it is paid on every request. Results are the same: unknown, empty and missing values all give `DIRECT`, and matching is still case-insensitive after `trim()`.
+    - **Bug fix:** `visits` was a plain `EnumMap` changed by many request threads at once, so counts could be lost or corrupted. Each source now has a `LongAdder`, created once in the constructor. The map itself is never changed after that, so it is safe to read from many threads.
+    - **API change:** `snapshot()` now returns `Map<Source, Long>` and includes sources with count 0. If other code needs `Integer` or only non-zero entries, filter or convert there.
+    - *Not applied:* no cache or extra layer for the lookup. A map of 7 entries is already as cheap as it gets.
+verify:
+  static_only: Java with jakarta.servlet API, not runnable with the stdlib-only verifier

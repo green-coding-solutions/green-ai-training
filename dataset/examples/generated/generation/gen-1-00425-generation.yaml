@@ -1,0 +1,158 @@
+id: gen-1-00425-generation
+category: generation
+language: html
+patterns:
+- dom-size
+messages:
+- role: user
+  content: |
+    We run an internal REST API with a lot of endpoints (around 1,500 right now, spread over about 40 tags like orders, invoices, customers, webhooks). Our devs keep asking for a simple reference page, so I want one static HTML file, plain JavaScript, no framework and no build step.
+
+    Requirements:
+    - Load the endpoints from `/api/endpoints.json`. It is an array of `{ method, path, summary, tag, deprecated }`.
+    - Group them by tag, sorted by name, and each group is collapsible.
+    - Show the method, the path in monospace and the summary. Deprecated endpoints get a strikethrough path.
+    - A search box that filters by path or summary. Multiple words must all match.
+    - It must work on laptops and on the old tablets in the support room.
+    - Keep the code short, I have to maintain it alone.
+- role: assistant
+  content: |
+    This renders only the ~40 group headers at start. A group's rows are built when it is opened and removed when it is closed. Search results are capped, so the page never holds all endpoints in the DOM at once.
+
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>API reference</title>
+    <style>
+      body { font: 15px/1.4 system-ui, sans-serif; margin: 0 auto; max-width: 60rem; padding: 1rem; }
+      input[type=search] { width: 100%; padding: .5rem; font: inherit; box-sizing: border-box; }
+      details { border-bottom: 1px solid #ddd; }
+      summary { cursor: pointer; padding: .5rem 0; font-weight: 600; }
+      ul { list-style: none; margin: 0; padding: 0 0 .5rem; }
+      li { display: flex; gap: .75rem; padding: .2rem 0; align-items: baseline; }
+      .m { flex: none; width: 4.5rem; font: 600 .75rem monospace; text-transform: uppercase; }
+      .dep code { text-decoration: line-through; color: #777; }
+      .note { color: #555; }
+      [hidden] { display: none; }
+    </style>
+    </head>
+    <body>
+    <h1>API reference</h1>
+    <label for="q" class="note">Search path or summary</label>
+    <input id="q" type="search" autocomplete="off" placeholder="e.g. orders refund">
+    <p id="status" class="note" role="status"></p>
+    <div id="groups"></div>
+    <ul id="results" hidden></ul>
+
+    <script>
+    const MAX_RESULTS = 100;
+    const groupsEl = document.getElementById('groups');
+    const resultsEl = document.getElementById('results');
+    const statusEl = document.getElementById('status');
+    const input = document.getElementById('q');
+
+    function row(e) {
+      const li = document.createElement('li');
+      if (e.deprecated) li.className = 'dep';
+      const m = document.createElement('span');
+      m.className = 'm';
+      m.textContent = e.method;
+      const code = document.createElement('code');
+      code.textContent = e.path;
+      const s = document.createElement('span');
+      s.className = 'note';
+      s.textContent = e.summary;
+      li.append(m, code, s);
+      return li;
+    }
+
+    async function init() {
+      const res = await fetch('/api/endpoints.json');
+      if (!res.ok) {
+        statusEl.textContent = 'Could not load endpoints (' + res.status + ').';
+        return;
+      }
+      const endpoints = await res.json();
+
+      const byTag = new Map();
+      for (const e of endpoints) {
+        if (!byTag.has(e.tag)) byTag.set(e.tag, []);
+        byTag.get(e.tag).push(e);
+      }
+
+      // One <details> per tag. Rows exist only while the group is open.
+      const frag = document.createDocumentFragment();
+      const tags = [...byTag].sort((a, b) => a[0].localeCompare(b[0]));
+      for (const [tag, items] of tags) {
+        const d = document.createElement('details');
+        const sum = document.createElement('summary');
+        sum.textContent = tag + ' (' + items.length + ')';
+        const ul = document.createElement('ul');
+        d.append(sum, ul);
+        d.addEventListener('toggle', () => {
+          if (d.open) {
+            if (!ul.hasChildNodes()) {
+              const f = document.createDocumentFragment();
+              for (const e of items) f.append(row(e));
+              ul.append(f);
+            }
+          } else {
+            ul.replaceChildren();
+          }
+        });
+        frag.append(d);
+      }
+      groupsEl.append(frag);
+
+      // Search runs on the in-memory array. The DOM only gets the first matches.
+      const haystack = endpoints.map(e => (e.path + ' ' + e.summary).toLowerCase());
+      let timer;
+
+      function search() {
+        const terms = input.value.toLowerCase().split(/\s+/).filter(Boolean);
+        if (terms.length === 0) {
+          resultsEl.hidden = true;
+          resultsEl.replaceChildren();
+          groupsEl.hidden = false;
+          statusEl.textContent = '';
+          return;
+        }
+        const f = document.createDocumentFragment();
+        let total = 0;
+        for (let i = 0; i < endpoints.length; i++) {
+          if (terms.every(t => haystack[i].includes(t))) {
+            if (total < MAX_RESULTS) f.append(row(endpoints[i]));
+            total++;
+          }
+        }
+        groupsEl.hidden = true;
+        resultsEl.replaceChildren(f);
+        resultsEl.hidden = false;
+        statusEl.textContent = total > MAX_RESULTS
+          ? 'Showing ' + MAX_RESULTS + ' of ' + total + ' matches. Add more words to narrow it down.'
+          : total + ' matches.';
+      }
+
+      input.addEventListener('input', () => {
+        clearTimeout(timer);
+        timer = setTimeout(search, 150);
+      });
+    }
+
+    init();
+    </script>
+    </body>
+    </html>
+    ```
+
+    **Green Notes**
+    - **Small DOM** ([Avoid excessive DOM size](https://patterns.greensoftware.foundation/development/web-performance/avoid-excessive-dom-size)) (reduces E on the client): the page starts with about 40 headers instead of about 1,500 rows. Style, layout and memory cost grow with node count, and old tablets feel it first.
+    - **Rows created on open, removed on close:** a developer usually reads one or two groups, so only those rows exist. Closing a group frees them again.
+    - **Capped search results** (100 rows): a one-letter query cannot rebuild the whole list. Filtering itself runs on the array, which is cheap.
+    - *Trade-off:* the browser's Ctrl+F cannot find text inside closed groups. The search box covers that case.
+    - *Not applied:* a virtual-scrolling library. The tag groups already split the data into small pieces, so it would only add code for you to maintain.
+verify:
+  static_only: HTML page that needs a browser DOM and a fetch to /api/endpoints.json

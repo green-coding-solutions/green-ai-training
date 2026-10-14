@@ -1,0 +1,138 @@
+id: gen-1-00347-multi-turn
+category: multi-turn
+language: python
+patterns:
+- simple-conditions
+facts:
+- F-COND
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    HEADLINES = {
+        "offer": "Start free for 30 days. No card needed.",
+        "returning": "Welcome back. Your workspace is waiting.",
+        "community": "Join 12,000 makers who ship with us.",
+        "education": "Free for students and teachers.",
+        "default": "Ship your product faster.",
+    }
+
+
+    def hero_variant(medium, source):
+        if medium is None:
+            medium = ""
+        if source is None:
+            source = ""
+        if medium.strip().lower() == "cpc" or medium.strip().lower() == "ppc" or medium.strip().lower() == "paid":
+            return "offer"
+        elif medium.strip().lower() == "email" or medium.strip().lower() == "newsletter":
+            return "returning"
+        elif medium.strip().lower() == "social" or source.strip().lower() in ("twitter", "x", "linkedin", "facebook", "mastodon"):
+            return "community"
+        elif source.strip().lower().endswith(".edu") or source.strip().lower().endswith(".ac.uk"):
+            return "education"
+        else:
+            return "default"
+
+
+    def render_hero(medium, source):
+        variant = hero_variant(medium, source)
+        return '<h1 class="hero-title" data-variant="%s">%s</h1>' % (variant, HEADLINES[variant])
+    ```
+- role: assistant
+  content: |
+    This runs on every landing page view, and it cleans the same two strings again and again. Here is a version that cleans each once and uses table lookups:
+
+    ```python
+    _BY_MEDIUM = {
+        "cpc": "offer",
+        "ppc": "offer",
+        "paid": "offer",
+        "email": "returning",
+        "newsletter": "returning",
+        "social": "community",
+    }
+    _SOCIAL_SOURCES = frozenset({"twitter", "x", "linkedin", "facebook", "mastodon"})
+    _EDU_SUFFIXES = (".edu", ".ac.uk")
+
+
+    def hero_variant(medium, source):
+        m = (medium or "").strip().lower()
+        s = (source or "").strip().lower()
+        variant = _BY_MEDIUM.get(m)
+        if variant is not None:
+            return variant
+        if s in _SOCIAL_SOURCES:
+            return "community"
+        if s.endswith(_EDU_SUFFIXES):
+            return "education"
+        return "default"
+    ```
+
+    `HEADLINES` and `render_hero` stay as they are. The output is the same for every input, including `None` and padded or mixed-case values.
+
+    **Green Notes**
+    - **Normalize once** (reduces E): the old code ran `strip().lower()` up to 9 times per call. Now it runs twice, and each call creates fewer temporary strings.
+    - **Dict and set lookups instead of `or` chains** (reduces E): the medium is checked with one hash lookup instead of up to six string comparisons. Adding a new medium is one line in the table.
+    - *Not applied:* `match`/`case`. It would not run any faster here.
+- role: user
+  content: |
+    hmm our designers add new sources every week and they only know how to read ifs. can you keep it as if statements? and should i use match instead
+
+    ```python
+    ```
+- role: assistant
+  content: |
+    Yes, an `if` chain is fine. Normalizing once is where most of the saving came from, and that stays. Here it is as plain `if` statements, with the values in small sets so designers only add a word to a list:
+
+    ```python
+    _PAID = {"cpc", "ppc", "paid"}
+    _EMAIL = {"email", "newsletter"}
+    _SOCIAL_SOURCES = {"twitter", "x", "linkedin", "facebook", "mastodon"}
+    _EDU_SUFFIXES = (".edu", ".ac.uk")
+
+
+    def hero_variant(medium, source):
+        m = (medium or "").strip().lower()
+        s = (source or "").strip().lower()
+
+        if m in _PAID:
+            return "offer"
+        if m in _EMAIL:
+            return "returning"
+        if m == "social" or s in _SOCIAL_SOURCES:
+            return "community"
+        if s.endswith(_EDU_SUFFIXES):
+            return "education"
+        return "default"
+    ```
+
+    Output is unchanged, and the order of the checks is the same as in your original code.
+
+    On `match`: don't switch for speed. In Green Metrics Tool micro-benchmarks (10,000,000 classifications), `match` and `if/elif` with the same conditions differed by about 1%, which is noise ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=123676d7-2121-4b9d-b78e-e065836fc608,a7780e2a-2934-4d26-b2a9-2cda7848adc1)). Simple equality checks used about 16% less CPU energy than complex range and modulo conditions, and this function only uses simple checks. Use `match` only if you find it easier to read.
+
+    **Green Notes**
+    - **Normalize once** (reduces E): this is the main saving per page view and it is kept.
+    - **Simple membership checks** (reduces E): each branch is one equality or set lookup, with no repeated string work.
+verify:
+  equivalence:
+    driver: |
+      cases = [
+          (None, None), ("", ""), ("CPC", "google"), (" ppc ", None), ("Paid", "x"),
+          ("email", "foo"), ("Newsletter", ""), ("social", ""), (None, "Twitter"),
+          ("", " X "), ("organic", "mastodon"), ("organic", "mit.edu"),
+          (None, "ox.ac.uk"), ("referral", "blog.example.com"), ("SOCIAL", "uni.edu"),
+          ("email", "twitter"), ("direct", ".EDU "),
+      ]
+      for medium, source in cases:
+          print(repr(medium), repr(source), hero_variant(medium, source))
+  test: |-
+    assert hero_variant(None, None) == "default"
+    assert hero_variant(" CPC ", "google") == "offer"
+    assert hero_variant("Newsletter", "twitter") == "returning"
+    assert hero_variant("organic", " LinkedIn ") == "community"
+    assert hero_variant("social", "") == "community"
+    assert hero_variant("", "cam.ac.uk") == "education"
+    assert hero_variant("referral", "blog.example.com") == "default"

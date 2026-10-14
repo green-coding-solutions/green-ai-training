@@ -1,0 +1,172 @@
+id: gen-1-00299-review
+category: review
+language: python
+patterns:
+- simple-conditions
+- hoist-invariants
+facts:
+- F-COND
+messages:
+- role: user
+  content: |
+    Could you review this solver? It relaxes a 2D scalar field (pressure-like) on a structured mesh. The cell codes come from our mesh exporter.
+
+    Requirements:
+    - Pure Python only. The cluster nodes have just the standard library.
+    - Keep the names and signatures of `classify_cell` and `solve`, because other scripts import them.
+    - Results must stay the same for valid input.
+
+    Typical run is a 400x400 grid and a few thousand iterations. We start many runs per week on the shared cluster. I mostly care about speed and cluster load, but tell me anything else that looks wrong.
+
+    ```python
+    def classify_cell(code):
+        # code = 10 * family + variant, written by the mesh exporter
+        if code == 0:
+            return "fluid"
+        elif code // 10 == 1 and code % 10 == 0:
+            return "wall_noslip"
+        elif code // 10 == 1 and code % 10 == 1:
+            return "wall_slip"
+        elif code // 10 == 2 and code % 10 == 0:
+            return "inlet"
+        elif code // 10 == 3 and code % 10 == 0:
+            return "outlet"
+        elif code // 10 == 4 and code % 10 == 0:
+            return "symmetry"
+        raise ValueError(f"unknown cell code {code}")
+
+
+    def relax_step(u, codes, omega, inlet_value):
+        ny, nx = len(u), len(u[0])
+        new = [row[:] for row in u]
+        diff = 0.0
+        for j in range(1, ny - 1):
+            for i in range(1, nx - 1):
+                kind = classify_cell(codes[j][i])
+                if kind == "fluid":
+                    avg = 0.25 * (u[j - 1][i] + u[j + 1][i] + u[j][i - 1] + u[j][i + 1])
+                    new[j][i] = u[j][i] + omega * (avg - u[j][i])
+                elif kind == "inlet":
+                    new[j][i] = inlet_value
+                elif kind == "outlet":
+                    new[j][i] = u[j][i - 1]
+                elif kind == "symmetry":
+                    new[j][i] = u[j - 1][i]
+                # walls keep their value
+                diff = abs(new[j][i] - u[j][i])
+        return new, diff
+
+
+    def solve(u, codes, omega, inlet_value, tol=1e-6, max_iter=5000):
+        for it in range(max_iter):
+            u, diff = relax_step(u, codes, omega, inlet_value)
+            if diff < tol:
+                break
+        return u, it + 1
+    ```
+- role: assistant
+  content: |
+    **Workload:** scientific computing (batch solver, many long runs)
+
+    #### [Bug] Convergence test looks at one cell only
+    - **Where:** `relax_step`, the line `diff = abs(new[j][i] - u[j][i])`
+    - **Issue:** `diff` is overwritten for every cell, so `solve` compares `tol` with the change of the last cell only. The run can stop while other cells still move, or run longer than needed.
+    - **Fix:** keep the largest change: `diff = max(diff, abs(...))`.
+
+    #### [High] Every cell is classified again in every iteration
+    - **Where:** `classify_cell(codes[j][i])` inside `relax_step`
+    - **Issue:** the codes never change during a solve, but each cell goes through the classification again in each iteration. That is the same answer computed thousands of times for every cell.
+    - **Fix:** classify once at the start of `solve` and pass the result to `relax_step`.
+    - **Impact:** reduces E. It removes a function call and several comparisons per cell per iteration, and this is the hot loop of every run.
+
+    #### [Medium] Compound arithmetic guards in `classify_cell`
+    - **Where:** the `code // 10 == ... and code % 10 == ...` branches
+    - **Issue:** later codes pass through several divisions and modulos before they match. In Green Metrics Tool micro-benchmarks (10,000,000 classifications), simple equality branches used about 16% less CPU energy than range and modulo conditions ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=123676d7-2121-4b9d-b78e-e065836fc608,a7780e2a-2934-4d26-b2a9-2cda7848adc1)). A dict lookup on the code is the simplest form of that. Rewriting the chain as `match` would not help: in the same benchmarks `match` and `if/elif` differed by about 1%.
+    - **Fix:** a lookup table with the same codes.
+    - **Impact:** small once the classification runs only once per cell. It still helps if other scripts call `classify_cell` per cell.
+
+    **Already good:** the loop covers only interior cells, so the `j - 1` and `i - 1` indices never wrap around. Reading from `u` and writing to `new` keeps each step consistent. I did not suggest NumPy because of your standard-library requirement.
+
+    ```python
+    CELL_KIND = {
+        0: "fluid",
+        10: "wall_noslip",
+        11: "wall_slip",
+        20: "inlet",
+        30: "outlet",
+        40: "symmetry",
+    }
+
+
+    def classify_cell(code):
+        kind = CELL_KIND.get(code)
+        if kind is None:
+            raise ValueError(f"unknown cell code {code}")
+        return kind
+
+
+    def relax_step(u, kinds, omega, inlet_value):
+        ny, nx = len(u), len(u[0])
+        new = [row[:] for row in u]
+        diff = 0.0
+        for j in range(1, ny - 1):
+            for i in range(1, nx - 1):
+                kind = kinds[j][i]
+                if kind == "fluid":
+                    avg = 0.25 * (u[j - 1][i] + u[j + 1][i] + u[j][i - 1] + u[j][i + 1])
+                    new[j][i] = u[j][i] + omega * (avg - u[j][i])
+                elif kind == "inlet":
+                    new[j][i] = inlet_value
+                elif kind == "outlet":
+                    new[j][i] = u[j][i - 1]
+                elif kind == "symmetry":
+                    new[j][i] = u[j - 1][i]
+                # walls keep their value
+                diff = max(diff, abs(new[j][i] - u[j][i]))
+        return new, diff
+
+
+    def solve(u, codes, omega, inlet_value, tol=1e-6, max_iter=5000):
+        # codes do not change during a solve, so classify once
+        kinds = [[classify_cell(c) for c in row] for row in codes]
+        for it in range(max_iter):
+            u, diff = relax_step(u, kinds, omega, inlet_value)
+            if diff < tol:
+                break
+        return u, it + 1
+    ```
+
+    Two behavior notes:
+    - `solve` now checks the border cells too, so an unknown code on the edge raises `ValueError` at the start. Before, it was silently ignored.
+    - With the corrected convergence test, runs that stopped early because of the last-cell check may now take more iterations. The results are then more accurate.
+
+    To see the effect on your cluster, time one fixed-iteration run before and after, for example with `time` or `perf stat`, and compare CPU time.
+verify:
+  green_block: 0
+  equivalence:
+    driver: |-
+      nx, ny = 14, 10
+      codes = [[0] * nx for _ in range(ny)]
+      for i in range(nx):
+          codes[0][i] = 10
+          codes[ny - 1][i] = 11
+      for j in range(ny):
+          codes[j][0] = 10
+          codes[j][nx - 1] = 10
+      for j in range(2, ny - 2):
+          codes[j][1] = 20
+          codes[j][nx - 2] = 30
+      for i in range(4, 8):
+          codes[1][i] = 40
+      codes[5][6] = 11
+      codes[4][6] = 10
+      u = [[((j * 7 + i * 3) % 11) / 10.0 for i in range(nx)] for j in range(ny)]
+      res, n = solve(u, codes, 1.3, 0.75, tol=0.0, max_iter=60)
+      print(n)
+      for row in res:
+          print([round(x, 9) for x in row])
+      for c in range(-12, 60):
+          try:
+              print(c, classify_cell(c))
+          except ValueError as e:
+              print(c, "error", e)

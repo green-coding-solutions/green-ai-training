@@ -1,0 +1,46 @@
+id: gen-1-00013-generation
+category: generation
+language: sql
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    postgres table for ci job logs, full text per job, 30 days retention
+- role: assistant
+  content: |
+    ```sql
+    -- Job metadata stays small, so status lists and dashboards never touch log text.
+    CREATE TABLE ci_jobs (
+        job_id      bigint PRIMARY KEY,
+        pipeline_id bigint NOT NULL,
+        name        text NOT NULL,
+        status      text NOT NULL,
+        finished_at timestamptz NOT NULL
+    );
+
+    CREATE INDEX ci_jobs_finished_at_idx ON ci_jobs USING brin (finished_at);
+
+    -- Large text goes in its own table. lz4 is a fast codec for TOASTed values (PostgreSQL 14+).
+    CREATE TABLE ci_job_logs (
+        job_id   bigint PRIMARY KEY REFERENCES ci_jobs (job_id) ON DELETE CASCADE,
+        log_text text COMPRESSION lz4 NOT NULL
+    );
+
+    -- Run daily. The cascade removes the logs with the jobs.
+    DELETE FROM ci_jobs
+    WHERE finished_at < now() - interval '30 days';
+    ```
+
+    Build logs are repetitive text and compress well. PostgreSQL only compresses values above about 2 KB, so short logs are stored as is. The `COMPRESSION` setting applies to newly written values only. If you later add it to an existing table, old rows stay as they are until they are rewritten.
+
+    **Green Notes**
+    - **Compress stored data** (reduces storage E): log text is written once per job and rarely read, so compressing it shrinks disk use, backups and replication traffic. I chose `lz4` over the default `pglz` or a stronger codec because every new log is compressed on write. In Green Metrics Tool micro-benchmarks on 100 MB of English text, the lz4 CLI used about 6 J to compress and gzip about 67 J ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=2584305c-7a1e-47e2-b6cc-26276962035e,addc5f5e-55da-47f8-956d-240d06304e4e,fb08d3c3-ba41-4f0f-85fd-0b6c34e6c39b,f1479db0-c453-4aaa-9116-e137621fad07,7b3bb87d-3b43-4f82-be99-0327405205b8,905bd408-6b31-4237-a4da-14b8fad90613,7f213a20-8028-4080-9583-6e465c217bb5,8e93a8d2-60b0-4831-905b-764b68257bc7)). Those are CLI tools, not PostgreSQL, so measure your own write path.
+      https://patterns.greensoftware.foundation/development/data-handling/compress-stored-data
+    - **Separate log table** (reduces E per query): job lists and dashboards read only the small `ci_jobs` rows. Log text is fetched and decompressed only when someone opens a log.
+    - *Not applied:* a stronger codec such as zstd or xz. Logs live 30 days and are written all the time, so the extra CPU per write would cost more than the extra space it saves.
+verify:
+  static_only: PostgreSQL-specific syntax (COMPRESSION lz4, BRIN) is not valid in SQLite

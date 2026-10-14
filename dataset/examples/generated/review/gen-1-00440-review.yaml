@@ -1,0 +1,119 @@
+id: gen-1-00440-review
+category: review
+language: javascript
+patterns:
+- lazy-load-images
+messages:
+- role: user
+  content: |
+    Please review our product grid script for the shop's category pages. Some categories have 150+ products and the page is heavy on phones.
+
+    Requirements:
+    - It must keep working with the old Safari versions some of our customers use.
+    - The first row of products must show up fast, because that is what people see first.
+    - We don't use a framework on this page, so it has to stay plain JS.
+
+    I wrote a scroll handler for lazy loading, but I'm not sure it does anything.
+
+    ```javascript
+    // product-grid.js
+    const grid = document.querySelector('#product-grid');
+
+    function cardHtml(p) {
+      return `
+        <article class="card" data-id="${p.id}">
+          <img class="thumb" src="${p.image}" alt="${p.name}">
+          <h3>${p.name}</h3>
+          <p class="price">${p.price.toFixed(2)} €</p>
+          <button class="add" data-id="${p.id}">Add to cart</button>
+        </article>`;
+    }
+
+    export function renderProducts(products) {
+      grid.innerHTML = products.map(cardHtml).join('');
+
+      // warm the browser cache so scrolling feels instant
+      products.forEach((p) => {
+        const img = new Image();
+        img.src = p.image;
+      });
+    }
+
+    // lazy load images that are below the fold
+    function lazyLoad() {
+      document.querySelectorAll('img.thumb[data-src]').forEach((img) => {
+        const top = img.getBoundingClientRect().top;
+        if (top < window.innerHeight + 200) {
+          img.src = img.dataset.src;
+          img.removeAttribute('data-src');
+        }
+      });
+    }
+
+    window.addEventListener('scroll', lazyLoad);
+    window.addEventListener('resize', lazyLoad);
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (e-commerce frontend)
+
+    #### [Security] Product data is inserted as raw HTML
+    - **Where:** `cardHtml` and `grid.innerHTML`
+    - **Issue:** `p.name` and `p.image` go straight into markup. A name with a quote or `<` breaks the page, and bad data from your catalog or an import can inject script.
+    - **Fix:** escape the values (helper in the code below).
+
+    #### [High] The lazy loader never runs, and the preload loop loads everything anyway
+    - **Where:** `lazyLoad` and the `new Image()` loop in `renderProducts`
+    - **Issue:** the cards use `src`, not `data-src`, so `img.thumb[data-src]` matches nothing. The scroll handler only does a query on every scroll event. On top of that, the "warm the cache" loop requests every image right away. With 150+ products, each visit downloads every thumbnail, including all the ones nobody scrolls to.
+    - **Fix:** delete the loop and the scroll/resize handlers. Use the native `loading="lazy"` attribute. Browsers that don't know the attribute (older Safari) ignore it and load the images normally, so nothing breaks there.
+    - **Impact:** reduces network bytes and client CPU per visit. Images below the fold are only fetched if the user scrolls to them. Removing the scroll handler also removes work on the main thread.
+
+    #### [Medium] First row should not be lazy
+    - **Where:** the first cards in the grid
+    - **Issue:** lazy loading images that are visible on load delays them. Your requirement is that the first row appears fast.
+    - **Fix:** keep the first row eager and give the very first image `fetchpriority="high"`. Lazy-load the rest. The row size depends on your layout, so `EAGER_COUNT = 4` is a guess to adjust.
+
+    #### [Low] No image dimensions
+    - **Where:** `<img class="thumb">`
+    - **Issue:** without `width` and `height`, the layout jumps when a lazy image arrives. Users may then scroll past the spot and trigger more loads than needed.
+    - **Fix:** set the intrinsic size, or `aspect-ratio` in CSS. Add `decoding="async"` so decoding does not block the main thread.
+
+    ```javascript
+    // product-grid.js
+    const grid = document.querySelector('#product-grid');
+    const EAGER_COUNT = 4; // cards visible without scrolling, adjust to your layout
+
+    const escapeHtml = (s) =>
+      String(s).replace(/[&<>"']/g, (c) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+      })[c]);
+
+    function cardHtml(p, index) {
+      const eager = index < EAGER_COUNT;
+      const imgAttrs = eager
+        ? `${index === 0 ? 'fetchpriority="high"' : ''}`
+        : 'loading="lazy"';
+      return `
+        <article class="card" data-id="${escapeHtml(p.id)}">
+          <img class="thumb" src="${escapeHtml(p.image)}" alt="${escapeHtml(p.name)}"
+               width="400" height="400" decoding="async" ${imgAttrs}>
+          <h3>${escapeHtml(p.name)}</h3>
+          <p class="price">${p.price.toFixed(2)} €</p>
+          <button class="add" data-id="${escapeHtml(p.id)}">Add to cart</button>
+        </article>`;
+    }
+
+    export function renderProducts(products) {
+      grid.innerHTML = products.map(cardHtml).join('');
+    }
+    ```
+
+    **Already good:** the grid is rendered with one `innerHTML` write, not one DOM insert per card.
+
+    If a category can hold hundreds of cards, also think about pagination or a "load more" button. That keeps the DOM small, and lazy loading alone does not do that. Measure with your browser's network panel (bytes and request count on first load).
+
+    **Green Notes**
+    - **Defer offscreen images** (reduces network): native lazy loading fetches below-the-fold thumbnails only when needed. https://patterns.greensoftware.foundation/development/media-and-code-efficiency/defer-offscreen-images
+    - *Not applied:* an Intersection Observer polyfill for old Safari. The attribute degrades safely to eager loading, so the extra script would cost more than it saves.
+verify:
+  static_only: needs a browser DOM and image loading; cannot run in plain Node with stdlib

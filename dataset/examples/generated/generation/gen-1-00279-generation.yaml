@@ -1,0 +1,96 @@
+id: gen-1-00279-generation
+category: generation
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    hello, I use FastAPI for our small team chat tool. I need endpoint POST /previews, user send a list of links (max 10) and I must give back title and og:image of every page, so the chat can show a link card. Some sites are slow or dead, this should not break the whole answer. Can you write it? Thx
+- role: assistant
+  content: |
+    One shared async client fetches all links at the same time. A failed link returns an error entry and does not break the others:
+
+    ```python
+    import asyncio
+    import re
+    from contextlib import asynccontextmanager
+    from html import unescape
+
+    import httpx
+    from fastapi import FastAPI, Request
+    from pydantic import BaseModel, Field, HttpUrl
+
+    MAX_URLS = 10
+    MAX_PARALLEL = 5
+    MAX_BYTES = 200_000  # titles and meta tags are near the top of the page
+
+    TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+    OG_IMAGE_RE = re.compile(
+        r"""<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)""", re.I
+    )
+
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        app.state.http = httpx.AsyncClient(
+            timeout=5.0,
+            follow_redirects=True,
+            limits=httpx.Limits(max_connections=20),
+        )
+        yield
+        await app.state.http.aclose()
+
+
+    app = FastAPI(lifespan=lifespan)
+
+
+    class PreviewRequest(BaseModel):
+        urls: list[HttpUrl] = Field(min_length=1, max_length=MAX_URLS)
+
+
+    async def fetch_preview(client: httpx.AsyncClient, sem: asyncio.Semaphore, url: str) -> dict:
+        async with sem:
+            try:
+                body = bytearray()
+                async with client.stream("GET", url) as resp:
+                    resp.raise_for_status()
+                    async for chunk in resp.aiter_bytes():
+                        body += chunk
+                        if len(body) >= MAX_BYTES:
+                            break
+            except httpx.HTTPError as exc:
+                return {"url": url, "error": type(exc).__name__}
+
+        html = body.decode("utf-8", errors="ignore")
+        title = TITLE_RE.search(html)
+        image = OG_IMAGE_RE.search(html)
+        return {
+            "url": url,
+            "title": unescape(title.group(1)).strip() if title else None,
+            "image": unescape(image.group(1)) if image else None,
+        }
+
+
+    @app.post("/previews")
+    async def previews(req: PreviewRequest, request: Request):
+        sem = asyncio.Semaphore(MAX_PARALLEL)
+        client = request.app.state.http
+        results = await asyncio.gather(
+            *(fetch_preview(client, sem, str(u)) for u in req.urls)
+        )
+        return {"previews": results}  # same order as the request
+    ```
+
+    Because the links come from users, also block private and internal IP ranges before you fetch (SSRF). Add that check before going to production.
+
+    **Green Notes**
+    - **Async network calls** (reduces E): the up to 10 requests overlap instead of running one after another, so the worker does not sit idle for the sum of all waits. In Green Metrics Tool micro-benchmarks, 10 HTTP requests with async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib` ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=97acc9a0-3856-4bbb-b816-2b64030fba98,6415cccb-ad1a-4d87-ae46-92740c5e285b)). The gain is mostly wall time, not CPU.
+      https://patterns.greensoftware.foundation/development/use-async-instead-of-sync
+    - **One shared client:** connections are reused across requests, so fewer TCP/TLS handshakes.
+    - **Capped read size and parallelism:** only the first 200 KB of each page is downloaded, since the tags are near the top. A semaphore keeps at most 5 requests open at once.
+    - *Not applied:* async makes no difference for a single link. With one URL a plain call would do the same job.
+verify:
+  static_only: needs fastapi, httpx, pydantic and network access

@@ -1,0 +1,64 @@
+id: gen-1-00201-refactor
+category: refactor
+language: sql
+patterns:
+- compress-stored
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    Postgres 16 migration for the order snapshot archive. One row per order, written once at checkout, read only when support opens a refund or a tax audit asks for it. Kept for 7 years. Snapshots are big JSON (cart, prices, address, shipping quotes, promo state). Someone set STORAGE EXTERNAL "so reads are fast". Diff only, please.
+
+    ```sql
+    CREATE TABLE order_snapshots (
+        order_id     bigint PRIMARY KEY,
+        customer_id  bigint NOT NULL,
+        shop_id      integer NOT NULL,
+        placed_at    timestamptz NOT NULL,
+        currency     char(3) NOT NULL,
+        total_cents  bigint NOT NULL,
+        snapshot     jsonb NOT NULL
+    );
+
+    ALTER TABLE order_snapshots
+        ALTER COLUMN snapshot SET STORAGE EXTERNAL;
+
+    CREATE INDEX order_snapshots_customer_idx
+        ON order_snapshots (customer_id, placed_at DESC);
+    ```
+- role: assistant
+  content: |
+    ```sql
+    CREATE TABLE order_snapshots (
+        order_id     bigint PRIMARY KEY,
+        customer_id  bigint NOT NULL,
+        shop_id      integer NOT NULL,
+        placed_at    timestamptz NOT NULL,
+        currency     char(3) NOT NULL,
+        total_cents  bigint NOT NULL,
+    -   snapshot     jsonb NOT NULL
+    +   snapshot     jsonb COMPRESSION lz4 NOT NULL
+    );
+
+    -ALTER TABLE order_snapshots
+    -    ALTER COLUMN snapshot SET STORAGE EXTERNAL;
+    -
+    CREATE INDEX order_snapshots_customer_idx
+        ON order_snapshots (customer_id, placed_at DESC);
+    ```
+
+    For a table that already exists:
+
+    ```sql
+    ALTER TABLE order_snapshots ALTER COLUMN snapshot SET STORAGE EXTENDED;
+    ALTER TABLE order_snapshots ALTER COLUMN snapshot SET COMPRESSION lz4;
+    ```
+
+    **Green Notes**
+    - **Compress the stored JSON** (reduces E, M): `STORAGE EXTERNAL` turns off TOAST compression, so every large snapshot is stored as raw text for 7 years. Repetitive JSON like this compresses well. The default (`EXTENDED`) compresses large values. Less stored data means less disk, fewer backup bytes and fewer replica bytes.
+    - **`lz4` instead of the default `pglz`** (reduces E): it is a fast codec, which fits data that is written once and read now and then. Reads pay a small decompression cost, and that cost is low for lz4. Slow, high-ratio codecs would not fit here.
+    - **Old rows stay as they are.** The `ALTER` only affects values written from now on. Existing snapshots stay uncompressed until you rewrite them, for example in batches with an `UPDATE` that rewrites the value. Do it off-peak, because it writes a lot of WAL.
+    - **Check first:** `lz4` needs a server built with `--with-lz4` (most packaged builds have it). To see the effect on your data, compare `pg_column_size(snapshot)` before and after on a sample.
+    - *Not applied:* no extra compression in the application. Values below the TOAST threshold are stored inline and uncompressed. That is fine, because small values gain little.
+verify:
+  static_only: PostgreSQL-only DDL (TOAST storage mode and column compression), cannot run in SQLite

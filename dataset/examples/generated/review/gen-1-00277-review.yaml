@@ -1,0 +1,54 @@
+id: gen-1-00277-review
+category: review
+language: javascript
+patterns:
+- minify-assets
+messages:
+- role: user
+  content: |
+    review build.mjs for our log viewer frontend (on-call team uses it, ~40 people, internal). just give me the diff
+
+    ```javascript
+    // build.mjs
+    import { build } from "esbuild";
+    import { readFileSync, writeFileSync } from "node:fs";
+
+    const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+
+    await build({
+      entryPoints: ["src/viewer.js", "src/filters.js"],
+      bundle: true,
+      minify: false,
+      sourcemap: "inline",
+      target: "es2022",
+      outdir: "public/assets",
+      define: { __VERSION__: JSON.stringify(pkg.version) },
+    });
+
+    writeFileSync("public/version.txt", pkg.version + "\n");
+    console.log(`built ${pkg.name}@${pkg.version}`);
+    ```
+- role: assistant
+  content: |
+    **Workload:** web frontend (internal tool, loaded on every page visit)
+
+    #### [Medium] Unminified bundles with inline source maps are served to every client
+    - **Where:** `minify: false`, `sourcemap: "inline"`
+    - **Issue:** `public/assets/*.js` ships with whitespace, long names and the full source map base64-encoded inside each file. Every client downloads and parses all of it, though only devtools ever uses the map.
+    - **Fix:**
+      ```text
+      -  minify: false,
+      -  sourcemap: "inline",
+      +  minify: process.env.NODE_ENV === "production",
+      +  sourcemap: process.env.NODE_ENV === "production" ? "linked" : "inline",
+      ```
+      `linked` writes a separate `.map` file. Browsers fetch it only when devtools are open, so normal visits skip it. Keep it for readable stack traces in production.
+    - **Impact:** reduces network bytes and client parse work on each uncached load. With ~40 users the absolute effect is small. The change costs nothing at runtime and is one line in the build, so it is still worth doing.
+
+    #### [Low] Source exposure
+    - **Where:** same `sourcemap: "inline"`
+    - **Issue:** inline maps put your full source into every bundle. That is fine behind the VPN. If the viewer is ever reachable from outside, don't deploy the `.map` files.
+
+    **Already good:** `target: "es2022"` avoids needless downleveling helpers, and the version is injected at build time via `define`.
+verify:
+  static_only: needs esbuild and a package.json, which are not available in the stdlib-only sandbox

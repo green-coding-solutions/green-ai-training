@@ -1,0 +1,138 @@
+id: gen-1-00068-generation
+category: generation
+language: javascript
+patterns:
+- simple-conditions
+messages:
+- role: user
+  content: |
+    I need a small Node CLI called `logsum` that reads application logs from stdin and prints how many lines there are per level. Requirements:
+
+    - Node 20+, ESM, no npm dependencies
+    - lines look like `2026-10-09T12:00:01Z [WARN] disk almost full`
+    - our services are not consistent: they write WARN, warning, Err, CRITICAL, notice, dbg and so on, so these must be folded into six levels: trace, debug, info, warn, error, fatal
+    - lines that don't match the format or have an unknown level are counted as "unparsed"
+    - logs can be several GB, so don't load everything into memory
+    - exit code 1 if there is at least one error or fatal line, otherwise 0
+- role: assistant
+  content: |
+    ```javascript
+    #!/usr/bin/env node
+    import { createInterface } from "node:readline";
+    import { fileURLToPath } from "node:url";
+
+    const LEVELS = ["trace", "debug", "info", "warn", "error", "fatal"];
+
+    // Every spelling we accept maps straight to its canonical level.
+    const ALIASES = new Map([
+      ["trace", "trace"],
+      ["debug", "debug"], ["dbg", "debug"],
+      ["info", "info"], ["notice", "info"],
+      ["warn", "warn"], ["warning", "warn"],
+      ["error", "error"], ["err", "error"],
+      ["fatal", "fatal"], ["crit", "fatal"], ["critical", "fatal"],
+    ]);
+
+    const LINE = /^\S+\s+\[([A-Za-z]+)\]/;
+
+    export function summarize(lines) {
+      const counts = Object.fromEntries(LEVELS.map((l) => [l, 0]));
+      let unparsed = 0;
+
+      for (const line of lines) {
+        const match = LINE.exec(line);
+        const level = match && ALIASES.get(match[1].toLowerCase());
+        if (level === undefined || level === null) {
+          unparsed++;
+        } else {
+          counts[level]++;
+        }
+      }
+      return { counts, unparsed };
+    }
+
+    async function main() {
+      const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+      const { counts, unparsed } = summarize(rl); // readline is iterable, lines are streamed
+
+      // summarize() is synchronous, so for stdin we need the async version below.
+    }
+    ```
+
+    Wait: `readline` is an async iterable, so `summarize` must be async to stream. Here is the corrected, complete file:
+
+    ```javascript
+    #!/usr/bin/env node
+    import { createInterface } from "node:readline";
+    import { fileURLToPath } from "node:url";
+
+    const LEVELS = ["trace", "debug", "info", "warn", "error", "fatal"];
+
+    // Every spelling we accept maps straight to its canonical level.
+    const ALIASES = new Map([
+      ["trace", "trace"],
+      ["debug", "debug"], ["dbg", "debug"],
+      ["info", "info"], ["notice", "info"],
+      ["warn", "warn"], ["warning", "warn"],
+      ["error", "error"], ["err", "error"],
+      ["fatal", "fatal"], ["crit", "fatal"], ["critical", "fatal"],
+    ]);
+
+    const LINE = /^\S+\s+\[([A-Za-z]+)\]/;
+
+    // Works with any sync or async iterable of lines.
+    export async function summarize(lines) {
+      const counts = Object.fromEntries(LEVELS.map((l) => [l, 0]));
+      let unparsed = 0;
+
+      for await (const line of lines) {
+        const match = LINE.exec(line);
+        const level = match ? ALIASES.get(match[1].toLowerCase()) : undefined;
+        if (level === undefined) {
+          unparsed++;
+        } else {
+          counts[level]++;
+        }
+      }
+      return { counts, unparsed };
+    }
+
+    async function main() {
+      const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+      const { counts, unparsed } = await summarize(rl);
+
+      for (const level of LEVELS) {
+        console.log(`${level.padEnd(7)}${counts[level]}`);
+      }
+      console.log(`${"unparsed".padEnd(7)} ${unparsed}`);
+
+      process.exitCode = counts.error + counts.fatal > 0 ? 1 : 0;
+    }
+
+    if (process.argv[1] === fileURLToPath(import.meta.url)) {
+      await main();
+    }
+    ```
+
+    Usage: `zcat app.log.gz | node logsum.mjs`
+
+    **Green Notes**
+    - **Simple equality lookup instead of a condition chain** (reduces E): each line costs one regex match plus one `Map.get`. An `if/else` ladder with `startsWith`, `includes` or length checks would run several tests per line, and this runs once per log line. I did not measure this in JavaScript. The direction comes from Green Metrics Tool Python micro-benchmarks, where simple equality branches cost less than complex guard expressions.
+    - **Streaming with `readline`** (reduces E and M): memory stays flat for multi-GB input, so the job fits on a small machine.
+    - *Not applied:* `switch` or a worker-thread pool. A `switch` would not be faster than the `Map` and would repeat the alias list in code. A single stream is enough for a CLI that reads one pipe.
+verify:
+  module: true
+  test: |-
+    import assert from "node:assert";
+    const lines = [
+      "2026-10-09T12:00:01Z [WARN] a",
+      "2026-10-09T12:00:02Z [warning] b",
+      "x [Critical] c",
+      "x [Err] d",
+      "x [dbg] e",
+      "garbage",
+      "t [nope] f",
+    ];
+    const result = await summarize(lines);
+    assert.deepStrictEqual(result.counts, { trace: 0, debug: 1, info: 0, warn: 2, error: 1, fatal: 1 });
+    assert.strictEqual(result.unparsed, 2);

@@ -1,0 +1,166 @@
+id: refactor-sql-union-all-001
+category: refactor
+language: sql
+patterns: [efficient-algorithm]
+messages:
+  - role: user
+    content: |
+      Can this be faster? It builds the combined activity feed export. invoices and refunds have separate id sequences and the type column already keeps the rows apart.
+
+      ```sql
+      SELECT 'invoice' AS type, id, customer_id, amount, created_at FROM invoices
+      UNION
+      SELECT 'refund' AS type, id, customer_id, -amount, created_at FROM refunds
+      ORDER BY created_at;
+      ```
+  - role: assistant
+    content: |
+      ```sql
+      SELECT 'invoice' AS type, id, customer_id, amount, created_at FROM invoices
+      UNION ALL
+      SELECT 'refund' AS type, id, customer_id, -amount, created_at FROM refunds
+      ORDER BY created_at;
+      ```
+
+      **Green Notes**
+      - **`UNION ALL` instead of `UNION`** (reduces E): `UNION` removes duplicate rows, which forces the database to sort or hash the whole combined result. Your rows can never be duplicates, because the `type` literal differs between the two halves, so that work was always wasted. The result is identical.
+      - Keep plain `UNION` only where the two halves can really produce the same row and you need it once.
+verify:
+  sql:
+    compare: true
+    ordered: true
+    setup: |
+      CREATE TABLE invoices (id INTEGER PRIMARY KEY, customer_id INTEGER, amount REAL, created_at TEXT);
+      CREATE TABLE refunds (id INTEGER PRIMARY KEY, customer_id INTEGER, amount REAL, created_at TEXT);
+      INSERT INTO invoices VALUES (1, 10, 99.0, '2026-01-01'), (2, 11, 15.5, '2026-01-03'), (3, 10, 20.0, '2026-01-05');
+      INSERT INTO refunds VALUES (1, 10, 99.0, '2026-01-02'), (2, 12, 5.0, '2026-01-04');
+---
+id: gen-sql-keyset-pagination-001
+category: generation
+language: sql
+patterns: [select-columns, efficient-algorithm]
+messages:
+  - role: user
+    content: |
+      I need the SQL for an export endpoint that pages through our transactions table (~50M rows, id is the primary key). Clients fetch 1000 rows at a time, we only need id, account_id, amount, booked_at.
+  - role: assistant
+    content: |
+      Use keyset pagination: the client sends the last `id` it received, and you continue from there.
+
+      ```sql
+      -- first page: pass 0 as last_id
+      SELECT id, account_id, amount, booked_at
+      FROM transactions
+      WHERE id > ?          -- last_id from the previous page
+      ORDER BY id
+      LIMIT 1000;
+      ```
+
+      The response includes the last `id` of the page, and the client sends it back to get the next page. An empty page means the export is done.
+
+      **Green Notes**
+      - **Keyset instead of `OFFSET`** (reduces E): with `LIMIT 1000 OFFSET 40000000` the database reads and throws away 40 million rows to return 1000, and every page gets slower than the one before. `WHERE id > ?` jumps straight into the primary key index, so every page costs the same.
+      - **Only the four needed columns** (reduces network): less data read and transferred for 50 million rows.
+        https://patterns.greensoftware.foundation/development/data-handling/reduce-transmitted-data
+verify:
+  static_only: "parameterized query; syntax checked with SQLite"
+---
+id: review-sql-last-order-subquery-001
+category: review
+language: sql
+patterns: [efficient-algorithm]
+messages:
+  - role: user
+    content: |
+      Monthly CRM report, takes forever on 400k customers. Any ideas?
+
+      ```sql
+      SELECT c.id,
+             c.name,
+             (SELECT MAX(o.created_at) FROM orders o WHERE o.customer_id = c.id) AS last_order,
+             (SELECT COUNT(*) FROM orders o WHERE o.customer_id = c.id) AS order_count,
+             (SELECT SUM(o.total) FROM orders o WHERE o.customer_id = c.id) AS revenue
+      FROM customers c
+      ORDER BY c.id;
+      ```
+  - role: assistant
+    content: |
+      **Workload:** data pipeline (monthly report)
+
+      #### [Medium] Three correlated subqueries per customer
+      - **Where:** the three `(SELECT ... WHERE o.customer_id = c.id)` columns
+      - **Issue:** for each of the 400k customers, the orders table is searched three separate times. Without an index on `orders.customer_id`, each search is a full scan.
+      - **Fix:** aggregate the orders once per customer and join the result.
+      - **Impact:** reduces E: the orders table is read once in total instead of three times per customer.
+
+      ```sql
+      SELECT c.id,
+             c.name,
+             o.last_order,
+             COALESCE(o.order_count, 0) AS order_count,
+             o.revenue
+      FROM customers c
+      LEFT JOIN (
+          SELECT customer_id,
+                 MAX(created_at) AS last_order,
+                 COUNT(*)        AS order_count,
+                 SUM(total)      AS revenue
+          FROM orders
+          GROUP BY customer_id
+      ) o ON o.customer_id = c.id
+      ORDER BY c.id;
+      ```
+
+      The `LEFT JOIN` keeps customers without orders, with `NULL` for last order and revenue and 0 for the count, just like the original. Also check that `orders.customer_id` is indexed. Other queries probably need that index anyway.
+verify:
+  sql:
+    compare: true
+    ordered: true
+    setup: |
+      CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT);
+      CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, total REAL, created_at TEXT);
+      INSERT INTO customers VALUES (1, 'Ada'), (2, 'Bob'), (3, 'Cleo');
+      INSERT INTO orders (customer_id, total, created_at) VALUES
+        (1, 10.0, '2026-01-01'), (1, 5.5, '2026-03-01'), (3, 99.0, '2026-02-10'), (1, 1.0, '2026-02-01');
+---
+id: gen-sql-postgres-bulk-upsert-001
+category: generation
+language: sql
+sql_dialect: postgres
+patterns: [batch-db-writes]
+facts: [F-PG-INSERT]
+messages:
+  - role: user
+    content: |
+      Every night we get a CSV with ~2 million products (sku, name, price, stock) from our ERP and need to upsert it into the `products` table in Postgres. Most rows don't change. What's the best way?
+  - role: assistant
+    content: |
+      Load the file with `COPY` into a staging table, then upsert in one statement and skip rows that didn't change:
+
+      ```sql
+      BEGIN;
+
+      CREATE TEMP TABLE products_import (LIKE products INCLUDING DEFAULTS) ON COMMIT DROP;
+
+      \copy products_import (sku, name, price, stock) FROM 'products.csv' WITH (FORMAT csv, HEADER true)
+
+      INSERT INTO products AS p (sku, name, price, stock)
+      SELECT sku, name, price, stock
+      FROM products_import
+      ON CONFLICT (sku) DO UPDATE
+         SET name  = EXCLUDED.name,
+             price = EXCLUDED.price,
+             stock = EXCLUDED.stock
+       WHERE (p.name, p.price, p.stock) IS DISTINCT FROM (EXCLUDED.name, EXCLUDED.price, EXCLUDED.stock);
+
+      COMMIT;
+      ```
+
+      Run it with `psql -f nightly_import.sql`. From Python, psycopg's `cursor.copy()` does the same as `\copy`.
+
+      **Green Notes**
+      - **`COPY` instead of row-by-row `INSERT`** (reduces E): one streaming bulk load instead of 2 million statements and round trips. In Green Metrics Tool measurements, COPY used about 22× less CPU energy than row-by-row inserts for batches of 5,000 rows ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=8e80b599-3332-432f-8c7e-1cfb93a3a354,8b4c205d-5fb1-40af-ab77-0427ca572f4e,adff4e53-2f1a-4d88-9c0d-dd681d02923f)).
+      - **Skip unchanged rows** (reduces E and storage): the `WHERE ... IS DISTINCT FROM` clause means Postgres only writes rows that really changed. Every update writes a new row version and WAL, and creates work for autovacuum later. With most rows unchanged, this avoids most of the write volume.
+      - **Temp table with `ON COMMIT DROP`:** nothing stays behind and no WAL is written for the staging data.
+verify:
+  static_only: "PostgreSQL dialect and psql meta-command"

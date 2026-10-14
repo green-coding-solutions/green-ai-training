@@ -1,0 +1,231 @@
+id: gen-1-00126-review
+category: review
+language: go
+patterns:
+- set-membership
+- memoize
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    hi, im new to Go. i made the landing page server for our small shop. it works but i feel something is wrong and i dont know what. can you look at it? spam_referrers.txt has about 15k domains in it
+
+    ```go
+    package main
+
+    import (
+        "bufio"
+        "fmt"
+        "html/template"
+        "net/http"
+        "net/url"
+        "os"
+        "strings"
+    )
+
+    type Plan struct {
+        Name     string
+        Cents    int
+        Features []string
+    }
+
+    var plans = []Plan{
+        {"Starter", 900, []string{"1 shop", "Email support"}},
+        {"Growth", 2900, []string{"5 shops", "Priority support", "Reports"}},
+        {"Pro", 7900, []string{"Unlimited shops", "Phone support", "Reports", "API"}},
+    }
+
+    var spamReferrers []string
+
+    func loadSpamReferrers(path string) {
+        f, err := os.Open(path)
+        if err != nil {
+            return
+        }
+        defer f.Close()
+        sc := bufio.NewScanner(f)
+        for sc.Scan() {
+            spamReferrers = append(spamReferrers, sc.Text())
+        }
+    }
+
+    func isSpam(host string) bool {
+        for _, s := range spamReferrers {
+            if s == host {
+                return true
+            }
+        }
+        return false
+    }
+
+    func renderPlanCards(plans []Plan) template.HTML {
+        var b strings.Builder
+        for _, p := range plans {
+            b.WriteString("<div class=\"plan\"><h3>" + template.HTMLEscapeString(p.Name) + "</h3>")
+            b.WriteString(fmt.Sprintf("<p class=\"price\">$%d.%02d / month</p><ul>", p.Cents/100, p.Cents%100))
+            for _, f := range p.Features {
+                b.WriteString("<li>" + template.HTMLEscapeString(f) + "</li>")
+            }
+            b.WriteString("</ul></div>")
+        }
+        return template.HTML(b.String())
+    }
+
+    func landing(w http.ResponseWriter, r *http.Request) {
+        tmpl, err := template.ParseFiles("templates/landing.html")
+        if err != nil {
+            http.Error(w, "server error", 500)
+            return
+        }
+        if u, err := url.Parse(r.Referer()); err == nil && isSpam(u.Hostname()) {
+            http.Error(w, "forbidden", 403)
+            return
+        }
+        data := map[string]any{
+            "Title": "Shopwise",
+            "Cards": renderPlanCards(plans),
+        }
+        tmpl.Execute(w, data)
+    }
+
+    func main() {
+        loadSpamReferrers("spam_referrers.txt")
+        http.HandleFunc("/", landing)
+        http.ListenAndServe(":8080", nil)
+    }
+    ```
+- role: assistant
+  content: |
+    **Workload:** web backend (landing page, hit on every visit)
+
+    #### [Bug] Direct visitors can get a 403
+    - **Where:** `loadSpamReferrers` / `isSpam`
+    - **Issue:** blank lines are added to the list too. Many text files end with an empty line. Then `""` is in `spamReferrers`. A visitor who types your URL has no `Referer`, so `u.Hostname()` is `""`, and `isSpam("")` returns true. They see "forbidden".
+    - **Fix:** skip blank lines, and lowercase the names, because host names are case-insensitive.
+
+    #### [Bug] Errors are ignored
+    - **Where:** `os.Open` in `loadSpamReferrers`, `ListenAndServe` and `tmpl.Execute` in `main` / `landing`
+    - **Issue:** if the file is missing, the server starts with an empty list and says nothing. If the port is busy, the program exits without a message.
+    - **Fix:** return the error and stop at startup with `log.Fatal`.
+
+    #### [High] Template is read from disk and parsed on every request
+    - **Where:** `template.ParseFiles` inside `landing`
+    - **Issue:** the file and the result never change while the server runs. Every visit repeats the file read and the parse for the same answer.
+    - **Fix:** parse once at startup with `template.Must`. A parsed template can safely be used by many requests at the same time.
+    - **Impact:** reduces E on every request (file I/O and CPU).
+
+    #### [High] Linear scan of 15k entries on every request
+    - **Where:** `isSpam`
+    - **Issue:** each visit compares the host with up to 15,000 strings. A map lookup is one hash and one compare.
+    - **Fix:** load the list into a `map[string]struct{}` once at startup. Reads from a map that is never written after startup are safe without a lock.
+    - **Impact:** reduces E per request, from O(n) to O(1).
+    - A set only pays off when you look up many times. In Green Metrics Tool micro-benchmarks, one membership test on a 10,000,000-element list (~6.9 J) used less CPU energy than converting it to a set first and testing once (~10.5 J) ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=70871c0f-e630-4755-a459-b98e5d4031f2,722fea72-6f69-4acb-8ce7-632caeb444f4)). Here you build the map once and use it for every visit, so it fits.
+
+    #### [Medium] Plan cards are rebuilt on every request
+    - **Where:** `renderPlanCards(plans)` in `landing`
+    - **Issue:** `plans` is hard-coded and only changes when you deploy. The HTML is the same every time.
+    - **Fix:** build it once in `main`. This is not a cache with expiry, because the input is fixed.
+    - If prices later come from a database and can change, don't keep the HTML forever without a way to refresh it.
+
+    ```go
+    package main
+
+    import (
+        "bufio"
+        "fmt"
+        "html/template"
+        "log"
+        "net/http"
+        "net/url"
+        "os"
+        "strings"
+    )
+
+    type Plan struct {
+        Name     string
+        Cents    int
+        Features []string
+    }
+
+    var plans = []Plan{
+        {"Starter", 900, []string{"1 shop", "Email support"}},
+        {"Growth", 2900, []string{"5 shops", "Priority support", "Reports"}},
+        {"Pro", 7900, []string{"Unlimited shops", "Phone support", "Reports", "API"}},
+    }
+
+    var (
+        landingTmpl   = template.Must(template.ParseFiles("templates/landing.html"))
+        spamReferrers map[string]struct{}
+        planCards     template.HTML
+    )
+
+    func loadSpamReferrers(path string) (map[string]struct{}, error) {
+        f, err := os.Open(path)
+        if err != nil {
+            return nil, err
+        }
+        defer f.Close()
+
+        set := make(map[string]struct{})
+        sc := bufio.NewScanner(f)
+        for sc.Scan() {
+            host := strings.ToLower(strings.TrimSpace(sc.Text()))
+            if host == "" {
+                continue
+            }
+            set[host] = struct{}{}
+        }
+        return set, sc.Err()
+    }
+
+    func isSpam(host string) bool {
+        _, ok := spamReferrers[strings.ToLower(host)]
+        return ok
+    }
+
+    func renderPlanCards(plans []Plan) template.HTML {
+        var b strings.Builder
+        for _, p := range plans {
+            b.WriteString("<div class=\"plan\"><h3>" + template.HTMLEscapeString(p.Name) + "</h3>")
+            b.WriteString(fmt.Sprintf("<p class=\"price\">$%d.%02d / month</p><ul>", p.Cents/100, p.Cents%100))
+            for _, f := range p.Features {
+                b.WriteString("<li>" + template.HTMLEscapeString(f) + "</li>")
+            }
+            b.WriteString("</ul></div>")
+        }
+        return template.HTML(b.String())
+    }
+
+    func landing(w http.ResponseWriter, r *http.Request) {
+        if u, err := url.Parse(r.Referer()); err == nil && isSpam(u.Hostname()) {
+            http.Error(w, "forbidden", http.StatusForbidden)
+            return
+        }
+        data := map[string]any{
+            "Title": "Shopwise",
+            "Cards": planCards,
+        }
+        if err := landingTmpl.Execute(w, data); err != nil {
+            log.Printf("render landing: %v", err)
+        }
+    }
+
+    func main() {
+        var err error
+        spamReferrers, err = loadSpamReferrers("spam_referrers.txt")
+        if err != nil {
+            log.Fatalf("load spam referrers: %v", err)
+        }
+        planCards = renderPlanCards(plans)
+
+        http.HandleFunc("/", landing)
+        log.Fatal(http.ListenAndServe(":8080", nil))
+    }
+    ```
+
+    **Already good:** `html/template` escapes your data, and you use `strings.Builder` instead of `+=` in the loop.
+
+    If the spam list changes while the server runs, reload it into a new map and swap it in under a lock or with `atomic.Pointer`. Don't write to the live map from a handler.
+verify:
+  static_only: Go toolchain and template files are not available in the verifier

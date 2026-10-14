@@ -1,0 +1,71 @@
+id: gen-1-00225-refactor
+category: refactor
+language: bash
+patterns:
+- bash-quoting
+facts:
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    ```bash
+    #!/bin/bash
+    # builds the replay fixture for the orders API load test
+    set -euo pipefail
+
+    OUT="${1:-fixtures/orders.ndjson}"
+    COUNT="${2:-200000}"
+    BASE_URL="${API_BASE_URL:-http://localhost:8080}"
+
+    mkdir -p "$(dirname "$OUT")"
+    : > "$OUT"
+
+    for ((i = 1; i <= COUNT; i++)); do
+      method="POST"
+      path="/v1/orders"
+      ua="orders-loadtest/1.4 (+https://wiki.internal.example/loadtest)"
+      note="synthetic order from the fixture builder, no real customer data, safe to delete, see the wiki page for the loadtest setup"
+      printf "{\"method\":\"%s\",\"url\":\"%s%s\",\"headers\":{\"User-Agent\":\"%s\"},\"body\":{\"order_id\":%d,\"currency\":\"EUR\",\"note\":\"%s\"}}\n" \
+        "$method" "$BASE_URL" "$path" "$ua" "$i" "$note" >> "$OUT"
+    done
+
+    echo "wrote $COUNT requests to $OUT"
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```bash
+    #!/bin/bash
+    # builds the replay fixture for the orders API load test
+    set -euo pipefail
+
+    OUT="${1:-fixtures/orders.ndjson}"
+    COUNT="${2:-200000}"
+    BASE_URL="${API_BASE_URL:-http://localhost:8080}"
+
+    mkdir -p "$(dirname "$OUT")"
+
+    method='POST'
+    path='/v1/orders'
+    ua='orders-loadtest/1.4 (+https://wiki.internal.example/loadtest)'
+    note='synthetic order from the fixture builder, no real customer data, safe to delete, see the wiki page for the loadtest setup'
+
+    for ((i = 1; i <= COUNT; i++)); do
+      printf '{"method":"%s","url":"%s%s","headers":{"User-Agent":"%s"},"body":{"order_id":%d,"currency":"EUR","note":"%s"}}\n' \
+        "$method" "$BASE_URL" "$path" "$ua" "$i" "$note"
+    done > "$OUT"
+
+    echo "wrote $COUNT requests to $OUT"
+    ```
+
+    The output file is the same as before, including when `COUNT` is 0 (an empty file).
+
+    **Green Notes**
+    - **Single quotes for literals without expansion** (reduces E): `method`, `path`, `ua`, `note` and the `printf` format contain no `$`, backticks or expanded backslashes. Bash scans double-quoted text for those, but takes single-quoted text as is. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal 1,000,000 times used about 24% less CPU energy with single quotes ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=dd9bbb4e-b056-4067-8ad2-7b1818a86f10,b265ef9b-adb9-4b56-a14b-ae34fdaa7247,28d92c15-79d7-44ca-8f43-a733fe2e265a,a9533378-71f0-49df-bd5f-1e5f27cda9c2)). Your literals are much shorter, so the saving here is smaller. It grows with literal length and loop count.
+    - **Constants moved out of the loop:** the four assignments ran 200,000 times for the same values. Now they run once.
+    - **One redirect for the whole loop:** `done > "$OUT"` opens the file once. Before, `>> "$OUT"` opened and closed it on every iteration. The separate truncate line is no longer needed.
+    - **Readability:** the single-quoted `printf` format has no `\"` escapes, so the JSON is easier to read.
+    - Quotes around `"$BASE_URL"`, `"$OUT"` and the other variable expansions stay as they are. They are needed.
+verify:
+  static_only: bash fixture generator; no Python/JS equivalence harness, output depends on shell and filesystem

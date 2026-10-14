@@ -1,0 +1,104 @@
+id: gen-1-00072-generation
+category: generation
+language: html
+patterns:
+- modern-image-formats
+- lazy-load-images
+facts:
+- F-IMGRENDER
+- F-IMGENC
+messages:
+- role: user
+  content: |
+    I'm writing a small CLI (`trailcam-report`) that writes a static HTML page after each sync of our wildlife camera traps. The page is opened by volunteers, mostly on phones in the field.
+
+    The tool already creates three files per photo in the output folder: `IMG_0042.avif`, `IMG_0042.webp`, `IMG_0042.jpg` (1600 px wide), and the same with a `-480` suffix (480 px wide), e.g. `IMG_0042-480.avif`. All photos are 3:2.
+
+    What I need is the HTML that my tool fills in, as a template with `{{ }}` placeholders:
+    - the page skeleton with a title and a short summary line
+    - the first photo shown large at the top
+    - all other photos in a responsive grid (1 column on phones, 3 on wide screens)
+    - a caption (time + camera name) under each photo
+    - no layout jumping while loading
+    - must still work on old browsers
+
+    Plain HTML and a bit of CSS, no JavaScript, no framework.
+- role: assistant
+  content: |
+    Use `<picture>` with AVIF first, then WebP, then JPEG as the fallback. Old browsers ignore the `<source>` tags and load the JPEG.
+
+    ```html
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>{{ title }}</title>
+      <style>
+        body { font-family: system-ui, sans-serif; margin: 0 auto; max-width: 70rem; padding: 1rem; }
+        img { display: block; width: 100%; height: auto; }
+        figure { margin: 0; }
+        figcaption { font-size: .9rem; padding: .25rem 0 .75rem; }
+        .grid { display: grid; gap: 1rem; grid-template-columns: 1fr; }
+        @media (min-width: 900px) { .grid { grid-template-columns: repeat(3, 1fr); } }
+      </style>
+    </head>
+    <body>
+      <h1>{{ title }}</h1>
+      <p>{{ summary }}</p>
+
+      <!-- First photo: above the fold, so load it right away -->
+      <figure>
+        <picture>
+          <source type="image/avif"
+                  srcset="{{ first.name }}-480.avif 480w, {{ first.name }}.avif 1600w"
+                  sizes="(min-width: 70rem) 68rem, 100vw">
+          <source type="image/webp"
+                  srcset="{{ first.name }}-480.webp 480w, {{ first.name }}.webp 1600w"
+                  sizes="(min-width: 70rem) 68rem, 100vw">
+          <img src="{{ first.name }}.jpg"
+               srcset="{{ first.name }}-480.jpg 480w, {{ first.name }}.jpg 1600w"
+               sizes="(min-width: 70rem) 68rem, 100vw"
+               width="1600" height="1067" fetchpriority="high"
+               alt="{{ first.alt }}">
+        </picture>
+        <figcaption>{{ first.time }} · {{ first.camera }}</figcaption>
+      </figure>
+
+      <div class="grid">
+        {% for photo in photos %}
+        <figure>
+          <picture>
+            <source type="image/avif"
+                    srcset="{{ photo.name }}-480.avif 480w, {{ photo.name }}.avif 1600w"
+                    sizes="(min-width: 900px) 23rem, 100vw">
+            <source type="image/webp"
+                    srcset="{{ photo.name }}-480.webp 480w, {{ photo.name }}.webp 1600w"
+                    sizes="(min-width: 900px) 23rem, 100vw">
+            <img src="{{ photo.name }}-480.jpg"
+                 srcset="{{ photo.name }}-480.jpg 480w, {{ photo.name }}.jpg 1600w"
+                 sizes="(min-width: 900px) 23rem, 100vw"
+                 width="1600" height="1067" loading="lazy" decoding="async"
+                 alt="{{ photo.alt }}">
+          </picture>
+          <figcaption>{{ photo.time }} · {{ photo.camera }}</figcaption>
+        </figure>
+        {% endfor %}
+      </div>
+    </body>
+    </html>
+    ```
+
+    Notes on the template:
+    - `width`/`height` plus `height: auto` in the CSS reserve the 3:2 box before the file arrives, so nothing jumps.
+    - The `sizes` values assume a 70 rem page and a 3-column grid. Change them if you change the layout.
+    - Use the same `<picture>` markup for every photo, so the generator needs only one macro.
+
+    **Green Notes**
+    - **Modern formats with a JPEG fallback** (reduces network): AVIF and WebP files are usually much smaller than the JPEG for photos, which matters on mobile data. Decoding costs a bit more on the client: in Green Metrics Tool browser benchmarks, AVIF page loads used about 19% more CPU energy than JPG ([measurements](https://metrics.green-coding.io/stats.html?id=b31ca361-1745-4fac-8e6b-a97ec99bf476)). So the gain comes from fewer transferred bytes, not from cheaper decoding.
+    - **Encode in the CLI, once per sync** (reduces E): AVIF encoding is expensive, about 7× the energy of JPG in Green Metrics Tool micro-benchmarks ([measurements](https://metrics.green-coding.io/stats.html?id=81a932bc-04da-443b-93cf-d4d8468de247)). Keep it in your build step and skip photos that already have output files. Never convert on request.
+    - **`srcset` + `sizes`** (reduces network): phones take the 480 px file, wide screens the 1600 px one.
+    - **Lazy loading below the first photo** (reduces network): `loading="lazy"` on the grid images means photos nobody scrolls to are never downloaded. The first image is not lazy, so it shows fast.
+    - *Not applied:* a CDN or JavaScript gallery library — a static page for volunteers does not need them.
+verify:
+  static_only: HTML template with placeholders, no runnable code

@@ -1,0 +1,108 @@
+id: gen-1-00028-review
+category: review
+language: java
+patterns:
+- deque-or-append
+- keep-star-imports
+messages:
+- role: user
+  content: |
+    Hi, please can you review this class? It is in our ETL job that read csv rows from a big export (few million rows per night). We keep last rows in window for checking the avarage amount. The job is slow and I dont know why. Also my colleague say the `import java.util.*` is bad for performance, is this true?
+
+    ```java
+    import java.util.*;
+
+    public class RowWindow {
+        private final List<String[]> window = new ArrayList<>();
+        private final int maxRows;
+
+        public RowWindow(int maxRows) {
+            this.maxRows = maxRows;
+        }
+
+        public void add(String[] row) {
+            window.add(0, row);
+            while (window.size() > maxRows) {
+                window.remove(window.size() - 1);
+            }
+        }
+
+        public List<String[]> latest(int n) {
+            int end = Math.min(n, window.size());
+            return new ArrayList<>(window.subList(0, end));
+        }
+
+        public double averageAmount(int col) {
+            double sum = 0;
+            for (String[] row : window) {
+                sum += Double.parseDouble(row[col]);
+            }
+            return sum / window.size();
+        }
+    }
+    ```
+
+    We use maxRows = 100000.
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly batch, `add()` runs once per row)
+
+    #### [High] Front insertion into an `ArrayList` for every row
+    - **Where:** `RowWindow.add`, the line `window.add(0, row)`
+    - **Issue:** `add(0, ...)` moves every stored element one slot to the right. With `maxRows = 100000`, a full window means about 100,000 element moves for each new row. Over a few million rows this is the main cost of the job.
+    - **Fix:** use `ArrayDeque`. `addFirst` and `removeLast` are O(1). Iteration still starts with the newest row, so `latest()` and `averageAmount()` return the same results.
+    - **Impact:** reduces E per row from work proportional to the window size to constant work. This is a counting argument, not a measurement. To check it, run the job with `perf stat` or the Green Metrics Tool before and after.
+
+    #### [Bug] Empty window gives `NaN`
+    - **Where:** `averageAmount`
+    - **Issue:** with no rows, `0 / 0` gives `NaN` as a `double`. It will silently pass into any later calculation.
+    - **Fix:** return `0.0` (or throw) for an empty window. The code below returns `0.0`, which is a small behavior change.
+
+    #### [Low] `import java.util.*` is fine
+    - Your colleague is wrong here. A wildcard import is resolved by the compiler. It does not change the bytecode, and it costs nothing at runtime. Leave it as it is. Do not spend time on it.
+
+    ```java
+    import java.util.*;
+
+    public class RowWindow {
+        private final Deque<String[]> window = new ArrayDeque<>();
+        private final int maxRows;
+
+        public RowWindow(int maxRows) {
+            this.maxRows = maxRows;
+        }
+
+        public void add(String[] row) {
+            window.addFirst(row);
+            if (window.size() > maxRows) {
+                window.removeLast();
+            }
+        }
+
+        public List<String[]> latest(int n) {
+            List<String[]> out = new ArrayList<>(Math.min(n, window.size()));
+            for (String[] row : window) {
+                if (out.size() == n) break;
+                out.add(row);
+            }
+            return out;
+        }
+
+        public double averageAmount(int col) {
+            if (window.isEmpty()) return 0.0;
+            double sum = 0;
+            for (String[] row : window) {
+                sum += Double.parseDouble(row[col]);
+            }
+            return sum / window.size();
+        }
+    }
+    ```
+
+    `ArrayDeque` does not accept `null` elements. Your old code would already fail on a `null` row in `averageAmount`, so this should not matter.
+
+    `averageAmount` still walks the whole window on each call. If you call it per row, keep a running sum instead (add the new value, subtract the removed one). That would remove another O(window) pass per row.
+
+    **Already good:** the window is bounded, so memory stays flat during the whole run. `latest()` returns a copy, so callers cannot change the window by accident.
+verify:
+  static_only: Java code is not executed by the verifier (no JDK-based runner for this example).

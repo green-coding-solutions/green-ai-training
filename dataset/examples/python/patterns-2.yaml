@@ -1,0 +1,466 @@
+id: gen-py-config-price-cache-001
+category: generation
+language: python
+patterns: [memoize]
+facts: [F-LRU]
+messages:
+  - role: user
+    content: |
+      Write `configured_price(model: str, options: tuple[str, ...]) -> int` for our bike configurator. It has to walk our rule engine (`rules.evaluate(model, options)`, pure function, ~20 ms per call). It's called on every page view of a configuration page, and in practice there are only a few hundred popular configurations.
+  - role: assistant
+    content: |
+      ```python
+      from functools import lru_cache
+
+      @lru_cache(maxsize=1024)
+      def _price_for(model: str, options: frozenset[str]) -> int:
+          return rules.evaluate(model, tuple(sorted(options)))
+
+      def configured_price(model: str, options: tuple[str, ...]) -> int:
+          # option order doesn't change the price, so ("a", "b") and ("b", "a") share one cache entry
+          return _price_for(model, frozenset(options))
+      ```
+
+      After a deploy of new price rules, call `_price_for.cache_clear()`.
+
+      **Green Notes**
+      - **Memoize a pure, expensive function** (reduces E): a few hundred configurations account for most page views, so most calls are answered from the cache instead of 20 ms of rule evaluation. In Green Metrics Tool micro-benchmarks with inputs drawn from only 200 distinct values, `lru_cache` used about 9× less energy than recomputing ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=ddf98f50-15ee-48e2-ab38-cc89acc88142,808b9a2c-1abf-4af5-9b04-3a6ce700fcdb)).
+      - **Bounded cache** (`maxsize=1024`): memory stays limited even if crawlers request thousands of rare combinations.
+      - **Normalized key:** the same options in a different order hit the same entry.
+
+      This assumes `rules.evaluate` depends only on its arguments. If prices also depend on time (sales, currency rates), add that to the key or use a TTL cache instead.
+verify:
+  setup: |
+    import types
+    calls = []
+    def _evaluate(model, options):
+        calls.append((model, options))
+        return 1000 + 10 * len(options) + len(model)
+    rules = types.SimpleNamespace(evaluate=_evaluate)
+  test: |
+    assert configured_price("city", ("rack", "lights")) == 1000 + 20 + 4
+    assert configured_price("city", ("lights", "rack")) == 1024
+    assert configured_price("gravel", ()) == 1006
+    assert len(calls) == 2, calls
+    assert calls[0] == ("city", ("lights", "rack"))
+---
+id: review-py-lru-cache-misuse-001
+category: review
+language: python
+patterns: [memoize]
+messages:
+  - role: user
+    content: |
+      I added caching to speed up our API. Does this look right?
+
+      ```python
+      from functools import lru_cache
+
+      class ReportService:
+          def __init__(self, db):
+              self.db = db
+
+          @lru_cache(maxsize=None)
+          def daily_report(self, account_id, day):
+              rows = self.db.fetch_events(account_id, day)
+              return summarize(rows)
+
+      @lru_cache(maxsize=None)
+      def render_request_log(request_id, payload):
+          return format_log_line(request_id, payload)
+      ```
+  - role: assistant
+    content: |
+      **Workload:** web backend
+
+      #### [Bug] Cached reports never refresh for today
+      - **Where:** `daily_report`
+      - **Issue:** the report for the current day is cached on first request, and new events that arrive later are never shown.
+      - **Fix:** only cache days that are complete, or add a TTL.
+
+      #### [High] Unbounded cache on unique keys
+      - **Where:** `render_request_log` with `maxsize=None`
+      - **Issue:** every request id is unique, so the cache never gets a hit. It only stores every log line forever. Memory grows until the process restarts, and you pay for hashing and storing on every call for nothing.
+      - **Fix:** remove the cache. Memoization only saves work when the same inputs come back.
+      - **Impact:** reduces memory steadily (reduces M), and removes useless work per request.
+
+      #### [Medium] `lru_cache` on a method keeps instances alive
+      - **Where:** `@lru_cache` on `ReportService.daily_report`
+      - **Issue:** `self` becomes part of every cache key, so the cache holds a reference to each `ReportService` and its `db` connection, and they are never freed. With `maxsize=None` this also grows without limit.
+      - **Fix:** cache a module-level function keyed by `(account_id, day)` with a bounded size.
+
+      ```python
+      import datetime
+      from functools import lru_cache
+
+      class ReportService:
+          def __init__(self, db):
+              self.db = db
+
+          def daily_report(self, account_id, day: datetime.date):
+              if day >= datetime.date.today():
+                  return summarize(self.db.fetch_events(account_id, day))  # still changing, don't cache
+              return _closed_day_report(self.db, account_id, day)
+
+      @lru_cache(maxsize=4096)
+      def _closed_day_report(db, account_id, day):
+          return summarize(db.fetch_events(account_id, day))
+
+      def render_request_log(request_id, payload):
+          return format_log_line(request_id, payload)
+      ```
+
+      `db` is still part of the key here, which is fine if you have one long-lived database object. Past days don't change, so those reports are safe to keep.
+verify:
+  green_block: 0
+  setup: |
+    def summarize(rows):
+        return sum(rows)
+    def format_log_line(rid, payload):
+        return f"{rid}:{payload}"
+    class FakeDB:
+        def __init__(self):
+            self.calls = 0
+        def fetch_events(self, account_id, day):
+            self.calls += 1
+            return [account_id, day.toordinal() % 7]
+  test: |
+    import datetime
+    db = FakeDB()
+    svc = ReportService(db)
+    past = datetime.date.today() - datetime.timedelta(days=3)
+    a = svc.daily_report(1, past); b = svc.daily_report(1, past)
+    assert a == b and db.calls == 1
+    svc.daily_report(1, datetime.date.today()); svc.daily_report(1, datetime.date.today())
+    assert db.calls == 3
+    assert render_request_log("r1", "x") == "r1:x"
+---
+id: gen-py-status-class-001
+category: generation
+language: python
+patterns: [simple-conditions]
+facts: [F-COND]
+messages:
+  - role: user
+    content: |
+      For our metrics middleware I need a function that maps an HTTP status code to "informational", "success", "redirect", "client_error", "server_error" or "unknown". It runs on every request.
+  - role: assistant
+    content: |
+      ```python
+      _STATUS_CLASSES = ("unknown", "informational", "success", "redirect", "client_error", "server_error")
+
+      def status_class(code: int) -> str:
+          group = code // 100
+          return _STATUS_CLASSES[group] if 1 <= group <= 5 else "unknown"
+      ```
+
+      **Green Notes**
+      - **One integer division and a tuple lookup** (reduces E): no chain of range comparisons like `100 <= code < 200 or ...` evaluated branch by branch on every request. In Green Metrics Tool micro-benchmarks, simple equality-style dispatch used about 16% less energy than complex range and modulo conditions ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=123676d7-2121-4b9d-b78e-e065836fc608,a7780e2a-2934-4d26-b2a9-2cda7848adc1)).
+      - The table is built once at import time, not per call.
+verify:
+  test: |
+    assert status_class(101) == "informational"
+    assert status_class(200) == "success"
+    assert status_class(204) == "success"
+    assert status_class(301) == "redirect"
+    assert status_class(404) == "client_error"
+    assert status_class(503) == "server_error"
+    assert status_class(99) == "unknown"
+    assert status_class(600) == "unknown"
+    assert status_class(0) == "unknown"
+---
+id: refactor-py-parse-missing-values-001
+category: refactor
+language: python
+patterns: [avoid-exception-flow]
+messages:
+  - role: user
+    content: |
+      We parse a weather station export with millions of values. Lots of them are "NA" or empty (sensor offline), maybe 40%. Make this faster?
+
+      ```python
+      def parse_values(raw_values):
+          result = []
+          for v in raw_values:
+              try:
+                  result.append(float(v))
+              except ValueError:
+                  result.append(None)
+          return result
+      ```
+  - role: assistant
+    content: |
+      ```python
+      MISSING = frozenset({"", "NA", "N/A", "null"})
+
+      def _parse(v):
+          if v in MISSING:
+              return None
+          try:
+              return float(v)
+          except ValueError:
+              return None  # unexpected garbage stays None, like before
+
+      def parse_values(raw_values):
+          return [_parse(v) for v in raw_values]
+      ```
+
+      **Green Notes**
+      - **Check the expected case first** (reduces E): with ~40% missing values, the old code raised and caught a `ValueError` for millions of entries. Raising an exception is far more expensive than a set lookup. Known missing markers are now handled without an exception.
+      - **`try` stays as a safety net** for rare, unexpected strings, where exceptions are cheap because they almost never happen.
+      - Same output: missing or invalid values become `None`, everything else a float. Add other markers your export uses to `MISSING`.
+verify:
+  equivalence:
+    driver: |
+      import random
+      random.seed(4)
+      vals = [random.choice(["", "NA", "N/A", "null", "x?", f"{random.uniform(-30, 40):.1f}"]) for _ in range(3000)]
+      print(parse_values(vals))
+  benchmark:
+    driver: |
+      import random, time
+      random.seed(4)
+      vals = [random.choice(["", "NA", f"{random.uniform(-30, 40):.1f}", f"{random.uniform(-30, 40):.2f}", "N/A"]) for _ in range(400_000)]
+      t = time.process_time()
+      parse_values(vals)
+      print("__CPU__", time.process_time() - t)
+    min_speedup: 1.3
+---
+id: review-py-validation-no-grad-001
+category: review
+language: python
+patterns: [torch-no-grad]
+facts: [F-NOGRAD]
+messages:
+  - role: user
+    content: |
+      Review the validation part of our training loop? It runs after every epoch on a 50k-sample validation set.
+
+      ```python
+      def validate(model, loader, loss_fn, device):
+          total_loss, correct, n = 0.0, 0, 0
+          for x, y in loader:
+              x, y = x.to(device), y.to(device)
+              logits = model(x)
+              total_loss += loss_fn(logits, y).item() * len(y)
+              correct += (logits.argmax(dim=1) == y).sum().item()
+              n += len(y)
+          return total_loss / n, correct / n
+      ```
+  - role: assistant
+    content: |
+      **Workload:** AI/ML (training, runs every epoch)
+
+      #### [Bug] Model stays in training mode
+      - **Where:** no `model.eval()` before the loop
+      - **Issue:** dropout is active and batch norm uses and updates batch statistics, so the validation numbers are noisy and the batch-norm running stats get changed by validation data.
+      - **Fix:** `model.eval()` at the start, and switch back with `model.train()` in the training loop.
+
+      #### [Medium] Gradients tracked during validation
+      - **Where:** `logits = model(x)` without `torch.no_grad()`
+      - **Issue:** autograd builds the backward graph for every validation batch and keeps activations in memory, although no backward pass follows. That costs compute every epoch and limits the batch size you can use for validation.
+      - **Fix:** run the loop under `torch.inference_mode()`.
+      - **Impact:** reduces E every epoch. In Green Metrics Tool micro-benchmarks, CPU inference with `no_grad()` used about 14% less energy, plus the memory savings ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=42de8e68-4536-43f4-a9bd-427ec42affd1,7e6a3886-425a-4992-9f14-180bede2d841)).
+
+      ```python
+      import torch
+
+      @torch.inference_mode()
+      def validate(model, loader, loss_fn, device):
+          model.eval()
+          total_loss, correct, n = 0.0, 0, 0
+          for x, y in loader:
+              x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+              logits = model(x)
+              total_loss += loss_fn(logits, y).item() * len(y)
+              correct += (logits.argmax(dim=1) == y).sum().item()
+              n += len(y)
+          return total_loss / n, correct / n
+      ```
+
+      Call `model.train()` again at the beginning of each training epoch.
+verify:
+  static_only: "needs torch"
+---
+id: gen-py-rolling-latency-001
+category: generation
+language: python
+patterns: [deque-or-append]
+messages:
+  - role: user
+    content: |
+      I need a small class that keeps the last N latency samples (ms) and gives me the current average. `add()` is called for every request, `average()` maybe once per second by a metrics exporter.
+  - role: assistant
+    content: |
+      ```python
+      from collections import deque
+
+      class RollingAverage:
+          def __init__(self, size: int = 60):
+              self._samples = deque(maxlen=size)
+              self._total = 0.0
+
+          def add(self, value: float) -> None:
+              if len(self._samples) == self._samples.maxlen:
+                  self._total -= self._samples[0]  # this one drops out on append
+              self._samples.append(value)
+              self._total += value
+
+          def average(self) -> float | None:
+              return self._total / len(self._samples) if self._samples else None
+      ```
+
+      **Green Notes**
+      - **`deque(maxlen=N)`** (reduces E): old samples drop out in O(1). A list with `pop(0)` or slicing would shift or copy all N samples on every request.
+      - **Running total:** `add` keeps the sum up to date, so `average()` doesn't loop over the window.
+      - For very long-running processes with float values, floating-point error in the running total stays tiny for typical latency ranges. If you need exact values, recompute the sum from the deque occasionally.
+verify:
+  test: |
+    r = RollingAverage(3)
+    assert r.average() is None
+    for v in (10, 20, 30):
+        r.add(v)
+    assert abs(r.average() - 20) < 1e-9
+    r.add(60)
+    assert abs(r.average() - (20 + 30 + 60) / 3) < 1e-9
+    for v in range(1000):
+        r.add(5.0)
+    assert abs(r.average() - 5.0) < 1e-9
+---
+id: gen-py-csv-copy-postgres-001
+category: generation
+language: python
+patterns: [batch-db-writes]
+facts: [F-PG-INSERT]
+messages:
+  - role: user
+    content: |
+      Python function to load a CSV of ~300k newsletter subscribers (email, name, signed_up_at) into the `subscribers` table in Postgres. We use psycopg 3.
+  - role: assistant
+    content: |
+      ```python
+      import csv
+
+      import psycopg
+
+      def load_subscribers(csv_path: str, dsn: str) -> int:
+          with psycopg.connect(dsn) as conn, open(csv_path, newline="", encoding="utf-8") as f:
+              reader = csv.DictReader(f)
+              with conn.cursor() as cur:
+                  with cur.copy("COPY subscribers (email, name, signed_up_at) FROM STDIN") as copy:
+                      count = 0
+                      for row in reader:
+                          copy.write_row((row["email"].strip().lower(), row["name"].strip(), row["signed_up_at"]))
+                          count += 1
+              # the connection context manager commits once at the end
+          return count
+      ```
+
+      **Green Notes**
+      - **`COPY` instead of one `INSERT` per row** (reduces E): all rows stream to the server in a single bulk operation. 300k separate statements would mean 300k round trips and as many statement executions. In Green Metrics Tool measurements with PostgreSQL and psycopg, COPY used about 22× less CPU energy than one `execute()` per row, and about 8× less than `executemany()` ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=8e80b599-3332-432f-8c7e-1cfb93a3a354,8b4c205d-5fb1-40af-ab77-0427ca572f4e,adff4e53-2f1a-4d88-9c0d-dd681d02923f)).
+      - **One transaction:** commits once, so the whole import either succeeds or leaves the table unchanged.
+      - The CSV is read row by row, so memory stays small regardless of file size.
+
+      If the table can already contain some of these emails, `COPY` into a temporary table first and then `INSERT ... SELECT ... ON CONFLICT (email) DO NOTHING`.
+verify:
+  static_only: "needs psycopg and PostgreSQL"
+---
+id: review-py-log-archive-compress-001
+category: review
+language: python
+patterns: [compress-stored]
+facts: [F-COMPRESS-CODECS]
+messages:
+  - role: user
+    content: |
+      This nightly job archives yesterday's application logs (~40 GB of text per day) to S3, where we keep them for 13 months for compliance. Rarely read. Feedback?
+
+      ```python
+      import datetime
+      import boto3
+
+      s3 = boto3.client("s3")
+
+      def archive(day: datetime.date, log_path: str):
+          key = f"logs/{day:%Y/%m/%d}/app.log"
+          s3.upload_file(log_path, "acme-log-archive", key)
+      ```
+  - role: assistant
+    content: |
+      **Workload:** data pipeline (nightly batch, long-term storage)
+
+      #### [High] 13 months of uncompressed text
+      - **Where:** `s3.upload_file(log_path, ...)`
+      - **Issue:** application logs are highly repetitive text, and they are stored for over a year and rarely read. This is the case where compression clearly pays off: it is done once per file, and the storage and transfer savings then last for 13 months.
+      - **Fix:** compress with zstd at a moderate level before upload. In Green Metrics Tool measurements on 100 MB of text, zstd at its default level used about 4× less energy than gzip, while xz used about 29× more than zstd ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=2584305c-7a1e-47e2-b6cc-26276962035e,addc5f5e-55da-47f8-956d-240d06304e4e,fb08d3c3-ba41-4f0f-85fd-0b6c34e6c39b,f1479db0-c453-4aaa-9116-e137621fad07,7b3bb87d-3b43-4f82-be99-0327405205b8,905bd408-6b31-4237-a4da-14b8fad90613,7f213a20-8028-4080-9583-6e465c217bb5,8e93a8d2-60b0-4831-905b-764b68257bc7)). Stronger codecs give somewhat smaller files, but for 40 GB every night a fast codec keeps the daily compression cost low and still removes most of the size of repetitive logs.
+      - **Impact:** reduces storage and network on every upload and every day of retention (reduces M on the storage side).
+
+      #### [Low] Storage class
+      - **Issue:** rarely read compliance data sits in S3 Standard by default.
+      - **Fix:** a lifecycle rule to a colder storage class after 30 days. That is configuration, not code.
+
+      ```python
+      import datetime
+      import os
+      import tempfile
+
+      import boto3
+      import zstandard
+
+      s3 = boto3.client("s3")
+
+      def archive(day: datetime.date, log_path: str):
+          key = f"logs/{day:%Y/%m/%d}/app.log.zst"
+          with tempfile.NamedTemporaryFile(suffix=".zst", delete=False) as tmp:
+              tmp_path = tmp.name
+              with open(log_path, "rb") as src:
+                  zstandard.ZstdCompressor(level=6, threads=-1).copy_stream(src, tmp)
+          try:
+              s3.upload_file(tmp_path, "acme-log-archive", key,
+                             ExtraArgs={"ContentType": "text/plain", "ContentEncoding": "zstd"})
+          finally:
+              os.unlink(tmp_path)
+      ```
+
+      Reading a file later: `zstd -d app.log.zst`, or stream it with `zstandard` in Python.
+verify:
+  static_only: "needs boto3, zstandard and S3"
+---
+id: gen-py-django-titles-001
+category: generation
+language: python
+patterns: [select-columns]
+facts: [F-PG-SELECT]
+messages:
+  - role: user
+    content: |
+      Django: the sidebar on every blog page lists the 10 newest article titles with links. Article model has title, slug, body (long HTML), cover_image, author FK, published_at. Write the query + context code.
+  - role: assistant
+    content: |
+      ```python
+      from .models import Article
+
+      def sidebar_articles():
+          return list(
+              Article.objects.filter(published_at__isnull=False)
+              .order_by("-published_at")
+              .values("title", "slug")[:10]
+          )
+      ```
+
+      ```html
+      <ul class="sidebar-articles">
+        {% for a in sidebar_articles %}
+          <li><a href="{% url 'article-detail' a.slug %}">{{ a.title }}</a></li>
+        {% endfor %}
+      </ul>
+      ```
+
+      **Green Notes**
+      - **Fetch only `title` and `slug`** (reduces E and network): `.values("title", "slug")` keeps the long `body` HTML and the other columns out of the query. Without it, every page view would load ten full articles just to show ten links. In Green Metrics Tool measurements on a PostgreSQL table with large text columns, `SELECT *` used about 7× the energy of naming the needed columns ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=b7203ffe-39ae-4e84-bf85-998c9389ea46,4702c2ee-13d5-4d70-bcfe-31e193104a8e)).
+        https://patterns.greensoftware.foundation/development/data-handling/reduce-transmitted-data
+      - **`[:10]` becomes `LIMIT 10`** in SQL, so the database returns only ten rows.
+
+      Make sure `published_at` is indexed, so the `ORDER BY ... LIMIT` doesn't sort the whole table.
+verify:
+  static_only: "needs Django project"

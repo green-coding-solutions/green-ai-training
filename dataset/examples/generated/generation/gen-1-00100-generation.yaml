@@ -1,0 +1,95 @@
+id: gen-1-00100-generation
+category: generation
+language: yaml
+patterns:
+- text-compression
+messages:
+- role: user
+  content: |
+    ```yaml
+    # traefik/dynamic/exports.yml
+    http:
+      routers:
+        exports:
+          rule: "Host(`pipeline.internal.example.com`) && PathPrefix(`/exports`)"
+          entryPoints:
+            - websecure
+          middlewares:
+            - export-auth
+            - export-ratelimit
+          service: export-api
+          tls: {}
+
+      middlewares:
+        export-auth:
+          basicAuth:
+            usersFile: /etc/traefik/export-users
+            removeHeader: true
+        export-ratelimit:
+          rateLimit:
+            average: 20
+            burst: 40
+
+      services:
+        export-api:
+          loadBalancer:
+            servers:
+              - url: "http://export-api:8080"
+    ```
+
+    ?
+- role: assistant
+  content: |
+    The router sends CSV, NDJSON and JSON exports with no compression step. Here is the config with a `compress` middleware added:
+
+    ```yaml
+    # traefik/dynamic/exports.yml
+    http:
+      routers:
+        exports:
+          rule: "Host(`pipeline.internal.example.com`) && PathPrefix(`/exports`)"
+          entryPoints:
+            - websecure
+          middlewares:
+            - export-auth
+            - export-ratelimit
+            - export-compress
+          service: export-api
+          tls: {}
+
+      middlewares:
+        export-auth:
+          basicAuth:
+            usersFile: /etc/traefik/export-users
+            removeHeader: true
+        export-ratelimit:
+          rateLimit:
+            average: 20
+            burst: 40
+        export-compress:
+          compress:
+            minResponseBodyBytes: 1024
+            excludedContentTypes:
+              - application/octet-stream
+              - application/gzip
+              - application/zip
+              - application/vnd.apache.parquet
+              - image/png
+              - image/jpeg
+
+      services:
+        export-api:
+          loadBalancer:
+            servers:
+              - url: "http://export-api:8080"
+    ```
+
+    **Green Notes**
+    - **Compress text responses** (reduces network): CSV, NDJSON and JSON are very repetitive text. They shrink a lot, so far fewer bytes cross the network for every download. Traefik only compresses when the client sends `Accept-Encoding`.
+      https://patterns.greensoftware.foundation/development/web-performance/enable-text-compression
+    - **Skip already-compressed formats:** Parquet, ZIP, gzip files and PNG/JPEG gain nothing from a second pass. Excluding them saves CPU on every download of those files.
+    - **`minResponseBodyBytes: 1024`:** tiny responses cost CPU and gain almost no size reduction.
+    - *Not applied:* a fixed high-ratio codec for all responses. These exports are generated per request, so a fast codec is the right choice. Use a strong codec only for files you build once and serve many times. If you store the exports, compress them once at write time instead of on every download.
+    - The middleware goes after auth and rate limiting. Rejected requests never reach it, so they cost no compression work.
+verify:
+  static_only: Traefik dynamic configuration, needs a Traefik instance

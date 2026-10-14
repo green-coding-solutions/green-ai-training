@@ -1,0 +1,88 @@
+id: gen-1-00355-generation
+category: generation
+language: java
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+messages:
+- role: user
+  content: |
+    hi, i am new to java and jdbc. we have a small CI dashboard and i need a method that gives the list of failed builds for one pipeline, newest first, for a table on the page. the table `builds` has id, pipeline, branch, status, started_at, duration_ms, log_output and artifact_json. the log_output is very big text (the full build log). i am not sure how to write it the right way, can you show me?
+- role: assistant
+  content: |-
+    The dashboard table only needs a few small fields, so the query names exactly those columns. It also takes a limit, so one call never loads every failed build. The big log is read by a separate method, only when someone opens one build.
+
+    ```java
+    import java.sql.Connection;
+    import java.sql.PreparedStatement;
+    import java.sql.ResultSet;
+    import java.sql.SQLException;
+    import java.sql.Timestamp;
+    import java.util.ArrayList;
+    import java.util.List;
+    import java.util.Optional;
+
+    public class BuildRepository {
+
+        public record BuildSummary(
+                long id, String branch, Timestamp startedAt, long durationMs) {}
+
+        private static final String FAILED_SQL =
+                "SELECT id, branch, started_at, duration_ms "
+                + "FROM builds "
+                + "WHERE pipeline = ? AND status = 'failed' "
+                + "ORDER BY started_at DESC "
+                + "LIMIT ?";
+
+        private static final String LOG_SQL =
+                "SELECT log_output FROM builds WHERE id = ?";
+
+        private final Connection conn;
+
+        public BuildRepository(Connection conn) {
+            this.conn = conn;
+        }
+
+        // For the dashboard table: small columns only.
+        public List<BuildSummary> findFailed(String pipeline, int limit) throws SQLException {
+            List<BuildSummary> result = new ArrayList<>();
+            try (PreparedStatement ps = conn.prepareStatement(FAILED_SQL)) {
+                ps.setString(1, pipeline);
+                ps.setInt(2, limit);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        result.add(new BuildSummary(
+                                rs.getLong("id"),
+                                rs.getString("branch"),
+                                rs.getTimestamp("started_at"),
+                                rs.getLong("duration_ms")));
+                    }
+                }
+            }
+            return result;
+        }
+
+        // Only called when a user opens one build.
+        public Optional<String> findLog(long buildId) throws SQLException {
+            try (PreparedStatement ps = conn.prepareStatement(LOG_SQL)) {
+                ps.setLong(1, buildId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? Optional.ofNullable(rs.getString(1)) : Optional.empty();
+                }
+            }
+        }
+    }
+    ```
+
+    Use it like this:
+
+    ```java
+    List<BuildRepository.BuildSummary> failed = repo.findFailed("backend-main", 25);
+    ```
+
+    **Green Notes**
+    - **Name the columns, skip `log_output` and `artifact_json`** (reduces E, network): the database no longer reads, sends and decodes a full build log for every row in the list. In Green Metrics Tool micro-benchmarks on a 52-column table with large text columns, naming 10 columns instead of `SELECT *` used about 5.5× to 7× less CPU energy ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=b7203ffe-39ae-4e84-bf85-998c9389ea46,4702c2ee-13d5-4d70-bcfe-31e193104a8e)). Your table is smaller, so treat that as a direction, not a prediction. The saving grows with the size of the skipped columns. https://patterns.greensoftware.foundation/development/data-handling/reduce-transmitted-data
+    - **`LIMIT ?`** (reduces network): the page gets at most N rows, not the whole build history. If you need more pages later, add keyset paging on `started_at` and `id`.
+    - **Load the log on demand** (reduces E): the big text is fetched only for the one build a person opens.
+    - Prepared statements also keep user input out of the SQL string. An index on `(pipeline, status, started_at)` will help if the table grows, but check your query plan first.

@@ -1,0 +1,127 @@
+id: gen-1-00285-refactor
+category: refactor
+language: java
+patterns:
+- deque-or-append
+messages:
+- role: user
+  content: |
+    We have a nightly ETL job that reads sensor rows from a big export (about 40 million rows) and cleans them before loading. For every row we keep a "late event window" of the most recent rows, so we can smooth a value over the last k rows and dump the window when a row fails validation. Window size is 20,000 by default. The job got slower when we raised the window size, and I think this class is the reason.
+
+    Requirements:
+    - keep the public API the same (`add`, `smoothedValue`, `newestFirst`, `droppedCount`)
+    - `newestFirst()` must still return rows newest first
+    - Java 17, no new dependencies
+    - single thread only, no need for locking
+
+    ```java
+    import java.util.ArrayList;
+    import java.util.List;
+
+    public class LateEventWindow {
+
+        public record SensorRow(String id, long ts, double value) {}
+
+        private final int capacity;
+        private final List<SensorRow> window = new ArrayList<>();
+        private long dropped = 0;
+
+        public LateEventWindow(int capacity) {
+            this.capacity = capacity;
+        }
+
+        public void add(SensorRow row) {
+            window.add(0, row);
+            if (window.size() > capacity) {
+                window.remove(window.size() - 1);
+                dropped++;
+            }
+        }
+
+        /** Average value of the k newest rows, NaN if the window is empty. */
+        public double smoothedValue(int k) {
+            int n = Math.min(k, window.size());
+            if (n == 0) {
+                return Double.NaN;
+            }
+            double sum = 0;
+            for (int i = 0; i < n; i++) {
+                sum += window.get(i).value();
+            }
+            return sum / n;
+        }
+
+        public List<SensorRow> newestFirst() {
+            return new ArrayList<>(window);
+        }
+
+        public long droppedCount() {
+            return dropped;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    Your guess is right. `window.add(0, row)` shifts every element in the list one slot to the right, on every row. With a full 20,000-row window, that is up to 20,000 element moves per row, about 40 million times a night. A deque makes the insert at the front O(1).
+
+    ```java
+    import java.util.ArrayDeque;
+    import java.util.ArrayList;
+    import java.util.Deque;
+    import java.util.Iterator;
+    import java.util.List;
+    import java.util.Objects;
+
+    public class LateEventWindow {
+
+        public record SensorRow(String id, long ts, double value) {}
+
+        private final int capacity;
+        // first element = newest row, last element = oldest row
+        private final Deque<SensorRow> window = new ArrayDeque<>();
+        private long dropped = 0;
+
+        public LateEventWindow(int capacity) {
+            this.capacity = capacity;
+        }
+
+        public void add(SensorRow row) {
+            Objects.requireNonNull(row, "row");
+            window.addFirst(row);
+            if (window.size() > capacity) {
+                window.removeLast();
+                dropped++;
+            }
+        }
+
+        /** Average value of the k newest rows, NaN if the window is empty. */
+        public double smoothedValue(int k) {
+            int n = Math.min(k, window.size());
+            if (n == 0) {
+                return Double.NaN;
+            }
+            double sum = 0;
+            Iterator<SensorRow> it = window.iterator(); // starts at the newest row
+            for (int i = 0; i < n; i++) {
+                sum += it.next().value();
+            }
+            return sum / n;
+        }
+
+        public List<SensorRow> newestFirst() {
+            return new ArrayList<>(window);
+        }
+
+        public long droppedCount() {
+            return dropped;
+        }
+    }
+    ```
+
+    **Green Notes**
+    - **`ArrayDeque` instead of `ArrayList.add(0, x)`** (reduces E): the front insert no longer moves the whole window. Work per row drops from O(capacity) to O(1), so the cost no longer grows when you raise the window size. This is the hot path of the job, so the saving repeats for every row.
+    - **Iterator instead of `get(i)`** (neutral): `ArrayDeque` has no index access, so `smoothedValue` walks from the newest row with an iterator. It reads the same k rows in the same order, so the result is identical.
+    - **Behavior change:** `ArrayDeque` does not accept `null`, so `add(null)` now throws a `NullPointerException` right away. Before, a null row was stored and would fail later in `smoothedValue`. Everything else, including the newest-first order and the dropped counter, is unchanged.
+    - *Not applied:* a hand-written ring buffer. It would save the small copy cost of `newestFirst()`, but it is more code to maintain. Only worth it if profiling shows that call is hot.
+verify:
+  static_only: Java code, no JVM-based verification available in the harness

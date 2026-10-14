@@ -1,0 +1,77 @@
+id: gen-1-00183-general
+category: general
+language: typescript
+patterns:
+- none
+messages:
+- role: user
+  content: |
+    ```typescript
+    import express, { Request, Response } from "express";
+    import { db } from "./db";
+
+    const router = express.Router();
+
+    router.get("/users/:id", async (req: Request, res: Response) => {
+      const id = Number(req.params.id);
+      if (Number.isNaN(id)) {
+        res.status(400).json({ error: "invalid id" });
+      }
+
+      const user = await db.users.findById(id);
+      if (!user) {
+        res.status(404).json({ error: "not found" });
+      }
+
+      res.json({ id: user.id, name: user.name, email: user.email });
+    });
+
+    export default router;
+    ```
+
+    ?
+- role: assistant
+  content: |
+    The handler is missing `return` after both error responses. `res.status(...).json(...)` sends the response, but it does not stop the function. Execution continues.
+
+    What goes wrong:
+
+    - **Invalid id:** the 400 is sent, then the code still calls `findById(NaN)`. It ends with a second `res.json(...)`, which throws `ERR_HTTP_HEADERS_SENT` ("Cannot set headers after they are sent").
+    - **User not found:** the 404 is sent, then `user.id` throws a `TypeError` because `user` is `null`.
+    - **Express 4:** a rejected promise from an `async` handler is not passed to the error middleware. You get an unhandled rejection instead, which can crash the process on current Node versions. Express 5 forwards it to the error handler.
+
+    Fixed:
+
+    ```typescript
+    import express, { NextFunction, Request, Response } from "express";
+    import { db } from "./db";
+
+    const router = express.Router();
+
+    router.get("/users/:id", async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const id = Number(req.params.id);
+        if (!Number.isInteger(id)) {
+          return res.status(400).json({ error: "invalid id" });
+        }
+
+        const user = await db.users.findById(id);
+        if (!user) {
+          return res.status(404).json({ error: "not found" });
+        }
+
+        return res.json({ id: user.id, name: user.name, email: user.email });
+      } catch (err) {
+        next(err);
+      }
+    });
+
+    export default router;
+    ```
+
+    Two small extras:
+
+    - `Number.isInteger` also rejects values like `1.5`. `Number("")` is `0`, but an empty `:id` segment never matches this route anyway.
+    - The `try/catch` with `next(err)` is only needed on Express 4. On Express 5 you can drop it.
+verify:
+  static_only: TypeScript with express and an external db module; needs packages beyond stdlib

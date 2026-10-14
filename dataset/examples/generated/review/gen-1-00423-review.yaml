@@ -1,0 +1,111 @@
+id: gen-1-00423-review
+category: review
+language: python
+patterns:
+- set-membership
+messages:
+- role: user
+  content: |
+    Can you review this cleanup step from our telescope photometry pipeline? It runs after each night's reduction. Typical input is about 2 million observation rows, and `bad_frames.txt` lists roughly 30k frame ids that failed quality checks.
+
+    Requirements: the kept rows must stay in the original order, the first row for a (target, mjd) pair wins, and the output must not change for the same input. I'd like to know about bugs and anything that makes it slow.
+
+    ```python
+    def load_bad_frames(path):
+        bad = []
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and line not in bad:
+                    bad.append(line)
+        return bad
+
+
+    def clean_observations(rows, bad_frames, seen=[]):
+        kept = []
+        for row in rows:
+            frame_id = row["frame_id"]
+            if frame_id in bad_frames:
+                continue
+            key = (row["target"], row["mjd"])
+            if key in seen:
+                continue
+            seen.append(key)
+            kept.append(row)
+        return kept
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline
+
+    #### [Bug] Mutable default argument `seen=[]`
+    - **Where:** `clean_observations` signature
+    - **Issue:** the default list is created once and shared by every call. If you clean a second night's data in the same process, the keys from the first night are still in `seen`, and matching rows are silently dropped.
+    - **Fix:** create the collection inside the function. The version below does this.
+
+    #### [High] List lookup for every row
+    - **Where:** `frame_id in bad_frames`
+    - **Issue:** `bad_frames` is a list, so each check scans up to 30k ids. With 2 million rows that is in the order of 10^10 string comparisons.
+    - **Fix:** build a set once and test against it. Each lookup becomes O(1) on average, and the set is built once and then used 2 million times, so it pays off.
+    - **Impact:** reduces E from O(rows × bad) to O(rows + bad).
+
+    #### [High] Duplicate check against a growing list
+    - **Where:** `key in seen` and `seen.append(key)`
+    - **Issue:** `seen` grows with every kept row, so the check gets slower as the run goes on. In the worst case it is quadratic in the number of kept rows.
+    - **Fix:** use a set of keys. The order of `kept` does not depend on `seen`, so row order and "first row wins" stay the same.
+    - **Impact:** reduces E from O(n²) to O(n). This is the larger of the two costs on a big night.
+
+    #### [Medium] Quadratic de-duplication in the loader
+    - **Where:** `line not in bad` in `load_bad_frames`
+    - **Issue:** every line is compared with all ids read so far. The order of the bad ids does not matter for later checks, so a list is not needed.
+    - **Fix:** read directly into a set.
+
+    ```python
+    def load_bad_frames(path):
+        with open(path) as f:
+            return {line.strip() for line in f if line.strip()}
+
+
+    def clean_observations(rows, bad_frames):
+        bad = set(bad_frames)
+        seen = set()
+        kept = []
+        for row in rows:
+            if row["frame_id"] in bad:
+                continue
+            key = (row["target"], row["mjd"])
+            if key in seen:
+                continue
+            seen.add(key)
+            kept.append(row)
+        return kept
+    ```
+
+    Output is the same for a single call: same rows, same order, first (target, mjd) wins. Only the shared-state bug is gone, so repeated calls in one process now behave independently. `set(bad_frames)` accepts a list or a set, so existing callers still work.
+
+    **Not changed:** the set of 30k ids and the set of keys use extra memory, but this is small next to 2 million row dicts. A set only helps because you look up many times. For a handful of checks, a plain list would be fine.
+verify:
+  equivalence:
+    driver: |
+      rows = [{"frame_id": f"f{i % 50}", "target": f"T{i % 7}", "mjd": str(59000 + i // 3)} for i in range(400)]
+      bad = [f"f{i}" for i in range(0, 50, 5)]
+      print(clean_observations(rows, bad))
+  test: |-
+    import os, tempfile
+    rows = [
+        {"frame_id": "a", "target": "T1", "mjd": "1"},
+        {"frame_id": "b", "target": "T1", "mjd": "1"},
+        {"frame_id": "c", "target": "T2", "mjd": "1"},
+        {"frame_id": "d", "target": "T2", "mjd": "2"},
+    ]
+    out = clean_observations(rows, ["a"])
+    assert [r["frame_id"] for r in out] == ["b", "c", "d"]
+    out2 = clean_observations(rows, ["a"])
+    assert out == out2
+    assert clean_observations(rows, set()) [0]["frame_id"] == "a"
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as tmp:
+        tmp.write("a\n\nb\na\n")
+    try:
+        assert load_bad_frames(tmp.name) == {"a", "b"}
+    finally:
+        os.unlink(tmp.name)

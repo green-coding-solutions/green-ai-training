@@ -1,0 +1,59 @@
+id: gen-1-00058-general
+category: general
+language: bash
+patterns:
+- none
+messages:
+- role: user
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    set -e
+
+    API="https://api.example.com/v2"
+    TOKEN=$TOKEN
+
+    status=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$API/health")
+
+    if [ $status == 200 ]; then
+      echo "api up"
+    else
+      echo "api down: $status"
+      exit 1
+    fi
+    ```
+
+    ?
+- role: assistant
+  content: |
+    This is a health check for a REST API. It sends a `GET` to `/health` with a bearer token. It throws away the body (`-o /dev/null`) and prints only the HTTP status code (`-w`). It exits with `0` if the status is `200` and with `1` otherwise.
+
+    There is one real bug and a few small problems:
+
+    - **The "down" branch never runs for network errors.** With `set -e`, a failing `curl` (DNS error, refused connection, timeout) makes the `status=$(...)` line fail, so the script stops silently with curl's exit code. You never see `api down`.
+    - **`[ $status == 200 ]` is fragile.** `$status` is unquoted. If it is ever empty, `[` gets a syntax error. Also, `==` inside `[ ]` is a bash extension. Use `[[ "$status" == 200 ]]` in bash.
+    - **`TOKEN=$TOKEN` does nothing.** It assigns the variable to itself. If `TOKEN` is not set, you get an empty `Bearer ` header and a confusing `401`.
+    - **There is no timeout.** A hung server blocks the script forever.
+
+    Fixed version:
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    API="https://api.example.com/v2"
+
+    status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+      -H "Authorization: Bearer $TOKEN" "$API/health") || status=000
+
+    if [[ "$status" == 200 ]]; then
+      echo "api up"
+    else
+      echo "api down: $status"
+      exit 1
+    fi
+    ```
+
+    `set -u` makes the script fail with a clear message when `TOKEN` is unset. `|| status=000` keeps the script alive when curl fails, so the `else` branch can report it. curl already prints `000` as the code when it gets no HTTP response.
+verify:
+  static_only: needs network access to an HTTP API

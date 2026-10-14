@@ -1,0 +1,140 @@
+id: gen-1-00226-refactor
+category: refactor
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    ```python
+    import argparse
+    import csv
+    import sys
+
+    import torch
+    from torch import nn
+
+
+    class SensorAE(nn.Module):
+        def __init__(self, n_features=16, hidden=6):
+            super().__init__()
+            self.enc = nn.Sequential(nn.Linear(n_features, hidden), nn.ReLU(), nn.Dropout(0.1))
+            self.dec = nn.Linear(hidden, n_features)
+
+        def forward(self, x):
+            return self.dec(self.enc(x))
+
+
+    def load_model(path):
+        model = SensorAE()
+        model.load_state_dict(torch.load(path, map_location="cpu"))
+        return model
+
+
+    def read_rows(path):
+        with open(path, newline="") as f:
+            reader = csv.reader(f)
+            next(reader)
+            return [[float(v) for v in row[1:]] for row in reader],
+
+    def score(model, rows, batch_size=256):
+        scores = []
+        for i in range(0, len(rows), batch_size):
+            x = torch.tensor(rows[i:i + batch_size], dtype=torch.float32)
+            recon = model(x)
+            err = ((recon - x) ** 2).mean(dim=1)
+            scores.extend(err.tolist())
+        return scores
+
+
+    def main():
+        p = argparse.ArgumentParser()
+        p.add_argument("csv")
+        p.add_argument("--model", default="ae.pt")
+        p.add_argument("--threshold", type=float, default=0.8)
+        args = p.parse_args()
+
+        model = load_model(args.model)
+        rows = read_rows(args.csv)[0]
+        for idx, s in enumerate(score(model, rows)):
+            if s > args.threshold:
+                print(f"{idx},{s:.4f}")
+        print(f"scored {len(rows)} rows", file=sys.stderr)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    ?
+- role: assistant
+  content: |-
+    ```python
+    import argparse
+    import csv
+    import sys
+
+    import torch
+    from torch import nn
+
+
+    class SensorAE(nn.Module):
+        def __init__(self, n_features=16, hidden=6):
+            super().__init__()
+            self.enc = nn.Sequential(nn.Linear(n_features, hidden), nn.ReLU(), nn.Dropout(0.1))
+            self.dec = nn.Linear(hidden, n_features)
+
+        def forward(self, x):
+            return self.dec(self.enc(x))
+
+
+    def load_model(path):
+        model = SensorAE()
+        model.load_state_dict(torch.load(path, map_location="cpu"))
+        model.eval()
+        return model
+
+
+    def read_rows(path):
+        with open(path, newline="") as f:
+            reader = csv.reader(f)
+            next(reader)
+            return [[float(v) for v in row[1:]] for row in reader]
+
+
+    def score(model, rows, batch_size=256):
+        scores = []
+        with torch.inference_mode():
+            for i in range(0, len(rows), batch_size):
+                x = torch.tensor(rows[i:i + batch_size], dtype=torch.float32)
+                recon = model(x)
+                err = ((recon - x) ** 2).mean(dim=1)
+                scores.extend(err.tolist())
+        return scores
+
+
+    def main():
+        p = argparse.ArgumentParser()
+        p.add_argument("csv")
+        p.add_argument("--model", default="ae.pt")
+        p.add_argument("--threshold", type=float, default=0.8)
+        args = p.parse_args()
+
+        model = load_model(args.model)
+        rows = read_rows(args.csv)
+        for idx, s in enumerate(score(model, rows)):
+            if s > args.threshold:
+                print(f"{idx},{s:.4f}")
+        print(f"scored {len(rows)} rows", file=sys.stderr)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **`torch.inference_mode()` around the scoring loop** (reduces E): this tool only does forward passes, but PyTorch was recording an autograd graph for every batch. That work is never used. In Green Metrics Tool micro-benchmarks, 100,000 CPU inferences used about 14% less CPU energy with `torch.no_grad()` (~135 J vs ~157 J) ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=42de8e68-4536-43f4-a9bd-427ec42affd1,7e6a3886-425a-4992-9f14-180bede2d841)). `inference_mode()` is the stricter version of the same idea. The saving grows with the number of rows.
+    - **Bug fix: `model.eval()` added.** The model has a `Dropout` layer and was never switched to eval mode. Scores were randomly noisy, so the same CSV could give different flagged rows on each run. Scores will now be stable. They may differ slightly from old runs, and the threshold may flag different rows.
+    - **`read_rows` cleanup:** it returned a one-item tuple (`return [...],`) that you unpacked with `[0]`. It now returns the list directly. The output is the same.
