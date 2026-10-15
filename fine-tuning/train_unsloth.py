@@ -6,6 +6,7 @@ os.environ["UNSLOTH_DISABLE_UPDATE_CHECK"] = "1"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
 import argparse
+import math
 from unsloth import FastLanguageModel, is_bfloat16_supported
 from unsloth.chat_templates import train_on_responses_only
 import torch
@@ -85,6 +86,13 @@ def train_model(model_name, target_modules, dataset_path, output_dir, split_and_
     if eval_dataset:
         eval_dataset = eval_dataset.map(format_example)
 
+    batch_size = 2
+    gradient_accumulation_steps = 4
+    # Warm up over 10% of all optimizer steps. Passed as a whole number because the MLX trainer
+    # ignores fractional warmup_steps and would start at the full learning rate.
+    total_steps = math.ceil(len(train_dataset) / (batch_size * gradient_accumulation_steps)) * epochs
+    warmup_steps = max(1, int(total_steps * 0.1))
+
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
@@ -94,12 +102,12 @@ def train_model(model_name, target_modules, dataset_path, output_dir, split_and_
             output_dir=output_dir,
             dataset_text_field="text",
             max_length=max_seq_length,
-            per_device_train_batch_size=2,
-            gradient_accumulation_steps=4,
+            per_device_train_batch_size=batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
             num_train_epochs=epochs,
             learning_rate=learning_rate,
             lr_scheduler_type="cosine",
-            warmup_steps=0.1,  # < 1 means fraction of total steps
+            warmup_steps=warmup_steps,
             weight_decay=0.01,
             logging_steps=1,
             save_strategy="epoch",
