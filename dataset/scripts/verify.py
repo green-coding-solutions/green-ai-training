@@ -5,7 +5,7 @@ Checks per example:
   schema        ids, categories, patterns, message order
   style         Green Notes / review format per category, code fence tags, banned phrases, spec leakage
   numbers       energy / % / multiplier figures only when backed by a cited fact in spec/measured-facts.md
-  urls          GSF pattern links must be in the taxonomy whitelist, measurement links must be in a cited fact
+  urls          no GSF pattern, measurement or benchmark links in answers, only the figures themselves
   syntax        python (ast), javascript (node --check), bash (bash -n), json, yaml, sql (sqlite parser)
   execution     optional `verify:` block -> run, test, equivalence (original vs green output), benchmark (CPU time)
   contamination code in user messages must not be a near copy of ../../test-cases (that is the eval set)
@@ -60,8 +60,7 @@ NUMBER_PATTERNS = [
     re.compile(NUM + r"\s*times\s+(?:less|more|faster|slower|cheaper)", re.IGNORECASE),
 ]
 
-GSF_URL_RE = re.compile(r"https?://patterns\.greensoftware\.foundation[^\s)>\]`\"']*")
-MEASUREMENT_URL_RE = re.compile(r"https?://(?:metrics\.green-coding\.io|github\.com/green-coding-solutions)[^\s)>\]`\"']*")
+REFERENCE_URL_RE = re.compile(r"https?://(?:patterns\.greensoftware\.foundation|metrics\.green-coding\.io|github\.com/green-coding-solutions)[^\s)>\]`\"']*")
 URL_RE = re.compile(r"https?://[^\s)>\]`\"']+")
 
 EXEC_TIMEOUT = 60
@@ -289,18 +288,11 @@ def check_bash_quoting(ex, errors):
                     errors.append(f"style: bash literal(s) in double quotes, use single quotes: {lits[:3]}")
 
 
-def check_urls(ex, whitelist, facts, errors):
-    cited_urls = {u.rstrip(".,;:") for f in ex.get("facts") or [] for u in MEASUREMENT_URL_RE.findall(facts.get(f, ""))}
+def check_urls(ex, errors):
+    # reference links teach the model to reproduce run ids it cannot know, only the figures are kept
     for m in assistant_turns(ex):
-        for url in GSF_URL_RE.findall(m["content"]):
-            url = url.rstrip(".,;:")
-            if url not in whitelist:
-                errors.append(f"urls: GSF url not in taxonomy whitelist: {url}")
-        # measurement links must be copied verbatim from a cited fact, a model must not make up run ids
-        for url in MEASUREMENT_URL_RE.findall(m["content"]):
-            url = url.rstrip(".,;:")
-            if url not in cited_urls:
-                errors.append(f"urls: measurement url not in a cited fact: {url}")
+        for url in REFERENCE_URL_RE.findall(m["content"]):
+            errors.append(f"urls: reference link in answer, quote the figure without a link: {url.rstrip('.,;:')}")
 
 
 def sqlite_syntax_error(sql):
@@ -590,7 +582,6 @@ def example_hash(ex):
 
 def verify_all(paths=None, no_exec=False, use_cache=True, quiet=False):
     taxonomy = load_taxonomy()
-    whitelist = {p["url"] for p in taxonomy["patterns"] if p.get("url")}
     facts = load_facts()
     test_shingles = load_test_case_shingles()
     cache_path = OUT_DIR / "verify-cache.json"
@@ -611,7 +602,7 @@ def verify_all(paths=None, no_exec=False, use_cache=True, quiet=False):
             if not errors:
                 check_style(ex, errors, warnings)
                 check_numbers(ex, facts, errors)
-                check_urls(ex, whitelist, facts, errors)
+                check_urls(ex, errors)
                 check_star_imports(ex, errors)
                 check_bash_quoting(ex, errors)
                 check_syntax(ex, errors, warnings, verified)

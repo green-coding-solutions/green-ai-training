@@ -40,31 +40,22 @@ messages:
 
     #### [Bug] Successful jobs without `attempts` count as `broken`
     - **Where:** first two `if` lines in `classify`
-    - **Issue:** if `job.attempts` is missing, both `undefined <= 1` and `undefined > 1` are false. The job falls through to the end and returns `'broken'`. That can close your release gate for green jobs.
+    - **Issue:** if `job.attempts` is missing, both `undefined <= 1` and `undefined > 1` are false. The job falls through to the end and returns `'broken'`. That can close your release gate even when the jobs passed.
     - **Fix:** treat a missing value as one attempt: `(job.attempts ?? 1) > 1`.
     - **Impact:** correctness. A false `broken` can trigger a rerun of the whole pipeline.
 
     #### [Bug] `exitCode % 128 === 9` matches more than an OOM kill
     - **Where:** the `infra` line with the `137` comment
     - **Issue:** the modulo also matches plain exit code `9` and `265`. Only `137` (128 + SIGKILL) is an OOM kill. Exit `137` is already covered by the next line, because it is not in the range 1 to 127. So the modulo check only adds the wrong match for `9`.
-    - **Fix:** drop it. The rewrite below classifies exit code `9` as `broken`. If you really want it in `infra`, say so in a comment.
+    - **Fix:** drop it. The new version below classifies exit code `9` as `broken`. If you really want it in `infra`, say so in a comment.
     - **Impact:** correctness of the bucket counts.
 
     #### [Low] Chain of string tests repeated per job
     - **Where:** `classify`
-    - **Issue:** every job goes through up to five conditions. `indexOf('succ')` is scanned twice, and the negated range test is hard to read. The work per job is tiny and the script runs once per pipeline, so the energy saving is small. The main gain is that a lookup is simple and each job takes the same short path. It also makes the status spellings explicit.
-    - **Fix:** normalize the status once and look it up in a `Map`. Then use a small `switch` on simple equality. Only the exit code range check stays as a comparison.
-    - **Impact:** reduces E slightly per job, and mostly improves readability. The prefix match `succ*` becomes an explicit list. Add other spellings to the map if your exporter produces them.
-
-    #### [Low] `process.exit()` right after `console.log`
-    - **Where:** last line
-    - **Issue:** if stdout is a pipe, `process.exit` can cut off buffered output.
-    - **Fix:** set `process.exitCode` and let the process end normally.
+    - **Issue:** every job goes through up to five conditions. `indexOf('succ')` runs twice, and the negated range test is hard to read. The work per job is tiny and the script runs once per pipeline, so the energy saving is small. The main gain is that a lookup is simple and each job takes the same short path. It also makes the status spellings explicit.
+    - **Fix:** normalize the status once, look it up in a `Map`, then use a small `switch` on simple equality. Only the exit code range check stays a comparison. Replace `classify` with:
 
     ```javascript
-    'use strict';
-    const fs = require('fs');
-
     const STATUS_KIND = new Map([
       ['success', 'ok'],
       ['succeeded', 'ok'],
@@ -91,29 +82,25 @@ messages:
           return 'broken';
       }
     }
-
-    function main(path) {
-      const jobs = JSON.parse(fs.readFileSync(path, 'utf8'));
-      const summary = { pass: 0, flaky: 0, ignored: 0, infra: 0, broken: 0 };
-      for (const job of jobs) {
-        summary[classify(job)]++;
-      }
-      console.log(JSON.stringify(summary));
-      process.exitCode = summary.broken > 0 ? 1 : 0;
-    }
-
-    if (require.main === module) {
-      main(process.argv[2]);
-    }
-
-    module.exports = { classify };
     ```
 
-    **Already good:** one pass over the data, one `JSON.parse`, no per-job I/O, and no dependencies. Nothing here needs a heavier change.
+    - **Impact:** reduces E slightly per job, but the main gain is readability. The prefix match `succ*` becomes an explicit list, so add any other spellings your exporter produces. A job with a missing `status` now counts as `broken` instead of crashing the script.
+
+    #### [Low] `process.exit()` right after `console.log`
+    - **Where:** last line
+    - **Issue:** if stdout is a pipe, `process.exit` can cut off buffered output.
+    - **Fix:** set `process.exitCode` and let the process end normally:
+
+    ```javascript
+    console.log(JSON.stringify(summary));
+    process.exitCode = summary.broken > 0 ? 1 : 0;
+    ```
+
+    **Already good:** one pass over the data, one `JSON.parse`, no I/O per job, and no dependencies. Nothing here needs a bigger change.
 verify:
-  module: true
+  green_block: 0
   test: |-
-    const assert = require('assert');
+    import assert from 'node:assert';
     assert.strictEqual(classify({ status: 'success', attempts: 1 }), 'pass');
     assert.strictEqual(classify({ status: 'Success', attempts: 3 }), 'flaky');
     assert.strictEqual(classify({ status: 'success' }), 'pass');
@@ -126,6 +113,8 @@ verify:
     assert.strictEqual(classify({ status: 'failure', exitCode: 0 }), 'infra');
     assert.strictEqual(classify({ status: 'failure' }), 'infra');
     assert.strictEqual(classify({ status: 'failure', exitCode: 1 }), 'broken');
+    assert.strictEqual(classify({ status: 'failure', exitCode: 9 }), 'broken');
     assert.strictEqual(classify({ status: 'failure', exitCode: 127 }), 'broken');
     assert.strictEqual(classify({ status: 'failure', exitCode: 128 }), 'infra');
     assert.strictEqual(classify({ status: 'neutral' }), 'broken');
+    assert.strictEqual(classify({}), 'broken');

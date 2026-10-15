@@ -11,11 +11,14 @@ messages:
     hi, we have github actions pipeline for our docs site (vite build, then rsync dist to the nginx server). I need a node script for the step after build, who makes precompressed files so nginx dont need to do it for every request. we have html, css, js, json, svg, and also png, woff2 and some small files. script should be run like `node precompress.js dist`. no npm packages please, only what node have. thanks!
 - role: assistant
   content: |
+    The script is an ES module, because Vite projects usually have `"type": "module"` in `package.json`. If yours does not, name the file `precompress.mjs`.
+
     ```javascript
-    const fs = require('node:fs/promises');
-    const path = require('node:path');
-    const zlib = require('node:zlib');
-    const { promisify } = require('node:util');
+    import fs from 'node:fs/promises';
+    import path from 'node:path';
+    import zlib from 'node:zlib';
+    import { promisify } from 'node:util';
+    import { pathToFileURL } from 'node:url';
 
     const brotli = promisify(zlib.brotliCompress);
     const gzip = promisify(zlib.gzip);
@@ -34,7 +37,7 @@ messages:
       }
     }
 
-    async function precompress(dir) {
+    export async function precompress(dir) {
       const stats = { compressed: 0, skipped: 0 };
       for await (const file of walk(dir)) {
         if (!TEXT_EXT.has(path.extname(file))) {
@@ -65,17 +68,18 @@ messages:
       return stats;
     }
 
-    module.exports = { precompress };
+    const isMain =
+      process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 
-    if (require.main === module) {
+    if (isMain) {
       const dir = process.argv[2];
       if (!dir) {
         console.error('usage: node precompress.js <dir>');
-        process.exit(1);
-      }
-      precompress(dir).then(({ compressed, skipped }) => {
+        process.exitCode = 1;
+      } else {
+        const { compressed, skipped } = await precompress(dir);
         console.log(`compressed ${compressed} files, skipped ${skipped}`);
-      });
+      }
     }
     ```
 
@@ -89,33 +93,43 @@ messages:
     You can run the script again safely. `.br` and `.gz` files are not in the extension list, so they are skipped.
 
     **Green Notes**
-    - **Precompressed static text** (reduces E, network): the server compresses nothing per request. It sends the ready file, and the browser downloads fewer bytes. See [Enable text compression](https://patterns.greensoftware.foundation/development/web-performance/enable-text-compression).
-    - **Brotli quality 11 only at build time**: in Green Metrics Tool micro-benchmarks, brotli at its default quality 11 used about 45× the CPU energy of gzip to compress 100 MB of text ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=fb08d3c3-ba41-4f0f-85fd-0b6c34e6c39b,f1479db0-c453-4aaa-9116-e137621fad07,8e93a8d2-60b0-4831-905b-764b68257bc7)). Decompression was cheap. That cost is paid once per build and the file is served many times. Don't use this level for responses compressed on every request.
+    - **Precompressed static text** (reduces E, network): the server compresses nothing per request. It sends the ready file, and the browser downloads fewer bytes. See Enable text compression.
+    - **Brotli quality 11 only at build time**: in Green Metrics Tool micro-benchmarks, brotli at its default quality 11 used about 45× the CPU energy of gzip to compress 100 MB of text. Decompression was cheap. That cost is paid once per build and the file is served many times. Don't use this level for responses compressed on every request.
     - **Skipped files**: PNG and WOFF2 are already compressed, and files under 1 KB gain nothing, so no CPU is spent on them.
     - *Not applied:* compression of dynamic API responses. That needs a fast level, so it is a different setup.
 verify:
   module: true
   test: |-
-    const os = require('node:os');
-    const fsSync = require('node:fs');
-    (async () => {
-      const dir = fsSync.mkdtempSync(path.join(os.tmpdir(), 'pc-'));
-      const html = Buffer.from('<p>hello docs</p>\n'.repeat(500));
-      fsSync.writeFileSync(path.join(dir, 'index.html'), html);
-      fsSync.writeFileSync(path.join(dir, 'small.json'), '{"a":1}');
-      fsSync.writeFileSync(path.join(dir, 'logo.png'), Buffer.alloc(5000, 1));
-      fs.mkdir(path.join(dir, 'sub')).catch(() => {});
-      let stats = await precompress(dir);
-      assert = require('node:assert');
-      assert.strictEqual(stats.compressed, 1);
-      assert.ok(fsSync.existsSync(path.join(dir, 'index.html.br')));
-      assert.ok(fsSync.existsSync(path.join(dir, 'index.html.gz')));
-      assert.ok(zlib.brotliDecompressSync(fsSync.readFileSync(path.join(dir, 'index.html.br'))).equals(html));
-      assert.ok(zlib.gunzipSync(fsSync.readFileSync(path.join(dir, 'index.html.gz'))).equals(html));
-      assert.ok(!fsSync.existsSync(path.join(dir, 'small.json.br')));
-      assert.ok(!fsSync.existsSync(path.join(dir, 'logo.png.gz')));
-      stats = await precompress(dir);
-      assert.strictEqual(stats.compressed, 1);
-      assert.ok(!fsSync.existsSync(path.join(dir, 'index.html.br.br')));
-      fsSync.rmSync(dir, { recursive: true, force: true });
-    })();
+    import os from 'node:os';
+    import fsSync from 'node:fs';
+    import assert from 'node:assert';
+
+    const tmp = fsSync.mkdtempSync(path.join(os.tmpdir(), 'pc-'));
+    const html = Buffer.from('<p>hello docs</p>\n'.repeat(500));
+    const css = Buffer.from('body{color:red}\n'.repeat(200));
+    fsSync.writeFileSync(path.join(tmp, 'index.html'), html);
+    fsSync.writeFileSync(path.join(tmp, 'small.json'), '{"a":1}');
+    fsSync.writeFileSync(path.join(tmp, 'logo.png'), Buffer.alloc(5000, 1));
+    fsSync.mkdirSync(path.join(tmp, 'sub'));
+    fsSync.writeFileSync(path.join(tmp, 'sub', 'app.css'), css);
+
+    let stats = await precompress(tmp);
+    assert.strictEqual(stats.compressed, 2);
+    assert.strictEqual(stats.skipped, 2);
+    assert.ok(fsSync.existsSync(path.join(tmp, 'index.html.br')));
+    assert.ok(fsSync.existsSync(path.join(tmp, 'index.html.gz')));
+    assert.ok(fsSync.existsSync(path.join(tmp, 'sub', 'app.css.br')));
+    assert.ok(zlib.brotliDecompressSync(fsSync.readFileSync(path.join(tmp, 'index.html.br'))).equals(html));
+    assert.ok(zlib.gunzipSync(fsSync.readFileSync(path.join(tmp, 'index.html.gz'))).equals(html));
+    assert.ok(zlib.gunzipSync(fsSync.readFileSync(path.join(tmp, 'sub', 'app.css.gz'))).equals(css));
+    assert.ok(!fsSync.existsSync(path.join(tmp, 'small.json.br')));
+    assert.ok(!fsSync.existsSync(path.join(tmp, 'logo.png.gz')));
+
+    stats = await precompress(tmp);
+    assert.strictEqual(stats.compressed, 2);
+    assert.ok(!fsSync.existsSync(path.join(tmp, 'index.html.br.br')));
+    fsSync.rmSync(tmp, { recursive: true, force: true });
+
+    // The CLI block may have set exitCode = 1 if this file ran as the entry point without args.
+    process.exitCode = 0;
+    console.log('ok');

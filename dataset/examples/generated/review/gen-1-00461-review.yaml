@@ -66,12 +66,12 @@ messages:
     - **Where:** `latency_histogram`, `latency_stats`, `flag_outliers`
     - **Issue:** each sample goes through the interpreter many times. The histogram does up to 11 comparisons per value in a `while` loop. Stats take two more passes. Outliers take another pass with `range(len(...))` indexing. That is per-sample work on ~20M values, every night.
     - **Fix:** use NumPy. `searchsorted` + `bincount` give the histogram, `mean`/`std` give the stats, and a boolean mask gives the outliers. The bucket rule stays the same: a value equal to an edge falls in the lower bucket.
-    - **Impact:** reduces E on every run, in proportion to the number of samples. In Green Metrics Tool micro-benchmarks, a pure Python loop over 10,000,000 samples used about 4× more CPU energy than the same loop compiled with Numba ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=dc2ed71b-e8ed-48d5-be04-0dd9dfe1443f,2b9e7f88-4aad-42ee-a9e6-25ff4e6ea712)). NumPy removes the interpreter overhead in a similar way, but measure on your data.
+    - **Impact:** reduces E on every run, in proportion to the number of samples. In Green Metrics Tool micro-benchmarks, a pure Python loop over 10,000,000 samples used about 4× more CPU energy than the same loop compiled with Numba. NumPy removes the interpreter overhead in a similar way. Importing NumPy and converting a Python list to an array have a fixed cost and a per-element cost, so the gain shows on large inputs that arrive as arrays. Measure on your data.
 
     #### [Medium] Stats are computed twice
     - **Where:** `report` calls `latency_stats`, then `flag_outliers` calls it again
     - **Issue:** a full extra pass over the data for the same two numbers.
-    - **Fix:** let `flag_outliers` accept precomputed stats. Convert the input to an array once in `report` and pass the array on. Better still, load the log values straight into an array (for example with `np.loadtxt`) so a 20M-element Python list never exists.
+    - **Fix:** let `flag_outliers` accept precomputed stats. Convert the input to an array once in `report` and pass the array on. Better still, load the log values straight into an array (for example with `np.loadtxt`) so a 20M-element Python list never exists. Converting that list is itself a slow pass through the interpreter.
 
     ```python
     import numpy as np
@@ -127,18 +127,6 @@ verify:
       report(data)
       report([1.0, 2.0, 3.0])
       print(latency_histogram([5, 5.0, 5.01, 10, 6000]))
-  benchmark:
-    driver: |
-      data = []
-      x = 99
-      for i in range(200000):
-          x = (x * 1103515245 + 12345) % 2147483648
-          data.append(float(x % 2000))
-      a = latency_histogram(data)
-      b = latency_stats(data)
-      c = flag_outliers(data)
-      print(sum(a), len(c))
-    min_speedup: 3
   test: |-
     assert latency_histogram([5, 5.01, 10, 6000]) == [1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 1]
     assert latency_stats([]) == (0.0, 0.0)

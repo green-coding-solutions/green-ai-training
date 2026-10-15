@@ -72,7 +72,7 @@ messages:
     - **Where:** `zlib.brotliCompressSync(..., { QUALITY: 11 })`
     - **Issue:** quality 11 is the slowest and most CPU-hungry setting. It is built for assets that are compressed once and served many times. Here every poll of every tab compresses a fresh 1-5 MB body. The `Sync` call also blocks the event loop, so your alert webhooks wait behind it.
     - **Fix:** use async gzip at its default level, and skip compression for small bodies. Dynamic JSON is highly repetitive, so gzip already shrinks it a lot.
-    - **Impact:** reduces E on the server for every request. In Green Metrics Tool measurements on a 100 MB text corpus, brotli at its CLI default (quality 11) used about 3019 J to compress, and gzip used about 67 J, roughly 45× less ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=fb08d3c3-ba41-4f0f-85fd-0b6c34e6c39b,f1479db0-c453-4aaa-9116-e137621fad07,8e93a8d2-60b0-4831-905b-764b68257bc7)). That measures energy only, not output size. If the link is slow and size matters more than CPU, a middle brotli setting is an option, but not quality 11.
+    - **Impact:** reduces E on the server for every request. In Green Metrics Tool measurements on a 100 MB text corpus, brotli at its CLI default (quality 11) used about 3019 J to compress, and gzip used about 67 J, roughly 45× less. That measures energy only, not output size. If the link is slow and size matters more than CPU, a middle brotli setting is an option, but not quality 11.
 
     #### [Medium] Two libraries for two tiny jobs
     - **Where:** `moment(l.ts).format(...)` and `_.countBy(rows, 'level')`
@@ -80,6 +80,8 @@ messages:
     - **Fix:** use `toISOString()` for the timestamp and count while you build the rows.
     - **Impact:** reduces E and M (less to load and keep in memory). The savings are small per request, but they come for free once the two dependencies are gone.
     - **Behavior change:** `moment(...).format()` prints in the server's local time zone. `toISOString()` prints UTC. If the servers run in UTC (usual for containers), the output is identical. Otherwise the dashboard timestamps shift.
+
+    Put these helpers at the top of the server file:
 
     ```javascript
     function formatTs(ts) {
@@ -96,19 +98,20 @@ messages:
       }
       return { rows, byLevel };
     }
-
-    module.exports = { formatTs, buildPayload };
     ```
+
+    The handler then uses them directly:
 
     ```javascript
     const http = require('http');
     const zlib = require('zlib');
     const { promisify } = require('util');
     const { loadLogs } = require('./store');
-    const { buildPayload } = require('./payload');
 
     const gzip = promisify(zlib.gzip);
     const MIN_COMPRESS_BYTES = 1024;
+
+    // formatTs() and buildPayload() from above go here
 
     const server = http.createServer(async (req, res) => {
       try {
@@ -140,17 +143,19 @@ messages:
 verify:
   green_block: 0
   test: |-
-    const assert = require('assert');
-    assert.strictEqual(formatTs('2026-10-09T12:30:45.123Z'), '2026-10-09 12:30:45');
+    function check(cond, msg) { if (!cond) throw new Error('check failed: ' + msg); }
+    const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+    check(formatTs('2026-10-09T12:30:45.123Z') === '2026-10-09 12:30:45', 'formatTs');
     const logs = [
       { ts: '2026-10-09T12:30:45.123Z', level: 'info', service: 'a', message: 'm1', raw: 'x' },
       { ts: '2026-10-09T12:31:00.000Z', level: 'error', service: 'b', message: 'm2', raw: 'y' },
       { ts: '2026-10-09T12:32:10.999Z', level: 'info', service: 'a', message: 'm3', raw: 'z' },
     ];
     const all = buildPayload(logs, null);
-    assert.strictEqual(all.rows.length, 3);
-    assert.deepStrictEqual(all.rows[1], { ts: '2026-10-09 12:31:00', level: 'error', service: 'b', message: 'm2' });
-    assert.deepStrictEqual(JSON.parse(JSON.stringify(all.byLevel)), { info: 2, error: 1 });
+    check(all.rows.length === 3, 'all rows');
+    check(same(all.rows[1], { ts: '2026-10-09 12:31:00', level: 'error', service: 'b', message: 'm2' }), 'row shape');
+    check(same(all.byLevel, { info: 2, error: 1 }), 'byLevel all');
     const onlyInfo = buildPayload(logs, 'info');
-    assert.strictEqual(onlyInfo.rows.length, 2);
-    assert.deepStrictEqual(JSON.parse(JSON.stringify(onlyInfo.byLevel)), { info: 2 });
+    check(onlyInfo.rows.length === 2, 'info rows');
+    check(same(onlyInfo.byLevel, { info: 2 }), 'byLevel info');
+    console.log('ok');

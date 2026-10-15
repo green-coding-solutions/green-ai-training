@@ -104,8 +104,8 @@ verify:                         # optional
   sustainability talk in general answers, language tags on code blocks, no leaked spec or fact ids.
 - **Numbers:** every energy, percentage or multiplier figure in an answer must appear in a cited fact or in the
   user's own message.
-- **URLs:** GSF pattern links must be in the taxonomy. Green Metrics Tool and benchmark links
-  (`metrics.green-coding.io`, `github.com/green-coding-solutions`) must be copied verbatim from a cited fact.
+- **URLs:** answers must not contain GSF pattern, Green Metrics Tool or benchmark links
+  (`patterns.greensoftware.foundation`, `metrics.green-coding.io`, `github.com/green-coding-solutions`).
 - **Syntax:** Python, JavaScript, bash, JSON, YAML, SQLite.
 - **Execution:** tests, output equivalence between original and answer, CPU-time benchmarks.
 - **Contamination:** user code must not be a near copy of `../test-cases` (the evaluation set).

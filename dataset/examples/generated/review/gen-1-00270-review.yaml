@@ -3,7 +3,6 @@ category: review
 language: javascript
 patterns:
 - builtin-functions
-- vectorize-or-jit
 - efficient-algorithm
 messages:
 - role: user
@@ -72,41 +71,42 @@ messages:
 
     #### [Bug] `Math.min(...values)` and `Math.max(...values)` crash on big input
     - **Where:** the `min` and `max` lines
-    - **Issue:** spread passes every value as a function argument. With millions of values this throws `RangeError: Maximum call stack size exceeded`. This is most likely your crash.
-    - **Fix:** get min and max in the same loop that computes the sum.
+    - **Issue:** the spread passes every value as a separate function argument. With millions of values this throws `RangeError: Maximum call stack size exceeded`. This is most likely your crash.
+    - **Fix:** find min and max in the same loop that computes the sum.
 
-    #### [Bug] A bad line gives `NaN` and breaks every result
+    #### [Bug] One bad line turns every result into `NaN`
     - **Where:** `values.push(parseFloat(lines[i]))`
-    - **Issue:** a header or a broken line becomes `NaN`. Then mean, std and median are all `NaN`, and the sort comparisons stop working. Also, an empty file divides by zero.
-    - **Fix:** skip lines that are not finite numbers, and handle the empty case. This changes behavior: bad lines are now ignored instead of poisoning the result.
+    - **Issue:** a header or a broken line becomes `NaN`. Then the mean, std and median are all `NaN`, and the sort comparisons stop working. An empty file also divides by zero.
+    - **Fix:** skip lines that are not finite numbers, and handle the empty case. This changes behavior: bad lines are now ignored instead of breaking the result.
 
     #### [High] Hand-written bubble sort for the median
     - **Where:** the double `for` loop on `sorted`
-    - **Issue:** this is O(n²). For 5 million values that is about 10¹³ comparisons, so it never finishes. The median needs the sorted data once.
-    - **Fix:** use the built-in sort on a `Float64Array`. It sorts numerically without a comparator function and runs in native code.
+    - **Issue:** this is O(n²). For 5 million values that is about 10¹³ comparisons, so it never finishes. The median only needs the data sorted once.
+    - **Fix:** use the built-in sort on a `Float64Array`. It sorts numbers without a comparator function and runs in native code.
     - **Impact:** reduces E a lot. The work goes from quadratic to O(n log n).
 
     #### [High] `indexOf` to count unique values
     - **Where:** the `unique` loop
-    - **Issue:** `indexOf` scans the whole `unique` array for every value, so it is O(n × u) and close to O(n²) when most values are different.
-    - **Fix:** `new Set(values).size`. One hash lookup per value.
-    - **Impact:** reduces E, same quadratic problem as above.
+    - **Issue:** `indexOf` scans the whole `unique` array for every value. That is O(n × u), close to O(n²) when most values are different.
+    - **Fix:** `new Set(values).size`. That is one hash lookup per value.
+    - **Impact:** reduces E. It is the same quadratic problem as the sort.
 
     #### [Medium] Plain arrays of numbers
     - **Where:** `values`, `sorted`
-    - **Issue:** a normal array with millions of `push` calls grows and copies repeatedly. A typed array uses 8 bytes per value, is allocated once, and its `.sort()` is numeric by default.
+    - **Issue:** with millions of `push` calls, a normal array grows and gets copied again and again. A typed array uses 8 bytes per value and is allocated once. Its `.sort()` sorts numbers by default.
     - **Fix:** fill a `Float64Array` while parsing.
 
-    #### [Low] Three passes for sum, mean and variance
-    - **Where:** the `sum` and `sq` loops
-    - **Issue:** fine for correctness. Sum, min and max can share one pass, so the data is read fewer times. Variance needs the mean first, so it stays a second pass.
+    #### [Low] Separate loops for sum, min and max
+    - **Where:** the `sum` loop and the `min`/`max` lines
+    - **Issue:** sum, min and max can share one pass, so the data is read fewer times. The variance needs the mean first, so it stays a second pass.
 
-    Rewritten version. The output format is the same:
+    Here is the rewritten version as an ES module. Save it as `stats.mjs` and run `node stats.mjs export.txt`. The output format stays the same:
 
     ```javascript
-    const fs = require("fs");
+    import { readFileSync } from "node:fs";
+    import { pathToFileURL } from "node:url";
 
-    function parse(text) {
+    export function parse(text) {
       const lines = text.split("\n");
       const out = new Float64Array(lines.length);
       let n = 0;
@@ -117,7 +117,7 @@ messages:
       return out.subarray(0, n);
     }
 
-    function summarize(values) {
+    export function summarize(values) {
       const n = values.length;
       if (n === 0) return null;
 
@@ -154,43 +154,53 @@ messages:
       };
     }
 
-    if (require.main === module) {
+    const isMain =
+      process.argv[1] !== undefined &&
+      import.meta.url === pathToFileURL(process.argv[1]).href;
+
+    if (isMain) {
       const file = process.argv[2];
       if (!file) {
-        console.error("usage: node stats.js <file>");
-        process.exit(1);
-      }
-      const s = summarize(parse(fs.readFileSync(file, "utf8")));
-      if (!s) {
-        console.log("no valid numbers in file");
+        console.error("usage: node stats.mjs <file>");
       } else {
-        console.log("count: " + s.count);
-        console.log("mean: " + s.mean.toFixed(3));
-        console.log("median: " + s.median.toFixed(3));
-        console.log("min: " + s.min + " max: " + s.max);
-        console.log("std: " + s.std.toFixed(3));
-        console.log("unique: " + s.unique);
+        const s = summarize(parse(readFileSync(file, "utf8")));
+        if (!s) {
+          console.log("no valid numbers in file");
+        } else {
+          console.log("count: " + s.count);
+          console.log("mean: " + s.mean.toFixed(3));
+          console.log("median: " + s.median.toFixed(3));
+          console.log("min: " + s.min + " max: " + s.max);
+          console.log("std: " + s.std.toFixed(3));
+          console.log("unique: " + s.unique);
+        }
       }
     }
     ```
 
-    **Already good:** the file is read once, and the variance formula is correct. If the file grows past a few hundred MB, `readFileSync` into one string will hit V8's string size limit. Then read it with `readline` or a stream and fill the typed array while you go.
+    **Already good:** the file is read only once, and the variance formula is correct. If the file grows past a few hundred MB, reading it into one string with `readFileSync` hits V8's string size limit. In that case, read it with `readline` or a stream and fill the typed array as you go.
 verify:
   module: true
   test: |-
+    function check(cond, msg) {
+      if (!cond) throw new Error("assertion failed: " + msg);
+    }
     const s = summarize(Float64Array.from([3, 1, 2, 2]));
-    console.assert(s.count === 4);
-    console.assert(s.sum === 8);
-    console.assert(s.mean === 2);
-    console.assert(s.median === 2);
-    console.assert(s.min === 1 && s.max === 3);
-    console.assert(Math.abs(s.std - Math.sqrt(0.5)) < 1e-12);
-    console.assert(s.unique === 3);
+    check(s.count === 4, "count");
+    check(s.sum === 8, "sum");
+    check(s.mean === 2, "mean");
+    check(s.median === 2, "median");
+    check(s.min === 1 && s.max === 3, "min/max");
+    check(Math.abs(s.std - Math.sqrt(0.5)) < 1e-12, "std");
+    check(s.unique === 3, "unique");
+    const odd = summarize(Float64Array.from([10, -5, 3]));
+    check(odd.median === 3 && odd.min === -5 && odd.max === 10, "odd median");
     const p = parse("1.5\n\nabc\n 2.5 \n10\n");
-    console.assert(p.length === 3 && p[0] === 1.5 && p[1] === 2.5 && p[2] === 10);
-    console.assert(summarize(new Float64Array(0)) === null);
+    check(p.length === 3 && p[0] === 1.5 && p[1] === 2.5 && p[2] === 10, "parse");
+    check(summarize(new Float64Array(0)) === null, "empty");
     const big = new Float64Array(300000);
     for (let i = 0; i < big.length; i++) big[i] = (i * 7919) % 1000;
     const b = summarize(big);
-    console.assert(b.min === 0 && b.max === 999 && b.unique === 1000);
-    if (process.exitCode) throw new Error("assertion failed");
+    check(b.min === 0 && b.max === 999 && b.unique === 1000, "big");
+    check(b.median === 499.5, "big median");
+    console.log("ok");

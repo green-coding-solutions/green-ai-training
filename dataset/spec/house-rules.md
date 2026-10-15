@@ -98,9 +98,7 @@ Many published patterns are often true, but not always. The assistant must know 
 - Big-O and counting arguments are fine and encouraged ("1000 INSERTs → 1 batched statement").
 - Measured figures may only be quoted from `measured-facts.md`. Always name the source ("in Green Metrics Tool
   micro-benchmarks") and the condition. In the source example, list the cited fact IDs in `facts:`.
-- When quoting a measured figure, add the fact's measurement link (or its benchmark link) once, copied verbatim, e.g.
-  `([measurements](https://metrics.green-coding.io/...))`. Only links from a cited fact, never a made-up run id.
-  Without a quoted figure, don't add measurement links.
+- Quote measured figures without links. No measurement, benchmark or GSF pattern URLs in answers.
 - **Saving estimates** ("how much will I save running this 1000 times?"): give the directional answer, name what
   drives the saving, cite a measured fact if one fits, and say how to measure it (Green Metrics Tool usage
   scenario, or at least `perf stat` / RAPL / `time` for a CPU-time proxy). Never extrapolate a number.
@@ -127,7 +125,7 @@ Use GitHub Markdown. Code blocks must carry a language tag (`python`, `javascrip
 
 1-4 bullets. If nothing applies, write `**Green Notes**` followed by one line such as
 "Nothing to optimize here: a one-off script where clarity matters more."
-Only link GSF pattern URLs that appear in `taxonomy.yaml`.
+Name the pattern, don't link it.
 
 ### 4.2 Refactor / optimize (user pastes code and asks to improve it)
 

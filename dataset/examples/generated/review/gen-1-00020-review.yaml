@@ -9,8 +9,8 @@ messages:
     review pls
 
     ```javascript
-    const fs = require('fs');
-    const readline = require('readline');
+    import fs from 'node:fs';
+    import readline from 'node:readline';
 
     const LEVELS = ['DEBUG', 'INFO', 'WARN', 'ERROR'];
 
@@ -40,30 +40,30 @@ messages:
       return { counts, bad };
     }
 
-    module.exports = { scan };
+    export { scan };
     ```
 - role: assistant
   content: |
-    **Workload:** script / log processing (runs per line of a large file)
+    **Workload:** script / log processing (runs on every line of a large file)
 
-    #### [Bug] Service names are pasted into the regex unescaped
+    #### [Bug] Service names go into the regex unescaped
     - **Where:** `new RegExp('\\b' + svc + '\\b', 'i')`
-    - **Issue:** a name like `api.v2` also matches `apiXv2`. A name like `cache(` or `c++` throws a `SyntaxError` in the middle of a long run.
-    - **Fix:** escape the name once before you build the pattern.
+    - **Issue:** a name like `api.v2` also matches `apiXv2`. A name like `cache(` or `c++` throws a `SyntaxError` partway through a long run.
+    - **Fix:** escape each name once, before you build its pattern.
 
     #### [High] Regexes are rebuilt for every log line
     - **Where:** the `line.match(new RegExp(...))` call, and the `new RegExp(...)` inside the `services` loop
-    - **Issue:** the line pattern never changes, yet it is parsed again for every line. The service patterns depend only on `services`, yet they are built again for every line and every service. With millions of lines and several services, that is millions of regex objects created and thrown away. V8 caches compiled patterns, so the gain is less than the raw count suggests. You still skip the string concatenation, the lookup and the allocation each time.
-    - **Fix:** build all patterns once before the loop. Do not add the `g` flag to them: with `.test()` a shared global regex keeps `lastIndex` between calls and skips matches.
-    - **Impact:** reduces E (CPU) per line, and the saving grows with file size and service count.
+    - **Issue:** the line pattern never changes, but it is parsed again for every line. The service patterns depend only on `services`, but they are rebuilt for every line and every service. With millions of lines and several services, the code creates and throws away millions of regex objects. V8 caches compiled patterns, so the real gain is smaller than that count suggests. You still save the string concatenation, the cache lookup and the allocation on every call.
+    - **Fix:** build all patterns once, before the loop. Don't add the `g` flag to them. With `.test()`, a shared global regex keeps `lastIndex` between calls and skips matches.
+    - **Impact:** reduces E (CPU) per line. The saving grows with file size and with the number of services.
 
-    #### [Low] Minimum level looked up per line
+    #### [Low] Minimum level is looked up on every line
     - **Where:** `LEVELS.indexOf(minLevel)` in the loop
-    - **Issue:** the value is the same on every line. It is a small cost, but it is free to move out.
+    - **Issue:** the value is the same for every line. The cost is small, but moving it out of the loop is free.
 
     ```javascript
-    const fs = require('fs');
-    const readline = require('readline');
+    import fs from 'node:fs';
+    import readline from 'node:readline';
 
     const LEVELS = ['DEBUG', 'INFO', 'WARN', 'ERROR'];
     const LINE_RE = new RegExp('^(\\S+) (' + LEVELS.join('|') + ') \\[(\\w+)\\] (.*)$');
@@ -95,17 +95,17 @@ messages:
       return { counts, bad };
     }
 
-    module.exports = { scan };
+    export { scan };
     ```
 
-    Output is the same for normal service names. Names with regex characters now match literally instead of failing or matching too much.
+    For normal service names, the output is the same. Names that contain regex characters now match literally. Before, they either threw an error or matched too much.
 
-    **Already good:** the file is streamed line by line, so memory stays flat on large logs.
+    **Already good:** the file is streamed line by line, so memory use stays flat on large logs.
 verify:
   equivalence:
     driver: |-
-      const os = require('os');
-      const path = require('path');
+      import os from 'node:os';
+      import path from 'node:path';
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scan-'));
       const file = path.join(dir, 'app.log');
       fs.writeFileSync(file, [
@@ -118,7 +118,6 @@ verify:
         '2026-10-09T10:00:05Z ERROR [db] authentication service down',
         ''
       ].join('\n'));
-      scan(file, ['auth', 'billing', 'cache'], 'INFO').then((r) => {
-        console.log(JSON.stringify(r));
-        fs.rmSync(dir, { recursive: true, force: true });
-      });
+      const r = await scan(file, ['auth', 'billing', 'cache'], 'INFO');
+      console.log(JSON.stringify(r));
+      fs.rmSync(dir, { recursive: true, force: true });

@@ -24,25 +24,25 @@ messages:
     ?
 - role: assistant
   content: |
-    Yes, it should save energy at that size. I can't give you a number for your system without measuring, but I can give you the direction and a measured reference.
+    Yes, it should save energy at this size. I can't give you a number for your system without measuring it, but I can tell you which way it goes and point you to a measured reference.
 
-    **What drives the saving:** you already use one transaction, so commits are not the problem. The cost is that every `INSERT` is its own statement. Each one is sent, parsed and planned on its own. With a multi-row `VALUES` list or `COPY`, the server does that work once per batch.
+    **What drives the saving:** you already use one transaction, so commits are not the problem. The cost is that every `INSERT` is a separate statement. The server receives, parses and plans each one separately. With a multi-row `VALUES` list or `COPY`, the server does that work once per batch.
 
-    **Measured reference:** in Green Metrics Tool micro-benchmarks on PostgreSQL 16, inserting 500,000 rows in batches of 5,000 rows used ~384 J of CPU energy with one `execute()` per row ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=8e80b599-3332-432f-8c7e-1cfb93a3a354,8b4c205d-5fb1-40af-ab77-0427ca572f4e,adff4e53-2f1a-4d88-9c0d-dd681d02923f)). `executemany()` used ~139 J, and `COPY ... FROM STDIN` used ~17 J, about 22× less than the per-row loop. Those runs used a Python client, with client and server on the same machine. A `psql -f` script of single-row statements has the same per-statement overhead, but I would not carry the exact figures over to it.
+    **Measured reference:** in Green Metrics Tool micro-benchmarks on PostgreSQL 16, inserting 500,000 rows in batches of 5,000 rows used ~384 J of CPU energy with one `execute()` per row. `executemany()` used ~139 J, and `COPY ... FROM STDIN` used ~17 J. That is about 22× less than the per-row loop. Those runs used a Python client, with client and server on the same machine. A `psql -f` script of single-row statements has the same per-statement overhead, but I would not carry the exact figures over to it.
 
-    **Where it matters less:** with batches of only 100 rows, the same benchmark showed small differences (loop ~13 J, `executemany` ~15 J, `COPY` ~9.5 J) ([measurements](https://metrics.green-coding.io/compare-simple.html?ids=8e80b599-3332-432f-8c7e-1cfb93a3a354,8b4c205d-5fb1-40af-ab77-0427ca572f4e,adff4e53-2f1a-4d88-9c0d-dd681d02923f)). Your chunks are large, so you are in the range where batching pays off.
+    **Where it matters less:** with batches of only 100 rows, the same benchmark showed small differences (loop ~13 J, `executemany` ~15 J, `COPY` ~9.5 J). Your chunks are large, so batching should pay off for you.
 
     **How to get your own number:**
-    1. Quick CPU-time proxy: build one real chunk in both forms and run `perf stat -e power/energy-pkg/ psql -q -f chunk_single.sql` against `chunk_batched.sql`. If RAPL is not available, use `time` on each and compare CPU time.
-    2. Real energy: run both loads as Green Metrics Tool usage scenarios on the same database setup and compare CPU energy. Multiply the per-chunk difference by your chunks per day.
+    1. Quick check: build one real chunk in both forms. Then run `perf stat -e power/energy-pkg/ psql -q -f chunk_single.sql` and the same command with `chunk_batched.sql`. If RAPL is not available, time each run with `time` and compare CPU time.
+    2. Real energy: run both loads as Green Metrics Tool usage scenarios on the same database setup and compare CPU energy. Multiply the difference per chunk by the number of chunks per day.
 
-    **Best option:** if `logship` can write a `COPY` file, use it:
+    **Best option:** if `logship` can write the chunk as a CSV file, load it with one `COPY`:
 
-    ```sql
-    COPY app_log (ts, host, level, service, message) FROM STDIN WITH (FORMAT csv);
+    ```bash
+    psql -q -c 'COPY app_log (ts, host, level, service, message) FROM STDIN WITH (FORMAT csv)' < chunk.csv
     ```
 
-    **If it has to stay SQL statements:** a multi-row `VALUES` list is a good middle step. Emit about 1,000 rows per statement, not all 40k in one:
+    **If it has to stay SQL statements:** a multi-row `VALUES` list is a good middle step. Put about 1,000 rows in each statement, not all 40k in one:
 
     ```sql
     BEGIN;

@@ -47,8 +47,8 @@ The student is trained WITHOUT any system prompt, so the conversation itself mus
 The user never mentions these rules. The user usually does not mention "green" or "energy" at all.
 
 Below are the spec files. Follow house-rules.md for behavior and response formats, use only facts from
-measured-facts.md for figures (and list their IDs in `facts:`), and only GSF URLs listed in the taxonomy.
-When quoting a figure, add the fact's measurement link once, copied verbatim from measured-facts.md.
+measured-facts.md for figures (and list their IDs in `facts:`). Quote figures without links: no measurement,
+benchmark or GSF pattern URLs in answers.
 Never mention the spec files, fact IDs, or that you are generating training data inside the conversation.
 
 Scope: build every example only around the patterns listed in taxonomy.yaml. The GSF file mentions more patterns

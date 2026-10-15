@@ -2,7 +2,8 @@ id: gen-1-00037-refactor
 category: refactor
 language: python
 patterns:
-- vectorize-or-jit
+- efficient-algorithm
+- hoist-invariants
 messages:
 - role: user
   content: |
@@ -32,39 +33,54 @@ messages:
 - role: assistant
   content: |
     ```python
-    import numpy as np
+    import math
 
     EARTH_RADIUS_KM = 6371.0
+    _PAD_DEG = 1e-6  # small safety margin so rounding never drops a store at the edge
 
 
     def stores_nearby(stores, lat, lon, radius_km, limit=20):
         """stores: list of dicts like {"id": 17, "lat": 52.5, "lon": 13.4, "name": "..."}"""
-        n = len(stores)
-        lats = np.fromiter((s["lat"] for s in stores), dtype=float, count=n)
-        lons = np.fromiter((s["lon"] for s in stores), dtype=float, count=n)
+        # Depends only on the query, so compute it once, not once per store.
+        lat_rad = math.radians(lat)
+        cos_lat = math.cos(lat_rad)
+        ang = radius_km / EARTH_RADIUS_KM  # search radius as an angle (radians)
 
-        dlat = np.radians(lats - lat)
-        dlon = np.radians(lons - lon)
-        a = (np.sin(dlat / 2) ** 2
-             + np.cos(np.radians(lat)) * np.cos(np.radians(lats)) * np.sin(dlon / 2) ** 2)
-        dist = 2 * EARTH_RADIUS_KM * np.arcsin(np.sqrt(a))
+        # Bounding box: a store outside it cannot be within radius_km.
+        max_dlat = math.degrees(ang) + _PAD_DEG
+        lat_min, lat_max = lat - max_dlat, lat + max_dlat
+        if ang < math.pi / 2 - abs(lat_rad) - _PAD_DEG:
+            max_dlon = math.degrees(math.asin(math.sin(ang) / cos_lat)) + _PAD_DEG
+        else:
+            max_dlon = 180.0  # circle touches a pole: no longitude filter
 
-        idx = np.flatnonzero(dist <= radius_km)
-        rounded = np.round(dist[idx], 2)
-        order = np.argsort(rounded, kind="stable")[:limit]
+        result = []
+        for s in stores:
+            s_lat = s["lat"]
+            if s_lat < lat_min or s_lat > lat_max:
+                continue
+            s_lon = s["lon"]
+            # Longitude difference wrapped to [-180, 180), so the date line works.
+            if abs((s_lon - lon + 180.0) % 360.0 - 180.0) > max_dlon:
+                continue
 
-        return [
-            {"id": stores[i]["id"], "distance_km": float(d)}
-            for i, d in zip(idx[order], rounded[order])
-        ]
+            dlat = math.radians(s_lat - lat)
+            dlon = math.radians(s_lon - lon)
+            a = (math.sin(dlat / 2) ** 2
+                 + cos_lat * math.cos(math.radians(s_lat)) * math.sin(dlon / 2) ** 2)
+            d = 2 * EARTH_RADIUS_KM * math.asin(math.sqrt(a))
+            if d <= radius_km:
+                result.append({"id": s["id"], "distance_km": round(d, 2)})
+
+        result.sort(key=lambda r: r["distance_km"])
+        return result[:limit]
     ```
 
     **Green Notes**
-    - **Vectorized distance math** (reduces E): the old code ran about six trig calls per store in the Python interpreter, for every request. Now NumPy does the whole formula for all stores in compiled loops. CPU time per request drops, so the same server handles more users.
-    - **Only the winners become dicts**: before, every store inside the radius got a result dict, and then the list was sorted. Now the filter and the sort work on arrays, and only the top `limit` entries are built.
-    - Behavior is the same: same formula, same rounding to 2 digits, same order. Stores with equal rounded distance keep their original order (stable sort). Tiny differences in the last floating point digit are possible, because NumPy and `math` can differ by one ulp.
-    - The list-to-array step still loops over all stores in Python on every call. If the store list changes rarely, build `lats` and `lons` once at startup and pass them in. Then this step disappears too.
-    - *Not applied:* a spatial index (grid or KD-tree). At 20 thousand stores the vectorized scan is simple and fast enough. An index only makes sense if the store count grows by a large factor.
+    - **Bounding-box pre-filter** (reduces E): before, every request ran the full trig formula for all 20 thousand stores. Now two cheap comparisons drop stores that are clearly too far, and only the few left get the exact distance. For a small "near me" radius, most stores never reach the trig math.
+    - **Hoisted query-only work** (reduces E): `cos(radians(lat))` was computed again for every store. Now it runs once per request.
+    - Behavior is the same: same formula, same rounding, same sort order, the same results. The box is a safe outer bound with a small margin. It also handles the date line, and near the poles it turns off the longitude filter.
+    - *Not applied:* NumPy. Converting 20 thousand dicts to arrays on every request would cost a lot of the gain. It only pays off if you keep the coordinates as arrays between requests. A spatial index (grid or KD-tree) is the next step only if the store count grows a lot.
 verify:
   equivalence:
     driver: |
@@ -74,10 +90,20 @@ verify:
           {"id": i, "lat": random.uniform(47.0, 55.0), "lon": random.uniform(6.0, 15.0), "name": f"Store {i}"}
           for i in range(500)
       ]
-      for lat, lon, radius in [(52.5, 13.4, 150.0), (48.1, 11.6, 80.0), (50.0, 8.0, 10.0), (0.0, 0.0, 5.0)]:
+      for lat, lon, radius in [(52.5, 13.4, 150.0), (48.1, 11.6, 80.0), (50.0, 8.0, 10.0), (0.0, 0.0, 5.0), (52.5, 13.4, 0.0)]:
           res = stores_nearby(stores, lat, lon, radius, limit=15)
           print(len(res), [(r["id"], f"{r['distance_km']:.2f}") for r in res])
       print(stores_nearby([], 52.5, 13.4, 100.0))
+      edge = [
+          {"id": 1, "lat": 10.0, "lon": 179.9},
+          {"id": 2, "lat": 10.0, "lon": -179.9},
+          {"id": 3, "lat": 89.9, "lon": 0.0},
+          {"id": 4, "lat": 89.9, "lon": 180.0},
+          {"id": 5, "lat": -45.0, "lon": 20.0},
+      ]
+      for lat, lon, radius in [(10.0, 179.95, 50.0), (10.0, -179.95, 50.0), (89.95, 90.0, 50.0), (0.0, 0.0, 30000.0)]:
+          res = stores_nearby(edge, lat, lon, radius)
+          print(len(res), [(r["id"], f"{r['distance_km']:.2f}") for r in res])
   benchmark:
     driver: |
       import random
@@ -86,6 +112,7 @@ verify:
           {"id": i, "lat": random.uniform(47.0, 55.0), "lon": random.uniform(6.0, 15.0), "name": f"Store {i}"}
           for i in range(20000)
       ]
-      for _ in range(5):
-          stores_nearby(stores, 52.5, 13.4, 200.0)
+      for radius in (25.0, 50.0, 200.0):
+          for _ in range(3):
+              stores_nearby(stores, 52.5, 13.4, radius)
     min_speedup: 2

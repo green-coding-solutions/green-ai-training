@@ -13,8 +13,9 @@ messages:
 
     ```javascript
     #!/usr/bin/env node
-    const fs = require("node:fs");
-    const path = require("node:path");
+    import fs from "node:fs";
+    import path from "node:path";
+    import { fileURLToPath } from "node:url";
 
     function walk(dir, exts, out = []) {
       for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -95,11 +96,12 @@ messages:
     function main() {
       const args = process.argv.slice(2);
       const keepIdx = args.indexOf("--keep");
-      const keep = keepIdx === -1 ? [] : args.splice(keepIdx, 2)[1].split(",");
+      const keep = keepIdx === -1 ? [] : (args.splice(keepIdx, 2)[1] || "").split(",");
       const [siteDir, cssIn, cssOut] = args;
       if (!siteDir || !cssIn || !cssOut) {
         console.error("usage: node purge-css.js <siteDir> <in.css> <out.css> [--keep a,b,c]");
-        process.exit(1);
+        process.exitCode = 1;
+        return;
       }
 
       const used = new Set(keep);
@@ -113,21 +115,23 @@ messages:
       console.log(`${cssIn}: ${before.length} -> ${after.length} characters`);
     }
 
-    module.exports = { purgeCss, collectTokens };
-    if (require.main === module) main();
+    export { purgeCss, collectTokens };
+    if (process.argv[1] === fileURLToPath(import.meta.url)) main();
     ```
+
+    The script uses ES module syntax. On Node 22.12 or newer, `node purge-css.js` runs it as is. On older Node, save it as `purge-css.mjs`.
 
     Check the new file in a browser before you replace the old one. If JavaScript builds class names from pieces (`"btn-" + type`), the script cannot see them. Add them by hand with `--keep btn-primary,btn-danger`.
 
     **Green Notes**
     - **Remove unused CSS** (reduces network and client E): the stylesheet is smaller, so every visitor downloads and parses less. Run the script once at build time, not on each request.
-      https://patterns.greensoftware.foundation/development/media-and-code-efficiency/remove-unused-css
+      Pattern: Remove unused CSS
     - **One pass over the files:** the script reads each file once and collects the words in a `Set`, so each class check is one lookup.
     - *Not applied:* a full CSS parser. This simple version is enough for a small site. For a big site or a framework, a tested tool like PurgeCSS handles more edge cases, for example selectors inside `:is(a, b)`.
 verify:
   module: true
   test: |-
-    const assert = require("node:assert");
+    import assert from "node:assert";
     const used = collectTokens('<div class="btn card">x</div>');
     assert.ok(used.has("btn") && used.has("card"));
     const css = ".btn{color:red}.unused{color:blue}.btn,.old{margin:0}@media (min-width:600px){.card{padding:1px}.gone{padding:2px}}@font-face{font-family:x}a{color:green}.btn.is-open{top:0}/* .btn{x:y} */";
@@ -137,3 +141,4 @@ verify:
       ".btn{color:red}.btn{margin:0}@media (min-width:600px){.card{padding:1px}}@font-face{font-family:x}a{color:green}"
     );
     assert.strictEqual(purgeCss("@media print{.gone{a:b}}", used), "");
+    process.exitCode = 0;
