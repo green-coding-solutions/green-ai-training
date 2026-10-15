@@ -24,8 +24,8 @@ def train_model(model_name, target_modules, dataset_path, output_dir, split_and_
         # We have seen 15-25% improvement unsloth/Qwen2.5-Coder-7B-Instruct which has BF16 tensors
         # => Always both parameter have to be set with each value inverse to the other!
         # Using 4-bit might use less memory, but can degrade the model if not already in 4bit
-        load_in_4bit=bool(quantize_4bit),
-        load_in_16bit=not bool(quantize_4bit),
+        load_in_4bit=quantize_4bit,
+        load_in_16bit=not quantize_4bit,
     )
 
     # Add LoRA adapters.
@@ -137,7 +137,7 @@ def main():
     parser.add_argument("--rank", help="LoRA rank (lora_alpha is set to the same value)", type=int, default=16)
     parser.add_argument("--max-seq-length", help="Maximum tokens per conversation, longer ones are truncated", type=int, default=2048)
     parser.add_argument("--target-modules", help="Comma-separated LoRA target modules (gate_proj,up_proj,down_proj are typically 'knowledge' and 'q_proj,k_proj,v_proj,o_proj 'behaviour and capabilities')", default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
-    parser.add_argument("--quantize-4bit", help="Force 4-bit quantization. Helpful if you have limited memory. Might reduce training speed and model accuracy in not already 4-bit models.")
+    parser.add_argument("--quantize-4bit", help="Force 4-bit quantization. Helpful if you have limited memory. Might reduce training speed and model accuracy in not already 4-bit models.", action="store_true")
 
     args = parser.parse_args()
 
