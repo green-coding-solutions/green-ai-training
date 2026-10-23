@@ -148,7 +148,8 @@ def main():
     parser.add_argument("--learning-rate", help="Learning rate", type=float, default=2e-4)
     parser.add_argument("--rank", help="LoRA rank (lora_alpha is set to the same value)", type=int, default=16)
     parser.add_argument("--max-seq-length", help="Maximum tokens per conversation, longer ones are truncated", type=int, default=2048)
-    parser.add_argument("--target-modules", help="Comma-separated LoRA target modules (gate_proj,up_proj,down_proj are typically 'knowledge' and 'q_proj,k_proj,v_proj,o_proj 'behaviour and capabilities')", default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
+    # These layers should ONLY be the language layers. Not the vision layers (like vision_model.XXX or vision.q_proj etc.)
+    parser.add_argument("--target-modules", help="Comma-separated LoRA language layer target modules (gate_proj,up_proj,down_proj are typically 'knowledge' and 'q_proj,k_proj,v_proj,o_proj 'behaviour and capabilities')", default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
     parser.add_argument("--quantize-4bit", help="Force 4-bit quantization. Helpful if you have limited memory. Might reduce training speed and model accuracy in not already 4-bit models.", action="store_true")
 
     args = parser.parse_args()
