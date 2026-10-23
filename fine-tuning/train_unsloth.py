@@ -25,7 +25,8 @@ class EvalAfterFirstStep(TrainerCallback):
         return control
 
 def train_model(model_name, target_modules, dataset_path, output_dir, split_and_evaluate,
-                eval_dataset_path=None, epochs=3, learning_rate=2e-4, rank=16, max_seq_length=2048, quantize_4bit=False):
+                eval_dataset_path=None, epochs=3, learning_rate=2e-4, rank=16, max_seq_length=2048, quantize_4bit=False,
+                batch_size=2, gradient_accumulation_steps=None):
 
     # Load the model
     model, tokenizer = FastLanguageModel.from_pretrained(
@@ -101,8 +102,10 @@ def train_model(model_name, target_modules, dataset_path, output_dir, split_and_
     if eval_dataset:
         eval_dataset = eval_dataset.map(format_example)
 
-    batch_size = 2
-    gradient_accumulation_steps = 4
+    # Keep the effective batch at 8 by default, so a smaller batch only saves memory
+    # and does not change the number of optimizer steps or the warmup
+    if gradient_accumulation_steps is None:
+        gradient_accumulation_steps = max(1, 8 // batch_size)
     # Warm up over 10% of all optimizer steps. Passed as a whole number because the MLX trainer
     # ignores fractional warmup_steps and would start at the full learning rate.
     total_steps = math.ceil(len(train_dataset) / (batch_size * gradient_accumulation_steps)) * epochs
@@ -168,6 +171,8 @@ def main():
     parser.add_argument("--epochs", help="Number of training epochs", type=float, default=3)
     parser.add_argument("--learning-rate", help="Learning rate", type=float, default=2e-4)
     parser.add_argument("--rank", help="LoRA rank (lora_alpha is set to the same value)", type=int, default=16)
+    parser.add_argument("--batch-size", help="Conversations per forward pass. Lower it to save memory", type=int, default=2)
+    parser.add_argument("--gradient-accumulation-steps", help="Batches per optimizer step (default: 8 / batch size, so the effective batch stays 8)", type=int, default=None)
     parser.add_argument("--max-seq-length", help="Maximum tokens per conversation, longer ones are truncated", type=int, default=2048)
     # These layers should ONLY be the language layers. Not the vision layers (like vision_model.XXX or vision.q_proj etc.)
     parser.add_argument("--target-modules", help="Comma-separated LoRA language layer target modules (gate_proj,up_proj,down_proj are typically 'knowledge' and 'q_proj,k_proj,v_proj,o_proj 'behaviour and capabilities')", default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
@@ -182,7 +187,8 @@ def main():
     print(f"Target modules: {target_modules}")
 
     train_model(args.model, target_modules, args.dataset, args.output, args.split_and_evaluate,
-                args.eval_dataset, args.epochs, args.learning_rate, args.rank, args.max_seq_length, args.quantize_4bit)
+                args.eval_dataset, args.epochs, args.learning_rate, args.rank, args.max_seq_length, args.quantize_4bit,
+                args.batch_size, args.gradient_accumulation_steps)
 
 if __name__ == "__main__":
     main()
