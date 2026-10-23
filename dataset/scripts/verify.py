@@ -5,7 +5,8 @@ Checks per example:
   schema        ids, categories, patterns, message order
   style         Green Notes / review format per category, code fence tags, banned phrases, spec leakage
   numbers       energy / % / multiplier figures only when backed by a cited fact in spec/measured-facts.md
-  urls          no GSF pattern, measurement or benchmark links in answers, only the figures themselves
+  urls          no pattern catalog, measurement or benchmark links in answers, only the figures themselves
+  scope         language must be benchmarked for the example's patterns, at least one backing fact
   syntax        python (ast), javascript (node --check), bash (bash -n), json, yaml, sql (sqlite parser)
   execution     optional `verify:` block -> run, test, equivalence (original vs green output), benchmark (CPU time)
   contamination code in user messages must not be a near copy of ../../test-cases (that is the eval set)
@@ -149,6 +150,22 @@ def check_schema(ex, taxonomy, errors, warnings):
         errors.append("schema: conversation must end with an assistant message")
     if ex.get("category") == "multi-turn" and len(msgs) < 4:
         errors.append("schema: multi-turn needs at least 2 user turns")
+
+
+def check_scope(ex, taxonomy, errors):
+    # the dataset only teaches what the benchmarks measured: their languages and their facts
+    by_id = {p["id"]: p for p in taxonomy["patterns"]}
+    category, language = ex.get("category"), ex.get("language")
+    measured = [by_id[p] for p in ex.get("patterns") or [] if p in by_id and by_id[p]["languages"]]
+    if category != "conceptual":
+        for p in measured:
+            if language not in p["languages"]:
+                errors.append(f"scope: pattern {p['id']} was only benchmarked in {p['languages']}, not {language!r}")
+    cited = set(ex.get("facts") or [])
+    if not cited:
+        errors.append("scope: no facts cited, every example needs a measured fact")
+    elif measured and not cited & {f for p in measured for f in p.get("facts") or []}:
+        errors.append(f"scope: cited facts {sorted(cited)} do not back any of the patterns {[p['id'] for p in measured]}")
 
 
 def check_style(ex, errors, warnings):
@@ -600,6 +617,7 @@ def verify_all(paths=None, no_exec=False, use_cache=True, quiet=False):
             errors, warnings, verified, metrics = [], [], [], {}
             check_schema(ex, taxonomy, errors, warnings)
             if not errors:
+                check_scope(ex, taxonomy, errors)
                 check_style(ex, errors, warnings)
                 check_numbers(ex, facts, errors)
                 check_urls(ex, errors)

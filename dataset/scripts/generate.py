@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generates synthetic training examples with a teacher model (Claude, via the Anthropic API).
 
-The teacher gets the spec (GSF rules + house rules + measured facts) as a cached system prompt and a job
+The teacher gets the spec (house rules + measured facts + taxonomy) as a cached system prompt and a job
 (category, pattern, language, domain, user style) plus hand-written examples of the same category as format
 reference. It returns one example in the YAML source format, which lands in examples/generated/ and then must
 pass verify.py like every hand-written example.
@@ -48,12 +48,17 @@ The user never mentions these rules. The user usually does not mention "green" o
 
 Below are the spec files. Follow house-rules.md for behavior and response formats, use only facts from
 measured-facts.md for figures (and list their IDs in `facts:`). Quote figures without links: no measurement,
-benchmark or GSF pattern URLs in answers.
+benchmark or pattern catalog URLs in answers.
 Never mention the spec files, fact IDs, or that you are generating training data inside the conversation.
 
-Scope: build every example only around the patterns listed in taxonomy.yaml. The GSF file mentions more patterns
-(AI/ML and agentic patterns, caching layers, N+1 queries, polling, tracking, ...). Do not write examples about them,
-do not put code into user messages whose main problem is one of them, and do not add findings or Green Notes for them.
+Scope: the dataset only teaches what was measured. Every example is about the case a fact in measured-facts.md
+measured, in one of the languages taxonomy.yaml lists for its pattern:
+- The user's code contains exactly the inefficiency the benchmark measured (or, for no-change, the case where the
+  fact says it does not pay off). Do not invent other refactorings or optimizations.
+- Do not add findings or Green Notes for anything without a fact in measured-facts.md (no caching layers, N+1
+  queries, polling, algorithm rewrites, other languages' idioms, ...). Review findings beyond the pattern are limited to
+  real bugs and security problems.
+- List the backing fact ids in `facts:`. Every example needs at least one fact.
 
 ## Output format
 
@@ -64,7 +69,7 @@ id: <given id>
 category: <given category>
 language: <main language>
 patterns: [<pattern ids from the taxonomy>]
-facts: [<fact ids, only if the assistant quotes a measured figure>]
+facts: [<fact ids backing the pattern, required>]
 sql_dialect: postgres            # only if SQL is not SQLite-compatible
 messages:
   - role: user
@@ -124,9 +129,7 @@ def plan_jobs(n, seed):
     jobs = []
     for i in range(n):
         category = rng.choices(cats, weights)[0]
-        if category in ("general",):
-            pats, language = ["none"], rng.choice(taxonomy["languages"])
-        elif category == "conceptual":
+        if category == "conceptual":
             pats, language = [rng.choice(patterns)["id"]], "text"
         else:
             primary = rng.choice(patterns)

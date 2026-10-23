@@ -28,9 +28,9 @@ def load_taxonomy():
 
 
 def load_spec_text():
-    """Concatenated teacher spec: GSF rules, house rules, measured facts, taxonomy."""
+    """Concatenated teacher spec: house rules, measured facts, taxonomy."""
     parts = []
-    for name in ("gsf-green-code-skill.md", "house-rules.md", "measured-facts.md", "taxonomy.yaml"):
+    for name in ("house-rules.md", "measured-facts.md", "taxonomy.yaml"):
         parts.append(f"<file name=\"{name}\">\n{(SPEC_DIR / name).read_text(encoding='utf-8')}\n</file>")
     return "\n\n".join(parts)
 

@@ -74,11 +74,15 @@ def train_model(model_name, target_modules, dataset_path, output_dir, split_and_
             },
         ]
 
+        if "enable_thinking" in tokenizer.get_chat_template():
+            template_kwargs["enable_thinking"] = False
+
         return {
             "text": tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=False,
+                **template_kwargs
             )
         }
 

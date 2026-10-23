@@ -10,10 +10,9 @@ teacher (a human author or `generate.py`). The training data has no system promp
 
 ```
 spec/
-  gsf-green-code-skill.md   GSF rules (MIT, Green Software Foundation), teacher input only
-  house-rules.md            target behavior, caveats, numbers policy, response formats (wins over GSF)
+  house-rules.md            target behavior, caveats, numbers policy, response formats
   measured-facts.md         GMT measurements from ../data/green-coding-measurement-data.csv, the only allowed figures
-  taxonomy.yaml             categories + mix, pattern ids, languages, domains
+  taxonomy.yaml             categories + mix, benchmarked patterns and their languages, domains
 examples/                   conversation sources (YAML, several documents per file)
   generated/                output of generate.py
 scripts/
@@ -104,8 +103,10 @@ verify:                         # optional
   sustainability talk in general answers, language tags on code blocks, no leaked spec or fact ids.
 - **Numbers:** every energy, percentage or multiplier figure in an answer must appear in a cited fact or in the
   user's own message.
-- **URLs:** answers must not contain GSF pattern, Green Metrics Tool or benchmark links
+- **URLs:** answers must not contain pattern catalog, Green Metrics Tool or benchmark links
   (`patterns.greensoftware.foundation`, `metrics.green-coding.io`, `github.com/green-coding-solutions`).
+- **Scope:** the example language must be one of the languages its patterns were benchmarked in (`taxonomy.yaml`),
+  and every example must cite at least one fact.
 - **Syntax:** Python, JavaScript, bash, JSON, YAML, SQLite.
 - **Execution:** tests, output equivalence between original and answer, CPU-time benchmarks.
 - **Contamination:** user code must not be a near copy of `../test-cases` (the evaluation set).
