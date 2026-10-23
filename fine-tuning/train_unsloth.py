@@ -9,9 +9,20 @@ import argparse
 import math
 from unsloth import FastLanguageModel, is_bfloat16_supported
 from unsloth.chat_templates import train_on_responses_only
+from unsloth.device_type import is_mlx_available
 import torch
 from datasets import load_dataset
 from trl import SFTTrainer, SFTConfig
+from transformers import TrainerCallback
+
+
+class EvalAfterFirstStep(TrainerCallback):
+    # The MLX trainer has no eval_on_start. Step 1 runs at 1/warmup_steps of the learning rate,
+    # so this eval is close to the untrained baseline.
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step == 1:
+            control.should_evaluate = True
+        return control
 
 def train_model(model_name, target_modules, dataset_path, output_dir, split_and_evaluate,
                 eval_dataset_path=None, epochs=3, learning_rate=2e-4, rank=16, max_seq_length=2048, quantize_4bit=False):
@@ -97,6 +108,8 @@ def train_model(model_name, target_modules, dataset_path, output_dir, split_and_
     total_steps = math.ceil(len(train_dataset) / (batch_size * gradient_accumulation_steps)) * epochs
     warmup_steps = max(1, int(total_steps * 0.1))
 
+    use_mlx = is_mlx_available()
+
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
@@ -118,17 +131,25 @@ def train_model(model_name, target_modules, dataset_path, output_dir, split_and_
             save_total_limit=2,
             bf16=is_bfloat16_supported(),
             fp16=not is_bfloat16_supported(),
+            # We could also use adamw_torch_fused when training on CUDA as it is faster and does not quantize
+            # But sadly we have seen OOM doing this on 32 GB shared memory MLX Training
             optim="adamw_8bit",
             seed=3407,
             report_to="none",
             # Small datasets have few steps per epoch, so evaluate once per epoch
             eval_strategy="epoch" if eval_dataset is not None else "no",
+            # Baseline val loss of the untrained model, to compare the epoch evals against.
+            # MLXTrainingConfig rejects this kwarg, MLX uses EvalAfterFirstStep instead.
+            **({"eval_on_start": eval_dataset is not None} if not use_mlx else {}),
         ),
     )
 
     # Loss only on the assistant turns. Otherwise the model also learns to reproduce the user
     # prompts and the system prompt. Instruction/response markers are detected from the chat template.
     trainer = train_on_responses_only(trainer)
+
+    if eval_dataset is not None and use_mlx:
+        trainer.add_callback(EvalAfterFirstStep())
 
     trainer.train()
 
