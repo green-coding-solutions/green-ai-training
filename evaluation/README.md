@@ -30,11 +30,11 @@ HF_ALLOW_CODE_EVAL=1 lm_eval \
   --tasks mbpp_plus \
   --batch_size 1 \
   --output_path results/base \
---apply_chat_template \
+  --apply_chat_template \
   --confirm_run_unsafe_code \
   --device mps
 ```
 
 In case you have not fused the model try:
 
-- `--model_args "pretrained=unsloth/Qwen2.5-Coder-7B-Instruct,peft=../fine-tuning/lora-adapter" \`
+- `--model_args "pretrained=unsloth/Qwen2.5-Coder-7B-Instruct,peft=../fine-tuning/lora-adapter"`
