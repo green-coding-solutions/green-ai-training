@@ -1,0 +1,81 @@
+id: gen-12764612-00050-review
+category: review
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    hi, i made this nginx config for a little page that shows stats from our server logs. A cron job makes the html and json files every hour and puts them in /srv/logstats/public. i think it is slow when the team opens it but i dont know what is wrong. can you look?
+
+    ```nginx
+    server {
+        listen 80;
+        server_name logstats.internal.example;
+
+        root /srv/logstats/public;
+        index index.html;
+
+        gzip on;
+        gzip_comp_level 9;
+        gzip_types text/css application/javascript;
+
+        location /data/ {
+            # hourly json from cron
+            expires 5m;
+        }
+
+        location /raw/ {
+            alias /var/log/nginx/;
+            autoindex on;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (static files from an hourly batch job)
+
+    #### [Security] Raw logs are open to everyone
+    - **Where:** `location /raw/`
+    - **Issue:** `autoindex on` lists every file in `/var/log/nginx/`, and anyone who can reach the server can download them. Access logs hold client IPs, URLs and often tokens in query strings. The error log can leak paths and internal details.
+    - **Fix:** remove the location, or protect it:
+      ```nginx
+      location /raw/ {
+          allow 10.0.0.0/8;   # your office/VPN range
+          deny  all;
+          alias /var/log/nginx/;
+          autoindex on;
+      }
+      ```
+
+    #### [High] Files are compressed again on every request
+    - **Where:** `gzip on; gzip_comp_level 9;`
+    - **Issue:** your files only change once an hour, but nginx compresses them again for every visitor, and level 9 is the most expensive gzip setting. In Green Metrics Tool micro-benchmarks with nginx serving 2,000 text requests, gzip level 5 per request used about 4× the CPU energy of serving precompressed files. Compression itself sent about 10× fewer bytes, so keep it on, but do the work once.
+    - **Fix:** let the cron job write a `.gz` file next to each output file, and let nginx serve it with `gzip_static`:
+      ```nginx
+      gzip_static on;
+      gzip on;                 # fallback for files without a .gz
+      gzip_comp_level 5;
+      gzip_min_length 1024;
+      gzip_vary on;
+      gzip_types text/css application/javascript application/json;
+      ```
+      At the end of the cron job, run `gzip -k -f` on the new `.html` and `.json` files. Do it every hour, because nginx serves an old `.gz` even if the original file is newer.
+    - **Impact:** E (server CPU) per request drops, and the network bytes stay small.
+
+    #### [Medium] JSON is not compressed at all
+    - **Where:** `gzip_types text/css application/javascript;`
+    - **Issue:** `gzip_types` does not list `application/json`, so your `/data/` files go out at full size. HTML is compressed by default. JSON is usually your biggest text file.
+    - **Fix:** add `application/json` (see the block above).
+    - **Impact:** network, and client download time.
+
+    #### [Low] Missing `gzip_vary`
+    - **Where:** the `gzip` settings
+    - **Issue:** without `Vary: Accept-Encoding`, a proxy or browser cache can hand a compressed answer to a client that did not ask for one.
+    - **Fix:** `gzip_vary on;` (already in the block above).
+
+    **Already good:** `expires 5m` on `/data/` matches the hourly update, so repeat visits do not download the files again. Do not enable gzip for the rotated `.gz` logs: they are already compressed and gain nothing.
+verify:
+  static_only: nginx config review, needs a running nginx and generated files

@@ -1,0 +1,81 @@
+id: gen-12764612-00222-no-change
+category: no-change
+language: python
+patterns:
+- vectorize-or-jit
+- context-tradeoff
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    hello, we have small webshop with flask and this function calculate the cart total on every checkout request. A cart have 1 to 30 lines, mostly 3 or 4. my collegue read that numba make python loops much more fast and green, so he want to put @njit on it. is this good idea? I am not sure, we have maybe 2000 checkouts per day.
+
+    ```python
+    TIERS = ((10, 15), (5, 10), (3, 5))  # (min_qty, discount percent)
+
+
+    def line_total_cents(unit_cents, qty):
+        pct = 0
+        for min_qty, p in TIERS:
+            if qty >= min_qty:
+                pct = p
+                break
+        gross = unit_cents * qty
+        return gross - (gross * pct) // 100
+
+
+    def cart_total_cents(items, free_shipping_from=5000, shipping_cents=490):
+        subtotal = 0
+        for it in items:
+            subtotal += line_total_cents(it["unit_cents"], it["qty"])
+        if subtotal < free_shipping_from:
+            subtotal += shipping_cents
+        return subtotal
+    ```
+- role: assistant
+  content: |
+    No, don't add Numba here. Leave the code as it is.
+
+    Numba helps CPU-bound numeric loops that run over a very large amount of data. In Green Metrics Tool micro-benchmarks, `@njit` used about 4× less CPU energy than a pure Python loop when quantizing 10,000,000 samples. Your loop runs over 1 to 30 items, so there is almost nothing to speed up.
+
+    Why it does not fit this function:
+    - The work per request is a few dozen integer operations. The time is dominated by the request handling, not by this loop.
+    - Numba compiles on first call, so every new worker process pays that cost. It also does not work well with a list of dicts, so you would have to change your data structures.
+    - It adds a heavy dependency to your image and a new thing to debug.
+
+    The code is already in good shape:
+    - integer cents, so no float rounding problems,
+    - one pass over the cart, no repeated work,
+    - the discount tiers are a tiny constant tuple with an early `break`.
+
+    ```python
+    TIERS = ((10, 15), (5, 10), (3, 5))  # (min_qty, discount percent)
+
+
+    def line_total_cents(unit_cents, qty):
+        pct = 0
+        for min_qty, p in TIERS:
+            if qty >= min_qty:
+                pct = p
+                break
+        gross = unit_cents * qty
+        return gross - (gross * pct) // 100
+
+
+    def cart_total_cents(items, free_shipping_from=5000, shipping_cents=490):
+        subtotal = 0
+        for it in items:
+            subtotal += line_total_cents(it["unit_cents"], it["qty"])
+        if subtotal < free_shipping_from:
+            subtotal += shipping_cents
+        return subtotal
+    ```
+
+    If you ever price millions of lines in a batch job, a JIT or a vectorized approach is worth measuring then. To check any change, compare CPU time with `perf stat` or `time` on a realistic workload.
+verify:
+  test: |-
+    assert cart_total_cents([{"unit_cents": 1000, "qty": 1}]) == 1490
+    assert cart_total_cents([{"unit_cents": 1000, "qty": 5}]) == 4990
+    assert cart_total_cents([{"unit_cents": 600, "qty": 10}]) == 5100
+    assert cart_total_cents([]) == 490

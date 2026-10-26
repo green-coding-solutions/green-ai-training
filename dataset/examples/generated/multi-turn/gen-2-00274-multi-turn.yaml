@@ -1,0 +1,248 @@
+id: gen-2-00274-multi-turn
+category: multi-turn
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    log report cron takes forever, fix this
+
+    ```python
+    import json
+    import urllib.request
+    from collections import Counter
+
+    HOSTS = [f"app-{i:02d}.internal" for i in range(1, 26)]
+    TAIL_URL = "http://{host}:9100/logs/tail?lines=2000"
+
+
+    def fetch_tail(host):
+        with urllib.request.urlopen(TAIL_URL.format(host=host)) as resp:
+            return resp.read().decode("utf-8", errors="replace").splitlines()
+
+
+    def summarize(lines):
+        levels = Counter()
+        for line in lines:
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                levels["unparsed"] += 1
+                continue
+            levels[entry.get("level", "unknown")] += 1
+        return levels
+
+
+    def main():
+        report = {}
+        for host in HOSTS:
+            lines = fetch_tail(host)
+            report[host] = summarize(lines)
+
+        total = Counter()
+        for counts in report.values():
+            total.update(counts)
+
+        for host, counts in report.items():
+            print(f"{host:20} error={counts['error']:5} warn={counts['warn']:5}")
+        print("total", dict(total))
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    The script waits for each host to answer before it asks the next one. `urlopen` also has no timeout, so one hung host stalls the whole run. This version fetches all hosts at once, with a timeout:
+
+    ```python
+    import asyncio
+    import json
+    import sys
+    from collections import Counter
+
+    import httpx
+
+    HOSTS = [f"app-{i:02d}.internal" for i in range(1, 26)]
+    TAIL_URL = "http://{host}:9100/logs/tail?lines=2000"
+    TIMEOUT = 10.0
+
+
+    async def fetch_tail(client, host):
+        resp = await client.get(TAIL_URL.format(host=host))
+        resp.raise_for_status()
+        return resp.content.decode("utf-8", errors="replace").splitlines()
+
+
+    def summarize(lines):
+        levels = Counter()
+        for line in lines:
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                levels["unparsed"] += 1
+                continue
+            levels[entry.get("level", "unknown")] += 1
+        return levels
+
+
+    async def collect(hosts):
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            results = await asyncio.gather(
+                *(fetch_tail(client, host) for host in hosts), return_exceptions=True
+            )
+        report, failed = {}, {}
+        for host, result in zip(hosts, results):
+            if isinstance(result, Exception):
+                failed[host] = result
+            else:
+                report[host] = summarize(result)
+        return report, failed
+
+
+    def main():
+        report, failed = asyncio.run(collect(HOSTS))
+
+        total = Counter()
+        for counts in report.values():
+            total.update(counts)
+
+        for host, counts in report.items():
+            print(f"{host:20} error={counts['error']:5} warn={counts['warn']:5}")
+        print("total", dict(total))
+
+        for host, exc in failed.items():
+            print(f"{host}: fetch failed: {exc!r}", file=sys.stderr)
+        if failed:
+            sys.exit(1)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **Concurrent requests** (reduces E): the run now takes about as long as the slowest host, not the sum of all hosts. In Green Metrics Tool micro-benchmarks, 10 HTTP requests with async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. Most of the gain is wall time, so the cron job holds its process and connections for less time.
+    - **Timeout (bug fix):** a host that accepts the connection but never answers now fails after 10 s. Before, it blocked the run with no limit.
+    - **Behavior change:** before, one failing host stopped the script with a traceback and no report. Now the other hosts are still reported, failures go to stderr, and the exit code is 1, so cron still flags the run.
+- role: user
+  content: |
+    cant pip install anything on the log box. stdlib only
+- role: assistant
+  content: |
+    Here is the same idea using only the standard library: a thread pool around your existing `urlopen` call.
+
+    ```python
+    import json
+    import sys
+    import urllib.request
+    from collections import Counter
+    from concurrent.futures import ThreadPoolExecutor
+
+    HOSTS = [f"app-{i:02d}.internal" for i in range(1, 26)]
+    TAIL_URL = "http://{host}:9100/logs/tail?lines=2000"
+    TIMEOUT = 10
+    MAX_WORKERS = 16
+
+
+    def fetch_tail(host):
+        with urllib.request.urlopen(TAIL_URL.format(host=host), timeout=TIMEOUT) as resp:
+            return resp.read().decode("utf-8", errors="replace").splitlines()
+
+
+    def summarize(lines):
+        levels = Counter()
+        for line in lines:
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                levels["unparsed"] += 1
+                continue
+            levels[entry.get("level", "unknown")] += 1
+        return levels
+
+
+    def fetch_one(host):
+        try:
+            return host, fetch_tail(host), None
+        except OSError as exc:  # URLError, HTTPError, timeouts, refused connections
+            return host, None, exc
+
+
+    def collect(hosts):
+        report, failed = {}, {}
+        workers = max(1, min(MAX_WORKERS, len(hosts)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for host, lines, exc in pool.map(fetch_one, hosts):
+                if exc is None:
+                    report[host] = summarize(lines)
+                else:
+                    failed[host] = exc
+        return report, failed
+
+
+    def main():
+        report, failed = collect(HOSTS)
+
+        total = Counter()
+        for counts in report.values():
+            total.update(counts)
+
+        for host, counts in report.items():
+            print(f"{host:20} error={counts['error']:5} warn={counts['warn']:5}")
+        print("total", dict(total))
+
+        for host, exc in failed.items():
+            print(f"{host}: fetch failed: {exc!r}", file=sys.stderr)
+        if failed:
+            sys.exit(1)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **Concurrent requests with threads** (reduces E): the work is almost all waiting on the network, and Python releases the GIL while a thread waits on a socket. For this script, threads give the same overlap as asyncio.
+    - `MAX_WORKERS` limits how many connections are open at the same time. Raise it if you add many more hosts.
+    - `pool.map` returns results in host order, so the report prints in the same order as before. Timeout and failure handling are the same as in the previous version.
+verify:
+  module: true
+  test: |
+    import http.server
+    import threading
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = (
+                b'{"level": "error"}\n{"level": "warn"}\n{"level": "error"}\n'
+                b'not json\n{"msg": "x"}\n'
+            )
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    _srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=_srv.serve_forever, daemon=True).start()
+    _port = _srv.server_address[1]
+    fetch_tail.__globals__["TAIL_URL"] = "http://{host}/logs/tail?lines=2000"
+
+    _good = f"127.0.0.1:{_port}"
+    _bad = "127.0.0.1:1"
+    report, failed = collect([_good, _bad])
+    assert list(report) == [_good], report
+    c = report[_good]
+    assert c["error"] == 2 and c["warn"] == 1, c
+    assert c["unparsed"] == 1 and c["unknown"] == 1, c
+    assert list(failed) == [_bad], failed
+
+    report2, failed2 = collect([])
+    assert report2 == {} and failed2 == {}
+    _srv.shutdown()

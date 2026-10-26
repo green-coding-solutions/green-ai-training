@@ -1,0 +1,167 @@
+id: gen-2-00440-generation
+category: generation
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    k8s 1.29. our per-PR preview namespaces (label env=preview) for the log pipeline sit there 24/7 and nobody cleans up. need manifests only, no explanation:
+    - cronjob: scale all deployments/statefulsets in env=preview namespaces to 0 at 19:00 every day, remember the old replica count
+    - cronjob: restore them 07:00 mon-fri
+    - cronjob: delete preview namespaces older than 5 days, skip ones labeled keep=true
+    - tz Europe/Berlin, own namespace preview-ops, least-privilege RBAC
+- role: assistant
+  content: |
+    ```yaml
+    apiVersion: v1
+    kind: Namespace
+    metadata:
+      name: preview-ops
+    ---
+    apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: preview-scaler
+      namespace: preview-ops
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    metadata:
+      name: preview-scaler
+    rules:
+      - apiGroups: [""]
+        resources: [namespaces]
+        verbs: [get, list, delete]
+      - apiGroups: [apps]
+        resources: [deployments, statefulsets]
+        verbs: [get, list, patch]
+      - apiGroups: [apps]
+        resources: [deployments/scale, statefulsets/scale]
+        verbs: [get, patch, update]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    metadata:
+      name: preview-scaler
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: ClusterRole
+      name: preview-scaler
+    subjects:
+      - kind: ServiceAccount
+        name: preview-scaler
+        namespace: preview-ops
+    ---
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata:
+      name: preview-scale-down
+      namespace: preview-ops
+    spec:
+      schedule: "0 19 * * *"
+      timeZone: Europe/Berlin
+      concurrencyPolicy: Forbid
+      successfulJobsHistoryLimit: 1
+      failedJobsHistoryLimit: 2
+      jobTemplate:
+        spec:
+          activeDeadlineSeconds: 600
+          backoffLimit: 1
+          template:
+            spec:
+              serviceAccountName: preview-scaler
+              restartPolicy: Never
+              containers:
+                - name: scaler
+                  image: alpine/k8s:1.29.4
+                  command: ["/bin/bash", "-ec"]
+                  args:
+                    - |
+                      for ns in $(kubectl get ns -l env=preview -o jsonpath='{.items[*].metadata.name}'); do
+                        for kind in deployment statefulset; do
+                          kubectl -n "$ns" get "$kind" -o json \
+                            | jq -r '.items[] | select(.spec.replicas > 0) | "\(.metadata.name) \(.spec.replicas)"' \
+                            | while read -r name replicas; do
+                                kubectl -n "$ns" annotate "$kind" "$name" "preview-scaler/replicas=$replicas" --overwrite
+                                kubectl -n "$ns" scale "$kind" "$name" --replicas=0
+                              done
+                        done
+                      done
+    ---
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata:
+      name: preview-scale-up
+      namespace: preview-ops
+    spec:
+      schedule: "0 7 * * 1-5"
+      timeZone: Europe/Berlin
+      concurrencyPolicy: Forbid
+      successfulJobsHistoryLimit: 1
+      failedJobsHistoryLimit: 2
+      jobTemplate:
+        spec:
+          activeDeadlineSeconds: 600
+          backoffLimit: 1
+          template:
+            spec:
+              serviceAccountName: preview-scaler
+              restartPolicy: Never
+              containers:
+                - name: scaler
+                  image: alpine/k8s:1.29.4
+                  command: ["/bin/bash", "-ec"]
+                  args:
+                    - |
+                      for ns in $(kubectl get ns -l env=preview -o jsonpath='{.items[*].metadata.name}'); do
+                        for kind in deployment statefulset; do
+                          kubectl -n "$ns" get "$kind" -o json \
+                            | jq -r '.items[] | select(.metadata.annotations["preview-scaler/replicas"]) | "\(.metadata.name) \(.metadata.annotations["preview-scaler/replicas"])"' \
+                            | while read -r name replicas; do
+                                kubectl -n "$ns" scale "$kind" "$name" --replicas="$replicas"
+                                kubectl -n "$ns" annotate "$kind" "$name" preview-scaler/replicas-
+                              done
+                        done
+                      done
+    ---
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata:
+      name: preview-reaper
+      namespace: preview-ops
+    spec:
+      schedule: "30 6 * * *"
+      timeZone: Europe/Berlin
+      concurrencyPolicy: Forbid
+      successfulJobsHistoryLimit: 1
+      failedJobsHistoryLimit: 2
+      jobTemplate:
+        spec:
+          activeDeadlineSeconds: 600
+          backoffLimit: 1
+          template:
+            spec:
+              serviceAccountName: preview-scaler
+              restartPolicy: Never
+              containers:
+                - name: reaper
+                  image: alpine/k8s:1.29.4
+                  command: ["/bin/bash", "-ec"]
+                  args:
+                    - |
+                      kubectl get ns -l 'env=preview,keep!=true' -o json \
+                        | jq -r '.items[] | select((.metadata.creationTimestamp | fromdateiso8601) < (now - 432000)) | .metadata.name' \
+                        | xargs -r kubectl delete ns
+    ```
+
+    **Green Notes**
+    - **Remove environments that nobody uses** (reduces E, M): the reaper deletes previews older than 5 days, so forgotten branches stop holding pods, memory and nodes. In Green Metrics Tool micro-benchmarks, an idle preview stack with extra replicas, Redis and a worker used only about 3% more CPU energy per minute than a trimmed one. The saving is in the hours an environment exists, not in its size.
+    - **Scale to zero outside working hours:** nights and weekends drop to 0 pods. The old replica counts are kept in an annotation and restored on weekday mornings.
+    - *Not applied:* trimming replicas per preview. The measured gain is small next to deleting or pausing whole environments.
+
+    Scaling to zero keeps PVCs. If Argo CD or Flux runs with self-heal on these namespaces, it will revert the replicas, so exclude them or pause sync.
+verify:
+  static_only: needs a Kubernetes cluster

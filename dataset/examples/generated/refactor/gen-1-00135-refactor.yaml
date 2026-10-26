@@ -1,0 +1,91 @@
+id: gen-1-00135-refactor
+category: refactor
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    hello, this script run in our gitlab pipline on every merge request. it check the docker images list before deploy. the list have around 6000 lines now (we render all helm charts to one file) and the job take many minutes, before it was fast. i dont know whats wrong, can you make it more fast and clean?
+
+    ```bash
+    #!/bin/bash
+    # check image list before deploy
+    LIST=$1
+    total=0
+    unpinned=0
+    rm -f /tmp/hosts.txt
+
+    for line in $(cat $LIST); do
+      total=$(expr $total + 1)
+      name=$(echo $line | cut -d: -f1)
+      tag=$(echo $line | cut -s -d: -f2)
+      host=$(echo $name | cut -d/ -f1)
+      echo $host >> /tmp/hosts.txt
+      if [ "$tag" = "" -o "$tag" = "latest" ]; then
+        echo "WARN: $line is not pinned"
+        unpinned=$(expr $unpinned + 1)
+      fi
+    done
+
+    echo "images: $total"
+    echo "not pinned: $unpinned"
+    sort /tmp/hosts.txt | uniq -c
+    ```
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    list=${1:?usage: $0 images.txt}
+    total=0
+    unpinned=0
+    declare -A hosts=()
+
+    while read -r line || [[ -n $line ]]; do
+        [[ -z $line ]] && continue
+        total=$((total + 1))
+
+        if [[ $line == */* ]]; then
+            host=${line%%/*}
+        else
+            host=${line%%:*}
+        fi
+        hosts[$host]=$(( ${hosts[$host]:-0} + 1 ))
+
+        last=${line##*/}
+        tag=''
+        [[ $last == *:* ]] && tag=${last#*:}
+
+        if [[ -z $tag || $tag == 'latest' ]]; then
+            echo "WARN: $line is not pinned"
+            unpinned=$((unpinned + 1))
+        fi
+    done < "$list"
+
+    echo "images: $total"
+    echo "not pinned: $unpinned"
+
+    if (( ${#hosts[@]} )); then
+        while read -r h; do
+            printf '%7d %s\n' "${hosts[$h]}" "$h"
+        done < <(printf '%s\n' "${!hosts[@]}" | sort)
+    fi
+    ```
+
+    **Green Notes**
+    - **Builtins instead of subprocesses in the loop** (reduces E): this was your problem. For every line the old script started several processes: `expr`, and three `echo | cut` command substitutions. With 6000 lines, that is tens of thousands of process starts on every merge request. Now `${line%%/*}`, `${line##*/}`, `[[ ]]` and `$(( ))` do the same work inside bash. In Green Metrics Tool micro-benchmarks on a 20,000-line log, a loop with `$(echo | cut)` and `$(expr)` used ~1302 J, the same loop with builtins only ~4.3 J, about 300× less. Your workload is different, so measure your own job time before and after.
+    - **No temp file** (reduces E): the host counts are kept in an associative array. This removes the `>> /tmp/hosts.txt` append per line and the shared `/tmp` path, which could clash when two jobs run on the same runner.
+
+    Other changes:
+    - `for line in $(cat ...)` is now `while read -r`. It reads the file line by line, and `$(cat)` with no quotes also expanded glob characters.
+    - Bug fixed: registries with a port, like `registry.local:5000/api:1.2`, were cut at the first `:`. The host was wrong and the tag was read as `5000/api`. Now the tag is only taken from the last path part.
+    - Blank lines are skipped, and the host summary looks the same as `uniq -c` output (sorted by host).
+    - The script still exits 0 when unpinned images are found. If the pipeline should fail, add `(( unpinned == 0 ))` as the last line.
+
+    If the list grows much bigger, one `awk` pass over the file is the next step. At 6000 lines the builtin loop is simple enough.
+verify:
+  static_only: bash script reads an input file from a CI job, no bash runner in the verifier

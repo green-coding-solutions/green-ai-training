@@ -1,0 +1,95 @@
+id: gen-1-00045-estimate
+category: estimate
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    We run a nightly job in our webshop backend that pushes loyalty points to our loyalty provider. After the day's orders are closed, we have about 300 members with new points, and we send one POST per member. It runs on a small VM with `requests`, one call after the other. Today it looks like this:
+
+    ```python
+    import requests
+
+    LOYALTY_URL = "https://loyalty.example.com/api/v2/members/{member_id}/points"
+
+    def push_points(updates: dict[str, int], token: str) -> dict[str, int]:
+        balances = {}
+        session = requests.Session()
+        session.headers["Authorization"] = f"Bearer {token}"
+        for member_id, delta in updates.items():
+            resp = session.post(
+                LOYALTY_URL.format(member_id=member_id),
+                json={"delta": delta},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            balances[member_id] = resp.json()["balance"]
+        return balances
+    ```
+
+    Our sustainability lead wants a number: how many kWh or kg CO2 per year do we save if we move this to httpx with asyncio? Requirements: the provider allows max 10 parallel connections, a failed member must not stop the others, and we need a figure for the report. Can you give me the number?
+- role: assistant
+  content: |
+    I can't give you an honest kWh or CO2 figure for this job, and I'd advise against putting one in the report. What I can give you is the direction and a measured reference point.
+
+    In Green Metrics Tool micro-benchmarks, 10 HTTP requests took ~9.1 J and 3.1 s with sync `urllib`, and ~8.4 J and 2.6 s with async `httpx`. That is about 7% less CPU energy and about 17% less wall time. For small request counts the gain is mostly wall time, not CPU energy. That benchmark used `urllib`, not `requests`, and it did not test your provider or your VM, so don't scale it to 300 members or to a year.
+
+    What drives the saving in your job:
+    - The job waits on the network for most of its run. Async lets those waits overlap, so the job finishes sooner and the VM holds resources for less time.
+    - The CPU work per request stays about the same. Expect a modest CPU saving, not a large one.
+    - Whether the VM can shut down or be used for something else after the job ends decides how much of the shorter runtime turns into a real saving.
+
+    If you still move to async, this keeps your 10-connection limit and isolates failures:
+
+    ```python
+    import asyncio
+    import httpx
+
+    LOYALTY_URL = "https://loyalty.example.com/api/v2/members/{member_id}/points"
+
+    async def _push_one(client, sem, member_id, delta):
+        async with sem:
+            resp = await client.post(
+                LOYALTY_URL.format(member_id=member_id),
+                json={"delta": delta},
+            )
+            resp.raise_for_status()
+            return resp.json()["balance"]
+
+    async def push_points(updates: dict[str, int], token: str):
+        sem = asyncio.Semaphore(10)
+        async with httpx.AsyncClient(
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+            limits=httpx.Limits(max_connections=10),
+        ) as client:
+            results = await asyncio.gather(
+                *(_push_one(client, sem, m, d) for m, d in updates.items()),
+                return_exceptions=True,
+            )
+
+        balances, failed = {}, {}
+        for member_id, result in zip(updates, results):
+            if isinstance(result, Exception):
+                failed[member_id] = result
+            else:
+                balances[member_id] = result
+        return balances, failed
+
+    # balances, failed = asyncio.run(push_points(updates, token))
+    ```
+
+    The return value changes: you now get `(balances, failed)`, so one bad member no longer stops the run. Retry the failed ones carefully. If a POST can time out after the provider already applied it, a blind retry may add points twice.
+
+    To get a number you can defend, measure it on your own setup:
+    1. Run the old and the new version against the provider's sandbox with the same 300 updates.
+    2. Record CPU time and wall time with `perf stat` or `time` for each, several runs each.
+    3. For energy, use a Green Metrics Tool usage scenario, or RAPL if your VM exposes it.
+    4. Report the measured difference for this job, and say plainly that it covers CPU only, not the provider's side or the network.
+
+    For a 300-call nightly job, the main benefit is a shorter run. I would write the report as "shorter runtime, small CPU saving, measured on our job", not as a yearly kWh figure.
+verify:
+  static_only: needs network access to the loyalty provider and the httpx package

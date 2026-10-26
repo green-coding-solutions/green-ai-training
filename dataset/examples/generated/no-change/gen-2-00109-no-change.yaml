@@ -1,0 +1,52 @@
+id: gen-2-00109-no-change
+category: no-change
+language: bash
+patterns:
+- compress-stored
+- none
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    Nightly archive job for our ingest service logs. About 3 GB of JSON lines per night, kept 60 days on the archive volume for audit. Platform wants every cron job "energy-reviewed" before the migration. Diff only, if there is anything.
+
+    ```bash
+    #!/usr/bin/env bash
+    # archive-logs.sh - runs nightly at 03:10, after logrotate
+    set -euo pipefail
+
+    SRC_DIR=/var/log/ingest
+    ARCHIVE_DIR=/mnt/archive/ingest-logs
+    RETENTION_DAYS=60
+    LOCK=/run/archive-logs.lock
+
+    exec 9>"$LOCK"
+    flock -n 9 || { echo 'archive-logs: already running' >&2; exit 1; }
+
+    day=$(date +%F)
+    dest="$ARCHIVE_DIR/$day"
+    mkdir -p "$dest"
+
+    # logrotate runs with nocompress, rotated files are api.log.1, worker.log.1, ...
+    find "$SRC_DIR" -maxdepth 1 -type f -name '*.log.[0-9]*' \
+        ! -name '*.zst' ! -name '*.gz' -mmin +5 -print0 |
+    while IFS= read -r -d '' f; do
+        zstd -q -T0 --rm -o "$dest/${f##*/}.zst" "$f"
+    done
+
+    find "$ARCHIVE_DIR" -type f -name '*.zst' -mtime +"$RETENTION_DAYS" -delete
+    find "$ARCHIVE_DIR" -mindepth 1 -type d -empty -delete
+    ```
+- role: assistant
+  content: |
+    No diff. The compression step is already the efficient choice for this data.
+
+    - **Codec:** zstd at its default level. In Green Metrics Tool benchmarks that compressed 100 MB of English text, zstd used ~16 J, gzip ~67 J and xz ~458 J. For 3 GB of text every night, a fast codec is the right choice.
+    - **Compressing at all pays off:** a Green Coding Solutions estimate puts zstd's break-even against storage at about 0.15 days, and that figure is a lower bound. Your logs stay for 60 days, which is far past it.
+    - **No wasted work:** files that are already `.zst` or `.gz` are skipped, so no CPU goes into data that would not shrink further.
+
+    Change something only if audit storage becomes the bottleneck. A higher zstd level gives smaller files for more CPU on every run. Those benchmarks compared energy, not compression ratio, so check the sizes on a few of your own logs before you switch.
+verify:
+  static_only: bash script needs zstd, flock and real log/archive directories

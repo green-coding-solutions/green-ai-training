@@ -1,0 +1,126 @@
+id: gen-2-00199-refactor
+category: refactor
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    FASTQ-to-sample matcher for our sequencing post-processing. It is fine on small runs. On NovaSeq runs with ~1,500 samples per sheet and a few thousand files it crawls. Only show the changed part, the rest of the script stays.
+
+    ```python
+    import csv
+    import os
+    import re
+    import sys
+    from collections import defaultdict
+
+
+    def load_sample_ids(sheet_path):
+        with open(sheet_path, newline="") as fh:
+            return [row["Sample_ID"].strip() for row in csv.DictReader(fh)]
+
+
+    def match_fastqs(sample_ids, fastq_dir):
+        """Group BCL Convert output by sample, sorted by lane and read."""
+        matched = defaultdict(list)
+        unmatched = []
+        for fn in sorted(os.listdir(fastq_dir)):
+            if not fn.endswith(".fastq.gz"):
+                continue
+            hit = None
+            for sid in sample_ids:
+                if re.match(rf"{re.escape(sid)}_S\d+_L\d{{3}}_R[12]_001\.fastq\.gz$", fn):
+                    hit = sid
+                    break
+            if hit is None:
+                unmatched.append(fn)
+                continue
+            lane = int(re.search(r"_L(\d{3})_", fn).group(1))
+            read = int(re.search(r"_R([12])_001", fn).group(1))
+            matched[hit].append((lane, read, os.path.join(fastq_dir, fn)))
+        return {sid: sorted(entries) for sid, entries in matched.items()}, unmatched
+
+
+    if __name__ == "__main__":
+        samples = load_sample_ids(sys.argv[1])
+        groups, orphans = match_fastqs(samples, sys.argv[2])
+        for sid, entries in groups.items():
+            print(sid, len(entries))
+        if orphans:
+            print(f"{len(orphans)} unmatched files", file=sys.stderr)
+    ```
+- role: assistant
+  content: |
+    Only `match_fastqs` changes. It also needs one module-level pattern.
+
+    ```python
+    import os
+    import re
+    from collections import defaultdict
+
+    FASTQ_RE = re.compile(r"(.*)_S\d+_L(\d{3})_R([12])_001\.fastq\.gz$")
+
+
+    def match_fastqs(sample_ids, fastq_dir):
+        """Group BCL Convert output by sample, sorted by lane and read."""
+        known = set(sample_ids)
+        matched = defaultdict(list)
+        unmatched = []
+        for fn in sorted(os.listdir(fastq_dir)):
+            if not fn.endswith(".fastq.gz"):
+                continue
+            m = FASTQ_RE.match(fn)
+            if m is None or m.group(1) not in known:
+                unmatched.append(fn)
+                continue
+            sid, lane, read = m.group(1), int(m.group(2)), int(m.group(3))
+            matched[sid].append((lane, read, os.path.join(fastq_dir, fn)))
+        return {sid: sorted(entries) for sid, entries in matched.items()}, unmatched
+    ```
+
+    **Green Notes**
+    - **One compiled pattern instead of one per sample** (reduces E): the old loop built a new pattern string for every (file, sample) pair. Python's `re` caches only 512 compiled patterns. With ~1,500 sample IDs the cache thrashes, so almost every call compiles again. In Green Metrics Tool micro-benchmarks, a forced recompile cost about 200× more per match than a cached pattern.
+    - **O(files × samples) → O(files) regex calls:** each file now gets one match and one set lookup on the captured sample ID.
+    - Precompiling only the fixed `_L`/`_R` searches would barely help. `re` already caches those, and the same benchmarks showed only about 18% less for a precompiled fixed pattern. The real cost was the dynamic patterns.
+    - **Bug fix:** lane and read now come from the filename suffix. The old `re.search` took the first `_Lnnn_` / `_Rn_001` anywhere in the name, so a sample ID like `pool_L002_A` got the wrong lane. Apart from that, groups, their order and the unmatched list are the same as before.
+verify:
+  module: true
+  equivalence:
+    driver: |
+      import os, random, tempfile
+      random.seed(3)
+      ids = [f"P{i:04d}" for i in range(40)] + ["A", "A_B", "A_S1", "s.1+x", "ctrl-neg"]
+      d = tempfile.mkdtemp()
+      chosen = random.sample(ids[:40], 25) + ["A", "A_B", "s.1+x", "ctrl-neg"]
+      names = []
+      for i, sid in enumerate(chosen):
+          for lane in (2, 1):
+              for r in (2, 1):
+                  names.append(f"{sid}_S{i + 1}_L{lane:03d}_R{r}_001.fastq.gz")
+      names += [
+          "Undetermined_S0_L001_R1_001.fastq.gz",
+          "A_S1_S9_L001_R1_001.fastq.gz",
+          "A_S2_L001_I1_001.fastq.gz",
+          "sX1+x_S5_L001_R1_001.fastq.gz",
+          "P9999_S7_L001_R1_001.fastq.gz",
+          "SampleSheet.csv",
+      ]
+      for n in names:
+          open(os.path.join(d, n), "w").close()
+      groups, orphans = match_fastqs(ids, d)
+      for sid, entries in groups.items():
+          print(sid, [(l, r, os.path.basename(p)) for l, r, p in entries])
+      print(orphans)
+  benchmark:
+    driver: |
+      import os, random, tempfile
+      random.seed(11)
+      ids = [f"LIB{i:05d}" for i in range(600)]
+      d = tempfile.mkdtemp()
+      for i, sid in enumerate(random.sample(ids, 150)):
+          open(os.path.join(d, f"{sid}_S{i + 1}_L001_R1_001.fastq.gz"), "w").close()
+      match_fastqs(ids, d)
+    min_speedup: 5

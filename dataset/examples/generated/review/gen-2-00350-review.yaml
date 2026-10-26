@@ -1,0 +1,95 @@
+id: gen-2-00350-review
+category: review
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    hi, I am new in our ML team. This script runs from cron every 2 minutes on each of our 6 inference nodes (image classifier). It packs the prediction files (.jsonl, one per batch, the model server writes them) and the thumbnails, and sends them to the analytics server. There a job unpacks them right away and loads them into the db.
+
+    My lead said "look at the compression, it slows down the model server" but I don't understand what is wrong. I used xz -9 because it makes the smallest files? Usually it's a few hundred MB per run, mostly jsonl. Can you review it?
+
+    ```bash
+    #!/bin/bash
+    # ship predictions + thumbnails to analytics box
+    # cron: */2 * * * *
+
+    OUT_DIR=/srv/inference/out
+    DEST=analytics@10.0.4.20:/data/incoming/
+    STAMP=$(date +%H%M)
+    ARCHIVE=/tmp/batch-$STAMP.tar.xz
+
+    cd $OUT_DIR
+
+    if ls *.jsonl >/dev/null 2>&1; then
+        tar -cf - *.jsonl thumbs/ | xz -9 -T1 > $ARCHIVE
+        scp -q $ARCHIVE $DEST
+        rm -f *.jsonl
+        rm -rf thumbs/*
+        rm -f $ARCHIVE
+        echo "$(date) shipped $ARCHIVE" >> /var/log/ship.log
+    else
+        echo "$(date) nothing to ship" >> /var/log/ship.log
+    fi
+    ```
+- role: assistant
+  content: |
+    **Workload:** AI/ML (inference nodes, cron every 2 minutes)
+
+    #### [Bug] Predictions are deleted even when nothing was sent
+    - **Where:** `scp ...` followed by `rm -f *.jsonl` and `rm -rf thumbs/*`
+    - **Issue:** the script has no error check. If `scp` fails (network blip, analytics box down), the `rm` lines still run and the batch is lost. There is a second problem: `rm -f *.jsonl` expands the glob again. A file the model server finished while `xz` was running gets deleted, but it was never in the archive. The same applies to `cd $OUT_DIR`. If it fails, the `rm` lines run in whatever directory cron started in.
+    - **Fix:** use `set -euo pipefail`, store the file list in an array once, and delete only those files after a successful upload (see the script below).
+
+    #### [Bug] Archive names collide between nodes
+    - **Where:** `ARCHIVE=/tmp/batch-$STAMP.tar.xz` with `STAMP=$(date +%H%M)`
+    - **Issue:** all 6 nodes run at the same minute and upload `batch-1402.tar.xz` into the same directory. One node overwrites the other. The name also repeats every day.
+    - **Fix:** put the host name and the full date and time into the name: `batch-$HOST-$(date +%Y%m%d-%H%M%S)`.
+
+    #### [High] `xz -9` for data that is unpacked a minute later
+    - **Where:** `tar ... | xz -9 -T1`
+    - **Issue:** xz is one of the most expensive codecs, and `-9` is its slowest level. It runs every 2 minutes on every node and takes CPU from the model server, so your lead is right. In Green Metrics Tool measurements of compressing 100 MB of text with default settings, xz used about 29× more CPU energy than zstd. Level 9 costs even more than the measured default. xz does make smaller files. But these archives go to a server on your internal network, which unpacks and deletes them right away. The smaller size saves very little there.
+    - **Fix:** `zstd -q -T1` instead of `xz -9 -T1`. Keep `-T1` so it does not compete with the model server for cores. Use a higher zstd level only if the link to the analytics box turns out to be slow.
+    - **Impact:** E on all 6 inference nodes, every run. It also removes the CPU spikes that hurt inference latency.
+
+    #### [Low] JPEG thumbnails gain nothing from compression
+    - **Where:** `thumbs/` inside the compressed tar
+    - **Issue:** JPEGs are already compressed. Running them through xz costs CPU and gives almost no smaller output. With zstd this matters much less. If thumbnails ever become most of the bytes, send them in a plain `tar` without a compressor.
+
+    ```bash
+    #!/bin/bash
+    # ship predictions + thumbnails to analytics box
+    # cron: */2 * * * *
+    set -euo pipefail
+
+    OUT_DIR='/srv/inference/out'
+    DEST='analytics@10.0.4.20:/data/incoming/'
+    LOG='/var/log/ship.log'
+    HOST=$(hostname -s)
+    ARCHIVE="/tmp/batch-$HOST-$(date +%Y%m%d-%H%M%S).tar.zst"
+    trap 'rm -f "$ARCHIVE"' EXIT
+
+    cd "$OUT_DIR"
+    shopt -s nullglob
+    preds=(*.jsonl)
+    thumbs=(thumbs/*)
+
+    if (( ${#preds[@]} == 0 )); then
+        echo "$(date) nothing to ship" >> "$LOG"
+        exit 0
+    fi
+
+    tar -cf - -- "${preds[@]}" "${thumbs[@]}" | zstd -q -T1 > "$ARCHIVE"
+    scp -q "$ARCHIVE" "$DEST"
+    rm -rf -- "${preds[@]}" "${thumbs[@]}"
+    echo "$(date) shipped $ARCHIVE" >> "$LOG"
+    ```
+
+    The analytics job has to unpack `.tar.zst` now: `tar --zstd -xf file.tar.zst` (GNU tar), or `zstd -dc file.tar.zst | tar -xf -`. Install `zstd` on both sides.
+
+    **Already good:** you compress text before you send it, and `-T1` keeps the compressor on one core.
+verify:
+  static_only: needs scp to a remote host, cron environment and the zstd binary

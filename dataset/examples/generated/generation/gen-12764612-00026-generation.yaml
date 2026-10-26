@@ -1,0 +1,55 @@
+id: gen-12764612-00026-generation
+category: generation
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    need get_supplier_prices(skus) -> {sku: price}, GET https://api.supplier.example/v2/items/{sku} returns json with "price". around 150 skus per run, use httpx
+- role: assistant
+  content: |
+    ```python
+    import asyncio
+    import logging
+    from urllib.parse import quote
+
+    import httpx
+
+    log = logging.getLogger(__name__)
+
+    BASE_URL = "https://api.supplier.example/v2/items"
+
+
+    async def _fetch_price(client, sem, sku):
+        async with sem:
+            try:
+                resp = await client.get(f"{BASE_URL}/{quote(sku, safe='')}")
+                resp.raise_for_status()
+                return sku, resp.json()["price"]
+            except (httpx.HTTPError, KeyError, ValueError) as exc:
+                log.warning("price lookup failed for %s: %s", sku, exc)
+                return sku, None
+
+
+    async def get_supplier_prices_async(skus, max_concurrency=10):
+        sem = asyncio.Semaphore(max_concurrency)
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            results = await asyncio.gather(
+                *(_fetch_price(client, sem, sku) for sku in skus)
+            )
+        return {sku: price for sku, price in results if price is not None}
+
+
+    def get_supplier_prices(skus):
+        return asyncio.run(get_supplier_prices_async(skus))
+    ```
+
+    SKUs that fail (HTTP error, timeout, missing `price`) are logged and left out of the result, so one bad SKU does not fail the whole run. Call `get_supplier_prices_async` directly if you are already inside an event loop, because `asyncio.run` raises an error there.
+
+    **Green Notes**
+    - **Concurrent I/O** (reduces E): the requests are independent, so they run concurrently on one shared client instead of one after another. In Green Metrics Tool micro-benchmarks of 10 HTTP requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. The gain is mostly wall time, and it grows with the number of requests. The semaphore caps parallel calls at 10 so the supplier API is not flooded.
+verify:
+  static_only: needs httpx and network access

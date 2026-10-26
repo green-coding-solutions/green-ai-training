@@ -1,0 +1,95 @@
+id: gen-2-00013-review
+category: review
+language: html
+patterns:
+- modern-image-formats
+facts:
+- F-IMGENC
+- F-IMGRENDER
+messages:
+- role: user
+  content: |
+    review pls. run pages are slow to open
+
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <title>Run 2417 – confocal stack, HeLa / mito-GFP</title>
+      <link rel="stylesheet" href="/static/run.css">
+    </head>
+    <body>
+      <header>
+        <h1>Run 2417</h1>
+        <p>Acquired 2026-10-14, 63x oil, 488 nm. Exported by stackview 0.9.</p>
+        <a href="/runs/2417/stack.ome.tif">Download raw stack</a>
+      </header>
+
+      <section class="overview">
+        <img src="/runs/2417/overview.png" width="1600" height="900"
+             alt="Maximum intensity projection of all 12 fields">
+      </section>
+
+      <section class="fields">
+        <figure>
+          <picture>
+            <source srcset="/convert?src=/runs/2417/field01.tif&fmt=avif&q=60" type="image/avif">
+            <img src="/runs/2417/field01.png" width="800" height="800" alt="Field 01">
+          </picture>
+          <figcaption>Field 01, z=12, mito-GFP</figcaption>
+        </figure>
+        <figure>
+          <picture>
+            <source srcset="/convert?src=/runs/2417/field02.tif&fmt=avif&q=60" type="image/avif">
+            <img src="/runs/2417/field02.png" width="800" height="800" alt="Field 02">
+          </picture>
+          <figcaption>Field 02, z=12, mito-GFP</figcaption>
+        </figure>
+        <!-- field 03 re-exported by hand after refocus -->
+        <figure>
+          <picture>
+            <img src="/runs/2417/field03.png" width="800" height="800" alt="Field 03">
+            <source srcset="/convert?src=/runs/2417/field03.tif&fmt=avif&q=60" type="image/avif">
+          </picture>
+          <figcaption>Field 03, z=14, mito-GFP (refocused)</figcaption>
+        </figure>
+        <!-- fields 04-12 same as 01 -->
+      </section>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (scientific results page, opened per run)
+
+    #### [Bug] Field 03 never uses its AVIF source
+    - **Where:** field 03 `<picture>`
+    - **Issue:** the browser picks the first matching `<source>` that comes *before* the `<img>`. Here the `<source>` comes after the `<img>`, so it is ignored and the PNG always loads.
+    - **Fix:** put the `<source>` before the `<img>`, as in the other figures.
+
+    #### [High] AVIF is encoded on every page view
+    - **Where:** `/convert?src=...tif&fmt=avif&q=60` in every field `<source>`
+    - **Issue:** each visit makes the server decode a TIFF and encode AVIF again, for all 12 fields. AVIF is expensive to encode. In Green Metrics Tool micro-benchmarks, encoding 50 BMP images used ~658 J for AVIF and ~89 J for JPG, about 7× more. That conversion is also why the page is slow to open: the browser waits for the encoder.
+    - **Fix:** encode once in the stackview export step, write `fieldNN.avif` and `fieldNN.jpg` next to the run, and serve them as static files:
+      ```html
+      <figure>
+        <picture>
+          <source srcset="/runs/2417/field01.avif" type="image/avif">
+          <img src="/runs/2417/field01.jpg" width="800" height="800" alt="Field 01">
+        </picture>
+        <figcaption>Field 01, z=12, mito-GFP</figcaption>
+      </figure>
+      ```
+      This also removes `/convert` from the page. If that endpoint reads any path from `src`, restrict it to the runs directory or delete it.
+    - **Impact:** E on the server goes from one AVIF encode per image per view to one per image per run. Static files can be cached, so repeat views cost almost nothing on the server.
+
+    #### [Medium] Large PNG for photographic content
+    - **Where:** `overview.png` (1600 px wide) and the PNG fallbacks of all fields
+    - **Issue:** a fluorescence projection is photo-like content. PNG stores it losslessly, so these files are much larger than AVIF or JPG at viewing quality. PNG is also not cheap to decode. In Green Metrics Tool page-load benchmarks (50 page loads per format, CPU energy), PNG used ~181 J, JPG ~134 J and AVIF ~159 J. So AVIF decodes about 19% more than JPG. The gain from AVIF is the smaller transfer, not the decode.
+    - **Fix:** export `overview.avif` and `overview.jpg` once, and use the same `<picture>` pattern with a JPG fallback instead of PNG.
+    - **Impact:** network: fewer bytes per view for every image. Lossy formats change pixel intensities, so they are fine for viewing but not for measurement. Keep the raw stack download (you already have it) or add lossless TIFF/PNG links for anyone who needs to quantify.
+
+    **Already good:** fixed `width`/`height` on every image (no layout shifts), and the raw data is a separate download, so it is not part of the page load.
+verify:
+  static_only: HTML page, nothing to execute

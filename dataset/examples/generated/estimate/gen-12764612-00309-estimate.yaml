@@ -1,0 +1,66 @@
+id: gen-12764612-00309-estimate
+category: estimate
+language: python
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    cli tool imports a csv into postgres, one execute() per row, ~40k rows, commit at the end. what do we save if I switch to executemany?
+
+    ```python
+    import csv
+    import sys
+    import psycopg
+
+    def main(path):
+        with psycopg.connect("dbname=inventory") as conn:
+            with conn.cursor() as cur:
+                with open(path, newline="") as f:
+                    for row in csv.DictReader(f):
+                        cur.execute(
+                            "INSERT INTO stock (sku, warehouse, qty) VALUES (%s, %s, %s)",
+                            (row["sku"], row["warehouse"], int(row["qty"])),
+                        )
+            conn.commit()
+
+    if __name__ == "__main__":
+        main(sys.argv[1])
+    ```
+- role: assistant
+  content: |
+    Less, and `executemany` is not the biggest step. In Green Metrics Tool micro-benchmarks with PostgreSQL 16 and psycopg 3 (client and server on one machine), inserting 500,000 rows in batches of 5,000 rows, CPU energy was:
+
+    - one `execute()` per row: ~384 J
+    - `executemany()`: ~139 J, about 2.8× less
+    - `COPY ... FROM STDIN`: ~17 J, about 22× less than the loop and about 8× less than `executemany`
+
+    With batches of only 100 rows the differences were small, because per-batch overhead dominates. Your 40k rows in one transaction are a large batch, so this is the regime where batching pays off. I would go straight to COPY:
+
+    ```python
+    import csv
+    import sys
+    import psycopg
+
+    def main(path):
+        with psycopg.connect("dbname=inventory") as conn:
+            with conn.cursor() as cur:
+                with open(path, newline="") as f:
+                    with cur.copy("COPY stock (sku, warehouse, qty) FROM STDIN") as copy:
+                        for row in csv.DictReader(f):
+                            copy.write_row((row["sku"], row["warehouse"], int(row["qty"])))
+            conn.commit()
+
+    if __name__ == "__main__":
+        main(sys.argv[1])
+    ```
+
+    Behavior notes:
+    - COPY has no `ON CONFLICT` support. If the table has unique keys and the CSV may contain duplicates, load into a staging table first, or stay with `executemany` plus `ON CONFLICT`.
+    - It is still one transaction. A bad row aborts the whole load, as before.
+
+    Do not scale the benchmark numbers to your job. Your row width, indexes and hardware change the result. To get your own figure, run the old and new versions on the same CSV in a Green Metrics Tool usage scenario. For a quick CPU-time proxy, compare `perf stat` or `time` output of both runs.
+verify:
+  static_only: needs a running PostgreSQL server and psycopg

@@ -1,0 +1,201 @@
+id: gen-2-00080-refactor
+category: refactor
+language: html
+patterns:
+- css-animations
+facts:
+- F-ANIM
+messages:
+- role: user
+  content: |
+    This is the chat panel of our internal LLM playground. The eval team uses it to try prompts against the models on our inference cluster, and most people keep it open in a tab all day. While the model is working we show three bouncing "thinking" dots. During streaming we show a blinking block cursor at the end of the answer. Both are animated in JS right now and I want to clean that up.
+
+    Requirements:
+    - Keep `showThinking`, `hideThinking`, `startCursor` and `stopCursor` with the same signatures. The retry button and the keyboard shortcuts call them from other files.
+    - The look should stay the same: dots bounce up and down with a stagger and fade a bit, and the cursor blinks at roughly the same speed.
+    - Respect `prefers-reduced-motion`. A colleague asked for it.
+    - No libraries and no build step. This file is served as is.
+
+    ```html
+    <div id="chat"></div>
+    <div id="thinking" class="thinking" hidden>
+      <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+    </div>
+
+    <style>
+      .thinking { display: flex; gap: 6px; padding: 12px 16px; }
+      .dot { width: 8px; height: 8px; border-radius: 50%; background: #8a8f98; }
+      .cursor { display: inline-block; width: 0.55em; height: 1.1em; background: #222;
+                vertical-align: text-bottom; margin-left: 2px; }
+    </style>
+
+    <script>
+      const thinkingEl = document.getElementById('thinking');
+      const dots = thinkingEl.querySelectorAll('.dot');
+      let thinkingActive = false;
+
+      function animateDots(ts) {
+        if (!thinkingActive) return;
+        dots.forEach((dot, i) => {
+          const s = Math.sin(ts / 180 - i * 0.9);
+          dot.style.transform = `translateY(${s * 4}px)`;
+          dot.style.opacity = 0.5 + 0.5 * Math.abs(s);
+        });
+        requestAnimationFrame(animateDots);
+      }
+
+      function showThinking() {
+        thinkingEl.hidden = false;
+        thinkingActive = true;
+        requestAnimationFrame(animateDots);
+      }
+
+      function hideThinking() {
+        thinkingActive = false;
+        thinkingEl.hidden = true;
+      }
+
+      let cursorTimer = null;
+      function startCursor(msgEl) {
+        const cursor = document.createElement('span');
+        cursor.className = 'cursor';
+        msgEl.appendChild(cursor);
+        cursorTimer = setInterval(() => {
+          cursor.style.visibility = cursor.style.visibility === 'hidden' ? 'visible' : 'hidden';
+        }, 530);
+        return cursor;
+      }
+
+      function stopCursor(cursor) {
+        clearInterval(cursorTimer);
+        cursor.remove();
+      }
+
+      async function sendPrompt(prompt) {
+        showThinking();
+        const res = await fetch('/v1/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prompt, stream: true }),
+        });
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        const msgEl = document.createElement('div');
+        msgEl.className = 'msg assistant';
+        document.getElementById('chat').appendChild(msgEl);
+        const textNode = document.createTextNode('');
+        msgEl.appendChild(textNode);
+        let first = true;
+        let cursor;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (first) { hideThinking(); cursor = startCursor(msgEl); first = false; }
+          textNode.data += decoder.decode(value, { stream: true });
+        }
+        stopCursor(cursor);
+      }
+    </script>
+    ```
+- role: assistant
+  content: |
+    ```html
+    <div id="chat"></div>
+    <div id="thinking" class="thinking" hidden>
+      <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+    </div>
+
+    <style>
+      .thinking { display: flex; gap: 6px; padding: 12px 16px; }
+      .thinking[hidden] { display: none; }
+
+      .dot {
+        width: 8px; height: 8px; border-radius: 50%; background: #8a8f98;
+        opacity: .5;
+        animation: dot-bounce 1.13s infinite;
+      }
+      /* Same stagger as before: each dot lags the previous one. Negative delays start all dots moving at once. */
+      .dot:nth-child(1) { animation-delay: -324ms; }
+      .dot:nth-child(2) { animation-delay: -162ms; }
+
+      @keyframes dot-bounce {
+        0%, 50%, 100% { transform: translateY(0);    opacity: .5; animation-timing-function: ease-out; }
+        25%           { transform: translateY(4px);  opacity: 1;  animation-timing-function: ease-in; }
+        75%           { transform: translateY(-4px); opacity: 1;  animation-timing-function: ease-in; }
+      }
+
+      .cursor {
+        display: inline-block; width: 0.55em; height: 1.1em; background: #222;
+        vertical-align: text-bottom; margin-left: 2px;
+        animation: cursor-blink 1.06s step-end infinite;
+      }
+      @keyframes cursor-blink {
+        50% { opacity: 0; }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .dot, .cursor { animation: none; }
+      }
+    </style>
+
+    <script>
+      const thinkingEl = document.getElementById('thinking');
+
+      function showThinking() {
+        thinkingEl.hidden = false;
+      }
+
+      function hideThinking() {
+        thinkingEl.hidden = true;
+      }
+
+      function startCursor(msgEl) {
+        const cursor = document.createElement('span');
+        cursor.className = 'cursor';
+        msgEl.appendChild(cursor);
+        return cursor;
+      }
+
+      function stopCursor(cursor) {
+        cursor?.remove();
+      }
+
+      async function sendPrompt(prompt) {
+        showThinking();
+        let cursor;
+        try {
+          const res = await fetch('/v1/generate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt, stream: true }),
+          });
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          const msgEl = document.createElement('div');
+          msgEl.className = 'msg assistant';
+          document.getElementById('chat').appendChild(msgEl);
+          const textNode = document.createTextNode('');
+          msgEl.appendChild(textNode);
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!cursor) { hideThinking(); cursor = startCursor(msgEl); }
+            textNode.data += decoder.decode(value, { stream: true });
+          }
+        } finally {
+          hideThinking();
+          stopCursor(cursor);
+        }
+      }
+    </script>
+    ```
+
+    **Green Notes**
+    - **CSS `@keyframes` instead of a `requestAnimationFrame` loop** (reduces E): the old loop ran JS on every frame and wrote six inline styles each time. The browser now runs the animation itself, with no per-frame callback. In Green Metrics Tool micro-benchmarks, a 20-second animation used ~161 J CPU energy with `requestAnimationFrame` and style updates, and ~145 J with CSS `@keyframes`, about 10% less. Tabs stay open all day here, so that work adds up per open tab. The period and stagger match the old sine curve. The bounce is now a keyframe approximation of it.
+    - **CSS blink instead of `setInterval`** (reduces E): there is no timer per streamed message anymore. Each new cursor starts blinking visible-first, as before.
+    - **Bug fixed, dots never disappeared:** `.thinking { display: flex }` overrides the `hidden` attribute, so `hideThinking()` only froze the dots on screen. `.thinking[hidden] { display: none }` fixes that. Hidden elements also don't run their CSS animation.
+    - **Bug fixed, stuck indicator:** if `fetch` or the stream failed, the dots stayed and the rAF loop ran forever. If the stream ended with no chunks, `stopCursor(undefined)` threw. `try/finally` and `cursor?.remove()` now clean up in every case. Errors still reject `sendPrompt` as before.
+
+    `prefers-reduced-motion: reduce` turns both animations off. The dots stay visible at half opacity and the cursor stays solid. The four public functions keep their signatures.
+verify:
+  static_only: HTML/CSS/JS page that needs a browser and a streaming /v1/generate endpoint

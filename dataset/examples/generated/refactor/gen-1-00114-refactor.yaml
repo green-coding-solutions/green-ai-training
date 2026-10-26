@@ -1,0 +1,108 @@
+id: gen-1-00114-refactor
+category: refactor
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    We have a product classifier behind a FastAPI service. Before the model runs, `LexiconFeatures` turns the title and description into a count vector from a keyword lexicon (about 40 labels, around 1,100 terms in total, loaded from our config at startup). `transform` runs once per request, and a nightly job calls `transform_batch` over the whole catalog. CPU use on the inference pods is higher than the model itself would explain, and a profile shows a lot of time in `re`.
+
+    Please optimize it. Requirements:
+    - the output vector must stay exactly the same (the model was trained on it)
+    - same class name, constructor and method signatures
+    - no new dependencies
+
+    ```python
+    import re
+    import numpy as np
+
+
+    class LexiconFeatures:
+        """Turns raw product text into a count vector for the classifier."""
+
+        def __init__(self, lexicon):
+            # lexicon: {"label": ["term", "term with spaces", ...]}
+            self.labels = sorted(lexicon)
+            self.dim = len(self.labels)
+            self.terms = [
+                (idx, term)
+                for idx, label in enumerate(self.labels)
+                for term in lexicon[label]
+            ]
+
+        def transform(self, text):
+            text = text.lower()
+            vec = np.zeros(self.dim, dtype=np.float32)
+            for idx, term in self.terms:
+                pattern = r"\b" + re.escape(term) + r"\b"
+                hits = re.findall(pattern, text)
+                vec[idx] += len(hits)
+            return vec
+
+        def transform_batch(self, texts):
+            return np.stack([self.transform(t) for t in texts])
+    ```
+- role: assistant
+  content: |
+    ```python
+    import re
+    import numpy as np
+
+
+    class LexiconFeatures:
+        """Turns raw product text into a count vector for the classifier."""
+
+        def __init__(self, lexicon):
+            # lexicon: {"label": ["term", "term with spaces", ...]}
+            self.labels = sorted(lexicon)
+            self.dim = len(self.labels)
+            self.terms = [
+                (idx, term)
+                for idx, label in enumerate(self.labels)
+                for term in lexicon[label]
+            ]
+            # Compile every pattern once, at startup.
+            self._patterns = [
+                (idx, re.compile(r"\b" + re.escape(term) + r"\b"))
+                for idx, term in self.terms
+            ]
+
+        def transform(self, text):
+            text = text.lower()
+            vec = np.zeros(self.dim, dtype=np.float32)
+            for idx, pattern in self._patterns:
+                vec[idx] += len(pattern.findall(text))
+            return vec
+
+        def transform_batch(self, texts):
+            return np.stack([self.transform(t) for t in texts])
+    ```
+
+    **Green Notes**
+    - **Compile regex once, outside the hot path** (reduces E): your code built a new pattern string for every term on every call. Python's `re` keeps an internal cache of compiled patterns, but it holds only 512. Your lexicon has far more distinct patterns than that. Each call loops over all of them in the same order, so the cache keeps evicting patterns before they are used again. In effect, every `findall` recompiled its pattern. In Green Metrics Tool micro-benchmarks, forcing a recompile on every match cost about 200× more per match than a precompiled pattern. That matches the `re` time in your profile.
+    - With only a few patterns the cache hides this: in the same benchmark, a precompiled pattern was only about 18% cheaper than an inline `re.match`. The big gain here comes from having more patterns than the cache can hold.
+    - The output is identical: same patterns, same `findall`, same counts, same `float32` vector. The compiled patterns now stay in memory for the life of the process, which is a small cost for a lexicon of this size.
+    - Compiling in `__init__` moves that work to service startup and to the nightly job's first step, so request latency no longer includes it.
+verify:
+  equivalence:
+    driver: |-
+      lex = {
+          "phone": ["smartphone", "5g", "usb-c", "dual sim"],
+          "laptop": ["laptop", "notebook", "16 gb ram", "ssd"],
+          "audio": ["headphones", "bluetooth", "noise cancelling", "usb-c"],
+      }
+      fx = LexiconFeatures(lex)
+      texts = [
+          "Smartphone with 5G and dual SIM, charges over USB-C",
+          "Notebook 16 GB RAM, fast SSD. A great laptop; laptop sleeve included.",
+          "Bluetooth headphones with noise cancelling and USB-C charging",
+          "Plain wooden chair",
+          "5gb data plan, not 5g phone",
+      ]
+      for v in fx.transform_batch(texts):
+          print(v.tolist())
+      print(fx.dim, fx.labels)
+      print(fx.transform("").tolist())

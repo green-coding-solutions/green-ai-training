@@ -1,0 +1,105 @@
+id: gen-2-00446-multi-turn
+category: multi-turn
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    hi, i set up nginx so my group can download the results of our ocean model runs. but when many people download at the same time the server CPU goes very high and i dont understand why. i am not a sysadmin, maybe something is wrong in my config?
+
+    ```nginx
+    server {
+        listen 80;
+        server_name results.oceanlab.example;
+        root /data/results;
+
+        gzip on;
+        gzip_comp_level 9;
+        gzip_types text/plain text/csv application/json image/png application/zip;
+
+        location / {
+            autoindex on;
+        }
+
+        location /plots/ {
+            expires 7d;
+        }
+    }
+    ```
+
+    the nightly job writes new csv and json files into /data/results, and the plots (png) too.
+- role: assistant
+  content: |
+    Yes, the gzip lines are the likely cause. Your files are static, but nginx compresses them again on every download, and level 9 is the most expensive setting. Also, PNG and ZIP files are already compressed, so gzip burns CPU on them and saves almost nothing.
+
+    Better: compress the text files once, after the nightly job, and let nginx serve the ready `.gz` files.
+
+    ```nginx
+    server {
+        listen 80;
+        server_name results.oceanlab.example;
+        root /data/results;
+
+        gzip_static on;
+
+        gzip on;
+        gzip_comp_level 5;
+        gzip_min_length 256;
+        gzip_vary on;
+        gzip_types text/plain text/csv application/json;
+
+        location / {
+            autoindex on;
+        }
+
+        location /plots/ {
+            expires 7d;
+        }
+    }
+    ```
+
+    Add this at the end of the nightly job:
+
+    ```bash
+    find /data/results -type f \( -name '*.csv' -o -name '*.json' \) -exec gzip -5 -k -f {} +
+    ```
+
+    **Green Notes**
+    - **Precompressed static files** (reduces E): in Green Metrics Tool micro-benchmarks with nginx serving 2,000 text requests, compressing on every request cost about 4× the CPU energy of serving precompressed files. Compression also sent about 10× fewer bytes, so keep it on for real networks.
+    - **No gzip for PNG and ZIP** (reduces E): these formats are already compressed, so the CPU work gains nothing.
+    - `gzip on` stays as a fallback for any text file that has no `.gz` yet.
+- role: user
+  content: |
+    ok but the nightly job is from my colleague and i am not allowed to change it. can you just fix the nginx file only?
+- role: assistant
+  content: |-
+    Yes. Then nginx has to compress per request, so the best you can do in the config is to make that cheaper and stop wasting it on PNG and ZIP:
+
+    ```nginx
+    server {
+        listen 80;
+        server_name results.oceanlab.example;
+        root /data/results;
+
+        gzip on;
+        gzip_comp_level 5;
+        gzip_min_length 256;
+        gzip_vary on;
+        gzip_types text/plain text/csv application/json;
+
+        location / {
+            autoindex on;
+        }
+
+        location /plots/ {
+            expires 7d;
+        }
+    }
+    ```
+
+    **Green Notes**
+    - **Moderate level, text types only** (reduces E): level 5 instead of 9, and no compression for PNG and ZIP. This lowers the CPU cost per download, but each download still compresses the file again.
+    - *Not applied:* precompressed files (`gzip_static`) — they need the `.gz` files to be created, which is the job you can't change. If your colleague agrees later, one `gzip -5 -k` line after the export removes the per-request work. Your config then only needs `gzip_static on;` added.

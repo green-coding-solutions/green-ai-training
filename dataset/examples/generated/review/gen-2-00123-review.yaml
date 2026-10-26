@@ -1,0 +1,171 @@
+id: gen-2-00123-review
+category: review
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    hi, can you review this script before I merge? it run in our nightly maintenance pipeline and flag CI jobs which suddenly take much longer (or shorter) then normaly. input is a CSV export from the CI database, around 3-4 milion rows per week, sorted by finished_at. the pipeline step fail when something is flagged so people look at it. it takes a while but its nightly so its ok i think.
+
+    ```python
+    #!/usr/bin/env python3
+    """Flag CI job runs whose duration is unusual compared to recent history.
+
+    Input: CSV export from the CI db (job_name, finished_at, duration_s),
+    finished_at as epoch seconds, sorted by finished_at.
+    """
+    import csv
+    import math
+    import sys
+    from collections import defaultdict
+
+    HALF_LIFE_S = 3 * 24 * 3600
+    Z_LIMIT = 4.0
+
+
+    class JobStats:
+        __slots__ = ("mean", "var", "last_ts", "n")
+
+        def __init__(self):
+            self.mean = 0.0
+            self.var = 0.0
+            self.last_ts = None
+            self.n = 0
+
+
+    def score_runs(rows):
+        stats = defaultdict(JobStats)
+        flagged = []
+        for job, ts, dur in rows:
+            s = stats[job]
+            x = math.log(dur)
+            if s.last_ts is None:
+                alpha = 1.0
+            else:
+                alpha = 1.0 - math.exp(-(ts - s.last_ts) * math.log(2) / HALF_LIFE_S)
+            s.n += 1
+            if s.n > 5:
+                z = (x - s.mean) / math.sqrt(s.var)
+                if abs(z) > Z_LIMIT:
+                    flagged.append((job, ts, dur, round(z, 2)))
+            diff = x - s.mean
+            s.mean += alpha * diff
+            s.var = (1 - alpha) * (s.var + alpha * diff * diff)
+            s.last_ts = ts
+        return flagged
+
+
+    def read_rows(path):
+        with open(path, newline="") as f:
+            for r in csv.DictReader(f):
+                yield r["job_name"], float(r["finished_at"]), float(r["duration_s"])
+
+
+    if __name__ == "__main__":
+        flagged = score_runs(read_rows(sys.argv[1]))
+        for job, ts, dur, z in flagged:
+            print(f"{job}\t{ts:.0f}\t{dur:.1f}s\tz={z}")
+        sys.exit(1 if flagged else 0)
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly CI maintenance job)
+
+    #### [Bug] Crash for jobs with a constant duration
+    - **Where:** `z = (x - s.mean) / math.sqrt(s.var)` in `score_runs`
+    - **Issue:** on the first run of a job `alpha` is 1, so `var` becomes 0. If the job always reports the same duration (cached or skipped jobs often do), `diff` stays 0 and `var` stays 0. After the warm-up runs this raises `ZeroDivisionError` and the whole nightly step fails. If the export is ever not sorted, `ts - s.last_ts` is negative, `alpha` goes negative, `var` can turn negative, and `math.sqrt` raises `ValueError`.
+    - **Fix:** only score when there is a variance: `if s.n > 5 and s.var > 0.0:`. Also keep `ORDER BY finished_at` in the export query. The guard stops the crash, but it cannot fix wrong statistics from unsorted input.
+
+    #### [Bug] `math.log(0)` for cancelled runs
+    - **Where:** `x = math.log(dur)`
+    - **Issue:** runs that are cancelled before they start usually export `duration_s = 0`. `math.log(0)` raises `ValueError: math domain error`.
+    - **Fix:** skip them before touching the stats: `if dur <= 0: continue`. Skipped runs no longer count toward `n` or update `last_ts`, which is what you want for runs that did no work.
+
+    #### [Low] Loop-invariant work in the per-row loop
+    - **Where:** `math.log(2) / HALF_LIFE_S`, and the `math.exp`, `math.log`, `math.sqrt` lookups
+    - **Issue:** `math.log(2)` is called on every row, but the result never changes. Each `math.xxx` is also a module attribute lookup per row. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local variable before a 10,000,000-iteration loop saved about 4-5%. So the gain is small. It is worth doing because it is a two-line change, not because it changes the runtime much.
+    - **Fix:** `LN2 = math.log(2)` at module level, and `exp, log, sqrt = math.exp, math.log, math.sqrt` before the loop. The arithmetic order stays the same, so the z-scores are exactly the same.
+    - **Impact:** E, a few percent of the loop's CPU time at most.
+
+    **Already good:** streaming the CSV with a generator, a single pass, `__slots__` on the per-job state, exit code as the CI gate.
+
+    All three changes together (`read_rows` and the `__main__` block stay as they are):
+
+    ```python
+    import math
+    from collections import defaultdict
+
+    HALF_LIFE_S = 3 * 24 * 3600
+    Z_LIMIT = 4.0
+    LN2 = math.log(2)
+
+
+    class JobStats:
+        __slots__ = ("mean", "var", "last_ts", "n")
+
+        def __init__(self):
+            self.mean = 0.0
+            self.var = 0.0
+            self.last_ts = None
+            self.n = 0
+
+
+    def score_runs(rows):
+        exp, log, sqrt = math.exp, math.log, math.sqrt
+        stats = defaultdict(JobStats)
+        flagged = []
+        for job, ts, dur in rows:
+            if dur <= 0:
+                continue  # cancelled or skipped run, log(0) is undefined
+            s = stats[job]
+            x = log(dur)
+            if s.last_ts is None:
+                alpha = 1.0
+            else:
+                alpha = 1.0 - exp(-(ts - s.last_ts) * LN2 / HALF_LIFE_S)
+            s.n += 1
+            if s.n > 5 and s.var > 0.0:
+                z = (x - s.mean) / sqrt(s.var)
+                if abs(z) > Z_LIMIT:
+                    flagged.append((job, ts, dur, round(z, 2)))
+            diff = x - s.mean
+            s.mean += alpha * diff
+            s.var = (1 - alpha) * (s.var + alpha * diff * diff)
+            s.last_ts = ts
+        return flagged
+    ```
+verify:
+  module: true
+  test: |
+    rows = [("build", float(i * 600), 30.0) for i in range(20)]
+    assert score_runs(rows) == []
+    rows = [("lint", 0.0, 0.0), ("lint", 600.0, 12.0)]
+    assert score_runs(rows) == []
+    import random
+    rng = random.Random(1)
+    rows = [("e2e", float(i * 3600), 300.0 * rng.uniform(0.9, 1.1)) for i in range(50)]
+    rows.append(("e2e", 50 * 3600.0, 3000.0))
+    out = score_runs(rows)
+    assert out and out[-1][0] == "e2e" and out[-1][2] == 3000.0
+  equivalence:
+    driver: |-
+      import random
+      rng = random.Random(7)
+      jobs = {"build": 240.0, "unit-tests": 600.0, "e2e": 1500.0, "lint": 45.0}
+      names = sorted(jobs)
+      rows = []
+      ts = 0.0
+      for i in range(4000):
+          ts += rng.uniform(60, 900)
+          job = rng.choice(names)
+          dur = jobs[job] * rng.lognormvariate(0, 0.15)
+          if rng.random() < 0.01:
+              dur *= rng.choice([0.2, 6.0])
+          rows.append((job, ts, dur))
+      out = score_runs(rows)
+      for r in out:
+          print(r[0], f"{r[1]:.0f}", f"{r[2]:.1f}", r[3])
+      print(len(out))

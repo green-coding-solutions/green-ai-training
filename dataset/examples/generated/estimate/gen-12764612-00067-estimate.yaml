@@ -1,0 +1,59 @@
+id: gen-12764612-00067-estimate
+category: estimate
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    Mesh post-processing step. Most cells in our coarse meshes are the background material, which isn't in the density table, so the except branch fires for roughly half of the cells. Runs on millions of cells per nightly job.
+
+    ```python
+    import numpy as np
+
+
+    def cell_density(mesh_materials, density_table, fallback=1.0):
+        out = np.empty(len(mesh_materials))
+        for i, mat in enumerate(mesh_materials):
+            try:
+                out[i] = density_table[mat]
+            except KeyError:
+                out[i] = fallback
+        return out
+    ```
+
+    If I swap the try/except for .get, how much energy does that save per night? Just the diff and a number.
+- role: assistant
+  content: |
+    Here is the change:
+
+    ```python
+    import numpy as np
+
+
+    def cell_density(mesh_materials, density_table, fallback=1.0):
+        out = np.empty(len(mesh_materials))
+        for i, mat in enumerate(mesh_materials):
+            out[i] = density_table.get(mat, fallback)
+        return out
+    ```
+
+    I can't give you a nightly number, and I won't scale one from a different workload. What I can say is that your case is the one where `.get` wins. In Green Metrics Tool micro-benchmarks, 10,000,000 dict lookups with about half of the keys missing used ~67 J with `dict.get(key, default)` and ~76 J with `try/except KeyError`. That is about 12% less for `get`. The cost is in raising and catching the exception on each miss.
+
+    - **Behavior:** unchanged. A hit returns the table value, a miss returns `fallback`.
+    - **Miss rate drives the saving.** If misses were rare, `try/except` would be cheap and the gain would be close to nothing. Yours are frequent, so it applies.
+    - **Size of the gain:** the loop is still a Python loop. This change trims the per-miss cost only. It won't move the nightly total much compared with removing the loop. I haven't measured that, so I'm not recommending it as a fix here.
+
+    To get your own number, time both versions on one real mesh with the same inputs, using `time` or `perf stat` as a CPU-time proxy. Or run both in a Green Metrics Tool usage scenario. Then multiply by your actual run count.
+verify:
+  equivalence:
+    driver: |-
+      import numpy as np
+      table = {1: 2.7, 2: 7.8, 3: 8.9}
+      mats = [1, 9, 2, 9, 9, 3, 4, 1, 2, 7] * 50
+      r = cell_density(mats, table)
+      print(r.sum(), r[:10].tolist())
+      r2 = cell_density(mats, table, fallback=0.0)
+      print(r2.sum(), r2[:10].tolist())

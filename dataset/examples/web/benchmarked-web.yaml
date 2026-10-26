@@ -1,0 +1,516 @@
+id: gen-nginx-vite-spa-gzip-static-001
+category: generation
+language: nginx
+patterns: [text-compression]
+facts: [F-TEXT-COMPRESS]
+messages:
+  - role: user
+    content: |
+      Need an nginx server block for our Vite single page app. Build output is copied to /usr/share/nginx/html, all unknown routes should go to index.html.
+  - role: assistant
+    content: |
+      Precompress the text files once in the build:
+
+      ```bash
+      npm run build
+      find dist -type f \( -name '*.js' -o -name '*.css' -o -name '*.html' -o -name '*.svg' -o -name '*.json' \) -exec gzip -k -9 {} +
+      ```
+
+      ```nginx
+      server {
+          listen 80;
+          root /usr/share/nginx/html;
+
+          gzip_static on;
+          gzip on;
+          gzip_comp_level 5;
+          gzip_types text/css application/javascript application/json image/svg+xml;
+
+          location / {
+              try_files $uri $uri/ /index.html;
+          }
+
+          location /assets/ {
+              try_files $uri =404;
+          }
+      }
+      ```
+
+      **Green Notes**
+      - **Enable text compression, precompressed** (reduces E and network): `gzip_static` sends the `.gz` file made at build time, so nginx doesn't compress on every request. In Green Metrics Tool measurements of nginx serving 2,000 requests for text assets, compressing on every request used ~54 J and precompressed files ~14 J, about 4× less, and both sent about 10× fewer bytes than no compression. `gzip on` stays as a fallback for files without a `.gz` copy.
+
+      `gzip -9` is fine here because it runs once per build, not per request.
+verify:
+  static_only: "nginx config and build command"
+---
+id: review-nginx-static-gzip-level-9-001
+category: review
+language: nginx
+patterns: [text-compression]
+facts: [F-TEXT-COMPRESS]
+messages:
+  - role: user
+    content: |
+      our docs site is served by this nginx config, can you have a look?
+
+      ```nginx
+      server {
+          listen 80;
+          server_name docs.example.com;
+          root /var/www/docs;
+
+          gzip on;
+          gzip_comp_level 9;
+          gzip_min_length 0;
+          gzip_types text/plain text/css application/javascript application/json image/svg+xml;
+
+          location / {
+              try_files $uri $uri/ =404;
+          }
+      }
+      ```
+  - role: assistant
+    content: |
+      **Workload:** web (static site)
+
+      #### [High] Static files compressed again on every request
+      - **Where:** `gzip on` with `gzip_comp_level 9`
+      - **Issue:** the docs are static, but nginx compresses each file again for every visitor, at the most expensive level. In Green Metrics Tool measurements of nginx serving 2,000 requests for text assets, gzip level 5 per request used ~54 J of CPU energy, and serving precompressed files with `gzip_static` ~14 J, about 4× less. Level 9 costs more than the measured level 5.
+      - **Fix:** compress once when you build the site, and let nginx send the ready files:
+        ```bash
+        find /var/www/docs -type f \( -name '*.html' -o -name '*.css' -o -name '*.js' -o -name '*.svg' -o -name '*.json' \) -exec gzip -k -9 {} +
+        ```
+        ```nginx
+        gzip_static on;
+        gzip on;
+        gzip_comp_level 5;
+        ```
+      - **Impact:** E on the server for every request. The bytes sent stay the same as now, about 10× fewer than without compression in the measurement.
+
+      #### [Low] Tiny responses compressed too
+      - **Where:** `gzip_min_length 0`
+      - **Issue:** responses of a few bytes get compressed, which can make them bigger and costs CPU for nothing. The default of 20 bytes, or something like 256, is enough.
+
+      **Already good:** compression is on, so readers download far fewer bytes. Keep it that way.
+verify:
+  static_only: "nginx config"
+---
+id: nochange-nginx-brotli-everything-001
+category: no-change
+language: nginx
+patterns: [text-compression, context-tradeoff]
+facts: [F-TEXT-COMPRESS, F-COMPRESS]
+messages:
+  - role: user
+    content: |
+      We serve precompressed assets and compress the API responses on the fly. Would switching everything to brotli at max level save more energy?
+
+      ```nginx
+      location /assets/ {
+          gzip_static on;
+          expires 1y;
+      }
+
+      location /api/ {
+          proxy_pass http://api:8080;
+          gzip on;
+          gzip_comp_level 5;
+          gzip_types application/json;
+      }
+      ```
+  - role: assistant
+    content: |
+      No, this setup is already the efficient one. I would not change the API part.
+
+      - **Assets:** precompressed files are the cheap path. In Green Metrics Tool measurements of nginx serving 2,000 requests for text assets, precompressed files used ~14 J and compressing on every request ~54 J, with about 10× fewer bytes than no compression either way.
+      - **API responses:** these are compressed per request, so the codec's CPU cost repeats on every call. Brotli at its maximum quality is very expensive to compress: on 100 MB of text it used ~3019 J, about 45× gzip. That would multiply the cost of every API response.
+
+      If you want smaller asset files, you can add `.br` files made with brotli at maximum quality at build time (it runs once there) and serve them with the `ngx_brotli` module's `brotli_static on`. Keep gzip at a moderate level for `/api/`.
+verify:
+  static_only: "nginx config"
+---
+id: refactor-css-six-ttf-fonts-001
+category: refactor
+language: css
+patterns: [system-fonts-and-deps]
+facts: [F-FONTS]
+messages:
+  - role: user
+    content: |
+      our blog feels heavy on first load. can you trim the font part of the css? the brand font is only really needed for headings
+
+      ```css
+      @font-face { font-family: "Lora"; src: url("/fonts/Lora-Regular.ttf"); font-weight: 400; }
+      @font-face { font-family: "Lora"; src: url("/fonts/Lora-Italic.ttf"); font-weight: 400; font-style: italic; }
+      @font-face { font-family: "Lora"; src: url("/fonts/Lora-Medium.ttf"); font-weight: 500; }
+      @font-face { font-family: "Lora"; src: url("/fonts/Lora-SemiBold.ttf"); font-weight: 600; }
+      @font-face { font-family: "Lora"; src: url("/fonts/Lora-Bold.ttf"); font-weight: 700; }
+      @font-face { font-family: "Lora"; src: url("/fonts/Lora-BoldItalic.ttf"); font-weight: 700; font-style: italic; }
+
+      body { font-family: "Lora", serif; font-size: 18px; line-height: 1.6; }
+      h1, h2, h3 { font-family: "Lora", serif; font-weight: 700; }
+      ```
+  - role: assistant
+    content: |
+      ```css
+      @font-face {
+        font-family: "Lora";
+        src: url("/fonts/lora-700-latin.woff2") format("woff2");
+        font-weight: 700;
+        font-display: swap;
+        unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+2018-201F, U+20AC;
+      }
+
+      body {
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        font-size: 18px;
+        line-height: 1.6;
+      }
+
+      h1, h2, h3 {
+        font-family: "Lora", Georgia, serif;
+        font-weight: 700;
+      }
+      ```
+
+      Create the subset once, for example with `pyftsubset Lora-Bold.ttf --unicodes="U+0000-00FF" --flavor=woff2 --output-file=lora-700-latin.woff2`.
+
+      **Green Notes**
+      - **System font stack for body text** (reduces network and E): no font files to download for the text people actually read. In Green Metrics Tool browser benchmarks with 30 cold page loads, six TTF files used ~556 J, two Latin-subset WOFF2 files ~488 J (about 12% less) and the system font stack ~410 J (about 26% less than the TTF set).
+      - **One WOFF2 subset for headings** (reduces network): the brand look stays where you need it, with one small file instead of six large ones.
+
+      Body text changes from Lora to the system font, so the blog will look a bit different. If you want Lora in the body too, keep it as two subset WOFF2 files (regular and bold), which is still far smaller than the TTF set.
+verify:
+  static_only: "CSS"
+---
+id: gen-html-cli-landing-page-001
+category: generation
+language: html
+patterns: [system-fonts-and-deps, lazy-load-images]
+facts: [F-FONTS, F-LAZY-IMG]
+messages:
+  - role: user
+    content: |
+      Write a simple landing page for our open source CLI tool "tidyup". Hero with name + one-liner + install command, then a screenshot further down, then a features list. No frameworks.
+  - role: assistant
+    content: |
+      ```html
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>tidyup – clean up your project folders</title>
+        <style>
+          body {
+            margin: 0;
+            font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            line-height: 1.6;
+            color: #1f2328;
+          }
+          main { max-width: 46rem; margin: 0 auto; padding: 3rem 1.25rem; }
+          code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+          pre { background: #f6f8fa; padding: 1rem; border-radius: 6px; overflow-x: auto; }
+          img { max-width: 100%; height: auto; border-radius: 6px; }
+        </style>
+      </head>
+      <body>
+        <main>
+          <h1>tidyup</h1>
+          <p>Find and remove build leftovers, caches and stale branches in one command.</p>
+          <pre><code>pipx install tidyup</code></pre>
+
+          <h2>See it in action</h2>
+          <img src="screenshot.png" width="1280" height="720" alt="tidyup listing removable folders" loading="lazy">
+
+          <h2>Features</h2>
+          <ul>
+            <li>Dry run by default, nothing is deleted without confirmation</li>
+            <li>Knows node_modules, __pycache__, target/ and more</li>
+            <li>Works on Linux, macOS and Windows</li>
+          </ul>
+        </main>
+      </body>
+      </html>
+      ```
+
+      **Green Notes**
+      - **System font stack** (reduces network and E): no web font files to download. In Green Metrics Tool browser benchmarks, the system font stack used ~410 J for 30 cold page loads, against ~556 J with six TTF files, about 26% less.
+      - **Defer offscreen images** (reduces network): the screenshot is below the hero, so it loads only when a visitor scrolls towards it. In the same kind of benchmarks, an article with images below the fold used about 12% less CPU energy when visitors didn't scroll.
+
+      `width` and `height` on the image keep the layout stable while it loads.
+verify:
+  static_only: "HTML page"
+---
+id: nochange-css-small-stylesheet-purge-001
+category: no-change
+language: css
+patterns: [remove-unused-css, context-tradeoff]
+facts: [F-UNUSED-CSS]
+messages:
+  - role: user
+    content: |
+      should I run PurgeCSS on this to make our page greener? it's our whole stylesheet, hand written
+
+      ```css
+      :root { --accent: #0a7d55; --text: #1f2328; }
+      body { margin: 0; font-family: system-ui, sans-serif; color: var(--text); }
+      header, footer { padding: 1rem 2rem; }
+      nav a { margin-right: 1rem; color: var(--accent); text-decoration: none; }
+      main { max-width: 60rem; margin: 0 auto; padding: 2rem; }
+      .card { border: 1px solid #d0d7de; border-radius: 8px; padding: 1rem; }
+      .card + .card { margin-top: 1rem; }
+      .btn { background: var(--accent); color: #fff; padding: .5rem 1rem; border-radius: 6px; }
+      .old-banner { background: #fff3cd; padding: .5rem; }
+      ```
+  - role: assistant
+    content: |
+      No need. This stylesheet is already small, so purging it won't make a measurable difference.
+
+      - In Green Metrics Tool browser benchmarks with 50 cold page loads, even a 16 KB stylesheet with mostly unused rules (~783 J) and the same page with it purged and minified to 0.75 KB (~764 J) were within noise of each other, about 2% apart.
+      - Your file is a fraction of that size. The few bytes PurgeCSS would remove don't matter on any network.
+
+      If `.old-banner` is no longer used anywhere, deleting it by hand keeps the file tidy, but that is housekeeping, not an energy fix. PurgeCSS starts to pay off when you ship a big framework stylesheet and use only a small part of it.
+verify:
+  static_only: "CSS"
+---
+id: gen-js-esbuild-production-build-001
+category: generation
+language: javascript
+patterns: [minify-assets]
+facts: [F-MINIFY]
+messages:
+  - role: user
+    content: |
+      write a build.mjs that bundles src/main.js and src/styles.css for production with esbuild, output to dist/
+  - role: assistant
+    content: |
+      ```javascript
+      import * as esbuild from 'esbuild';
+
+      await esbuild.build({
+        entryPoints: ['src/main.js', 'src/styles.css'],
+        outdir: 'dist',
+        bundle: true,
+        minify: true,
+        drop: ['console', 'debugger'],
+        sourcemap: false,
+        target: ['es2020'],
+        entryNames: '[name]-[hash]',
+        metafile: true,
+        logLevel: 'info',
+      });
+      ```
+
+      Run it with `node build.mjs`. The hashed file names (`main-3F2A1C.js`) let you serve the files with long cache times.
+
+      **Green Notes**
+      - **Minify web assets** (reduces network): whitespace, comments and `console` calls are removed, so every visitor downloads fewer bytes. In Green Metrics Tool browser benchmarks of a small booking page, the minified build used ~822 J for 50 cold page loads and the unminified sources ~837 J, about 2%, which is within noise. So the saving is in transferred bytes, not in client CPU, and it grows with the size of your bundle.
+
+      `drop: ['console']` also removes `console.error` calls. If you rely on them for error reporting in production, use `pure: ['console.log', 'console.debug']` instead.
+verify:
+  static_only: "needs esbuild"
+---
+id: gen-js-search-results-paginated-001
+category: generation
+language: javascript
+patterns: [dom-size]
+facts: [F-DOM-SIZE]
+messages:
+  - role: user
+    content: |
+      I need a function that shows search results in the #results list. The API /api/search?q= returns an array of {title, url, snippet}, can be several thousand entries.
+  - role: assistant
+    content: |
+      ```javascript
+      const PAGE_SIZE = 50;
+
+      export async function showResults(query, page = 0) {
+        const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
+        if (!res.ok) throw new Error(`search failed: ${res.status}`);
+        const results = await res.json();
+
+        const frag = document.createDocumentFragment();
+        for (const r of results.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)) {
+          const li = document.createElement('li');
+          const a = document.createElement('a');
+          a.href = r.url;
+          a.textContent = r.title;
+          const p = document.createElement('p');
+          p.textContent = r.snippet;
+          li.append(a, p);
+          frag.appendChild(li);
+        }
+        document.getElementById('results').replaceChildren(frag);
+
+        const pages = Math.ceil(results.length / PAGE_SIZE);
+        document.getElementById('page-info').textContent =
+          pages > 1 ? `Page ${page + 1} of ${pages}` : '';
+        return pages;
+      }
+      ```
+
+      **Green Notes**
+      - **Avoid excessive DOM size** (reduces E on the client): at most 50 results, three elements each, are in the page at any time, built off-DOM in one `DocumentFragment` and inserted once. In Green Metrics Tool browser benchmarks, a 10,000-row table with wrapper elements used ~1036 J for 30 page loads, and the same data paginated to 100 rows built in a `DocumentFragment` ~457 J, about 56% less.
+
+      This still downloads all results and only renders one page. If the API can take `&page=` and `&limit=`, request one page at a time, so the network and the server only handle what is shown. `textContent` instead of `innerHTML` also keeps titles and snippets from injecting markup.
+verify:
+  static_only: "browser DOM code"
+---
+id: gen-html-product-page-lazy-images-001
+category: generation
+language: html
+patterns: [lazy-load-images]
+facts: [F-LAZY-IMG]
+messages:
+  - role: user
+    content: |
+      write the html for a product detail page: main product photo at the top, then a gallery of 8 more photos, then customer reviews that can have photos too. just the body markup is fine
+  - role: assistant
+    content: |
+      ```html
+      <main class="product">
+        <img class="product-hero" src="/img/kettle-front.jpg" width="1200" height="1200"
+             alt="Steel kettle, front view" fetchpriority="high">
+
+        <section class="details">
+          <h1>Steel kettle 1.5 l</h1>
+          <p class="price">€49.00</p>
+          <button type="button">Add to cart</button>
+        </section>
+
+        <section class="gallery" aria-label="More photos">
+          <img src="/img/kettle-side.jpg" width="600" height="600" alt="Side view" loading="lazy">
+          <img src="/img/kettle-top.jpg" width="600" height="600" alt="Lid open" loading="lazy">
+          <img src="/img/kettle-base.jpg" width="600" height="600" alt="Base and cable" loading="lazy">
+          <img src="/img/kettle-handle.jpg" width="600" height="600" alt="Handle detail" loading="lazy">
+          <img src="/img/kettle-spout.jpg" width="600" height="600" alt="Spout and filter" loading="lazy">
+          <img src="/img/kettle-kitchen.jpg" width="600" height="600" alt="In a kitchen" loading="lazy">
+          <img src="/img/kettle-scale.jpg" width="600" height="600" alt="Size next to a mug" loading="lazy">
+          <img src="/img/kettle-box.jpg" width="600" height="600" alt="Packaging" loading="lazy">
+        </section>
+
+        <section class="reviews">
+          <h2>Reviews</h2>
+          <article class="review">
+            <h3>Boils fast, looks great</h3>
+            <p>Using it every morning for two months now.</p>
+            <img src="/img/review-1841.jpg" width="400" height="300" alt="Kettle on a customer's stove" loading="lazy">
+          </article>
+        </section>
+      </main>
+      ```
+
+      **Green Notes**
+      - **Defer offscreen images** (reduces network and E): the gallery and review photos load only when the visitor scrolls near them. In Green Metrics Tool browser benchmarks with an article of 15 photos, page loads without scrolling used about 12% less CPU energy with lazy loading below the fold (~325 J vs ~368 J). When visitors scrolled to the end, the difference was noise, so the saving comes from the visitors who leave early.
+      - *Not applied:* lazy loading on the main photo. It is above the fold, and lazy-loading it would only delay the most important image. `fetchpriority="high"` asks the browser to load it first.
+
+      `width` and `height` on every image reserve the space, so the page doesn't jump while photos arrive.
+verify:
+  static_only: "HTML markup"
+---
+id: refactor-js-setinterval-banner-animation-001
+category: refactor
+language: javascript
+patterns: [css-animations]
+facts: [F-ANIM]
+messages:
+  - role: user
+    content: |
+      This slides our promo banner in and out and makes the arrow bounce. Can you clean it up?
+
+      ```javascript
+      const banner = document.querySelector('.promo');
+      const arrow = document.querySelector('.promo .arrow');
+      let offset = -100;
+      let t = 0;
+
+      setInterval(() => {
+        if (offset < 0) {
+          offset += 2;
+          banner.style.transform = `translateY(${offset}%)`;
+        }
+        t += 0.1;
+        arrow.style.transform = `translateX(${Math.sin(t) * 6}px)`;
+      }, 16);
+      ```
+  - role: assistant
+    content: |
+      ```css
+      .promo {
+        transform: translateY(-100%);
+        transition: transform 0.8s ease-out;
+      }
+
+      .promo.is-visible {
+        transform: translateY(0);
+      }
+
+      .promo .arrow {
+        animation: nudge 1s ease-in-out infinite alternate;
+      }
+
+      @keyframes nudge {
+        from { transform: translateX(-6px); }
+        to   { transform: translateX(6px); }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .promo { transition: none; }
+        .promo .arrow { animation: none; }
+      }
+      ```
+
+      ```javascript
+      requestAnimationFrame(() => {
+        document.querySelector('.promo').classList.add('is-visible');
+      });
+      ```
+
+      **Green Notes**
+      - **CSS animation instead of a JS timer** (reduces E): the old code ran a callback about 60 times a second for as long as the page was open, even after the banner had arrived. Now the browser animates `transform` itself and no script runs per frame. In Green Metrics Tool browser benchmarks, a 20-second animation used ~161 J of CPU energy with a JavaScript `requestAnimationFrame` loop and ~145 J with CSS `@keyframes`, about 10% less, and a fixed 16 ms timer does even more work than `requestAnimationFrame` when the tab is in the background.
+
+      The motion looks the same: the banner slides in once and the arrow keeps nudging. Visitors who set "reduce motion" in their system now get no animation.
+verify:
+  static_only: "browser code"
+---
+id: multiturn-html-avif-on-the-fly-001
+category: multi-turn
+language: html
+patterns: [modern-image-formats]
+facts: [F-IMGENC, F-IMGRENDER]
+messages:
+  - role: user
+    content: |
+      html for a product photo that uses modern image formats with a fallback? file is /media/p/4711/main
+  - role: assistant
+    content: |
+      ```html
+      <picture>
+        <source srcset="/media/p/4711/main.avif" type="image/avif">
+        <source srcset="/media/p/4711/main.webp" type="image/webp">
+        <img src="/media/p/4711/main.jpg" width="1000" height="1000" alt="Product photo">
+      </picture>
+      ```
+
+      **Green Notes**
+      - **Serve images in modern formats** (reduces network): browsers pick the first format they support, so most visitors get the much smaller AVIF or WebP file, and old browsers still get the JPEG. The saving comes from fewer transferred bytes. Decoding AVIF is not cheaper: in Green Metrics Tool browser benchmarks it cost about 19% more CPU than JPG.
+
+      The three files have to exist on the server. Create them once when the photo is uploaded.
+  - role: user
+    content: |
+      creating 3 files per upload is annoying. can't our image endpoint just convert to avif on the fly when a browser asks for it?
+  - role: assistant
+    content: |
+      Only if you cache the result. Converting on every request is the expensive way.
+
+      AVIF encoding is costly. In Green Metrics Tool measurements, encoding 50 images took ~658 J as AVIF, ~290 J as WebP and ~89 J as JPG, so AVIF was about 7× JPG. On the fly, you pay that again for every visitor and every product view, while the file only needs to be made once.
+
+      Two setups that keep your upload code simple:
+
+      - **Convert lazily, store once:** the endpoint converts on the first request, saves the AVIF and WebP next to the original, and serves the stored file from then on. Same HTML as above.
+      - **Background job after upload:** the upload returns immediately, and a worker creates the two extra files a few seconds later. Until they exist, browsers fall back to the JPEG.
+
+      Either way, each photo is encoded once, not once per view.
+verify:
+  static_only: "HTML markup"

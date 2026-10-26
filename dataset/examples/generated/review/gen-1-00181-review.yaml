@@ -1,0 +1,80 @@
+id: gen-1-00181-review
+category: review
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    hi, i made this nginx config for my sisters bakery website (just html, css, a bit of js and photos, plus a contact form that goes to a small flask app). it works but i copied parts from different tutorials and im not sure whats wrong with it. can you look at it?
+
+    ```nginx
+    server {
+        listen 80;
+        server_name www.lenas-backwaren.example;
+
+        root /var/www/lena-site;
+        index index.html;
+
+        autoindex on;
+
+        gzip on;
+        gzip_comp_level 9;
+        gzip_min_length 0;
+        gzip_types text/html text/css application/javascript application/json
+                   image/svg+xml image/jpeg image/png image/webp font/woff2;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location /api/contact {
+            proxy_pass http://127.0.0.1:5000;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (static landing page with one small API route)
+
+    #### [Security] Directory listing is on
+    - **Where:** `autoindex on;`
+    - **Issue:** any folder without an `index.html` shows a list of all its files. Old drafts, backups and unused uploads become visible and downloadable.
+    - **Fix:** delete the line. `try_files ... =404` already gives a clean 404 for missing paths.
+
+    #### [High] Every static file is gzipped again on every request
+    - **Where:** `gzip on; gzip_comp_level 9;`
+    - **Issue:** your HTML, CSS and JS never change between requests, but nginx compresses them again for every visitor. Level 9 is the most CPU-hungry setting, and I did not find a measurement for it. In Green Metrics Tool micro-benchmarks (nginx, 2,000 requests for text assets, client and server CPU), gzip level 5 on every request used ~54 J. Serving files compressed once at build time (`gzip_static`) used ~14 J, about 4× less. Both sent about 10× fewer bytes than no compression.
+    - **Fix:** compress once when you deploy, and let nginx serve the `.gz` files:
+      ```bash
+      find /var/www/lena-site -type f \( -name '*.html' -o -name '*.css' -o -name '*.js' -o -name '*.svg' -o -name '*.json' \) -exec gzip -9 -k -f {} +
+      ```
+      ```nginx
+      gzip_static on;
+      gzip_vary on;
+      ```
+      Level 9 is fine in the build step, because it runs once. Re-run the command after every deploy, otherwise nginx serves old `.gz` files. `gzip_static` needs the `ngx_http_gzip_static_module`, which the usual Debian, Ubuntu and nginx.org packages include.
+    - **Impact:** E on the server, per request. Keep compression on: on real networks the byte saving is what counts. Precompressed files still cost more than uncompressed ones in the benchmark (about 2×), because the browser has to decompress them. That trade is worth it over the internet.
+
+    #### [Medium] Images and fonts are in `gzip_types`
+    - **Where:** `image/jpeg image/png image/webp font/woff2`
+    - **Issue:** JPEG, PNG, WebP and WOFF2 are already compressed. gzip makes them about the same size and only burns CPU on every request.
+    - **Fix:** list text types only. If you keep a runtime `gzip` as a fallback for files without a `.gz`:
+      ```nginx
+      gzip on;
+      gzip_comp_level 5;
+      gzip_min_length 256;
+      gzip_types text/css application/javascript application/json image/svg+xml;
+      ```
+
+    #### [Low] Small leftovers
+    - **Where:** `gzip_min_length 0;` and `text/html`
+    - **Issue:** a minimum length of 0 compresses tiny responses where the gzip header can make them bigger. `text/html` is always compressed already, and nginx warns about the duplicate.
+
+    **Already good:** `try_files` with a 404 fallback, and only `/api/contact` goes to Flask. Static files are served directly by nginx.
+verify:
+  static_only: nginx configuration, no runnable Python or JavaScript

@@ -1,0 +1,72 @@
+id: gen-12764612-00285-estimate
+category: estimate
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS
+messages:
+- role: user
+  content: |
+    We have a nightly export job on one backend host. It pulls the full orders export from our REST API (JSON, about 100 MB) and sends it to a partner's SFTP server. Right now it looks like this:
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    day=$(date +%F)
+    out="/var/exports/orders-$day.json.gz"
+
+    curl -sS --fail -H "Authorization: Bearer $API_TOKEN" \
+      "https://api.internal.example/v1/orders/export" \
+      | gzip -6 > "$out"
+
+    sftp -b - partner@sftp.example.com <<EOF
+    put $out /incoming/
+    EOF
+    ```
+
+    Requirements: the partner accepts both .gz and .zst. The link is fine, so size is not a problem. I want to put an estimate into a ticket: how many kWh per year do we save if we switch from gzip to zstd? Please give me a number if you can.
+- role: assistant
+  content: |
+    I can't give you an honest kWh per year. Any such number would be invented, because it depends on your CPU, your data and the load on the host. I can tell you the direction and what was measured.
+
+    In Green Metrics Tool micro-benchmarks, compressing 100 MB of English text with default settings used:
+
+    - zstd: ~16 J
+    - gzip (level 6): ~67 J
+
+    That is about 4× less energy for zstd. For decompression of 100 MB, zstd used ~5.3 J and gzip ~9.1 J, so the partner side gets a bit cheaper too.
+
+    Limits of these figures:
+
+    - They measured energy, not compression ratio. zstd's default level usually gives a file of similar size to gzip, but check your own output.
+    - The test data was English text, not your JSON. JSON compresses well, but the gap may differ.
+    - The job runs once a night and the compression is a small part of it. The curl transfer and the SFTP upload are not covered by these figures.
+
+    The switch is small and keeps your behavior:
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    day=$(date +%F)
+    out="/var/exports/orders-$day.json.zst"
+
+    curl -sS --fail -H "Authorization: Bearer $API_TOKEN" \
+      'https://api.internal.example/v1/orders/export' \
+      | zstd -q > "$out"
+
+    sftp -b - partner@sftp.example.com <<EOF
+    put $out /incoming/
+    EOF
+    ```
+
+    **Green Notes**
+    - **Fast codec** (reduces E): zstd at its default level used about 4× less energy than gzip -6 for compression in Green Metrics Tool micro-benchmarks. I kept the default level, because that is what was measured.
+    - **Not applied:** stronger codecs such as xz or brotli. In the same benchmarks they cost far more energy to compress (brotli ~3019 J for 100 MB). They only make sense for data compressed once and read many times.
+
+    To get a number for your ticket, measure it on the real host. Run each variant on a saved copy of the export, for example `perf stat -e power/energy-pkg/ zstd -q < orders.json > /dev/null` (needs RAPL access), or use `time` for CPU time as a proxy. Compare `ls -l` on both outputs. For a full picture, put both variants into a Green Metrics Tool usage scenario. Then multiply your own measured value by the number of runs.
+verify:
+  static_only: bash script that needs network access, an API token and an SFTP server

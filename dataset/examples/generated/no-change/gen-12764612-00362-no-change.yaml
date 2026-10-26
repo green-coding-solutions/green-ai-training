@@ -1,0 +1,38 @@
+id: gen-12764612-00362-no-change
+category: no-change
+language: sql
+patterns:
+- batch-db-writes
+- context-tradeoff
+facts:
+- F-PG-INSERT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    PUT /articles/:id/tags replaces the tag set of one article (max 20 tags, usually 3-8). Postgres 16. A colleague says this should be COPY because "bulk loading is greener". Diff only please.
+
+    ```sql
+    BEGIN;
+
+    DELETE FROM article_tags WHERE article_id = $1;
+
+    INSERT INTO article_tags (article_id, tag_id, position)
+    SELECT $1, t.tag_id, t.ord
+    FROM unnest($2::bigint[]) WITH ORDINALITY AS t(tag_id, ord);
+
+    UPDATE articles SET updated_at = now() WHERE id = $1;
+
+    COMMIT;
+    ```
+- role: assistant
+  content: |
+    No diff. Keep it as it is.
+
+    - **Already batched:** all tags go in with one `INSERT ... SELECT unnest(...)`, inside one transaction. There is no per-row round trip to remove.
+    - **Batch is tiny:** COPY pays off with many rows per batch. In Green Metrics Tool micro-benchmarks on PostgreSQL 16, COPY used about 22× less energy than one INSERT per row with 5,000-row batches. With batches of only 100 rows the gap was small (loop ~13 J, `executemany` ~15 J, COPY ~9.5 J). Your batches are at most 20 rows.
+    - **Worse fit:** COPY cannot do the `DELETE` and `UPDATE` in this flow. You would need extra statements or a staging table, which adds work for a few rows.
+
+    Switch to COPY if you ever load thousands of rows per batch, for example a bulk tag import.
+verify:
+  static_only: Postgres-specific SQL (unnest WITH ORDINALITY, array parameters); no code change in the answer

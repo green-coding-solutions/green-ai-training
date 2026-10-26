@@ -1,0 +1,103 @@
+id: gen-2-00065-generation
+category: generation
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    Need `refresh_open_shipments(tracking_numbers) -> dict[str, TrackingStatus]` in this module. A cron job in our order service calls it every 10 min with ~400 open shipments. The carrier allows 20 concurrent requests per API key. Failed lookups: log and skip, don't fail the run. Only show what to add, I know the rest.
+
+    ```python
+    # shipping/tracking.py
+    import logging
+    from dataclasses import dataclass
+    from datetime import datetime, timezone
+
+    import httpx
+
+    from shipping.config import CARRIER_API_URL, CARRIER_API_KEY
+
+    log = logging.getLogger(__name__)
+
+    TERMINAL_STATES = {"delivered", "returned", "lost"}
+
+
+    @dataclass
+    class TrackingStatus:
+        tracking_number: str
+        state: str
+        last_event: str | None
+        checked_at: datetime
+
+
+    def _parse(tracking_number: str, payload: dict) -> TrackingStatus:
+        events = payload.get("events") or []
+        return TrackingStatus(
+            tracking_number=tracking_number,
+            state=payload.get("status", "unknown").lower(),
+            last_event=events[-1]["description"] if events else None,
+            checked_at=datetime.now(timezone.utc),
+        )
+
+
+    def get_tracking(tracking_number: str) -> TrackingStatus:
+        with httpx.Client(base_url=CARRIER_API_URL, timeout=10.0) as client:
+            resp = client.get(
+                f"/v2/track/{tracking_number}",
+                headers={"Authorization": f"Bearer {CARRIER_API_KEY}"},
+            )
+            resp.raise_for_status()
+            return _parse(tracking_number, resp.json())
+    ```
+- role: assistant
+  content: |
+    Add to `shipping/tracking.py`:
+
+    ```python
+    import asyncio
+
+    MAX_CONCURRENT_REQUESTS = 20
+
+
+    async def _fetch_tracking(
+        client: httpx.AsyncClient, sem: asyncio.Semaphore, tracking_number: str
+    ) -> TrackingStatus | None:
+        async with sem:
+            try:
+                resp = await client.get(f"/v2/track/{tracking_number}")
+                resp.raise_for_status()
+                return _parse(tracking_number, resp.json())
+            except (httpx.HTTPError, ValueError, KeyError) as exc:
+                log.warning("tracking lookup failed for %s: %r", tracking_number, exc)
+                return None
+
+
+    async def _refresh_all(tracking_numbers: list[str]) -> dict[str, TrackingStatus]:
+        sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+        async with httpx.AsyncClient(
+            base_url=CARRIER_API_URL,
+            timeout=10.0,
+            headers={"Authorization": f"Bearer {CARRIER_API_KEY}"},
+        ) as client:
+            results = await asyncio.gather(
+                *(_fetch_tracking(client, sem, tn) for tn in tracking_numbers)
+            )
+        return {s.tracking_number: s for s in results if s is not None}
+
+
+    def refresh_open_shipments(tracking_numbers: list[str]) -> dict[str, TrackingStatus]:
+        # dedupe, keep order
+        unique = list(dict.fromkeys(tracking_numbers))
+        return asyncio.run(_refresh_all(unique))
+    ```
+
+    `asyncio.run` expects a sync caller. If the cron job already runs inside an event loop, `await _refresh_all(...)` directly.
+
+    **Green Notes**
+    - **Concurrent async I/O** (reduces E): up to 20 lookups now wait on the carrier at the same time instead of one after another. That cuts the run's wall time and how long it holds the worker and its connections, every 10 minutes. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync calls. The gain is mostly wall time.
+    - *Not applied:* `get_tracking` stays sync. It makes a single request, so async would gain nothing there.
+verify:
+  static_only: needs httpx and network access to the carrier API

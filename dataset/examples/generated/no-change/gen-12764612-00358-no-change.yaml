@@ -1,0 +1,73 @@
+id: gen-12764612-00358-no-change
+category: no-change
+language: python
+patterns:
+- torch-no-grad
+- context-tradeoff
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```python
+    import json
+    from collections import deque
+
+    import numpy as np
+    import paho.mqtt.client as mqtt
+    import torch
+
+    MODEL_PATH = "/opt/gateway/models/vib_ae.pt"
+    THRESHOLD = 0.042
+    WINDOW = 64
+
+    torch.set_num_threads(1)
+    model = torch.jit.load(MODEL_PATH, map_location="cpu")
+    model.eval()
+
+    buffers = {}
+
+
+    def score_window(samples):
+        x = torch.from_numpy(np.asarray(samples, dtype=np.float32)).unsqueeze(0)
+        with torch.inference_mode():
+            recon = model(x)
+            err = torch.mean((recon - x) ** 2)
+        return err.item()
+
+
+    def on_message(client, userdata, msg):
+        try:
+            payload = json.loads(msg.payload)
+            sensor = payload["sensor_id"]
+            value = float(payload["value"])
+        except (ValueError, KeyError, TypeError):
+            return
+        buf = buffers.setdefault(sensor, deque(maxlen=WINDOW))
+        buf.append(value)
+        if len(buf) < WINDOW:
+            return
+        err = score_window(buf)
+        if err > THRESHOLD:
+            client.publish(f"alerts/{sensor}", json.dumps({"err": err}), qos=1)
+
+
+    client = mqtt.Client()
+    client.on_message = on_message
+    client.connect("localhost", 1883)
+    client.subscribe("sensors/+/vibration")
+    client.loop_forever()
+    ```
+- role: assistant
+  content: |
+    I don't see anything to fix. The inference path is already in the efficient form:
+
+    - **No autograd graph.** `torch.inference_mode()` wraps the forward pass and the error calculation, so no graph is built. In Green Metrics Tool micro-benchmarks, skipping autograd on 100,000 CPU inferences used about 14% less CPU energy (~135 J vs ~157 J). `inference_mode` does the same job as `no_grad`, so you already have this.
+    - **Model loaded once.** `torch.jit.load` and `model.eval()` run at startup, not per message.
+    - **No work before the window is full.** Messages return early until the buffer holds `WINDOW` samples, and bad payloads are dropped before any tensor is created.
+
+    Rewriting any of this would only add risk. Leave it as is.
+verify:
+  static_only: needs PyTorch, a TorchScript model file and an MQTT broker

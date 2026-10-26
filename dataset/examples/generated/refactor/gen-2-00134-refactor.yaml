@@ -1,0 +1,120 @@
+id: gen-2-00134-refactor
+category: refactor
+language: python
+patterns:
+- regex-precompile
+- vectorize-or-jit
+facts:
+- F-REGEX
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    Hourly cron over the edge access logs, ~40M lines per run. Make it cheaper. Diff only, I know the rest.
+
+    ```python
+    import re
+    import sys
+    import math
+    import numpy as np
+
+    NBUCKETS = 32  # bucket i covers [2**i, 2**(i+1)) microseconds
+
+
+    def read_durations(path):
+        out = []
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = re.match(r'^(\S+) \S+ \S+ \[[^\]]+\] "(?:GET|POST|PUT|DELETE|PATCH) [^"]*" (\d{3}) \d+ rt=(\d+\.\d+)', line)
+                if m is None:
+                    continue
+                if m.group(2).startswith("5"):
+                    continue
+                out.append(float(m.group(3)))
+        return np.array(out, dtype=np.float64)
+
+
+    def histogram(durations_s):
+        counts = np.zeros(NBUCKETS, dtype=np.int64)
+        for d in durations_s:
+            us = d * 1e6
+            if us < 1.0:
+                b = 0
+            else:
+                b = int(math.log2(us))
+                if b >= NBUCKETS:
+                    b = NBUCKETS - 1
+            counts[b] += 1
+        return counts
+
+
+    def percentile_from_hist(counts, q):
+        target = q * counts.sum()
+        acc = 0
+        for i, c in enumerate(counts):
+            acc += c
+            if acc >= target:
+                return 2 ** (i + 1) / 1000.0  # upper bound in ms
+        return float("inf")
+
+
+    if __name__ == "__main__":
+        durs = read_durations(sys.argv[1])
+        h = histogram(durs)
+        print(f"requests: {len(durs)}")
+        for q in (0.5, 0.9, 0.99, 0.999):
+            print(f"p{q*100:g}: <= {percentile_from_hist(h, q):.3f} ms")
+    ```
+- role: assistant
+  content: |
+    Imports and module level:
+
+    ```python
+    from numba import njit
+
+    LINE_RE = re.compile(
+        r'^(\S+) \S+ \S+ \[[^\]]+\] "(?:GET|POST|PUT|DELETE|PATCH) [^"]*" (\d{3}) \d+ rt=(\d+\.\d+)'
+    )
+    ```
+
+    `read_durations` uses the compiled pattern. Only the `match` line changes:
+
+    ```python
+    def read_durations(path):
+        out = []
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = LINE_RE.match(line)
+                if m is None:
+                    continue
+                if m.group(2).startswith("5"):
+                    continue
+                out.append(float(m.group(3)))
+        return np.array(out, dtype=np.float64)
+    ```
+
+    `histogram` gets a decorator. The body stays the same:
+
+    ```python
+    @njit(cache=True)
+    def histogram(durations_s):
+        counts = np.zeros(NBUCKETS, dtype=np.int64)
+        for d in durations_s:
+            us = d * 1e6
+            if us < 1.0:
+                b = 0
+            else:
+                b = int(math.log2(us))
+                if b >= NBUCKETS:
+                    b = NBUCKETS - 1
+            counts[b] += 1
+        return counts
+    ```
+
+    **Green Notes**
+    - **Numba `@njit` on `histogram`** (reduces E): this is a CPU-bound float loop over every request, tens of millions of iterations per run. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples in a pure Python loop used ~40 J, and with Numba `@njit` ~9.5 J (about 4× less). The output is identical. `cache=True` writes the compiled code to disk, so each hourly process start loads it instead of compiling again.
+    - **Precompiled `LINE_RE`** (reduces E, small): `re` already caches this literal pattern internally, so precompiling only skips the cache lookup on each line. In Green Metrics Tool micro-benchmarks with 1,000,000 matches, a precompiled pattern used about 18% less than inline `re.match`. It is free to do, but it is not the big lever here.
+
+    *Not applied:* Numba on `read_durations` — it does string and regex work, which Numba does not speed up. `percentile_from_hist` loops over 32 buckets, so it is not worth touching. Numba becomes a new dependency, so pin it next to numpy.
+verify:
+  static_only: needs numba (not stdlib or numpy) and an access log file

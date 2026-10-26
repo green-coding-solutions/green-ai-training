@@ -1,0 +1,95 @@
+id: gen-1-00032-refactor
+category: refactor
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    Our shop's nightly job prices shipping for every parcel of the day's orders (usually 2-3 million parcels). Please refactor `quote_batch` so it uses less CPU. Requirements:
+
+    - The returned prices must stay exactly the same (rounded to 2 decimals, same order).
+    - The public interface must not change: `ParcelPricer(config)` and `quote_batch(parcels)`.
+    - Keep it readable. Other people maintain this.
+
+    ```python
+    import math
+
+
+    class ParcelPricer:
+        def __init__(self, config):
+            self.config = config
+
+        def quote_batch(self, parcels):
+            quotes = []
+            for p in parcels:
+                volume_weight = (p["length_cm"] * p["width_cm"] * p["height_cm"]) / self.config.volumetric_divisor
+                billable = max(p["weight_kg"], volume_weight)
+                steps = math.ceil(billable / self.config.step_kg)
+                price = self.config.base_fee + steps * self.config.per_step
+                if p["country"] != self.config.home_country:
+                    price = price * self.config.intl_multiplier
+                quotes.append(round(price, 2))
+            return quotes
+    ```
+- role: assistant
+  content: |
+    ```python
+    import math
+
+
+    class ParcelPricer:
+        def __init__(self, config):
+            self.config = config
+
+        def quote_batch(self, parcels):
+            cfg = self.config
+            divisor = cfg.volumetric_divisor
+            step_kg = cfg.step_kg
+            base_fee = cfg.base_fee
+            per_step = cfg.per_step
+            home_country = cfg.home_country
+            intl_multiplier = cfg.intl_multiplier
+            ceil = math.ceil
+
+            quotes = []
+            add_quote = quotes.append
+            for p in parcels:
+                volume_weight = (p["length_cm"] * p["width_cm"] * p["height_cm"]) / divisor
+                billable = max(p["weight_kg"], volume_weight)
+                steps = ceil(billable / step_kg)
+                price = base_fee + steps * per_step
+                if p["country"] != home_country:
+                    price = price * intl_multiplier
+                add_quote(round(price, 2))
+            return quotes
+    ```
+
+    Prices, rounding and order are unchanged. The class interface is the same.
+
+    **Green Notes**
+    - **Hoisted loop invariants** (reduces E): the six `self.config.*` values and `math.ceil` do not change inside the loop. They were looked up again for every parcel, which means millions of repeated attribute lookups per run. They are now read once into locals. The gain is small. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local before a 10,000,000-iteration loop saved about 4-5%. At your batch size it is worth it, and the code is still easy to read.
+    - **Behavior note:** this assumes `config` is not changed while `quote_batch` runs. If another thread can update prices mid-batch, the old version would pick up the change and this one would not.
+    - *Not applied:* no rewrite of the pricing math, no caching and no NumPy. Nothing in the measured case calls for it, and the plain loop is easy for others to maintain.
+verify:
+  equivalence:
+    driver: |-
+      from types import SimpleNamespace
+      cfg = SimpleNamespace(volumetric_divisor=5000, step_kg=0.5, base_fee=4.9,
+                            per_step=0.8, home_country="DE", intl_multiplier=1.35)
+      countries = ["DE", "FR", "US", "DE", "PL"]
+      parcels = []
+      for i in range(500):
+          parcels.append({
+              "length_cm": 10 + (i * 7) % 60,
+              "width_cm": 8 + (i * 5) % 40,
+              "height_cm": 3 + (i * 3) % 30,
+              "weight_kg": round(0.1 + (i * 13) % 97 / 10, 2),
+              "country": countries[i % len(countries)],
+          })
+      quotes = ParcelPricer(cfg).quote_batch(parcels)
+      print(len(quotes), round(sum(quotes), 2))
+      print(quotes[:25])
+      print(quotes[-5:])

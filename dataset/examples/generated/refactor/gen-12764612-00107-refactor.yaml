@@ -1,0 +1,80 @@
+id: gen-12764612-00107-refactor
+category: refactor
+language: bash
+patterns:
+- compress-stored
+- bash-quoting
+facts:
+- F-COMPRESS-CODECS
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    ```bash
+    #!/bin/bash
+    set -euo pipefail
+
+    ARTIFACT_DIR="/var/lib/ci/artifacts"
+    ARCHIVE_DIR="/mnt/archive/ci"
+    LOG_FILE="/var/log/ci-archive.log"
+
+    mkdir -p "$ARCHIVE_DIR"
+    echo "=== archive run $(date +%F) ===" >> "$LOG_FILE"
+
+    for dir in "$ARTIFACT_DIR"/build-*; do
+      [ -d "$dir" ] || continue
+      name=$(basename "$dir")
+      target="$ARCHIVE_DIR/$name.tar.xz"
+      if [ -f "$target" ]; then
+        echo "skip $name" >> "$LOG_FILE"
+        continue
+      fi
+      echo "archive $name" >> "$LOG_FILE"
+      tar -cf - -C "$ARTIFACT_DIR" "$name" | xz -9 > "$target"
+    done
+
+    find "$ARCHIVE_DIR" -name "*.tar.xz" -mtime +90 -delete
+    echo "done" >> "$LOG_FILE"
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```bash
+    #!/bin/bash
+    set -euo pipefail
+
+    ARTIFACT_DIR='/var/lib/ci/artifacts'
+    ARCHIVE_DIR='/mnt/archive/ci'
+    LOG_FILE='/var/log/ci-archive.log'
+
+    mkdir -p "$ARCHIVE_DIR"
+    echo "=== archive run $(date +%F) ===" >> "$LOG_FILE"
+
+    for dir in "$ARTIFACT_DIR"/build-*; do
+      [ -d "$dir" ] || continue
+      name=$(basename "$dir")
+      target="$ARCHIVE_DIR/$name.tar.zst"
+      if [ -f "$target" ] || [ -f "$ARCHIVE_DIR/$name.tar.xz" ]; then
+        echo "skip $name" >> "$LOG_FILE"
+        continue
+      fi
+      echo "archive $name" >> "$LOG_FILE"
+      tar -cf - -C "$ARTIFACT_DIR" "$name" | zstd -q > "$target.part"
+      mv "$target.part" "$target"
+    done
+
+    find "$ARCHIVE_DIR" \( -name '*.tar.zst' -o -name '*.tar.xz' \) -mtime +90 -delete
+    echo 'done' >> "$LOG_FILE"
+    ```
+
+    **Green Notes**
+    - **Fast codec for stored data** (reduces E): `xz -9` is one of the most expensive codecs, and this job runs it on every build directory. In Green Metrics Tool micro-benchmarks, compressing 100 MB of text at default levels used ~458 J with `xz` and ~16 J with `zstd`, about 29× more for `xz`. Compressing 90-day archives is still worth it, so the step stays, only the codec changes.
+    - **Single quotes for plain literals** (reduces E, tiny here): paths and `'done'` need no expansion, so they now use single quotes. Variables and `$(date +%F)` keep double quotes. In Green Metrics Tool micro-benchmarks, a 6,200-character literal assigned 1,000,000 times used about 24% less CPU energy with single quotes. Your strings are short and run once per build, so expect almost nothing from this one.
+
+    Behavior changes:
+    - New archives are `.tar.zst`, and they will be larger than the `.tar.xz` ones. The measurements compare energy, not file size. If archive disk space is tight or you keep archives for years, `xz` can still be the right choice.
+    - Old `.tar.xz` files are still skipped, so builds are not archived twice, and the 90-day cleanup removes both kinds.
+    - Bug fix: a failed `tar | xz` used to leave a partial `.tar.xz`, and the next run skipped it as "done". The archive is now written to `.part` and renamed only after it succeeds.
+verify:
+  static_only: needs tar, zstd and xz on the host plus CI artifact directories and a mounted archive volume

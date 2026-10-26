@@ -1,0 +1,127 @@
+id: gen-2-00298-estimate
+category: estimate
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    hi, our gateway is solar powered box (raspberry pi 4 + battery) on a remote pump station. it poll 25 modbus sensors at 5 Hz and keep the last 3600 reading per sensor for the local dashboard. dashboard show the newest value and the last minute.
+
+    colleague say `insert(0)` is very slow and i should use deque. how much energy / battery we would really save with this? is it worth to change? we want to argue in the team with numbers
+
+    ```python
+    import time
+    import threading
+
+    MAX_HISTORY = 3600
+    history = {}          # sensor_id -> list of (ts, value), newest first
+    lock = threading.Lock()
+
+
+    def record(sensor_id, value):
+        ts = time.time()
+        with lock:
+            buf = history.setdefault(sensor_id, [])
+            buf.insert(0, (ts, value))
+            if len(buf) > MAX_HISTORY:
+                buf.pop()
+
+
+    def latest(sensor_id):
+        with lock:
+            buf = history.get(sensor_id)
+            return buf[0] if buf else None
+
+
+    def last_minute(sensor_id, rate_hz=5):
+        with lock:
+            return list(history.get(sensor_id, [])[:60 * rate_hz])
+
+
+    def poll_loop(client, sensors):
+        while True:
+            for sid, reg in sensors.items():
+                rr = client.read_holding_registers(reg, count=1)
+                if not rr.isError():
+                    record(sid, rr.registers[0])
+            time.sleep(0.2)
+    ```
+- role: assistant
+  content: |
+    Short answer: your colleague is right about the direction. But in your case the absolute saving is probably small, and I can't give you a battery or CO2 number without measuring on the Pi.
+
+    **Measured reference:** in Green Metrics Tool micro-benchmarks, 1,000,000 × `list.insert(0, x)` used ~1515 J of CPU energy, and 1,000,000 × `list.append(x)` used ~1.2 J. That is over 1000× difference, because every front insert shifts the whole list.
+
+    **Why your case is different:**
+    - In the benchmark the list grew to 1,000,000 entries. Your list never holds more than 3,600, so each insert shifts at most 3,599 entries. The cost per insert is still O(n), but n is small.
+    - The benchmark compared front insert with `append`. `deque.appendleft` is also O(1) per call, but it was not measured itself.
+    - On your gateway, the Modbus reads and the poll cycle probably cost more than the list work. So don't scale the 1000× to your box.
+
+    It is still worth changing. The change is small, it removes the O(n) shift from every reading, and `deque(maxlen=...)` drops the oldest entry for you:
+
+    ```python
+    import time
+    import threading
+    from collections import deque
+    from itertools import islice
+
+    MAX_HISTORY = 3600
+    history = {}          # sensor_id -> deque of (ts, value), newest first
+    lock = threading.Lock()
+
+
+    def record(sensor_id, value):
+        ts = time.time()
+        with lock:
+            buf = history.get(sensor_id)
+            if buf is None:
+                buf = history[sensor_id] = deque(maxlen=MAX_HISTORY)
+            buf.appendleft((ts, value))   # oldest entry falls off the right end
+
+
+    def latest(sensor_id):
+        with lock:
+            buf = history.get(sensor_id)
+            return buf[0] if buf else None
+
+
+    def last_minute(sensor_id, rate_hz=5):
+        with lock:
+            return list(islice(history.get(sensor_id, ()), 60 * rate_hz))
+    ```
+
+    `poll_loop` stays the same. Order and content are the same as before. One difference: a deque does not support slicing, so any other code that does `history[sid][:n]` must use `islice` too.
+
+    **How to get your own number:**
+    1. Replay recorded readings through `record()` for a fixed time, once with each version. Compare CPU time with `time` or `perf stat`. This is a proxy only: the Pi 4 has no RAPL energy counters.
+    2. For real energy, put a USB power meter between the supply and the Pi, or run both versions as Green Metrics Tool usage scenarios. Then compare the whole gateway, not only the function.
+    3. For CO2, multiply the measured energy difference by the carbon intensity of your power source. On solar, the useful number for your team is battery runtime, and you get it from step 2.
+verify:
+  test: |
+    from collections import deque
+    for i in range(4000):
+        record("s", i)
+    assert isinstance(history["s"], deque)
+    assert len(history["s"]) == MAX_HISTORY
+    assert latest("s")[1] == 3999
+    lm = last_minute("s")
+    assert [v for _, v in lm[:3]] == [3999, 3998, 3997]
+    assert len(lm) == 300
+    assert history["s"][-1][1] == 4000 - MAX_HISTORY
+    assert latest("none") is None
+    assert last_minute("none") == []
+  equivalence:
+    driver: |-
+      for i in range(5000):
+          record("p1", i % 997)
+          if i % 3 == 0:
+              record("p2", i)
+      print(latest("p1")[1], latest("p2")[1], latest("x"))
+      print(len(history["p1"]), len(history["p2"]))
+      lm = last_minute("p1")
+      print([v for _, v in lm][:5], len(lm))
+      print([v for _, v in last_minute("p2", rate_hz=1)][-3:])
+      print(last_minute("missing"))

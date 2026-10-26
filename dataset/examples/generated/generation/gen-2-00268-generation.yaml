@@ -1,0 +1,76 @@
+id: gen-2-00268-generation
+category: generation
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    Downstream teams pull our nightly exports (CSV + NDJSON, a few hundred MB each) from this vhost. About a dozen consumers download the same files during the day. `export.sh` writes them at 02:00. Status API is a small FastAPI app. Want compression on. Diff only.
+
+    ```nginx
+    server {
+        listen 443 ssl;
+        server_name data.internal.example;
+
+        ssl_certificate     /etc/nginx/tls/data.crt;
+        ssl_certificate_key /etc/nginx/tls/data.key;
+
+        access_log /var/log/nginx/data_access.log;
+
+        location /exports/ {
+            alias /srv/etl/exports/;
+            autoindex on;
+            auth_basic "exports";
+            auth_basic_user_file /etc/nginx/htpasswd-exports;
+        }
+
+        location /api/ {
+            proxy_pass http://127.0.0.1:8080;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    End of `export.sh`, after all files are written:
+
+    ```bash
+    find "$EXPORT_DIR" -type f \( -name '*.csv' -o -name '*.ndjson' \) -print0 |
+      while IFS= read -r -d '' f; do
+        gzip -c -9 -- "$f" > "$f.gz.tmp" && mv -- "$f.gz.tmp" "$f.gz"
+      done
+    ```
+
+    nginx, added lines only:
+
+    ```nginx
+        location /exports/ {
+            # ...existing directives...
+            gzip_static on;
+            gzip_vary on;
+        }
+
+        location /api/ {
+            # ...existing directives...
+            gzip on;
+            gzip_comp_level 4;
+            gzip_min_length 1024;
+            gzip_types application/json;
+            gzip_vary on;
+        }
+    ```
+
+    **Green Notes**
+    - **Precompress the exports, don't compress per request** (reduces E and network): each file is compressed once per night instead of once per download. Leave `gzip on` off for `/exports/` so nginx never compresses a multi-hundred-MB file on the fly. In Green Metrics Tool measurements of nginx serving 2,000 requests for text assets, gzip on every request used ~54 J and precompressed files ~14 J, about 4× less CPU energy. Both sent about 10× fewer bytes than no compression.
+    - **`gzip -9` is fine here:** it runs once per export and the result is downloaded many times.
+    - **Dynamic API JSON at a moderate level:** responses change on every request, so they can't be precompressed. A low level keeps per-request CPU small.
+
+    Correctness notes:
+    - `gzip_static` does not check whether the `.gz` is older than the original. Always write the `.gz` again when an export changes, or consumers get stale data. The `.tmp` + `mv` step makes sure nobody downloads a half-written `.gz`.
+    - Clients only get the `.gz` if they send `Accept-Encoding: gzip`. Python `requests` does this by default. `curl` needs `--compressed`.
+verify:
+  static_only: nginx config and shell snippet that need an nginx server and an export directory

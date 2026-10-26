@@ -1,0 +1,83 @@
+id: gen-12764612-00063-review
+category: review
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    Hello, can you review this function? It make the product feed XML for our marketplace partner. It run every night and we have about 40k products in the shop. Sometimes the partner say the file is broken, but I dont see why.
+
+    ```python
+    def build_feed(products, shop_url):
+        xml = '<?xml version="1.0" encoding="UTF-8"?>\n'
+        xml += '<feed>\n'
+        for p in products:
+            xml += '  <item>\n'
+            xml += '    <id>' + str(p['sku']) + '</id>\n'
+            xml += '    <title>' + p['title'] + '</title>\n'
+            xml += '    <link>' + shop_url + '/p/' + p['slug'] + '</link>\n'
+            xml += '    <price>' + '%.2f' % p['price'] + ' EUR</price>\n'
+            if p['stock'] > 0:
+                xml += '    <availability>in stock</availability>\n'
+            else:
+                xml += '    <availability>out of stock</availability>\n'
+            xml += '  </item>\n'
+        xml += '</feed>\n'
+        return xml
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly batch)
+
+    #### [Bug] Text is not XML-escaped
+    - **Where:** `p['title']`, `p['slug']`, `shop_url`, `p['sku']`
+    - **Issue:** a title like `Salt & Pepper Set` or `Mug <large>` puts a raw `&` or `<` into the file. The XML is then invalid, and the partner's parser rejects it. This is most likely your "broken file" problem.
+    - **Fix:** escape every text value with `xml.sax.saxutils.escape`.
+
+    #### [High] String built with `+=` in a loop
+    - **Where:** every `xml += ...` line, about 8 per product
+    - **Issue:** with 40k products this is more than 300k appends to one growing string. Each append can copy the string built so far, so the work grows faster than the data.
+    - **Fix:** collect the pieces in a list and call `"".join()` once at the end.
+    - **Impact:** reduces E (CPU). In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces with `+=` used about 469 J of CPU energy, and `"".join()` used about 1.8 J, roughly 260× less. Your piece count is smaller, so the gap will be smaller, but it is the same pattern. It runs every night, so the saving repeats.
+
+    ```python
+    from xml.sax.saxutils import escape
+
+
+    def build_feed(products, shop_url):
+        parts = ['<?xml version="1.0" encoding="UTF-8"?>\n', '<feed>\n']
+        for p in products:
+            availability = 'in stock' if p['stock'] > 0 else 'out of stock'
+            parts.append(
+                '  <item>\n'
+                f'    <id>{escape(str(p["sku"]))}</id>\n'
+                f'    <title>{escape(p["title"])}</title>\n'
+                f'    <link>{escape(shop_url)}/p/{escape(p["slug"])}</link>\n'
+                f'    <price>{p["price"]:.2f} EUR</price>\n'
+                f'    <availability>{availability}</availability>\n'
+                '  </item>\n'
+            )
+        parts.append('</feed>\n')
+        return ''.join(parts)
+    ```
+
+    The output is the same as before for normal text. Only the special characters `&`, `<` and `>` are now escaped, which is the fix you need.
+
+    **Already good:** the price is formatted with two decimals, and the stock check is simple.
+verify:
+  equivalence:
+    driver: |
+      products = [
+          {'sku': 1001, 'title': 'Coffee Mug', 'slug': 'coffee-mug', 'price': 7.5, 'stock': 12},
+          {'sku': 1002, 'title': 'Tea Pot', 'slug': 'tea-pot', 'price': 24.999, 'stock': 0},
+          {'sku': 'A-77', 'title': 'Wooden Spoon Set', 'slug': 'spoon-set', 'price': 3, 'stock': 5},
+      ]
+      print(build_feed(products, 'https://shop.example.com'))
+  test: |-
+    out = build_feed([{'sku': 1, 'title': 'Salt & Pepper <Set>', 'slug': 'sp', 'price': 2.5, 'stock': 1}], 'https://x.example')
+    assert 'Salt &amp; Pepper &lt;Set&gt;' in out
+    assert out.endswith('</feed>\n')
+    assert '<price>2.50 EUR</price>' in out

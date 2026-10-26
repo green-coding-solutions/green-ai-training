@@ -1,0 +1,69 @@
+id: gen-1-00140-generation
+category: generation
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    hi, this is my first Dockerfile and I dont really know what I need. we have a small python program for the boiler room gateway (x86 mini pc). it subscribes to MQTT topics from the temperature sensors, saves the values in a sqlite file and shows a little status page with flask on port 5000.
+
+    files:
+    ```text
+    gateway/
+      app.py
+      requirements.txt
+    ```
+
+    requirements.txt:
+    ```text
+    flask==3.0.3
+    paho-mqtt==2.1.0
+    ```
+
+    app.py reads the db path from the env var DB_PATH. do I need to install gcc or something? the CI will build this image on every push
+- role: assistant
+  content: |
+    No compiler needed. Flask and paho-mqtt are pure Python, so pip installs them without building anything.
+
+    ```dockerfile
+    FROM python:3.12-slim
+
+    ENV PYTHONUNBUFFERED=1 \
+        DB_PATH=/data/readings.db
+
+    WORKDIR /app
+
+    # Dependencies first, so this layer is reused when only app.py changes
+    COPY gateway/requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY gateway/app.py .
+
+    RUN useradd --system --no-create-home gateway \
+        && mkdir /data && chown gateway /data
+    USER gateway
+
+    VOLUME /data
+    EXPOSE 5000
+
+    CMD ["python", "app.py"]
+    ```
+
+    Build from the folder above `gateway/`:
+
+    ```bash
+    docker build -t boiler-gateway -f gateway/Dockerfile .
+    docker run -d -p 5000:5000 -v gateway-data:/data boiler-gateway
+    ```
+
+    **Green Notes**
+    - **Slim base image** (reduces E, M, network): `python:3.12-slim` has no compilers, git or editors, so the image is smaller to build, push, pull and store. In Green Metrics Tool micro-benchmarks, building a small Flask image without a build cache used about 7× less energy with a slim base and runtime dependencies only than with the full `python:3.12` plus dev tools. Serving requests afterwards cost the same, so the saving repeats with every CI build and pull, not at runtime.
+    - **Dependency layer before the source:** `requirements.txt` is copied and installed before `app.py`. When you only edit code, Docker reuses the cached install layer, so most CI pushes skip the pip step.
+    - **`--no-cache-dir`:** pip does not keep downloaded packages in the image.
+
+    The `/data` volume keeps your sqlite file when the container is replaced. If you later add a package that has no prebuilt wheel and fails to install, add the compiler in a separate build stage. Do not put it in the final image.
+verify:
+  static_only: needs Docker to build the image

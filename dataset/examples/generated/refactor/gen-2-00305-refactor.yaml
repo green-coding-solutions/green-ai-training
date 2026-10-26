@@ -1,0 +1,216 @@
+id: gen-2-00305-refactor
+category: refactor
+language: python
+patterns:
+- regex-precompile
+- avoid-exception-flow
+facts:
+- F-REGEX
+- F-EXC
+messages:
+- role: user
+  content: |
+    Could you refactor our query featurizer? It sits in front of the ONNX ranking model for product search. Every search request goes through `featurize()` in the inference worker, and it takes more time than the model itself. py-spy shows most of that time somewhere inside `re`, which I don't get, because the brand patterns are trivial.
+
+    Requirements:
+    - keep the interface: `QueryFeaturizer(vocab_path, brands_path)`, and `featurize()` / `featurize_batch()` return the same dicts
+    - feature values must stay exactly the same. The model was trained on them, so no changes to tokenization or flag order
+    - stdlib only, Python 3.11
+
+    Context: the vocab has ~30k tokens. Real queries are full of SKUs, sizes and typos, and roughly half of the tokens in our logs map to UNK. `brands.txt` has ~1,800 aliases, one per line, and some of them are small regexes.
+
+    ```python
+    import json
+    import logging
+    import re
+
+    log = logging.getLogger(__name__)
+
+    UNK_ID = 1
+    PAD_ID = 0
+    MAX_LEN = 64
+
+
+    class QueryFeaturizer:
+        def __init__(self, vocab_path, brands_path):
+            with open(vocab_path) as f:
+                self.vocab = json.load(f)  # token -> id
+            with open(brands_path) as f:
+                # one alias per line, some are regexes ("levi'?s", "dr\.? martens")
+                self.brand_patterns = [line.strip() for line in f if line.strip()]
+            log.info("loaded %d tokens, %d brand patterns",
+                     len(self.vocab), len(self.brand_patterns))
+
+        def normalize(self, query):
+            q = query.lower()
+            q = re.sub(r"[^\w\s&'-]", " ", q)
+            q = re.sub(r"\s+", " ", q)
+            return q.strip()
+
+        def brand_flags(self, q):
+            flags = []
+            for pat in self.brand_patterns:
+                if re.search(r"\b" + pat + r"\b", q):
+                    flags.append(1)
+                else:
+                    flags.append(0)
+            return flags
+
+        def encode(self, q):
+            ids = []
+            for tok in q.split(" "):
+                try:
+                    ids.append(self.vocab[tok])
+                except KeyError:
+                    ids.append(UNK_ID)
+            ids = ids[:MAX_LEN]
+            mask = [1] * len(ids)
+            while len(ids) < MAX_LEN:
+                ids.append(PAD_ID)
+                mask.append(0)
+            return ids, mask
+
+        def featurize(self, query):
+            q = self.normalize(query)
+            ids, mask = self.encode(q)
+            return {
+                "input_ids": ids,
+                "attention_mask": mask,
+                "brand_flags": self.brand_flags(q),
+            }
+
+        def featurize_batch(self, queries):
+            return [self.featurize(q) for q in queries]
+    ```
+- role: assistant
+  content: |
+    ```python
+    import json
+    import logging
+    import re
+
+    log = logging.getLogger(__name__)
+
+    UNK_ID = 1
+    PAD_ID = 0
+    MAX_LEN = 64
+
+    _PUNCT_RE = re.compile(r"[^\w\s&'-]")
+    _SPACE_RE = re.compile(r"\s+")
+
+
+    class QueryFeaturizer:
+        def __init__(self, vocab_path, brands_path):
+            with open(vocab_path, encoding="utf-8") as f:
+                self.vocab = json.load(f)  # token -> id
+            with open(brands_path, encoding="utf-8") as f:
+                # one alias per line, some are regexes ("levi'?s", "dr\.? martens")
+                self.brand_patterns = [line.strip() for line in f if line.strip()]
+            # compiled once per worker, in file order (= flag order)
+            self._brand_res = [re.compile(r"\b" + pat + r"\b") for pat in self.brand_patterns]
+            log.info("loaded %d tokens, %d brand patterns",
+                     len(self.vocab), len(self.brand_patterns))
+
+        def normalize(self, query):
+            q = query.lower()
+            q = _PUNCT_RE.sub(" ", q)
+            q = _SPACE_RE.sub(" ", q)
+            return q.strip()
+
+        def brand_flags(self, q):
+            return [1 if rx.search(q) else 0 for rx in self._brand_res]
+
+        def encode(self, q):
+            ids = [self.vocab.get(tok, UNK_ID) for tok in q.split(" ")]
+            ids = ids[:MAX_LEN]
+            mask = [1] * len(ids)
+            while len(ids) < MAX_LEN:
+                ids.append(PAD_ID)
+                mask.append(0)
+            return ids, mask
+
+        def featurize(self, query):
+            q = self.normalize(query)
+            ids, mask = self.encode(q)
+            return {
+                "input_ids": ids,
+                "attention_mask": mask,
+                "brand_flags": self.brand_flags(q),
+            }
+
+        def featurize_batch(self, queries):
+            return [self.featurize(q) for q in queries]
+    ```
+
+    **Green Notes**
+    - **Compile regex once, outside the request path** (reduces E): this explains the time inside `re`. Python's `re` caches compiled patterns, but only up to 512 of them. Your brand loop cycles through about 1,800 patterns on every query. Each pattern gets evicted before it comes around again, so every `re.search` recompiled its pattern. In Green Metrics Tool micro-benchmarks, a recompile on every call cost about 200× more per match than a cached pattern. Now each worker compiles the brand patterns once at startup.
+    - **Normalize patterns as module constants** (reduces E): the brand loop also pushed the two `re.sub` patterns out of the cache, so they were recompiled on every query too. That no longer happens.
+    - **`dict.get` instead of `try/except KeyError`** (reduces E): with about half the tokens unknown, raising and catching the exception is the expensive part. In Green Metrics Tool micro-benchmarks with about half of the keys missing, `dict.get(key, default)` used about 12% less CPU energy than `try/except KeyError`. This gain is much smaller than the regex fix, but it applies to every token of every query.
+
+    The features are unchanged: same token ids, same mask, and the brand flags stay in file order. The cost moves to worker startup, which now compiles about 1,800 patterns once and keeps them in memory.
+
+    I also added `encoding="utf-8"` to both `open()` calls. Without it, Python uses the locale's encoding. On a non-UTF-8 host, a brand like `l'oréal` would load as the wrong string and never match.
+verify:
+  green_block: 0
+  test: |
+    import json, os, tempfile
+    _d = tempfile.mkdtemp()
+    _vp = os.path.join(_d, "vocab.json")
+    _bp = os.path.join(_d, "brands.txt")
+    with open(_vp, "w", encoding="utf-8") as f:
+        json.dump({"nike": 5, "shoes": 8}, f)
+    with open(_bp, "w", encoding="utf-8") as f:
+        f.write("nike\nadidas\n\n")
+    fz = QueryFeaturizer(_vp, _bp)
+    r = fz.featurize("Nike shoes, size 42!")
+    assert r["input_ids"][:4] == [5, 8, UNK_ID, UNK_ID]
+    assert len(r["input_ids"]) == MAX_LEN
+    assert sum(r["attention_mask"]) == 4
+    assert r["brand_flags"] == [1, 0]
+    assert len(fz._brand_res) == 2
+    assert fz.featurize_batch(["adidas"])[0]["brand_flags"] == [0, 1]
+  equivalence:
+    driver: |
+      import json, os, tempfile
+      _d = tempfile.mkdtemp()
+      _vp = os.path.join(_d, "vocab.json")
+      _bp = os.path.join(_d, "brands.txt")
+      _vocab = {"nike": 5, "air": 6, "max": 7, "shoes": 8, "levi's": 9, "501": 10,
+                "jeans": 11, "h&m": 12, "shirt": 13, "dr": 14, "martens": 15}
+      with open(_vp, "w", encoding="utf-8") as f:
+          json.dump(_vocab, f)
+      _brands = ["nike", "adidas", "levi'?s", "h&m", "new balance", "dr\\.? martens"]
+      _brands += ["brand%04d" % i for i in range(600)]
+      with open(_bp, "w", encoding="utf-8") as f:
+          f.write("\n".join(_brands) + "\n\n")
+      fz = QueryFeaturizer(_vp, _bp)
+      _queries = [
+          "Nike Air Max 90 shoes!!",
+          "levi's 501 jeans, W32/L34",
+          "H&M  shirt",
+          "new balance 574",
+          "Dr. Martens boots",
+          "brand0042 and brand0599",
+          "xyz sku-12345 " * 40,
+          "",
+      ]
+      for q in _queries:
+          r = fz.featurize(q)
+          print(repr(q[:20]), r["input_ids"][:12], sum(r["attention_mask"]),
+                [i for i, v in enumerate(r["brand_flags"]) if v])
+      _batch = fz.featurize_batch(_queries)
+      print(len(_batch), sum(sum(b["brand_flags"]) for b in _batch))
+  benchmark:
+    driver: |
+      import json, os, tempfile
+      _d = tempfile.mkdtemp()
+      _vp = os.path.join(_d, "vocab.json")
+      _bp = os.path.join(_d, "brands.txt")
+      with open(_vp, "w", encoding="utf-8") as f:
+          json.dump({"red": 2, "running": 3, "shoes": 4, "size": 5}, f)
+      with open(_bp, "w", encoding="utf-8") as f:
+          f.write("\n".join("brand%04d" % i for i in range(1000)) + "\n")
+      fz = QueryFeaturizer(_vp, _bp)
+      for i in range(40):
+          fz.featurize("red running shoes brand%04d size 42" % (i * 7))
+    min_speedup: 1.5

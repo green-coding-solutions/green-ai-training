@@ -1,0 +1,100 @@
+id: gen-2-00034-generation
+category: generation
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    hi, I'm still learning python. our test suite in GitLab CI takes ~25 min, so my lead asked me to split the test files over 4 parallel jobs (we use `parallel: 4`). we already save a json from the last main pipeline with the seconds per test file, like `{"tests/test_api.py": 41.2, "tests/test_models.py": 12.9, ...}`.
+
+    I tried to sum the times but it crash with KeyError:
+
+    ```python
+    for f in files:
+        total += timings[f]
+    ```
+
+    I think it's because new or renamed test files are not in the json yet. On feature branches that is often like half of them. Should I put a try/except around it? Can you write a script that each job runs and that prints its own list of test files for pytest? New files should get some guess for the time.
+- role: assistant
+  content: |
+    The `KeyError` comes from `timings[f]`. Files that are not in the JSON yet have no key. On your branches that happens for many files, so a missing timing is a normal case, not an error. Handle it with `in` and `dict.get` and a default value instead of `try/except`.
+
+    ```python
+    import heapq
+    import json
+    import os
+    from pathlib import Path
+
+    TIMINGS_FILE = Path(".ci/test-timings.json")
+
+
+    def load_timings(path: Path) -> dict[str, float]:
+        """Read {"tests/test_x.py": seconds, ...} from the last main pipeline."""
+        if not path.exists():
+            return {}
+        with path.open() as f:
+            return json.load(f)
+
+
+    def split_tests(test_files: list[str], timings: dict[str, float], shards: int) -> list[list[str]]:
+        # Guess for new or renamed files: the average of the files we do know.
+        known = [timings[name] for name in test_files if name in timings]
+        default = sum(known) / len(known) if known else 1.0
+        durations = {name: timings.get(name, default) for name in test_files}
+
+        # Longest files first. The path breaks ties, so every job computes the same split.
+        ordered = sorted(test_files, key=lambda name: (-durations[name], name))
+
+        # Always give the next file to the job with the smallest total so far.
+        heap = [(0.0, i) for i in range(shards)]
+        buckets: list[list[str]] = [[] for _ in range(shards)]
+        for name in ordered:
+            total, i = heapq.heappop(heap)
+            buckets[i].append(name)
+            heapq.heappush(heap, (total + durations[name], i))
+        return buckets
+
+
+    def main() -> None:
+        # GitLab sets these for jobs with `parallel:`. The index starts at one.
+        index = int(os.environ.get("CI_NODE_INDEX", "1"))
+        total = int(os.environ.get("CI_NODE_TOTAL", "1"))
+        files = sorted(p.as_posix() for p in Path("tests").rglob("test_*.py"))
+        timings = load_timings(TIMINGS_FILE)
+        print(" ".join(split_tests(files, timings, total)[index - 1]))
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    Use it in `.gitlab-ci.yml` like this:
+
+    ```yaml
+    test:
+      parallel: 4
+      script:
+        - pytest $(python ci/split_tests.py)
+    ```
+
+    The keys in the JSON must look like the paths the script finds (`tests/test_api.py`). One thing to watch: if a job ever gets no files, `pytest` with no arguments runs the whole suite. With many test files and few jobs this won't happen.
+
+    **Green Notes**
+    - **`in` / `dict.get` instead of `try/except KeyError`** (reduces E): here about half the lookups miss. Raising and catching an exception on every miss costs more than a lookup with a default. In Green Metrics Tool micro-benchmarks where about half the keys were missing, `dict.get(key, default)` used about 12% less CPU energy than `try/except KeyError`, and an `if key in d` check performed like `get`.
+
+    *Not applied:* nothing else. The script runs once per job over a few hundred files, so the absolute saving is small. The main gains are that it doesn't crash and that it reads clearly. If misses were rare (for example only after a typo), `try/except` would also be fine, because the cost is in raising the exception.
+verify:
+  module: true
+  test: |-
+    from pathlib import Path
+    files = ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py", "tests/test_d.py"]
+    timings = {"tests/test_a.py": 10.0, "tests/test_b.py": 6.0}
+    result = split_tests(files, timings, 2)
+    assert result == [["tests/test_a.py", "tests/test_b.py"], ["tests/test_c.py", "tests/test_d.py"]], result
+    assert sorted(sum(result, [])) == sorted(files)
+    assert split_tests(["x", "y", "z"], {}, 2) == [["x", "z"], ["y"]]
+    assert split_tests(["x"], {}, 3) == [["x"], [], []]
+    assert load_timings(Path("/nonexistent/dir/timings.json")) == {}

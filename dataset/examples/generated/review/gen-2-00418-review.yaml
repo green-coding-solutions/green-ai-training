@@ -1,0 +1,121 @@
+id: gen-2-00418-review
+category: review
+language: python
+patterns:
+- async-concurrent-io
+- memoize
+facts:
+- F-HTTP
+- F-LRU
+messages:
+- role: user
+  content: |
+    hi, im new to python and made this for our small online shop. it get the orders from the warehouse system and calculate the total with tax for each one, then the finance mail is made from it. it works but it feel slow when there are many orders. can you look at it and tell me what is wrong?
+
+    ```python
+    import requests
+
+    API = "https://warehouse.example-shop.com/api"
+    TAX_RULES = "DE:books:7;DE:food:7;DE:toys:19;AT:books:10;AT:food:10;AT:toys:20"
+
+
+    def tax_rate(country, category):
+        rate = 19.0
+        for rule in TAX_RULES.split(";"):
+            c, cat, r = rule.split(":")
+            if c == country and cat == category:
+                rate = float(r)
+        return rate / 100
+
+
+    def order_totals(order_ids):
+        results = {}
+        for oid in order_ids:
+            resp = requests.get(f"{API}/orders/{oid}")
+            order = resp.json()
+            total = 0
+            for line in order["lines"]:
+                net = line["price"] * line["qty"]
+                total += net * (1 + tax_rate(order["country"], line["category"]))
+            results[oid] = round(total, 2)
+        return results
+
+
+    if __name__ == "__main__":
+        totals = order_totals(["A1001", "A1002", "A1003", "A1004"])
+        for oid, total in totals.items():
+            print(oid, total)
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (data pipeline, runs per batch of orders)
+
+    #### [Bug] No timeout and no status check on the requests
+    - **Where:** `requests.get(...)` and `resp.json()` in `order_totals`
+    - **Issue:** `requests` waits forever by default, so one stuck warehouse call hangs the whole run. If the API answers with an error page, `resp.json()` fails with a confusing message, or the code reads a wrong body.
+    - **Fix:** set a timeout and call `raise_for_status()` before reading the body (both are in the code below).
+
+    #### [Medium] Orders are fetched one after another
+    - **Where:** the `for oid in order_ids` loop
+    - **Issue:** each call waits for the network before the next one starts. The calls do not depend on each other, so the program sits idle most of the time. The more orders you have, the longer it takes.
+    - **Fix:** send the requests together with `httpx.AsyncClient` and `asyncio.gather`. The results come back in the same order as `order_ids`.
+    - **Impact:** mostly wall time and the time the machine stays busy. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async used about 7% less CPU energy and about 17% less wall time than sync. The gain for CPU energy is modest. It grows with more requests.
+
+    #### [Medium] The same tax rate is parsed again for every order line
+    - **Where:** `tax_rate`
+    - **Issue:** every call splits the rules string and loops over all rules, but there are only a few different country and category pairs. The function always gives the same answer for the same input.
+    - **Fix:** add `@lru_cache` with a size limit. This is safe here because `TAX_RULES` is a constant. If the rules could change while the program runs, the cache would return old values.
+    - **Impact:** reduces E per order line. In Green Metrics Tool micro-benchmarks with 1,000,000 repeated computations over 200 distinct inputs, `lru_cache` used about 9× less CPU energy. With mostly unique inputs, a cache only adds overhead.
+
+    ```python
+    import asyncio
+    from functools import lru_cache
+
+    import httpx
+
+    API = "https://warehouse.example-shop.com/api"
+    TAX_RULES = "DE:books:7;DE:food:7;DE:toys:19;AT:books:10;AT:food:10;AT:toys:20"
+
+
+    @lru_cache(maxsize=256)
+    def tax_rate(country, category):
+        rate = 19.0
+        for rule in TAX_RULES.split(";"):
+            c, cat, r = rule.split(":")
+            if c == country and cat == category:
+                rate = float(r)
+        return rate / 100
+
+
+    async def fetch_order(client, oid):
+        resp = await client.get(f"{API}/orders/{oid}")
+        resp.raise_for_status()
+        return oid, resp.json()
+
+
+    async def order_totals(order_ids):
+        async with httpx.AsyncClient(timeout=10) as client:
+            orders = await asyncio.gather(
+                *(fetch_order(client, oid) for oid in order_ids)
+            )
+        results = {}
+        for oid, order in orders:
+            total = 0
+            for line in order["lines"]:
+                net = line["price"] * line["qty"]
+                total += net * (1 + tax_rate(order["country"], line["category"]))
+            results[oid] = round(total, 2)
+        return results
+
+
+    if __name__ == "__main__":
+        totals = asyncio.run(order_totals(["A1001", "A1002", "A1003", "A1004"]))
+        for oid, total in totals.items():
+            print(oid, total)
+    ```
+
+    Behavior notes: the output order is the same as before. If one order fails, the whole run now stops with an error instead of continuing with bad data. If you ever send thousands of orders at once, limit the parallel calls (for example with `asyncio.Semaphore`) so you don't overload the warehouse system.
+
+    **Already good:** the tax math is simple and the rules live in one place.
+verify:
+  static_only: needs network access to the warehouse API and the httpx package

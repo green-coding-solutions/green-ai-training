@@ -1,0 +1,67 @@
+id: gen-2-00039-generation
+category: generation
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    Need a script for an hourly cron job. It reads nginx access logs and prints stats per endpoint: request count, avg and max latency in ms, and how many requests were over a threshold (default 1s, `-t` to override). Strip the query string from the path. Args are one or more log files, and some of them are rotated `.gz`. Output TSV with a header, sorted by slow count. A busy hour is a few million lines.
+
+    Log format:
+    ```text
+    log_format timed '$remote_addr - [$time_local] "$request" $status $body_bytes_sent $request_time';
+    ```
+    Sample line:
+    ```text
+    10.0.4.17 - [23/Oct/2026:10:00:01 +0000] "GET /api/orders?page=2 HTTP/1.1" 200 512 0.034
+    ```
+    Just the script please, skip the explanation.
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # Usage: endpoint-latency.sh [-t threshold_seconds] access.log [access.log.1.gz ...]
+    set -euo pipefail
+    export LC_ALL=C
+
+    usage='usage: endpoint-latency.sh [-t seconds] logfile...'
+    threshold=1
+
+    while getopts 't:' opt; do
+      case $opt in
+        t) threshold=$OPTARG ;;
+        *) echo "$usage" >&2; exit 2 ;;
+      esac
+    done
+    shift $((OPTIND - 1))
+    (( $# > 0 )) || { echo "$usage" >&2; exit 2; }
+
+    printf 'endpoint\trequests\tavg_ms\tmax_ms\tslow\n'
+
+    # gzip -dcf decompresses .gz files and passes plain files through unchanged
+    gzip -dcf -- "$@" | awk -v thr="$threshold" '
+      # Skip malformed request lines ("-", extra spaces) and non-numeric request times
+      NF == 10 && $NF ~ /^[0-9]+(\.[0-9]+)?$/ {
+        path = $6
+        sub(/\?.*/, "", path)
+        t = $NF + 0
+        n[path]++
+        sum[path] += t
+        if (t > max[path]) max[path] = t
+        if (t > thr + 0) slow[path]++
+      }
+      END {
+        for (p in n)
+          printf "%s\t%d\t%.1f\t%.1f\t%d\n", p, n[p], sum[p] / n[p] * 1000, max[p] * 1000, slow[p]
+      }
+    ' | sort -t $'\t' -k5,5nr -k2,2nr
+    ```
+
+    **Green Notes**
+    - **One `awk` pass instead of a per-line shell loop** (reduces E): every line is parsed and aggregated inside a single process. A `while read` loop that calls `cut` or `expr` for each field would start several processes per line, which means millions of process starts every hour. In Green Metrics Tool micro-benchmarks that summarized a 20,000-line access log, one `awk` pass used over 1000× less CPU energy than a `while read` loop with `$(echo | cut)` and `$(expr)` per field, and about 4× less than a loop that used only builtins.
+    - **One `gzip -dcf` for all inputs** (reduces E): plain and rotated files go through one decompressor, so you don't need a separate `zcat`/`cat` call for each file.
+verify:
+  static_only: bash script; needs sample nginx logs and runs outside the Python/JavaScript harness

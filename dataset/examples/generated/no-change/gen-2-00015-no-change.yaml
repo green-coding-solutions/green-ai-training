@@ -1,0 +1,66 @@
+id: gen-2-00015-no-change
+category: no-change
+language: nginx
+patterns:
+- text-compression
+- none
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    ?
+
+    ```nginx
+    server {
+        listen 8080;
+        server_name exports.internal;
+
+        root /data/exports;
+        autoindex on;
+        autoindex_format json;
+
+        access_log /var/log/nginx/exports.access.log;
+
+        sendfile on;
+        tcp_nopush on;
+
+        # nightly ETL output: orders/2026-10-22/part-0000.parquet, events/2026-10-22/raw.jsonl.zst
+        location /daily/ {
+            gzip off;
+            types {
+                application/vnd.apache.parquet parquet;
+                application/zstd zst;
+            }
+            default_type application/octet-stream;
+            add_header Cache-Control "public, max-age=86400, immutable";
+        }
+
+        # run manifests, the job writes manifest.json and manifest.json.gz
+        location /manifests/ {
+            gzip off;
+            gzip_static on;
+            default_type application/json;
+            add_header Cache-Control "no-cache";
+        }
+
+        location = /healthz {
+            access_log off;
+            return 200 "ok\n";
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    This config is already efficient for compression. I wouldn't change anything there.
+
+    - **`gzip off` on `/daily/` is right.** Parquet stores its column chunks compressed (Snappy or zstd), and `.zst` files are already zstd. Gzipping them again on every download costs CPU on the server and on every consumer, and the files barely get smaller.
+    - **The manifests are precompressed.** The job compresses each manifest once, and `gzip_static` serves the `.gz` file to clients that accept gzip. In Green Metrics Tool benchmarks with nginx serving text assets, compression sent about 10× fewer bytes than no compression. Compressing on every request cost about 4× the CPU energy of serving precompressed files. Your setup pays the compression cost once per file, not once per request.
+    - **`sendfile` and `tcp_nopush`** let nginx hand the large export files to the kernel without copying them through user space.
+
+    Two things to check. They are not about efficiency:
+
+    - `gzip_static` needs `ngx_http_gzip_static_module`. Distro packages include it. Custom builds need `--with-http_gzip_static_module`. Check with `nginx -V`. Without the module, nginx rejects the directive at startup.
+    - nginx serves the `.gz` file whenever it exists. If the job ever rewrites `manifest.json` without rewriting `manifest.json.gz`, gzip-capable clients get the old manifest. Write both files together, for example to a temp name followed by `mv`. Likewise, `immutable` on `/daily/` is only safe as long as every run writes to a new dated path, as your example paths do.
+verify:
+  static_only: nginx configuration, no runnable Python or JavaScript

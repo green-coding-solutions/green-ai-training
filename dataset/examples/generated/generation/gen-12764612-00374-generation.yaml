@@ -1,0 +1,77 @@
+id: gen-12764612-00374-generation
+category: generation
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    Hello, I need small python script for our deploy pipeline in gitlab. After we deploy to staging, it must check the /health endpoint of our 12 microservices, and if one is not OK the pipeline must fail so we dont promote to production. Services are in a dict name -> url. Timeout 5 second for each. Please print one line for every service. Thanks!
+- role: assistant
+  content: |
+    ```python
+    import asyncio
+    import sys
+
+    import httpx
+
+    SERVICES = {
+        "auth": "https://auth.staging.example.com/health",
+        "billing": "https://billing.staging.example.com/health",
+        "catalog": "https://catalog.staging.example.com/health",
+        "checkout": "https://checkout.staging.example.com/health",
+        "inventory": "https://inventory.staging.example.com/health",
+        "notifications": "https://notifications.staging.example.com/health",
+        "orders": "https://orders.staging.example.com/health",
+        "search": "https://search.staging.example.com/health",
+        # ... add the other services here
+    }
+
+
+    async def check(client, name, url):
+        try:
+            resp = await client.get(url)
+        except httpx.HTTPError as exc:
+            return name, False, type(exc).__name__
+        return name, resp.status_code == 200, str(resp.status_code)
+
+
+    async def check_all(services, max_parallel=12):
+        sem = asyncio.Semaphore(max_parallel)
+
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            async def run(name, url):
+                async with sem:
+                    return await check(client, name, url)
+
+            return await asyncio.gather(
+                *(run(name, url) for name, url in services.items())
+            )
+
+
+    def main():
+        results = asyncio.run(check_all(SERVICES))
+        failed = 0
+        for name, ok, detail in results:
+            print(f"{'OK  ' if ok else 'FAIL'} {name}: {detail}")
+            if not ok:
+                failed += 1
+        if failed:
+            print(f"{failed} of {len(results)} services not healthy")
+            sys.exit(1)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    The script exits with code 1 if any service is not healthy, so the GitLab job fails and the production stage does not run. Output lines keep the order of the dict. A timeout or connection error counts as a failure, it does not crash the script.
+
+    **Green Notes**
+    - **Concurrent health checks** (reduces E, idle wait time): the 12 checks run at the same time, so the job waits for the slowest service and not for the sum of all. A sequential loop could wait up to 12 × 5 s when services are down. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. For this few requests the gain is mostly shorter wall time, so the CI runner is free earlier.
+    - **Bounded parallelism**: the semaphore caps open connections, so a bigger service list later will not open hundreds of sockets at once.
+    - *Not applied:* retries and polling. If your services need some seconds to start after deploy, add a small retry on failure only when you see it is needed.
+verify:
+  static_only: needs network access and the httpx package

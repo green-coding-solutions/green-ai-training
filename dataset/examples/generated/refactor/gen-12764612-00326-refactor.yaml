@@ -1,0 +1,91 @@
+id: gen-12764612-00326-refactor
+category: refactor
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    Nightly cron, ~60 raw float32 dumps per run, 40-60M samples each, one process per file. The quantize loop is basically the whole runtime. Numba is fine, we already ship it on that box. Diff only.
+
+    ```python
+    #!/usr/bin/env python3
+    """Convert raw float32 telemetry dumps to 8-bit files for the archive."""
+    import argparse
+    import sys
+    from pathlib import Path
+
+    import numpy as np
+
+
+    def quantize(samples, lo, hi, levels=256):
+        out = np.empty(len(samples), dtype=np.uint8)
+        scale = (levels - 1) / (hi - lo)
+        for i in range(len(samples)):
+            v = float(samples[i])
+            if v < lo:
+                v = lo
+            elif v > hi:
+                v = hi
+            out[i] = int((v - lo) * scale + 0.5)
+        return out
+
+
+    def main():
+        ap = argparse.ArgumentParser()
+        ap.add_argument("src", type=Path)
+        ap.add_argument("dst", type=Path)
+        ap.add_argument("--lo", type=float, default=-5.0)
+        ap.add_argument("--hi", type=float, default=5.0)
+        args = ap.parse_args()
+
+        samples = np.fromfile(args.src, dtype="<f4")
+        if samples.size == 0:
+            sys.exit("empty input")
+        q = quantize(samples, args.lo, args.hi)
+        q.tofile(args.dst)
+        clipped = int((samples < args.lo).sum() + (samples > args.hi).sum())
+        print(f"{samples.size} samples, clipped {clipped}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    ```diff
+     import numpy as np
+    +from numba import njit
+
+
+    -def quantize(samples, lo, hi, levels=256):
+    +@njit(cache=True)
+    +def _quantize(samples, lo, hi, levels):
+         out = np.empty(len(samples), dtype=np.uint8)
+         scale = (levels - 1) / (hi - lo)
+         for i in range(len(samples)):
+             v = float(samples[i])
+             if v < lo:
+                 v = lo
+             elif v > hi:
+                 v = hi
+             out[i] = int((v - lo) * scale + 0.5)
+         return out
+    +
+    +
+    +def quantize(samples, lo, hi, levels=256):
+    +    if np.isnan(samples).any():
+    +        raise ValueError("NaN in samples")
+    +    return _quantize(samples, lo, hi, levels)
+    ```
+
+    **Green Notes**
+    - **JIT-compile the hot numeric loop** (reduces E): this is a CPU-bound loop over tens of millions of floats, which is the case Numba is made for. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples in a pure Python loop used ~40 J of CPU energy and the same loop with `@njit` used ~9.5 J, about 4× less. Your files are 4-6× larger and run every night, so the loop is where the energy goes.
+    - **`cache=True`** (reduces E): you start a fresh process per file, so without the on-disk cache every run would compile again. With it, only the first run pays. The cache directory must be writable by the cron user.
+    - **NaN behavior kept:** the old loop raised `ValueError` on a NaN sample, because `int(nan)` fails. Compiled code would instead write a garbage byte silently. The wrapper check keeps the old error. It costs one extra vectorized pass.
+
+    Output bytes are unchanged, since the math is still float64 per sample. The measured gain is for large inputs. Numba import and compile time is a fixed cost, so it would not pay off for tiny files.
+verify:
+  static_only: needs numba, which is not in the stdlib or numpy

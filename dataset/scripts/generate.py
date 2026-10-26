@@ -120,19 +120,47 @@ def client():
 
 # ---------------------------------------------------------------- plan
 
-def plan_jobs(n, seed):
+def fill_categories(taxonomy, oversample):
+    """Categories needed so that existing + new examples match the target mix without removing any."""
+    have, by_pattern = defaultdict(int), defaultdict(int)
+    for _, ex in load_examples():
+        have[ex.get("category")] += 1
+        for p in ex.get("patterns") or []:
+            by_pattern[p] += 1
+    weights = {c: v["weight"] for c, v in taxonomy["categories"].items()}
+    total = max(have[c] / w for c, w in weights.items())
+    need = {c: max(0, round(total * w) - have[c]) for c, w in weights.items()}
+    print(f"Existing {sum(have.values())} examples, target {round(total)}. "
+          f"New per category (before x{oversample} for failures): {need}")
+    return [c for c, k in need.items() for _ in range(round(k * oversample))], by_pattern
+
+
+def plan_jobs(n, seed, fill=False, oversample=1.3):
     taxonomy = load_taxonomy()
     rng = random.Random(seed)
     cats = list(taxonomy["categories"])
     weights = [taxonomy["categories"][c]["weight"] for c in cats]
     patterns = [p for p in taxonomy["patterns"] if p["languages"]]
+    by_pattern = defaultdict(int)
+    if fill:
+        planned = fill_categories(taxonomy, oversample)
+        rng.shuffle(planned[0])
+        planned, by_pattern = planned
+        n = len(planned)
+
+    def pick_pattern(pool):
+        # thin patterns first: weight by 1 / (1 + examples that already have the pattern)
+        choice = rng.choices(pool, [1 / (1 + by_pattern[p["id"]]) for p in pool])[0] if fill else rng.choice(pool)
+        by_pattern[choice["id"]] += 1
+        return choice
+
     jobs = []
     for i in range(n):
-        category = rng.choices(cats, weights)[0]
+        category = planned[i] if fill else rng.choices(cats, weights)[0]
         if category == "conceptual":
-            pats, language = [rng.choice(patterns)["id"]], "text"
+            pats, language = [pick_pattern(patterns)["id"]], "text"
         else:
-            primary = rng.choice(patterns)
+            primary = pick_pattern(patterns)
             pats = [primary["id"]]
             if category in ("review", "refactor") and rng.random() < 0.4:
                 second = rng.choice([p for p in patterns if set(p["languages"]) & set(primary["languages"])])
@@ -367,7 +395,7 @@ Example:
 
 def repair(model, effort, workers):
     report_path = OUT_DIR / "verify-report.json"
-    if not report_path.exists():
+    if not report_path.exists() or not report_path.stat().st_size:
         sys.exit("Run scripts/verify.py examples/generated first.")
     report = json.loads(report_path.read_text())
     targets = [(k, v) for k, v in report.items()
@@ -400,6 +428,10 @@ def main():
     p_plan = sub.add_parser("plan", help="Sample a job matrix into out/jobs.jsonl")
     p_plan.add_argument("--n", type=int, default=1500)
     p_plan.add_argument("--seed", type=int, default=1)
+    p_plan.add_argument("--fill", action="store_true",
+                        help="Plan only what is missing for the target mix (thin patterns first), ignores --n")
+    p_plan.add_argument("--oversample", type=float, default=1.3,
+                        help="With --fill: plan this many times the gap, because some generated examples fail verify")
     p_run = sub.add_parser("run", help="Generate examples for pending jobs")
     p_run.add_argument("--mode", choices=["batch", "sync"], default="batch")
     p_run.add_argument("--limit", type=int)
@@ -414,7 +446,7 @@ def main():
 
     OUT_DIR.mkdir(exist_ok=True)
     if args.cmd == "plan":
-        jobs = plan_jobs(args.n, args.seed)
+        jobs = plan_jobs(args.n, args.seed, args.fill, args.oversample)
         with open(JOBS_FILE, "w") as f:
             for j in jobs:
                 f.write(json.dumps(j) + "\n")

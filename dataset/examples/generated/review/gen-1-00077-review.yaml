@@ -1,0 +1,95 @@
+id: gen-1-00077-review
+category: review
+language: python
+patterns:
+- select-columns
+- hoist-invariants
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+- F-ATTR
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```python
+    import math
+    import psycopg
+    from psycopg.rows import dict_row
+
+    FEATURES = ["price", "discount", "rating", "review_count", "stock", "days_since_release"]
+
+
+    class ProductScorer:
+        def __init__(self, dsn, weights, bias):
+            self.conn = psycopg.connect(dsn, row_factory=dict_row)
+            self.weights = weights
+            self.bias = bias
+
+        def load_rows(self, product_ids):
+            ids = ",".join(str(i) for i in product_ids)
+            cur = self.conn.execute(f"SELECT * FROM products WHERE id IN ({ids})")
+            return cur.fetchall()
+
+        def score(self, rows):
+            out = []
+            for row in rows:
+                z = self.bias
+                for name in FEATURES:
+                    z += self.weights[name] * row[name]
+                out.append((row["id"], 1.0 / (1.0 + math.exp(-z))))
+            return out
+
+        def rank(self, product_ids, top_k=20):
+            rows = self.load_rows(product_ids)
+            scored = self.score(rows)
+            scored.sort(key=lambda t: t[1], reverse=True)
+            return scored[:top_k]
+    ```
+- role: assistant
+  content: |
+    **Workload:** AI/ML (inference service)
+
+    #### [Security] SQL built with an f-string
+    - **Where:** `load_rows`
+    - **Issue:** the ids are pasted into the SQL text. If they come from a request, this is SQL injection. An empty list also gives `IN ()`, which is a syntax error.
+    - **Fix:** pass the ids as a parameter (see the fixed query below).
+
+    #### [High] `SELECT *` on a wide table
+    - **Where:** `load_rows`
+    - **Issue:** the scorer reads 6 columns, but `SELECT *` pulls every column of `products`. That includes the large text columns, which are read, sent and decoded for every request and then thrown away. In Green Metrics Tool micro-benchmarks on a 52-column products table with large text columns, naming the 10 needed columns used about 5.5× to 7× less CPU energy than `SELECT *`. The gap grows with the size of the columns you skip. Your table may differ, so check its column sizes.
+    - **Fix:**
+      ```python
+      def load_rows(self, product_ids):
+          cur = self.conn.execute(
+              "SELECT id, " + ", ".join(FEATURES) + " FROM products WHERE id = ANY(%s)",
+              (list(product_ids),),
+          )
+          return cur.fetchall()
+      ```
+      The column names come from the constant `FEATURES`, not from user input, so joining them is safe.
+    - **Impact:** E, M and network between app and database, on every request. Scores do not change.
+
+    #### [Low] Repeated lookups in the scoring loop
+    - **Where:** `score`
+    - **Issue:** `self.weights`, `self.bias` and `math.exp` are looked up again for every row and feature. In Green Metrics Tool micro-benchmarks, caching one function in a local variable before a 10,000,000-iteration loop saved about 4-5%. With a few hundred rows per request this is small, so keep it to this one function.
+    - **Fix:**
+      ```python
+      def score(self, rows):
+          weights = self.weights
+          bias = self.bias
+          exp = math.exp
+          out = []
+          for row in rows:
+              z = bias
+              for name in FEATURES:
+                  z += weights[name] * row[name]
+              out.append((row["id"], 1.0 / (1.0 + exp(-z))))
+          return out
+      ```
+    - **Impact:** E, a few percent at most.
+
+    **Already good:** `rank` sorts once and slices the top results. One connection is reused for all requests.
+verify:
+  static_only: needs a PostgreSQL server and psycopg

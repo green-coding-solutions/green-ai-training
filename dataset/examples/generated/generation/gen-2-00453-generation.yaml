@@ -1,0 +1,68 @@
+id: gen-2-00453-generation
+category: generation
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    hi, im not really a docker person, our data team asked me to containerize the script that loads the daily sales csv files into our reporting db. i dont know what to put in the Dockerfile. the project looks like this:
+
+    ```text
+    sales-loader/
+      requirements.txt
+      loader/
+        __init__.py
+        main.py
+        transform.py
+    ```
+
+    requirements.txt:
+
+    ```text
+    pandas==2.2.2
+    psycopg[binary]==3.2.1
+    pyyaml==6.0.1
+    ```
+
+    its python 3.12, run with `python -m loader.main`. csv files get mounted in /data when it runs. our gitlab ci will build the image on every push to every branch. can you write the Dockerfile?
+- role: assistant
+  content: |
+    ```dockerfile
+    FROM python:3.12-slim
+
+    WORKDIR /app
+
+    # Dependencies first: this layer is reused while requirements.txt is unchanged
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY loader/ loader/
+
+    # CSV files are mounted here at run time
+    VOLUME /data
+
+    CMD ["python", "-m", "loader.main"]
+    ```
+
+    Add a `.dockerignore` so the build context stays small:
+
+    ```text
+    .git
+    __pycache__
+    *.pyc
+    .venv
+    ```
+
+    Run it with `docker run -v /path/to/csv:/data sales-loader`.
+
+    **Green Notes**
+    - **Small container image** (reduces E): `python:3.12-slim` with only the runtime dependencies from `requirements.txt`, no compilers, git or dev tools. In Green Metrics Tool micro-benchmarks, building a small Flask app image this way used about 7× less energy than a full `python:3.12` image with build tools and dev packages (~124 J vs ~885 J). Serving requests afterwards cost the same, so the saving is in the build, pull and stored copy. Your CI repeats these on every push, so it adds up.
+    - **Dependency layer before the source:** code changes on a push reinstall nothing when `requirements.txt` is the same, as long as the CI keeps its layer cache.
+    - **`pip --no-cache-dir`:** the pip download cache is not kept in the image.
+
+    `psycopg[binary]` and `pandas` ship prebuilt wheels, so they install on the slim image without a compiler. If you later add a package that has to be built from source, install the build tools in a separate build stage and don't add them to this image.
+verify:
+  static_only: Dockerfile, needs a container build

@@ -1,0 +1,125 @@
+id: gen-2-00117-review
+category: review
+language: javascript
+patterns:
+- minify-assets
+facts:
+- F-MINIFY
+messages:
+- role: user
+  content: |
+    We launch a new landing page for our time-tracking SaaS next week. Static HTML on Netlify. This is the only JS file, loaded with `<script src="/js/landing.js" defer>`. It's about 9 KB right now, with comments and some console.logs from debugging.
+
+    Please review it before launch. Requirements:
+    - no framework, it should stay plain JS
+    - we have no build step today and I'd rather not add one just for this file. If minification really matters, tell me and I'll add it
+    - point out real bugs, I don't need style nitpicks
+
+    ```javascript
+    // landing.js: pricing toggle, FAQ accordion, newsletter signup
+
+    const PRICES = {
+      starter: { monthly: 9, yearly: 90 },
+      team: { monthly: 29, yearly: 290 },
+      business: { monthly: 79, yearly: 790 },
+    };
+
+    function renderPrices(period) {
+      console.log('renderPrices', period);
+      document.querySelectorAll('[data-plan]').forEach((card) => {
+        const price = PRICES[card.dataset.plan][period];
+        card.querySelector('.price').textContent = `€${price}`;
+        card.querySelector('.period').textContent = period === 'monthly' ? '/month' : '/year';
+      });
+    }
+
+    const toggle = document.getElementById('billing-toggle');
+    toggle.addEventListener('change', (e) => {
+      renderPrices(e.target.checked ? 'yearly' : 'monthly');
+    });
+
+    // FAQ accordion
+    document.querySelectorAll('.faq-question').forEach((q) => {
+      q.addEventListener('click', () => {
+        const answer = q.nextElementSibling;
+        const open = q.getAttribute('aria-expanded') === 'true';
+        q.setAttribute('aria-expanded', String(!open));
+        answer.hidden = open;
+      });
+    });
+
+    // Newsletter: prefill from ?email= links in our onboarding mails
+    const form = document.getElementById('newsletter-form');
+    const emailInput = form.querySelector('input[name=email]');
+    const prefill = new URLSearchParams(location.search).get('email');
+    if (prefill) emailInput.value = prefill;
+
+    form.addEventListener('submit', async (e) => {
+      const email = emailInput.value.trim();
+      console.log('submitting', email);
+      const res = await fetch('/api/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      });
+      const msg = document.getElementById('newsletter-msg');
+      if (res.ok) {
+        msg.innerHTML = `Thanks! We sent a confirmation to <b>${email}</b>.`;
+      } else {
+        msg.innerHTML = 'Something went wrong, please try again.';
+      }
+    });
+
+    renderPrices('monthly');
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (static landing page)
+
+    #### [Bug] The form does a full page submit
+    - **Where:** `form.addEventListener('submit', ...)`
+    - **Issue:** there is no `e.preventDefault()`. The browser also runs the native form submit and navigates away, so the `fetch` can be cancelled and the user never sees the message. If `fetch` fails with a network error, the promise rejects, nothing catches it, and no message is shown.
+    - **Fix:** call `preventDefault()` first and wrap the request in `try/catch` (see the snippet under Security).
+
+    #### [Bug] Prices can disagree with the toggle
+    - **Where:** `renderPrices('monthly')` at the end
+    - **Issue:** browsers restore checkbox state on reload and back navigation. If the toggle comes back checked, the page still shows monthly prices next to a "yearly" switch.
+    - **Fix:** render from the actual state:
+      ```javascript
+      renderPrices(toggle.checked ? 'yearly' : 'monthly');
+      ```
+
+    #### [Security] Email from the URL ends up in `innerHTML`
+    - **Where:** `msg.innerHTML = \`...<b>${email}</b>...\``
+    - **Issue:** `email` can come from the `?email=` parameter. A crafted link can put markup into the input, and that markup is rendered as HTML after submit (for example `<img src=x onerror=...>`). Your API may reject an invalid address, but the success branch should not depend on that.
+    - **Fix:** build the message with `textContent`:
+      ```javascript
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const email = emailInput.value.trim();
+        const msg = document.getElementById('newsletter-msg');
+        try {
+          const res = await fetch('/api/subscribe', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email }),
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const b = document.createElement('b');
+          b.textContent = email;
+          msg.replaceChildren('Thanks! We sent a confirmation to ', b, '.');
+        } catch {
+          msg.textContent = 'Something went wrong, please try again.';
+        }
+      });
+      ```
+
+    #### [Low] Shipped unminified, with debug logging
+    - **Where:** the whole file, served as-is
+    - **Issue:** comments, whitespace and `console.log` calls go to every visitor. The `console.log('submitting', email)` also writes the visitor's address to the console for no reason.
+    - **Fix:** delete the two `console.log` lines by hand. A build step is not needed for one small file. If the JS grows later, one command does it: `npx esbuild src/landing.js --minify --drop:console --outfile=js/landing.js`.
+    - **Impact:** network bytes only. In Green Metrics Tool measurements of a small booking page (50 cold page loads), the unminified sources used ~837 J and an esbuild build with `--minify --drop:console` used ~822 J, about 2% less, which is within measurement noise. So minification saves bytes on real networks, not measurable client CPU energy. For this file, skipping the build step is fine.
+
+    **Already good:** the script is loaded with `defer`, prices are rendered with `textContent`, the pricing data is inline instead of a separate request, and the accordion keeps `aria-expanded` in sync.
+verify:
+  static_only: browser DOM code (document, fetch, location); snippets are syntax-only

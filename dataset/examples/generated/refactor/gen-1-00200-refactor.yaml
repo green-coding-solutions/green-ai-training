@@ -1,0 +1,92 @@
+id: gen-1-00200-refactor
+category: refactor
+language: bash
+patterns:
+- bash-builtins
+- bash-quoting
+facts:
+- F-BASH-SUBPROC
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    Our shop gets a settlement file from the payment provider every night (about 150k lines) and this script builds the summary that finance imports. It now runs for over an hour on the small batch VM, and it used to be fast. Can you optimize it?
+
+    Requirements:
+    - the output file must stay exactly the same, finance's importer parses it
+    - it must stay a bash script (cron calls it), awk is installed on the VM, but no python or other new tools
+    - amounts are integer cents, currencies are 3-letter codes
+
+    Lines look like this (first line is a header):
+    ```text
+    ts|order_id|currency|amount_cents|status
+    2026-10-24T03:12:55Z|ORD-48213|EUR|1999|captured
+    2026-10-24T03:13:02Z|ORD-48214|USD|4500|refunded
+    ```
+
+    ```bash
+    #!/bin/bash
+    # nightly settlement summary
+    FILE="$1"
+    OUT="/tmp/settlement_summary.txt"
+
+    declare -A captured_cents
+    declare -A refund_cents
+    captured_count=0
+    refund_count=0
+
+    while read -r line; do
+      pay_status=$(echo "$line" | cut -d'|' -f5)
+      currency=$(echo "$line" | cut -d'|' -f3)
+      amount=$(echo "$line" | cut -d'|' -f4)
+
+      if [ "$pay_status" = "captured" ]; then
+        captured_cents[$currency]=$(expr ${captured_cents[$currency]:-0} + $amount)
+        captured_count=$(expr $captured_count + 1)
+      elif [ "$pay_status" = "refunded" ]; then
+        refund_cents[$currency]=$(expr ${refund_cents[$currency]:-0} + $amount)
+        refund_count=$(expr $refund_count + 1)
+      fi
+    done < "$FILE"
+
+    {
+      for currency in $(printf '%s\n' "${!captured_cents[@]}" "${!refund_cents[@]}" | sort -u); do
+        echo "$currency captured=${captured_cents[$currency]:-0} refunded=${refund_cents[$currency]:-0}"
+      done
+      echo "captured_orders=$captured_count refunds=$refund_count"
+    } > "$OUT"
+    ```
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    file=${1:?'usage: settlement_summary.sh SETTLEMENT_FILE'}
+    out='/tmp/settlement_summary.txt'
+
+    awk -F'|' '
+      $5 == "captured" { cap[$3] += $4; ncap++; seen[$3] = 1 }
+      $5 == "refunded" { ref[$3] += $4; nref++; seen[$3] = 1 }
+      END {
+        for (c in seen)
+          printf "%s captured=%.0f refunded=%.0f\n", c, cap[c], ref[c] | "sort"
+        close("sort")
+        printf "captured_orders=%d refunds=%d\n", ncap, nref
+      }
+    ' "$file" > "$out"
+    ```
+
+    The output format is the same: one line per currency in sorted order, then the totals line. The header line and any other line with a different status are skipped, as before.
+
+    **Green Notes**
+    - **Single-pass tools instead of subprocesses in loops** (reduces E): your loop started several processes for every line (`echo`, `cut` three times, `expr`). With 150k lines that is hundreds of thousands of process starts, and this is what makes the job slow. Now one `awk` process reads the file once. In Green Metrics Tool micro-benchmarks, summarizing a 20,000-line access log with per-field `$(echo | cut)` and `$(expr)` used over 1000× more CPU energy than one `awk` pass, and about 300× more than a loop with only bash builtins.
+    - **Single quotes for literals** (reduces E, small here): the path, the usage text and the awk program need no expansion, so they use single quotes. The saving is tiny for short strings in a script that runs once a night. It grows with literal length and loop count. The variable `"$file"` keeps its double quotes.
+
+    Differences to know about:
+    - `read` skipped a last line that has no trailing newline. `awk` reads it. If the provider's file ever ends that way, the new totals are the correct ones.
+    - The sums use `%.0f`, so large cent totals do not overflow on awk versions with 32-bit integers.
+    - `set -euo pipefail` makes the job fail loudly if the file is missing or `awk` fails, so cron can mail you instead of leaving a half-written summary unnoticed.
+    - The `declare -A` arrays are gone, so the script no longer needs bash 4.
+verify:
+  static_only: needs a sample settlement file and a temp output path, bash output compared by hand

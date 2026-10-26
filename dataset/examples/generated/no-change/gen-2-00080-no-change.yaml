@@ -1,0 +1,68 @@
+id: gen-2-00080-no-change
+category: no-change
+language: sql
+patterns:
+- select-columns
+- none
+facts:
+- F-PG-SELECT
+messages:
+- role: user
+  content: |
+    hi, i'm pretty new to SQL. I wrote this query for our nightly error report. It counts the errors per service for one day and skips services we muted. Our log_entries table has big columns (message and stack_trace can be several KB each), so I was careful.
+
+    But a reviewer ran some SQL linter on it and it says "avoid SELECT *" and "avoid COUNT(*)". Now I'm confused. Is my query slow or wasteful? Should I write COUNT(message) instead or something?
+
+    ```sql
+    SELECT service, COUNT(*) AS errors
+    FROM log_entries
+    WHERE level = 'ERROR'
+      AND logged_at >= '2026-10-01'
+      AND logged_at < '2026-10-02'
+      AND NOT EXISTS (
+        SELECT * FROM muted_services m
+        WHERE m.service = log_entries.service
+      )
+    GROUP BY service
+    ORDER BY errors DESC;
+    ```
+
+    what is wrong with it?
+- role: assistant
+  content: |
+    Nothing is wrong. This query is already efficient. The linter rule matches the `*` character, but neither `*` here works like `SELECT *`. Keep it as it is:
+
+    ```sql
+    SELECT service, COUNT(*) AS errors
+    FROM log_entries
+    WHERE level = 'ERROR'
+      AND logged_at >= '2026-10-01'
+      AND logged_at < '2026-10-02'
+      AND NOT EXISTS (
+        SELECT * FROM muted_services m
+        WHERE m.service = log_entries.service
+      )
+    GROUP BY service
+    ORDER BY errors DESC;
+    ```
+
+    Why it is fine:
+    - **`COUNT(*)` counts rows.** It reads no column values. The result has only `service` and one number per group, so `message` and `stack_trace` never leave the database.
+    - **The `*` inside `EXISTS` is ignored.** `EXISTS` only checks if a matching row exists. The database never builds that select list, so `SELECT 1` would behave the same there.
+    - **Your outer select list is already minimal.** You return two small values per service.
+
+    Don't change it to `COUNT(message)`. That counts only rows where `message` is not NULL, so it can give a different number, and it saves nothing.
+
+    The "avoid `SELECT *`" advice is for queries that return whole rows to your application. In Green Metrics Tool measurements on PostgreSQL, a query that read 2,500 rows from a 52-column table with large text columns used about 7× less CPU energy when it named the 10 needed columns instead of using `SELECT *`. That saving comes from not sending the big columns to the client. Your query doesn't send them at all. If you have something like `SELECT * FROM log_entries WHERE level = 'ERROR'` feeding a page or a script, that is the query where the rule helps.
+verify:
+  sql:
+    setup: CREATE TABLE log_entries (id INTEGER PRIMARY KEY, logged_at TEXT, level TEXT, service TEXT, message TEXT, stack_trace
+      TEXT); CREATE TABLE muted_services (service TEXT PRIMARY KEY); INSERT INTO muted_services VALUES ('legacy-cron'); INSERT
+      INTO log_entries (logged_at, level, service, message, stack_trace) VALUES ('2026-10-01 00:05:12', 'ERROR', 'checkout',
+      'payment timeout', 'Traceback ...'), ('2026-10-01 03:44:00', 'ERROR', 'checkout', 'payment timeout', 'Traceback ...'),
+      ('2026-10-01 09:10:31', 'ERROR', 'search', 'index unavailable', NULL), ('2026-10-01 11:00:00', 'WARN', 'search', 'slow
+      query', NULL), ('2026-10-01 12:30:00', 'ERROR', 'legacy-cron', 'job failed', 'Traceback ...'), ('2026-10-01 23:59:59',
+      'ERROR', 'auth', NULL, 'Traceback ...'), ('2026-10-01 18:20:00', 'ERROR', 'checkout', 'card declined', NULL), ('2026-10-02
+      00:00:00', 'ERROR', 'auth', 'token expired', NULL), ('2026-09-30 23:59:59', 'ERROR', 'search', 'index unavailable',
+      NULL);
+    compare: true

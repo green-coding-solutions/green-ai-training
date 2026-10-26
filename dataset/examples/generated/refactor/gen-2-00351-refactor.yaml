@@ -1,0 +1,114 @@
+id: gen-2-00351-refactor
+category: refactor
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    hi, this script push our stock and price feed to 4 marketplace partners every 15 min (cron). the feed is around 180 MB ndjson. the job take almost 12 minutes now and the cpu on the feed box is full. some times the next run is starting before the old one is finish. the partners import accept .gz, .xz or .zst files. can you optimise it pls?
+
+    ```bash
+    #!/bin/bash
+    # push stock+price feed to marketplaces, cron */15
+    set -e
+
+    FEED_DIR=/srv/shop/feeds
+    OUT=/tmp/feed_upload
+    PARTNERS='zalando otto kaufland bol'
+
+    mkdir -p $OUT
+
+    # export is written by the shop at minute 14
+    FEED=$FEED_DIR/stock_prices_latest.ndjson
+    if [ ! -f "$FEED" ]; then
+      echo 'no feed found' >&2
+      exit 1
+    fi
+
+    for p in $PARTNERS; do
+      url=$(grep "^$p=" /etc/shop/partners.conf | cut -d= -f2-)
+      token=$(cat /etc/shop/tokens/$p)
+
+      cp "$FEED" $OUT/$p.ndjson
+      xz -9e -f $OUT/$p.ndjson
+
+      curl -s -X POST "$url/feeds/import" \
+        -H "Authorization: Bearer $token" \
+        -F "file=@$OUT/$p.ndjson.xz;type=application/x-xz" \
+        -o $OUT/$p.response.json
+
+      status=$(jq -r .status $OUT/$p.response.json)
+      echo "$(date -Is) $p $status"
+      rm -f $OUT/$p.ndjson.xz
+    done
+    ```
+- role: assistant
+  content: |
+    ```bash
+    #!/bin/bash
+    # push stock+price feed to marketplaces, cron */15
+    set -eu
+
+    FEED_DIR=/srv/shop/feeds
+    PARTNERS='zalando otto kaufland bol'
+    FEED=$FEED_DIR/stock_prices_latest.ndjson
+
+    # skip this run if the previous one is still uploading
+    exec 9>/tmp/feed_upload.lock
+    if ! flock -n 9; then
+      echo "$(date -Is) previous run still active, skipping" >&2
+      exit 0
+    fi
+
+    if [ ! -f "$FEED" ]; then
+      echo 'no feed found' >&2
+      exit 1
+    fi
+
+    OUT=$(mktemp -d /tmp/feed_upload.XXXXXX)
+    trap 'rm -rf "$OUT"' EXIT
+
+    # compress once, every partner gets the same file
+    zstd -q -o "$OUT/stock_prices.ndjson.zst" "$FEED"
+
+    failed=0
+    for p in $PARTNERS; do
+      url=$(grep "^$p=" /etc/shop/partners.conf | cut -d= -f2-)
+      if [ -z "$url" ]; then
+        echo "$(date -Is) $p no url in partners.conf" >&2
+        failed=1
+        continue
+      fi
+      token=$(cat "/etc/shop/tokens/$p")
+
+      if ! curl -sS --fail -X POST "$url/feeds/import" \
+          -H "Authorization: Bearer $token" \
+          -F "file=@$OUT/stock_prices.ndjson.zst;type=application/zstd" \
+          -o "$OUT/$p.response.json"; then
+        echo "$(date -Is) $p upload failed" >&2
+        failed=1
+        continue
+      fi
+
+      status=$(jq -r .status "$OUT/$p.response.json") || status='unparsable response'
+      echo "$(date -Is) $p $status"
+    done
+
+    exit "$failed"
+    ```
+
+    **Green Notes**
+    - **zstd instead of `xz -9e`** (reduces E): Green Metrics Tool benchmarks compressed 100 MB of English text with default settings. There, xz used about 29× more energy than zstd. `-9e` is xz's slowest preset, so it is heavier than the measured default. Those figures compare energy, not file size. xz still makes smaller files. If a partner has an upload size limit or the link is slow, compare sizes on a real feed and raise the zstd level only if you need to.
+    - **Compress once, not per partner** (reduces E): the loop copied the feed and compressed it again for every partner. That was four identical compressions per run. Now there is one, and every partner gets the same bytes.
+
+    Behavior changes and bug fixes:
+    - The upload is now `stock_prices.ndjson.zst` with type `application/zstd`, instead of `<partner>.ndjson.xz`. You said all four partners accept `.zst`. Install `zstd` on the feed box if it is missing.
+    - **Overlapping runs:** two runs shared the fixed paths in `/tmp/feed_upload`, so they could overwrite each other's files mid-upload. `flock` now skips a run while the previous one is active. `mktemp` gives each run its own folder, and `trap` cleans it up.
+    - **One failing partner stopped the rest:** without `--fail`, an HTTP error page went into `jq`, and `set -e` aborted the whole loop. Now a failed upload is logged and the next partner still gets the feed. The script exits with 1 at the end, so cron still reports the error.
+
+    Run `time ./push_feed.sh` once before and once after the change to see the difference on your box.
+verify:
+  static_only: needs network access to partner APIs, zstd, jq and flock

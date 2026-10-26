@@ -1,0 +1,85 @@
+id: gen-12764612-00019-review
+category: review
+language: bash
+patterns:
+- bash-builtins
+- bash-quoting
+facts:
+- F-BASH-SUBPROC
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    Post-build check for our campaign landing pages, runs in CI on every merge (a few thousand html files in dist/). Diff only, please.
+
+    ```bash
+    #!/usr/bin/env bash
+    # post-build check for landing pages: size budget + sitemap
+    DIST=${1:-dist}
+    BUDGET=51200
+    OUT="$DIST/sitemap.xml"
+    over=0
+
+    echo "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" > "$OUT"
+    echo "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">" >> "$OUT"
+    for f in $(find "$DIST" -name "*.html"); do
+        rel=$(echo "$f" | sed "s|^$DIST/||")
+        size=$(wc -c < "$f" | tr -d ' ')
+        if [ $size -gt $BUDGET ]; then
+            echo "over budget: $rel ($size bytes)"
+            over=$((over + 1))
+        fi
+        echo "  <url><loc>https://example.com/$rel</loc></url>" >> "$OUT"
+    done
+    echo "</urlset>" >> "$OUT"
+    echo "$over page(s) over budget"
+    [ "$over" -eq 0 ]
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (CI, runs on every merge, thousands of files)
+
+    #### [Bug] Word splitting on `$(find ...)`
+    - **Where:** `for f in $(find ...)`, `[ $size -gt $BUDGET ]`
+    - **Issue:** a file name with a space is split into several "files", so `wc` fails and the sitemap gets broken entries. An empty `$size` makes the `[` test a syntax error.
+    - **Fix:** read the list line by line, as in the diff below.
+
+    #### [High] Four process starts per file
+    - **Where:** the `for` loop body
+    - **Issue:** `echo | sed` and `wc | tr` start four processes per file, so thousands of files mean well over ten thousand process starts per merge. In Green Metrics Tool micro-benchmarks on a 20,000-line log, a loop with `$(echo | cut)` and `$(expr)` per line was about 300× more expensive than the same loop with builtins only. That benchmark was a log parser, not a file-size check, so the ratio is only a guide here.
+    - **Fix:** let `find` print size and relative path in one pass, and use parameter-free builtins in the loop. This needs GNU `find` (`-printf`).
+    - **Impact:** E, process starts drop from about four per file to none in the loop. The output and the exit code stay the same.
+
+    #### [Low] Double quotes around literals without expansion
+    - **Where:** the two XML header lines, `"*.html"`, `"</urlset>"`
+    - **Issue:** nothing is expanded in them, and the header lines need backslash-escaped inner quotes. Bash scans double-quoted text for `$`, backticks and backslashes. In Green Metrics Tool micro-benchmarks a 6,200-character literal in a loop was about 24% cheaper in single quotes. These literals are short and run once, so the real saving is negligible. The main gain is readability.
+    - **Fix:** single quotes, included in the diff. Keep double quotes where `$rel`, `$size` or `$over` expand.
+
+    ```diff
+    -echo "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" > "$OUT"
+    -echo "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">" >> "$OUT"
+    -for f in $(find "$DIST" -name "*.html"); do
+    -    rel=$(echo "$f" | sed "s|^$DIST/||")
+    -    size=$(wc -c < "$f" | tr -d ' ')
+    -    if [ $size -gt $BUDGET ]; then
+    +echo '<?xml version="1.0" encoding="UTF-8"?>' > "$OUT"
+    +echo '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' >> "$OUT"
+    +while read -r size rel; do
+    +    if (( size > BUDGET )); then
+             echo "over budget: $rel ($size bytes)"
+             over=$((over + 1))
+         fi
+         echo "  <url><loc>https://example.com/$rel</loc></url>" >> "$OUT"
+    -done
+    -echo "</urlset>" >> "$OUT"
+    +done < <(find "$DIST" -name '*.html' -printf '%s %P\n')
+    +echo '</urlset>' >> "$OUT"
+     echo "$over page(s) over budget"
+     [ "$over" -eq 0 ]
+    ```
+
+    `done < <(...)` instead of a pipe keeps the loop in the main shell, so `over` is still set when the loop ends.
+
+    **Already good:** variables are quoted where they expand, and the script's exit code reports the budget result.
+verify:
+  static_only: needs GNU find and a dist/ directory of html files; bash syntax of the answer is checked only

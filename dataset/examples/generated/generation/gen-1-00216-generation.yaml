@@ -1,0 +1,100 @@
+id: gen-1-00216-generation
+category: generation
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    hello, I work in hydrology group and we have web viewer for our flood simulation results (python app + postgres + redis + a worker that recompute the rasters). Now we want a preview for every pull request so my colleagues can look on the changes before merge. Please write me the github actions workflow.
+
+    Some infos:
+    - helm chart is in ./chart, values keys are app.replicas, postgres.enabled, redis.enabled, worker.enabled, image.tag, ingress.host
+    - image is already build by other workflow and tagged with the commit sha
+    - kubeconfig is in secret KUBE_CONFIG
+    - namespace should be flood-pr-<number>, host pr-<number>.preview.hydrolab.example
+    - when PR is closed the preview must go away
+
+    Thank you very much!
+- role: assistant
+  content: |
+    Here is one workflow that deploys on open and push, and removes the preview when the PR closes.
+
+    ```yaml
+    name: preview
+
+    on:
+      pull_request:
+        types: [opened, synchronize, reopened, closed]
+
+    concurrency:
+      group: preview-${{ github.event.number }}
+      cancel-in-progress: true
+
+    env:
+      NS: flood-pr-${{ github.event.number }}
+      HOST: pr-${{ github.event.number }}.preview.hydrolab.example
+
+    jobs:
+      deploy:
+        if: >-
+          github.event.action != 'closed' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+
+          - name: Configure kubectl
+            run: |
+              mkdir -p "$HOME/.kube"
+              printf '%s' "$KUBE_CONFIG" > "$HOME/.kube/config"
+              chmod 600 "$HOME/.kube/config"
+            env:
+              KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+
+          - name: Deploy preview
+            run: |
+              helm upgrade --install "$NS" ./chart \
+                --namespace "$NS" --create-namespace \
+                --set image.tag="$SHA" \
+                --set ingress.host="$HOST" \
+                --set app.replicas=1 \
+                --set postgres.enabled=true \
+                --set redis.enabled=false \
+                --set worker.enabled=false \
+                --atomic --timeout 5m
+              kubectl label namespace "$NS" env=preview --overwrite
+            env:
+              SHA: ${{ github.event.pull_request.head.sha }}
+
+      teardown:
+        if: >-
+          github.event.action == 'closed' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        runs-on: ubuntu-latest
+        steps:
+          - name: Configure kubectl
+            run: |
+              mkdir -p "$HOME/.kube"
+              printf '%s' "$KUBE_CONFIG" > "$HOME/.kube/config"
+              chmod 600 "$HOME/.kube/config"
+            env:
+              KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+
+          - name: Remove preview
+            run: |
+              helm uninstall "$NS" --namespace "$NS" --ignore-not-found || true
+              kubectl delete namespace "$NS" --ignore-not-found --wait=false
+    ```
+
+    Fork PRs are skipped on purpose, because they cannot read the kubeconfig secret and should not get cluster access.
+
+    **Green Notes**
+    - **Minimal preview environment** (reduces E, M): one app replica and Postgres, with Redis and the worker off. A reviewer needs to see the change, not production load. In Green Metrics Tool micro-benchmarks, an idle preview with 3 app replicas, Postgres, Redis and a worker used ~269 J in 60 seconds, and 1 replica plus Postgres used ~262 J (about 3% less). So the extra services cost little per minute. The fewer services mostly reserve less memory.
+    - **Teardown on close** (reduces E, M): the real saving is environments that do not exist. Removing the namespace when the PR closes removes all of its idle hours.
+    - **`concurrency` with cancel-in-progress:** a new push replaces a running deploy. You don't pay for deploys nobody will look at.
+    - *Not applied:* scale to zero at night. Add it if previews often stay open for days. If a PR changes the rasters recompute, set `worker.enabled=true` for that PR only.
+verify:
+  static_only: GitHub Actions workflow needs a cluster, helm and secrets

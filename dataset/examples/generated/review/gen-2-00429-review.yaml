@@ -1,0 +1,126 @@
+id: gen-2-00429-review
+category: review
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    Review this, checkout service. Diff only please, not a rewrite of the file. `cart_totals` runs on every cart update and at checkout.
+
+    ```python
+    import json
+    from decimal import Decimal
+
+    RULES_PATH = "config/vat_rules.json"
+
+    with open(RULES_PATH) as f:
+        VAT_RULES = json.load(f)  # [{"country": "DE", "categories": ["*"], "rate": "0.19"}, ...]
+
+
+    def reload_rules():
+        """Called from the SIGHUP handler after finance edits the file."""
+        global VAT_RULES
+        with open(RULES_PATH) as f:
+            VAT_RULES = json.load(f)
+
+
+    def vat_rate(country: str, category: str) -> Decimal:
+        best = None
+        for rule in VAT_RULES:
+            if rule["country"] != country:
+                continue
+            if category in rule["categories"] or "*" in rule["categories"]:
+                # most specific rule = shortest category list
+                if best is None or len(rule["categories"]) < len(best["categories"]):
+                    best = rule
+        if best is None:
+            raise KeyError(f"no VAT rule for {country}/{category}")
+        return Decimal(best["rate"])
+
+
+    def cart_totals(cart: dict) -> dict:
+        net = Decimal("0")
+        vat = Decimal("0")
+        for line in cart["lines"]:
+            rate = vat_rate(cart["ship_to"], line["category"])
+            line_net = Decimal(str(line["unit_price"])) * line["qty"]
+            net += line_net
+            vat += line_net * rate
+        vat = vat.quantize(Decimal("0.01"))
+        return {"net": net, "vat": vat, "gross": net + vat}
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (checkout API)
+
+    #### [Bug] Wildcard rule can win over a specific rule
+    - **Where:** `vat_rate`, the `len(rule["categories"]) < len(best["categories"])` check
+    - **Issue:** a wildcard rule has one entry (`["*"]`), so it counts as "more specific" than any rule that lists two or more categories. With `["*"]` at 0.19 and `["books", "ebooks"]` at 0.07 for DE, books get 0.19. Rules with one category each tie, and then file order decides.
+    - **Fix:** an exact category match wins, the wildcard is only the fallback. This assumes exact rules for one country don't overlap. The first match wins.
+    - **Impact:** wrong VAT on every affected line.
+
+    #### [High] Rules table is scanned again for every cart line
+    - **Where:** `vat_rate`, called from the `cart_totals` loop
+    - **Issue:** `vat_rate` is pure: the result depends only on `(country, category)` and the loaded rules. The set of distinct pairs is small, but each call walks the whole rule list again, on every cart update.
+    - **Fix:** memoize with a bounded cache and clear it when the rules are reloaded. Without the `cache_clear()`, the cache would keep serving old rates after a SIGHUP.
+    - **Impact:** E per request, in the per-line loop. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations drawn from 200 distinct inputs used about 9× less CPU energy with `functools.lru_cache` (~43 J vs ~4.7 J). That only holds because inputs repeat, which they do here. `maxsize` keeps memory bounded if odd values arrive. The cached `Decimal` is immutable, so sharing it is safe. A failed lookup raises `KeyError` and is not cached.
+
+    ```python
+    import json
+    from decimal import Decimal
+    from functools import lru_cache
+
+
+    def reload_rules():
+        """Called from the SIGHUP handler after finance edits the file."""
+        global VAT_RULES
+        with open(RULES_PATH) as f:
+            VAT_RULES = json.load(f)
+        vat_rate.cache_clear()
+
+
+    @lru_cache(maxsize=1024)
+    def vat_rate(country: str, category: str) -> Decimal:
+        wildcard = None
+        for rule in VAT_RULES:
+            if rule["country"] != country:
+                continue
+            if category in rule["categories"]:
+                return Decimal(rule["rate"])
+            if "*" in rule["categories"]:
+                wildcard = rule
+        if wildcard is None:
+            raise KeyError(f"no VAT rule for {country}/{category}")
+        return Decimal(wildcard["rate"])
+    ```
+
+    `cart_totals` stays unchanged.
+verify:
+  test: |-
+    import tempfile, os
+    VAT_RULES = [
+        {"country": "DE", "categories": ["*"], "rate": "0.19"},
+        {"country": "DE", "categories": ["books", "ebooks"], "rate": "0.07"},
+        {"country": "FR", "categories": ["*"], "rate": "0.20"},
+    ]
+    assert vat_rate("DE", "books") == Decimal("0.07")
+    assert vat_rate("DE", "toys") == Decimal("0.19")
+    assert vat_rate("FR", "books") == Decimal("0.20")
+    try:
+        vat_rate("US", "toys")
+        assert False
+    except KeyError:
+        pass
+    vat_rate("DE", "toys")
+    h0 = vat_rate.cache_info().hits
+    vat_rate("DE", "toys")
+    assert vat_rate.cache_info().hits == h0 + 1
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump([{"country": "DE", "categories": ["*"], "rate": "0.21"}], f)
+    RULES_PATH = f.name
+    reload_rules()
+    assert vat_rate("DE", "toys") == Decimal("0.21")
+    os.unlink(RULES_PATH)

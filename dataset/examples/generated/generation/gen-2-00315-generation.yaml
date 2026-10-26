@@ -1,0 +1,111 @@
+id: gen-2-00315-generation
+category: generation
+language: python
+patterns:
+- simple-conditions
+facts:
+- F-COND
+messages:
+- role: user
+  content: |
+    We serve a token-classification model for PII redaction behind our FastAPI service. I need the decoding step that turns per-token predictions into character spans.
+
+    Setup:
+    - The model gives one label id per token (argmax is already done, we get a list or a 1-D numpy array of ints).
+    - The tokenizer gives `offsets`, a list of `(start_char, end_char)` per token. Special tokens (`[CLS]`, `[SEP]`, padding) have `(0, 0)`.
+    - The label layout comes from our training repo and is not stored in the model config:
+
+    ```python
+    ENTITY_TYPES = ["PERSON", "EMAIL", "PHONE", "IBAN", "ADDRESS"]
+    # label 0 = O (outside)
+    # entity type k: B- = 2*k + 1, I- = 2*k + 2
+    ```
+
+    Requirements:
+    - `decode_spans(label_ids, offsets) -> list[tuple[int, int, str]]`, each tuple is `(start_char, end_char, entity_type)`.
+    - Skip special tokens.
+    - A `B-` label always starts a new span. An `I-` label continues the current span only if it has the same type. Otherwise it starts a new span (the model sometimes predicts `I-` without a `B-`).
+    - It runs on every token of every request, several million tokens per day. Python 3.11, no extra dependencies.
+- role: assistant
+  content: |
+    ```python
+    ENTITY_TYPES = ("PERSON", "EMAIL", "PHONE", "IBAN", "ADDRESS")
+
+    # Built once at import: label id -> (is_begin, entity_type). Label 0 ("O") -> None.
+    # Layout: entity type k has B- = 2*k + 1 and I- = 2*k + 2.
+    _LABELS = (None,) + tuple(
+        entry
+        for etype in ENTITY_TYPES
+        for entry in ((True, etype), (False, etype))
+    )
+    NUM_LABELS = len(_LABELS)
+
+
+    def decode_spans(label_ids, offsets) -> list[tuple[int, int, str]]:
+        spans = []
+        cur_type = None
+        cur_start = cur_end = 0
+
+        for label_id, (start, end) in zip(label_ids, offsets):
+            if start == end:  # special token: [CLS], [SEP], padding
+                continue
+
+            label = _LABELS[label_id]
+            if label is None:  # O
+                if cur_type is not None:
+                    spans.append((cur_start, cur_end, cur_type))
+                    cur_type = None
+                continue
+
+            is_begin, etype = label
+            if is_begin or etype != cur_type:
+                if cur_type is not None:
+                    spans.append((cur_start, cur_end, cur_type))
+                cur_type = etype
+                cur_start = start
+            cur_end = end
+
+        if cur_type is not None:
+            spans.append((cur_start, cur_end, cur_type))
+        return spans
+    ```
+
+    The layout lives only in your training repo, so check it once at startup: `assert model.config.num_labels == NUM_LABELS`. If someone reorders `ENTITY_TYPES`, the service fails at startup instead of mislabeling PII. Negative ids would index from the end of the tuple. Argmax never returns them.
+
+    **Green Notes**
+    - **Simple checks instead of range/modulo conditions per token** (reduces E): the B/I and type arithmetic (`% 2`, `(id - 1) // 2`) runs once at import, when the table is built. Each token then needs one tuple index plus `is None` and equality checks. With several million tokens a day, this is the hot path. In Green Metrics Tool micro-benchmarks with 10,000,000 classifications, simple equality branches used about 16% less CPU energy than complex range/modulo conditions.
+    - *Not applied:* `match` statement. In the same benchmarks, `match` and `if/elif` with the same conditions differed by about 1%, which is noise. The plain `if` reads fine here.
+verify:
+  test: |-
+    import numpy as np
+
+    assert NUM_LABELS == 11
+    assert _LABELS[1] == (True, "PERSON") and _LABELS[2] == (False, "PERSON")
+    assert _LABELS[5] == (True, "PHONE") and _LABELS[10] == (False, "ADDRESS")
+
+    # [CLS] Anna Schmidt mail anna @x.de [SEP]
+    ids = [0, 1, 2, 0, 3, 4, 0]
+    offs = [(0, 0), (0, 4), (5, 12), (13, 17), (18, 22), (22, 27), (0, 0)]
+    assert decode_spans(ids, offs) == [(0, 12, "PERSON"), (18, 27, "EMAIL")]
+
+    # numpy input works the same
+    assert decode_spans(np.array(ids), offs) == [(0, 12, "PERSON"), (18, 27, "EMAIL")]
+
+    # I- after O starts a new span
+    assert decode_spans([0, 6], [(0, 3), (4, 10)]) == [(4, 10, "PHONE")]
+
+    # I- of a different type starts a new span
+    assert decode_spans([2, 4], [(0, 4), (5, 9)]) == [(0, 4, "PERSON"), (5, 9, "EMAIL")]
+
+    # B- after B- of the same type: two spans
+    assert decode_spans([1, 1], [(0, 4), (5, 9)]) == [(0, 4, "PERSON"), (5, 9, "PERSON")]
+
+    # special token inside a span is skipped, span continues
+    assert decode_spans([7, 0, 8], [(0, 4), (0, 0), (4, 20)]) == [(0, 20, "IBAN")]
+
+    # span running to the end without trailing O
+    assert decode_spans([9, 10, 10], [(0, 3), (4, 9), (10, 15)]) == [(0, 15, "ADDRESS")]
+
+    # nothing found
+    assert decode_spans([0, 0], [(0, 0), (0, 5)]) == []
+    assert decode_spans([], []) == []

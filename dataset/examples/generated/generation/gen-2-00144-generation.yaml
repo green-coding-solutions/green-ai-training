@@ -1,0 +1,99 @@
+id: gen-2-00144-generation
+category: generation
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    Hi, I am new to backend work. Our Flask API has roles, and some roles inherit from others. For example admin should get everything support and editor have, and both of them get everything viewer has. I need a function `can(role, permission)` that we call at the start of every endpoint. The roles are in a dict like this:
+
+    ```python
+    ROLES = {
+        "viewer":  {"inherits": [], "permissions": ["orders:read", "products:read"]},
+        "support": {"inherits": ["viewer"], "permissions": ["orders:refund", "customers:read"]},
+        "editor":  {"inherits": ["viewer"], "permissions": ["products:write"]},
+        "admin":   {"inherits": ["support", "editor"], "permissions": ["users:manage"]},
+    }
+    ```
+
+    I tried a for loop over "inherits" but I got confused when a role has two parents, and I'm not sure what happens if someone makes a mistake and two roles inherit from each other. Can you write it?
+- role: assistant
+  content: |
+    Recursion handles roles with several parents. A set removes the duplicates you get when two parents share a grandparent, like `viewer` here. A `path` tuple catches roles that inherit from each other.
+
+    ```python
+    from functools import lru_cache
+
+    ROLES = {
+        "viewer":  {"inherits": [], "permissions": ["orders:read", "products:read"]},
+        "support": {"inherits": ["viewer"], "permissions": ["orders:refund", "customers:read"]},
+        "editor":  {"inherits": ["viewer"], "permissions": ["products:write"]},
+        "admin":   {"inherits": ["support", "editor"], "permissions": ["users:manage"]},
+    }
+
+
+    def _collect(role: str, path: tuple[str, ...]) -> set[str]:
+        if role in path:
+            chain = " -> ".join(path + (role,))
+            raise ValueError(f"role inheritance cycle: {chain}")
+        spec = ROLES[role]  # KeyError here means a typo in "inherits"
+        perms = set(spec["permissions"])
+        for parent in spec["inherits"]:
+            perms |= _collect(parent, path + (role,))
+        return perms
+
+
+    @lru_cache(maxsize=128)
+    def effective_permissions(role: str) -> frozenset[str]:
+        """All permissions of a role, including inherited ones."""
+        return frozenset(_collect(role, ()))
+
+
+    def can(role: str, permission: str) -> bool:
+        if role not in ROLES:
+            return False  # unknown role: deny
+        return permission in effective_permissions(role)
+    ```
+
+    Use it in an endpoint like this: `if not can(current_user.role, "orders:refund"): abort(403)`.
+
+    **Green Notes**
+    - **Memoize the role expansion** (reduces E): every request asks about one of only a few roles, so the inheritance tree is walked once per role. After that, each check is one cache lookup and one set lookup. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations with inputs drawn from only 200 distinct values used about 9× less CPU energy with `lru_cache`. Caching pays off only because the inputs repeat this much. With mostly unique inputs it would only add overhead.
+    - **Bounded and safe to share:** `maxsize=128` caps the cache, and `can()` rejects unknown roles before they reach it, so random role strings can't fill it. The result is a `frozenset`, so no caller can change the cached permissions by mistake.
+    - If you later load roles from the database and they can change while the app runs, call `effective_permissions.cache_clear()` after every change. Otherwise the old permissions stay in use.
+verify:
+  green_block: 0
+  test: |-
+    assert can("admin", "orders:read")
+    assert can("admin", "users:manage")
+    assert can("admin", "products:write")
+    assert can("support", "products:read")
+    assert not can("editor", "orders:refund")
+    assert not can("viewer", "products:write")
+    assert not can("guest", "orders:read")
+    assert effective_permissions("admin") == frozenset({
+        "orders:read", "products:read", "orders:refund",
+        "customers:read", "products:write", "users:manage",
+    })
+    assert isinstance(effective_permissions("viewer"), frozenset)
+
+    effective_permissions.cache_clear()
+    can("admin", "orders:read")
+    can("admin", "users:manage")
+    info = effective_permissions.cache_info()
+    assert info.misses == 1 and info.hits == 1
+
+    ROLES["a"] = {"inherits": ["b"], "permissions": []}
+    ROLES["b"] = {"inherits": ["a"], "permissions": []}
+    try:
+        effective_permissions("a")
+    except ValueError as e:
+        assert "cycle" in str(e)
+    else:
+        raise AssertionError("cycle not detected")
+    del ROLES["a"], ROLES["b"]
+    effective_permissions.cache_clear()
+    print("ok")

@@ -1,0 +1,46 @@
+id: gen-2-00050-generation
+category: generation
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    hi, i need a Dockerfile for our flask service, its a small inventory api. code is in src/inventory/ and the app is made with a factory `create_app()` in src/inventory/__init__.py. we run it with gunicorn on port 8000.
+    there is requirements.txt (flask, gunicorn, sqlalchemy, psycopg[binary]) and requirements-dev.txt with pytest, black, mypy, ipython.
+    Gitlab CI build the image for every merge request and push it to our registry, the tests run in a seperate job before. can you write it please?
+- role: assistant
+  content: |
+    ```dockerfile
+    FROM python:3.12-slim
+
+    ENV PYTHONDONTWRITEBYTECODE=1 \
+        PYTHONUNBUFFERED=1 \
+        PYTHONPATH=/app/src
+
+    WORKDIR /app
+
+    # Dependencies first: this layer is reused while requirements.txt is unchanged
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    # Source last: code changes only rebuild from here
+    COPY src/ ./src/
+
+    RUN useradd --create-home --uid 10001 app
+    USER app
+
+    EXPOSE 8000
+    CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "2", "inventory:create_app()"]
+    ```
+
+    The `inventory:create_app()` syntax calls the factory and needs gunicorn 20.1 or newer. `PYTHONPATH=/app/src` lets Python import `inventory` without installing the package.
+
+    **Green Notes**
+    - **Small container images** (reduces E, M, network): this image uses the slim base and installs only runtime dependencies. `requirements-dev.txt` stays out because pytest, black, mypy and ipython belong in your separate test job. The dependency layer comes before the source, and `--no-cache-dir` keeps pip's download cache out of the image. In Green Metrics Tool benchmarks of a small Flask app built without a build cache, a full `python:3.12` image with build tools and dev packages used ~885 J and 157 s. A slim image with runtime dependencies only used ~124 J and 25 s, about 7× less. Serving 2,000 requests cost the same with both images (~17 J). So the saving comes from each build, pull and stored copy, and your CI repeats those on every merge request.
+
+    If you later add a dependency that has no prebuilt wheel, the slim image has no compiler and the build fails. Then use a multi-stage build: compile wheels in a builder stage and copy only the wheels into the slim stage.
+verify:
+  static_only: Dockerfile, needs docker build and the user's project files

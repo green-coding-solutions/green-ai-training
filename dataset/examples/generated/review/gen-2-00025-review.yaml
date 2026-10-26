@@ -1,0 +1,98 @@
+id: gen-2-00025-review
+category: review
+language: python
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    Nightly ingest for our detector runs. Each .npz holds a few hundred thousand samples, and we get a few dozen files per night. Review it. Just the diff, skip the essay.
+
+    ```python
+    import sys
+
+    import numpy as np
+    import psycopg
+
+    DSN = "dbname=lab user=ingest host=db01"
+
+
+    def load_run(path):
+        data = np.load(path)
+        # adc is float32, dropped samples are NaN
+        return data["t_ns"], data["channel"], data["adc"], int(data["run_id"])
+
+
+    def calibrate(adc, gain, offset):
+        return (adc - offset) * gain
+
+
+    def ingest(path, gain=0.0125, offset=512.0):
+        t, ch, adc, run_id = load_run(path)
+        volts = calibrate(adc.astype(np.float64), gain, offset)
+
+        with psycopg.connect(DSN) as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM samples WHERE run_id = %s", (run_id,))
+                n = 0
+                for i in range(len(t)):
+                    if volts[i] is np.nan:
+                        continue
+                    cur.execute(
+                        "INSERT INTO samples (run_id, t_ns, channel, volts) "
+                        "VALUES (%s, %s, %s, %s)",
+                        (run_id, int(t[i]), int(ch[i]), float(volts[i])),
+                    )
+                    n += 1
+                    if n % 1000 == 0:
+                        conn.commit()
+                conn.commit()
+        print(f"run {run_id}: {n} samples")
+
+
+    if __name__ == "__main__":
+        for p in sys.argv[1:]:
+            ingest(p)
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline
+
+    #### [Bug] NaN samples are never skipped
+    - **Where:** `if volts[i] is np.nan`
+    - **Issue:** indexing a numpy array creates a new scalar object, so this identity check is always false. Dropped samples are written as NaN, and `n` counts them too.
+    - **Fix:** use a mask, `~np.isnan(volts)`, as in the code below.
+
+    #### [High] One INSERT per sample
+    - **Where:** the `for i in range(len(t))` loop
+    - **Issue:** each sample is its own statement and round trip. That is hundreds of thousands per file, every night. In Green Metrics Tool micro-benchmarks (PostgreSQL 16, psycopg 3, 500,000 rows in batches of 5,000), one `execute()` per row used ~384 J and `COPY ... FROM STDIN` used ~17 J, about 22× less.
+    - **Fix:** stream the rows with one COPY per file. Replace `ingest` with the version below.
+    - **Impact:** E per row. Many statements become one COPY stream per file, on every file, every night.
+
+    ```python
+    def ingest(path, gain=0.0125, offset=512.0):
+        t, ch, adc, run_id = load_run(path)
+        volts = calibrate(adc.astype(np.float64), gain, offset)
+        mask = ~np.isnan(volts)
+        rows = zip(t[mask].tolist(), ch[mask].tolist(), volts[mask].tolist())
+
+        with psycopg.connect(DSN) as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM samples WHERE run_id = %s", (run_id,))
+                with cur.copy(
+                    "COPY samples (run_id, t_ns, channel, volts) FROM STDIN"
+                ) as copy:
+                    for ti, ci, vi in rows:
+                        copy.write_row((run_id, ti, ci, vi))
+        n = int(mask.sum())
+        print(f"run {run_id}: {n} samples")
+    ```
+
+    `.tolist()` returns native Python ints and floats, so you don't need a cast per element anymore. The connection block commits once when it exits, so the DELETE and the COPY now run in one transaction. Readers see the whole run or none of it, never a half-loaded run.
+
+    **Already good:** the DELETE by `run_id` makes reruns safe, and the calibration is already vectorized.
+verify:
+  static_only: needs a PostgreSQL server and psycopg

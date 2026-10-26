@@ -1,0 +1,133 @@
+id: gen-1-00254-review
+category: review
+language: html
+patterns:
+- dom-size
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    ?
+
+    ```html
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Find a dealer | Brightwave Solar</title>
+      <link rel="stylesheet" href="/css/landing.css">
+    </head>
+    <body>
+      <header class="hero">
+        <h1>Solar for every roof</h1>
+        <a class="cta" href="/quote">Get a quote</a>
+      </header>
+
+      <section id="dealers">
+        <h2>Find a dealer near you</h2>
+        <input id="search" type="search" placeholder="Name, city or ZIP">
+        <div id="dealer-list" class="dealer-list"></div>
+      </section>
+
+      <script>
+        fetch('/api/dealers.json')
+          .then(function (r) { return r.json(); })
+          .then(function (dealers) {
+            var list = document.getElementById('dealer-list');
+            dealers.forEach(function (d) {
+              var card = document.createElement('div');
+              card.className = 'dealer-card';
+              card.innerHTML =
+                '<div class="dealer-body">' +
+                  '<div class="dealer-head"><h3><span class="dealer-name">' + d.name + '</span></h3></div>' +
+                  '<div class="dealer-addr"><span>' + d.street + '</span><span>' + d.zip + ' ' + d.city + '</span></div>' +
+                  '<div class="dealer-contact"><span>' + d.phone + '</span></div>' +
+                '</div>';
+              list.appendChild(card);
+            });
+          });
+
+        document.getElementById('search').addEventListener('input', function (e) {
+          var q = e.target.value.toLowerCase();
+          document.querySelectorAll('.dealer-card').forEach(function (c) {
+            c.style.display = c.textContent.toLowerCase().indexOf(q) !== -1 ? '' : 'none';
+          });
+        });
+      </script>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (landing page)
+
+    #### [Security] Data written into `innerHTML` without escaping
+    - **Where:** `card.innerHTML = '<div ...' + d.name + ...`
+    - **Issue:** dealer fields go straight into HTML. A name like `<img src=x onerror=...>` in the JSON runs script on your page. Dealer data often comes from partners or a CMS, so treat it as untrusted.
+    - **Fix:** build the nodes with `textContent` (see the code in the next finding).
+
+    #### [High] Every dealer is rendered at once
+    - **Where:** the `dealers.forEach` loop and the `input` handler
+    - **Issue:** each dealer makes about 10 elements, and each card is appended to the live document one by one. With thousands of dealers that is tens of thousands of nodes on every page load. Every keystroke in the search box then walks all cards and changes their style. In Green Metrics Tool browser benchmarks, a 10,000-row table built from 14 elements per row used ~1036 J for 30 page loads. The same data paginated to 100 rows as a plain `<table>` built in a `DocumentFragment` used ~457 J, about 56% less. Visitors to a landing page rarely look past the first results.
+    - **Fix:** keep the data in memory, filter the array, and render only 50 cards at a time. Use a lean card with 4 elements. Add `<button id="more" hidden>Show more</button>` after the list.
+      ```javascript
+      var PAGE = 50;
+      var dealers = [];
+      var matches = [];
+      var shown = 0;
+      var list = document.getElementById('dealer-list');
+      var more = document.getElementById('more');
+
+      function buildCard(d) {
+        var card = document.createElement('article');
+        card.className = 'dealer-card';
+        var name = document.createElement('h3');
+        name.textContent = d.name;
+        var addr = document.createElement('p');
+        addr.textContent = d.street + ', ' + d.zip + ' ' + d.city;
+        var phone = document.createElement('p');
+        phone.textContent = d.phone;
+        card.append(name, addr, phone);
+        return card;
+      }
+
+      function showMore() {
+        var frag = document.createDocumentFragment();
+        matches.slice(shown, shown + PAGE).forEach(function (d) {
+          frag.appendChild(buildCard(d));
+        });
+        list.appendChild(frag);
+        shown = Math.min(shown + PAGE, matches.length);
+        more.hidden = shown >= matches.length;
+      }
+
+      function applyFilter(q) {
+        q = q.trim().toLowerCase();
+        matches = dealers.filter(function (d) {
+          return [d.name, d.street, d.zip, d.city, d.phone].join(' ').toLowerCase().indexOf(q) !== -1;
+        });
+        list.replaceChildren();
+        shown = 0;
+        showMore();
+      }
+
+      fetch('/api/dealers.json')
+        .then(function (r) { return r.json(); })
+        .then(function (data) { dealers = data; applyFilter(''); });
+
+      document.getElementById('search').addEventListener('input', function (e) {
+        applyFilter(e.target.value);
+      });
+      more.addEventListener('click', showMore);
+      ```
+    - **Impact:** E on the client for every page view and every keystroke. The DOM stays at about 200 elements instead of tens of thousands. If the JSON grows much larger, let the server do the search and return one page at a time, so the network cost drops too.
+
+    #### [Medium] Wrapper elements inside each card
+    - **Where:** `dealer-body`, `dealer-head`, `dealer-addr`, `dealer-contact` and the inner `span`s
+    - **Issue:** these wrappers only hold one thing each. They multiply the element count without adding structure. `h3` and `p` are enough, and you can style them with the card class in `landing.css`. The rewrite above already does this. Update the CSS selectors that used the old class names.
+
+    **Already good:** the script sits at the end of the body, so it does not block the first paint of the hero.
+verify:
+  static_only: browser DOM code in an HTML page

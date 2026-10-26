@@ -1,0 +1,124 @@
+id: gen-12764612-00281-refactor
+category: refactor
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    fix this, its slow on the gateway when the log is big
+
+    ```python
+    import struct
+
+    RECORD = struct.Struct("<IhH")  # unix ts, temp in 1/100 C, battery mV
+    ERASED = 0xFFFFFFFF
+
+
+    def read_flash_log(path, max_records=None):
+        """Read sensor records from the end of the log file.
+        Returns them oldest first."""
+        records = []
+        taken = 0
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            pos = f.tell()
+            while pos >= RECORD.size:
+                pos -= RECORD.size
+                f.seek(pos)
+                ts, temp, mv = RECORD.unpack(f.read(RECORD.size))
+                if ts == ERASED:
+                    continue
+                records.insert(0, {
+                    "ts": ts,
+                    "temp_c": temp / 100,
+                    "battery_mv": mv,
+                })
+                taken += 1
+                if max_records is not None and taken >= max_records:
+                    break
+        return records
+    ```
+- role: assistant
+  content: |
+    ```python
+    import struct
+
+    RECORD = struct.Struct("<IhH")  # unix ts, temp in 1/100 C, battery mV
+    ERASED = 0xFFFFFFFF
+
+
+    def read_flash_log(path, max_records=None):
+        """Read sensor records from the end of the log file.
+        Returns them oldest first."""
+        records = []
+        taken = 0
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            pos = f.tell()
+            while pos >= RECORD.size:
+                pos -= RECORD.size
+                f.seek(pos)
+                ts, temp, mv = RECORD.unpack(f.read(RECORD.size))
+                if ts == ERASED:
+                    continue
+                records.append({
+                    "ts": ts,
+                    "temp_c": temp / 100,
+                    "battery_mv": mv,
+                })
+                taken += 1
+                if max_records is not None and taken >= max_records:
+                    break
+        records.reverse()
+        return records
+    ```
+
+    **Green Notes**
+    - **Avoid front insertion** (reduces E): `records.insert(0, ...)` shifts every item already in the list, so the loop is O(n²). Now each record is appended (O(1)) and the list is reversed once at the end. In Green Metrics Tool micro-benchmarks, 1,000,000 front inserts used about 1515 J, while 1,000,000 appends used about 1.2 J. That is over 1000× less CPU energy. The cost grows with log size, so it matters most on a large flash log.
+    - **No deque needed:** you return a plain list, so append plus one `reverse()` is simpler than a `deque`.
+
+    The output is identical: same records, same oldest-first order, same handling of erased slots and `max_records`.
+verify:
+  test: |
+    import os, tempfile
+    rec = struct.Struct("<IhH")
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "log.bin")
+    with open(p, "wb") as fh:
+        fh.write(b"".join(rec.pack(i + 1, i * 10 - 50, 3000 + i) for i in range(10)))
+    out = read_flash_log(p)
+    assert [r["ts"] for r in out] == list(range(1, 11))
+    assert out[0] == {"ts": 1, "temp_c": -0.5, "battery_mv": 3000}
+    last3 = read_flash_log(p, 3)
+    assert [r["ts"] for r in last3] == [8, 9, 10]
+    empty = os.path.join(d, "empty.bin")
+    open(empty, "wb").close()
+    assert read_flash_log(empty) == []
+  equivalence:
+    driver: |
+      import os, tempfile, struct
+      rec = struct.Struct("<IhH")
+      data = b"".join(
+          rec.pack(i + 1 if i % 7 else 0xFFFFFFFF, i * 10 - 50, 3000 + i)
+          for i in range(40)
+      )
+      p = os.path.join(tempfile.mkdtemp(), "log.bin")
+      with open(p, "wb") as fh:
+          fh.write(data)
+      print(read_flash_log(p))
+      print(read_flash_log(p, 5))
+      print(read_flash_log(p, 100))
+  benchmark:
+    driver: |
+      import os, tempfile, struct
+      rec = struct.Struct("<IhH")
+      data = b"".join(rec.pack(i + 1, i % 3000, 3000 + i % 500) for i in range(60000))
+      p = os.path.join(tempfile.mkdtemp(), "log.bin")
+      with open(p, "wb") as fh:
+          fh.write(data)
+      out = read_flash_log(p)
+      print(len(out), out[0]["ts"], out[-1]["ts"])
+    min_speedup: 1.5

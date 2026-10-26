@@ -1,0 +1,117 @@
+id: gen-12764612-00148-review
+category: review
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    Can you review this re-ranking step from our recommendation service? It runs after the model scores candidates, once per request, at roughly 150 requests/s.
+
+    Numbers: about 2,000 candidates per request, `seen_items` is the user's history (up to ~5,000 ids), and the blocked list has ~8,000 ids and is loaded once at startup.
+
+    Requirements: the output order must not change (highest score first, ties in input order), the function signature must stay compatible with the callers, and we are on Python 3.11. I mostly care about p99 latency and correctness.
+
+    ```python
+    import logging
+
+    log = logging.getLogger("rerank")
+
+    # loaded at startup from the moderation export
+    BLOCKED_ITEMS = [f"sku-{n}" for n in range(0, 24000, 3)]
+
+
+    def rerank(user_id, candidate_ids, scores, seen_items=[], top_n=20):
+        """Return the top_n unseen, unblocked candidates, best score first."""
+        results = []
+        for item_id, score in zip(candidate_ids, scores):
+            if item_id in seen_items:
+                continue
+            if item_id in BLOCKED_ITEMS:
+                continue
+            results.append((item_id, float(score)))
+
+        results.sort(key=lambda r: r[1], reverse=True)
+        top = results[:top_n]
+
+        # remember what we showed so it is not repeated
+        seen_items.extend(item_id for item_id, _ in top)
+        log.debug("rerank user=%s kept=%d", user_id, len(top))
+        return top
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (per-request, ~150 requests/s)
+
+    #### [Bug] Shared mutable default argument
+    - **Where:** `seen_items=[]` in the signature
+    - **Issue:** the default list is created once and shared by all calls. When a caller omits `seen_items`, the function extends that shared list. Items shown to one user then get hidden from the next user, and the list grows forever.
+    - **Fix:** default to `None` and create a fresh list inside the function.
+
+    #### [High] Linear list scans for every candidate
+    - **Where:** `item_id in seen_items` and `item_id in BLOCKED_ITEMS`
+    - **Issue:** both are lists. Each of the 2,000 candidates may scan up to 5,000 history entries and 8,000 blocked entries, on every request. The cost is O(candidates × list size) in CPU time, and it hurts p99 latency.
+    - **Fix:**
+      - Make `BLOCKED_ITEMS` a `frozenset` when you load it. It is built once at startup, so lookups are O(1) with no per-request cost.
+      - Build `set(seen_items)` once per request. That is one O(n) pass followed by 2,000 O(1) lookups.
+    - **Impact:** reduces E (CPU time) on the hot path. This works because there are many lookups per list. In Green Metrics Tool micro-benchmarks, a *single* membership test on a 10,000,000-element list used less energy than converting it to a set first (the set route cost about 50% more). Here the set wins clearly, with thousands of lookups per conversion. For a request with only a handful of candidates, a plain list scan would be fine.
+
+    ```python
+    import logging
+
+    log = logging.getLogger("rerank")
+
+    # loaded at startup from the moderation export
+    BLOCKED_ITEMS = frozenset(f"sku-{n}" for n in range(0, 24000, 3))
+
+
+    def rerank(user_id, candidate_ids, scores, seen_items=None, top_n=20):
+        """Return the top_n unseen, unblocked candidates, best score first."""
+        if seen_items is None:
+            seen_items = []
+        seen = set(seen_items)
+
+        results = [
+            (item_id, float(score))
+            for item_id, score in zip(candidate_ids, scores)
+            if item_id not in seen and item_id not in BLOCKED_ITEMS
+        ]
+
+        results.sort(key=lambda r: r[1], reverse=True)
+        top = results[:top_n]
+
+        # remember what we showed so it is not repeated
+        seen_items.extend(item_id for item_id, _ in top)
+        log.debug("rerank user=%s kept=%d", user_id, len(top))
+        return top
+    ```
+
+    Behavior is unchanged for callers that pass `seen_items`. The sort is stable, so ties keep input order. Duplicate candidate ids are still both kept, as before. `seen` is a snapshot taken before the loop, which matches the old behavior because the old code only extended the list after filtering.
+
+    Things to check:
+    - Ids must be hashable (strings or ints are fine).
+    - If the blocked list is reloaded at runtime, build a new `frozenset` and swap the reference. Do not mutate it in place.
+    - If your session store can hand you `seen_items` as a set already, skip the `set(...)` call.
+
+    **Already good:** the list comprehension, the single sort per request, and the lazy `%`-style log formatting.
+verify:
+  equivalence:
+    driver: |
+      cands = [f"sku-{n}" for n in range(0, 60, 2)] + ["sku-4", "sku-4"]
+      scores = [((n * 37) % 11) / 10 for n in range(len(cands))]
+      seen = ["sku-2", "sku-10", "sku-20"]
+      res = rerank("u1", cands, scores, seen_items=seen, top_n=5)
+      print(res)
+      print(seen)
+      print(rerank("u2", cands, scores, seen_items=[], top_n=3))
+      print(rerank("u3", cands, scores))
+  test: |-
+    assert isinstance(BLOCKED_ITEMS, (set, frozenset))
+    a = rerank("a", ["sku-1", "sku-2"], [0.5, 0.9])
+    b = rerank("b", ["sku-1", "sku-2"], [0.5, 0.9])
+    assert a == b == [("sku-2", 0.9), ("sku-1", 0.5)]
+    s = ["sku-2"]
+    assert rerank("c", ["sku-1", "sku-2", "sku-3"], [0.1, 0.9, 0.5], seen_items=s) == [("sku-1", 0.1)]
+    assert s == ["sku-2", "sku-1"]

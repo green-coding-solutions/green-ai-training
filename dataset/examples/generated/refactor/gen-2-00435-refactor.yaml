@@ -1,0 +1,92 @@
+id: gen-2-00435-refactor
+category: refactor
+language: python
+patterns:
+- async-concurrent-io
+- torch-no-grad
+facts:
+- F-HTTP
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    CI triage step, runs on every failed pipeline. Diff only, please.
+
+    ```python
+    import sys
+    import urllib.request
+
+    import torch
+
+    from triage_model import load_model, featurize
+
+    CI_API = "https://ci.internal.example/api/v1"
+
+
+    def fetch_log(job_id):
+        url = f"{CI_API}/jobs/{job_id}/log"
+        with urllib.request.urlopen(url, timeout=20) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+
+
+    def classify_failures(job_ids):
+        model = load_model("triage.pt")
+        model.eval()
+        results = {}
+        for job_id in job_ids:
+            text = fetch_log(job_id)
+            x = featurize(text)
+            scores = model(x)
+            results[job_id] = int(scores.argmax(dim=-1))
+        return results
+
+
+    if __name__ == "__main__":
+        for job_id, label in classify_failures(sys.argv[1:]).items():
+            print(job_id, label)
+    ```
+- role: assistant
+  content: |
+    Replace `fetch_log` and `classify_failures`, drop the `urllib.request` import, add `asyncio` and `httpx`:
+
+    ```python
+    import asyncio
+
+    import httpx
+
+
+    async def fetch_logs(job_ids, limit=8):
+        sem = asyncio.Semaphore(limit)
+        async with httpx.AsyncClient(timeout=20) as client:
+
+            async def one(job_id):
+                async with sem:
+                    resp = await client.get(f"{CI_API}/jobs/{job_id}/log")
+                    resp.raise_for_status()
+                    return resp.content.decode("utf-8", errors="replace")
+
+            return await asyncio.gather(*(one(j) for j in job_ids))
+
+
+    def classify_failures(job_ids):
+        model = load_model("triage.pt")
+        model.eval()
+        logs = asyncio.run(fetch_logs(job_ids))
+        results = {}
+        with torch.no_grad():
+            for job_id, text in zip(job_ids, logs):
+                results[job_id] = int(model(featurize(text)).argmax(dim=-1))
+        return results
+    ```
+
+    **Green Notes**
+    - **No gradient tracking for inference** (reduces E): the model only predicts here, so autograd bookkeeping is wasted work. In Green Metrics Tool micro-benchmarks, 100,000 PyTorch CPU inferences used about 14% less energy with `torch.no_grad()`.
+    - **Concurrent log downloads** (reduces idle wait time): the logs are fetched in parallel instead of one blocking call per job. In Green Metrics Tool micro-benchmarks, 10 HTTP requests with async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. The gain is mostly wall time, so expect the same here. The semaphore caps parallel requests at 8, so a big pipeline does not hit the CI server all at once.
+
+    Behavior notes:
+    - Result order and keys are unchanged.
+    - `raise_for_status()` keeps the old error behavior, because `urlopen` also raised on HTTP errors. The first failed download still aborts the run.
+    - All logs are now held in memory before inference. If a pipeline can have hundreds of large logs, process them in chunks.
+    - `asyncio.run` cannot be called from inside a running event loop. This is fine for the CLI entry point.
+verify:
+  static_only: needs torch, httpx and a network CI API

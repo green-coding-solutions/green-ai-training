@@ -1,0 +1,127 @@
+id: gen-2-00399-review
+category: review
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    hi, I am new to python. I made this script to sum up all my bike rides from my GPS exports (one CSV per ride with lat,lon columns, about 300 files in the folder). The total it prints is way too big, I don't ride that much lol. Some single rides also look way too long. It also takes a few seconds to run. I don't know what is wrong, can you check it?
+
+    ```python
+    import csv
+    import math
+    import sys
+    from pathlib import Path
+
+    R = 6371.0  # earth radius in km
+
+
+    def main():
+        folder = Path(sys.argv[1])
+        total_km = 0.0
+        prev = None
+
+        for path in sorted(folder.glob("*.csv")):
+            ride_km = 0.0
+            with open(path, newline="") as f:
+                for row in csv.DictReader(f):
+                    lat = float(row["lat"])
+                    lon = float(row["lon"])
+                    if prev is not None:
+                        lat0, lon0 = prev
+                        dlat = math.radians(lat - lat0)
+                        dlon = math.radians(lon - lon0)
+                        a = (math.sin(dlat / 2) ** 2
+                             + math.cos(lat0) * math.cos(lat) * math.sin(dlon / 2) ** 2)
+                        ride_km += 2 * R * math.asin(math.sqrt(a))
+                    prev = (lat, lon)
+            total_km += ride_km
+            print(f"{path.name}: {ride_km:.1f} km")
+
+        print(f"total: {total_km:.1f} km")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (run by hand over a folder of ride exports)
+
+    #### [Bug] Distance carries over from one ride to the next
+    - **Where:** `prev = None` in `main`, set once before the file loop
+    - **Issue:** when a new file starts, `prev` still holds the last point of the previous ride. The first point of every ride then adds the straight-line jump from where the last ride ended. This is why some rides look far too long and the total is too big.
+    - **Fix:** set `prev = None` at the start of each file.
+
+    #### [Bug] `math.cos` gets degrees instead of radians
+    - **Where:** `math.cos(lat0) * math.cos(lat)`
+    - **Issue:** `math.cos` expects radians. You convert `dlat` and `dlon`, but not the two latitudes. East-west movement gets scaled by the wrong factor, so every distance is off.
+    - **Fix:** `math.cos(math.radians(lat0)) * math.cos(math.radians(lat))`.
+
+    #### [Low] `math.` lookups repeated for every point
+    - **Where:** the inner `for row in csv.DictReader(f)` loop
+    - **Issue:** each point looks up `radians`, `sin`, `cos`, `asin` and `sqrt` on the `math` module again. The functions never change, so you can look them up once.
+    - **Fix:** bind them to local names before the loop.
+    - **Impact:** reduces E slightly. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local variable before a 10,000,000-iteration loop saved about 4-5%. Here, CSV parsing and `float()` cost more than the lookups, so expect a small effect. It is not the reason for the wrong numbers.
+
+    ```python
+    import csv
+    import math
+    import sys
+    from pathlib import Path
+
+    R = 6371.0  # earth radius in km
+
+
+    def main():
+        folder = Path(sys.argv[1])
+        total_km = 0.0
+        radians, sin, cos, asin, sqrt = math.radians, math.sin, math.cos, math.asin, math.sqrt
+
+        for path in sorted(folder.glob("*.csv")):
+            ride_km = 0.0
+            prev = None  # every ride starts fresh
+            with open(path, newline="") as f:
+                for row in csv.DictReader(f):
+                    lat = float(row["lat"])
+                    lon = float(row["lon"])
+                    if prev is not None:
+                        lat0, lon0 = prev
+                        dlat = radians(lat - lat0)
+                        dlon = radians(lon - lon0)
+                        a = (sin(dlat / 2) ** 2
+                             + cos(radians(lat0)) * cos(radians(lat)) * sin(dlon / 2) ** 2)
+                        ride_km += 2 * R * asin(sqrt(a))
+                    prev = (lat, lon)
+            total_km += ride_km
+            print(f"{path.name}: {ride_km:.1f} km")
+
+        print(f"total: {total_km:.1f} km")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    A few seconds for a whole folder is normal when pure Python reads CSV row by row. For a script you run now and then, that is fine.
+
+    **Already good:** `with open(...)` and `newline=""` for `csv`, rows are streamed instead of loaded into memory, and the files are sorted so the output order is stable.
+verify:
+  module: true
+  green_block: 0
+  test: |-
+    import contextlib, io, sys, tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as d:
+        Path(d, "ride1.csv").write_text("lat,lon\n0,0\n0,1\n")
+        Path(d, "ride2.csv").write_text("lat,lon\n60,0\n60,1\n")
+        sys.argv = ["rides.py", d]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            main()
+        out = buf.getvalue().splitlines()
+    assert out == ["ride1.csv: 111.2 km", "ride2.csv: 55.6 km", "total: 166.8 km"], out

@@ -1,0 +1,158 @@
+id: gen-12764612-00128-refactor
+category: refactor
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    hello, this script count our nginx access log by where the client ip come from (office, internal or external). it run every night on big files, many million lines, and now it take too long. can you make it more faster? i dont know what is slow
+
+    ```python
+    import ipaddress
+    import sys
+    from collections import Counter
+
+    OFFICE_NETS = [
+        ipaddress.ip_network("203.0.113.0/28"),
+        ipaddress.ip_network("198.51.100.64/26"),
+    ]
+    INTERNAL_NETS = [
+        ipaddress.ip_network("10.0.0.0/8"),
+        ipaddress.ip_network("172.16.0.0/12"),
+        ipaddress.ip_network("192.168.0.0/16"),
+    ]
+
+
+    def classify_ip(ip_text):
+        addr = ipaddress.ip_address(ip_text)
+        for net in OFFICE_NETS:
+            if addr in net:
+                return "office"
+        for net in INTERNAL_NETS:
+            if addr in net:
+                return "internal"
+        if addr.is_loopback:
+            return "local"
+        return "external"
+
+
+    def summarize(lines):
+        counts = Counter()
+        bad = 0
+        for line in lines:
+            ip_text = line.split(" ", 1)[0]
+            if not ip_text:
+                continue
+            try:
+                kind = classify_ip(ip_text)
+            except ValueError:
+                bad += 1
+                continue
+            counts[kind] += 1
+        return counts, bad
+
+
+    if __name__ == "__main__":
+        counts, bad = summarize(sys.stdin)
+        for kind in sorted(counts):
+            print(kind, counts[kind])
+        print("bad lines", bad)
+    ```
+- role: assistant
+  content: |
+    The slow part is `classify_ip`. It parses the IP text and checks it against every network, for every line. A log has far fewer distinct client IPs than lines, so the same answer is computed again and again. The function is pure, so you can cache it.
+
+    ```python
+    import ipaddress
+    import sys
+    from collections import Counter
+    from functools import lru_cache
+
+    OFFICE_NETS = [
+        ipaddress.ip_network("203.0.113.0/28"),
+        ipaddress.ip_network("198.51.100.64/26"),
+    ]
+    INTERNAL_NETS = [
+        ipaddress.ip_network("10.0.0.0/8"),
+        ipaddress.ip_network("172.16.0.0/12"),
+        ipaddress.ip_network("192.168.0.0/16"),
+    ]
+
+
+    @lru_cache(maxsize=4096)
+    def classify_ip(ip_text):
+        addr = ipaddress.ip_address(ip_text)
+        for net in OFFICE_NETS:
+            if addr in net:
+                return "office"
+        for net in INTERNAL_NETS:
+            if addr in net:
+                return "internal"
+        if addr.is_loopback:
+            return "local"
+        return "external"
+
+
+    def summarize(lines):
+        counts = Counter()
+        bad = 0
+        for line in lines:
+            ip_text = line.split(" ", 1)[0]
+            if not ip_text:
+                continue
+            try:
+                kind = classify_ip(ip_text)
+            except ValueError:
+                bad += 1
+                continue
+            counts[kind] += 1
+        return counts, bad
+
+
+    if __name__ == "__main__":
+        counts, bad = summarize(sys.stdin)
+        for kind in sorted(counts):
+            print(kind, counts[kind])
+        print("bad lines", bad)
+    ```
+
+    The output is the same. Invalid IPs still raise `ValueError` each time, because `lru_cache` does not store exceptions, so the "bad lines" count is unchanged.
+
+    **Green Notes**
+    - **Memoize repeated pure computations** (reduces E): each distinct IP is parsed and matched once, and every later line with that IP is a cache hit. In Green Metrics Tool micro-benchmarks with Python, 1,000,000 repeated computations over 200 distinct inputs used about 9× less CPU energy with `@functools.lru_cache` than without.
+    - **Bounded cache:** `maxsize=4096` keeps memory fixed. If your logs have mostly unique IPs (for example, a public site with huge traffic from many different clients), the cache rarely hits and only adds overhead. Check `classify_ip.cache_info()` after a run. If hits are low, remove the decorator.
+    - To measure the gain on your real files, compare `time` or `perf stat` for both versions on the same log.
+verify:
+  module: true
+  green_block: 0
+  test: |
+    lines = [
+        "10.1.2.3 - - [x] \"GET / HTTP/1.1\" 200 5",
+        "10.1.2.3 - - [x] \"GET /a HTTP/1.1\" 200 5",
+        "203.0.113.5 - - [x] \"GET / HTTP/1.1\" 200 5",
+        "8.8.8.8 - - [x] \"GET / HTTP/1.1\" 200 5",
+        "127.0.0.1 - - [x] \"GET / HTTP/1.1\" 200 5",
+        "not-an-ip - - [x] \"GET / HTTP/1.1\" 400 5",
+        "",
+    ]
+    counts, bad = summarize(lines)
+    assert dict(counts) == {"internal": 2, "office": 1, "external": 1, "local": 1}
+    assert bad == 1
+    assert classify_ip.cache_info().hits >= 1
+    assert classify_ip("192.168.1.1") == "internal"
+  equivalence:
+    driver: |-
+      lines = []
+      for i in range(300):
+          lines.append("10.0.%d.%d - - [x] \"GET / HTTP/1.1\" 200 1" % (i % 5, i % 7))
+          lines.append("203.0.113.%d - - [x] \"GET / HTTP/1.1\" 200 1" % (i % 20))
+          lines.append("198.51.100.%d - - [x] \"GET / HTTP/1.1\" 200 1" % (60 + i % 10))
+          lines.append("8.8.%d.8 - - [x] \"GET / HTTP/1.1\" 200 1" % (i % 3))
+      lines.append("127.0.0.1 - - [x] \"GET / HTTP/1.1\" 200 1")
+      lines.append("bogus - - [x] \"GET / HTTP/1.1\" 400 1")
+      lines.append("")
+      counts, bad = summarize(lines)
+      print(sorted(counts.items()), bad)

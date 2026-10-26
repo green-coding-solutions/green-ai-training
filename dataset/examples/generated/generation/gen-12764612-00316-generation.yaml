@@ -1,0 +1,56 @@
+id: gen-12764612-00316-generation
+category: generation
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    hi, i am not so good with pytorch, so maybe I do something wrong. we have a small Raspberry Pi in our greenhouse, it is the gateway for the sensors. A bridge program prints one JSON line per reading to stdout, like {"temp_c": 2.1, "humidity": 88, "soil_temp_c": 4.0, "wind_ms": 1.2, "pressure_hpa": 1011, "light_lux": 0}. I have a TorchScript model models/frost.pt (6 inputs, gives one number, a logit I think) who tell the frost risk. Can you write python script who read the lines from stdin, and for every reading print the risk and if it is over 0.7 set alert true? CPU only. It runs all day.
+- role: assistant
+  content: |
+    ```python
+    import json
+    import sys
+
+    import torch
+
+    MODEL_PATH = "models/frost.pt"
+    FEATURES = ("temp_c", "humidity", "soil_temp_c", "wind_ms", "pressure_hpa", "light_lux")
+    ALERT_THRESHOLD = 0.7
+
+    model = torch.jit.load(MODEL_PATH, map_location="cpu")
+    model.eval()  # inference mode for layers like dropout and batch norm
+
+
+    @torch.no_grad()
+    def frost_risk(reading: dict) -> float:
+        x = torch.tensor([[float(reading[k]) for k in FEATURES]], dtype=torch.float32)
+        return torch.sigmoid(model(x)).item()  # logit -> probability
+
+
+    def main() -> None:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                risk = frost_risk(json.loads(line))
+            except (ValueError, KeyError, TypeError) as exc:
+                print(f"skipped bad reading: {exc}", file=sys.stderr)
+                continue
+            print(json.dumps({"risk": round(risk, 3), "alert": risk > ALERT_THRESHOLD}), flush=True)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    The script skips lines that are not valid JSON or miss a field, so one bad reading does not stop it. If your model already outputs a probability between 0 and 1, remove the `torch.sigmoid` call.
+
+    **Green Notes**
+    - **`torch.no_grad()` for inference** (reduces E): the model is only used for predictions here, so PyTorch does not need to build the autograd graph on every reading. This script runs all day, so it saves work on every reading. In Green Metrics Tool micro-benchmarks, 100,000 CPU inferences used about 14% less energy with `no_grad` (~135 J vs ~157 J). The output stays the same.
+verify:
+  static_only: needs PyTorch and a TorchScript model file

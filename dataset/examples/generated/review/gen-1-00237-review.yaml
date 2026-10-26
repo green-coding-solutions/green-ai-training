@@ -1,0 +1,95 @@
+id: gen-1-00237-review
+category: review
+language: python
+patterns:
+- torch-no-grad
+- regex-precompile
+facts:
+- F-NOGRAD
+- F-REGEX
+messages:
+- role: user
+  content: |
+    review pls, diff only. internal CLI, we run it on exported support mailboxes (~300k messages per run, CPU box). scores urgency per message.
+
+    ```python
+    #!/usr/bin/env python3
+    """Usage: urgency.py in.jsonl out.jsonl"""
+    import json
+    import re
+    import sys
+
+    import torch
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    MODEL_DIR = "models/urgency-distilbert"
+
+
+    def clean(text):
+        text = re.sub(r"https?://\S+", " ", text)
+        text = re.sub(r"\b[\w.+-]+@[\w-]+\.[\w.]+\b", " ", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+
+    def main(src, dst):
+        tok = AutoTokenizer.from_pretrained(MODEL_DIR)
+        model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR)
+        with open(src) as fin, open(dst, "w") as fout:
+            for line in fin:
+                rec = json.loads(line)
+                enc = tok(clean(rec["body"]), truncation=True,
+                          max_length=256, return_tensors="pt")
+                logits = model(**enc).logits
+                rec["urgency"] = torch.softmax(logits, dim=-1)[0, 1].item()
+                fout.write(json.dumps(rec) + "\n")
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1], sys.argv[2])
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (batch inference over ~300k records)
+
+    #### [High] Inference runs with autograd enabled
+    - **Where:** `logits = model(**enc).logits` in `main`
+    - **Issue:** the forward pass builds a gradient graph for every message, and nothing ever calls `backward()`. This is wasted work and memory on every record.
+    - **Fix:** wrap the forward pass and softmax in `torch.no_grad()`. The scores stay the same.
+    - **Impact:** reduces E per record. In Green Metrics Tool micro-benchmarks, 100,000 PyTorch CPU inferences used about 14% less CPU energy with `torch.no_grad()`.
+
+    #### [Low] Regex literals passed to `re.sub` on every call
+    - **Where:** `clean()`
+    - **Issue:** Python's `re` caches compiled patterns, so this is not a real problem. Precompiling still skips the cache lookup, which was about 18% less CPU energy per match in Green Metrics Tool micro-benchmarks. It is a small win, but `clean()` runs once per message and the change is cheap.
+    - **Fix:** compile the three patterns once at module level.
+    - **Impact:** reduces E, small.
+
+    ```text
+     MODEL_DIR = "models/urgency-distilbert"
+    +URL_RE = re.compile(r"https?://\S+")
+    +EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.]+\b")
+    +SPACE_RE = re.compile(r"\s+")
+
+
+     def clean(text):
+    -    text = re.sub(r"https?://\S+", " ", text)
+    -    text = re.sub(r"\b[\w.+-]+@[\w-]+\.[\w.]+\b", " ", text)
+    -    text = re.sub(r"\s+", " ", text)
+    +    text = URL_RE.sub(" ", text)
+    +    text = EMAIL_RE.sub(" ", text)
+    +    text = SPACE_RE.sub(" ", text)
+         return text.strip()
+    @@ def main(src, dst):
+                 enc = tok(clean(rec["body"]), truncation=True,
+                           max_length=256, return_tensors="pt")
+    -            logits = model(**enc).logits
+    -            rec["urgency"] = torch.softmax(logits, dim=-1)[0, 1].item()
+    +            with torch.no_grad():
+    +                logits = model(**enc).logits
+    +                rec["urgency"] = torch.softmax(logits, dim=-1)[0, 1].item()
+                 fout.write(json.dumps(rec) + "\n")
+    ```
+
+    **Already good:** the model and tokenizer load once, input is streamed line by line, and tokenizer truncation caps the cost per message.
+verify:
+  static_only: needs torch and transformers with a local model directory

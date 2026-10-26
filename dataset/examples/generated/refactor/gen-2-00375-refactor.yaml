@@ -1,0 +1,158 @@
+id: gen-2-00375-refactor
+category: refactor
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    hi, I made the reviews section for our game's landing page. this script turns the reviews export into json files. the page loads page-1.json first and the "load more" button fetches the next page. when we started it was instant, but now the export has about 250k reviews and the build takes almost a minute. is json.loads slow?? I don't really know what is wrong, can you clean it up?
+
+    ```python
+    import json
+    import os
+    from datetime import datetime
+
+    EXPORT = "data/reviews.jsonl"
+    OUT_DIR = "static/reviews"
+    PAGE_SIZE = 24
+
+
+    def load_reviews(path):
+        wall = []
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                r = json.loads(line)
+                if r.get("hidden") or r["rating"] < 4:
+                    continue
+                # newest review should be first on the page
+                wall.insert(0, {
+                    "name": r["display_name"],
+                    "stars": r["rating"],
+                    "text": r["text"][:280],
+                    "date": datetime.fromisoformat(r["created_at"]).strftime("%b %d, %Y"),
+                })
+        return wall
+
+
+    def write_pages(wall, out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+        pages = 0
+        for start in range(0, len(wall), PAGE_SIZE):
+            chunk = wall[start:start + PAGE_SIZE]
+            pages += 1
+            with open(os.path.join(out_dir, f"page-{pages}.json"), "w", encoding="utf-8") as f:
+                json.dump({"page": pages, "reviews": chunk}, f, ensure_ascii=False)
+        with open(os.path.join(out_dir, "index.json"), "w", encoding="utf-8") as f:
+            json.dump({"pages": pages, "total": len(wall)}, f)
+
+
+    if __name__ == "__main__":
+        reviews = load_reviews(EXPORT)
+        write_pages(reviews, OUT_DIR)
+        print(f"{len(reviews)} reviews, newest first")
+    ```
+- role: assistant
+  content: |
+    `json.loads` is fine. The slow part is `wall.insert(0, ...)`.
+
+    ```python
+    import json
+    import os
+    from datetime import datetime
+
+    EXPORT = "data/reviews.jsonl"
+    OUT_DIR = "static/reviews"
+    PAGE_SIZE = 24
+
+
+    def load_reviews(path):
+        wall = []
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                r = json.loads(line)
+                if r.get("hidden") or r["rating"] < 4:
+                    continue
+                wall.append({
+                    "name": r["display_name"],
+                    "stars": r["rating"],
+                    "text": r["text"][:280],
+                    "date": datetime.fromisoformat(r["created_at"]).strftime("%b %d, %Y"),
+                })
+        # export is oldest first: flip once so the newest review comes first
+        wall.reverse()
+        return wall
+
+
+    def write_pages(wall, out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+        pages = 0
+        for start in range(0, len(wall), PAGE_SIZE):
+            chunk = wall[start:start + PAGE_SIZE]
+            pages += 1
+            with open(os.path.join(out_dir, f"page-{pages}.json"), "w", encoding="utf-8") as f:
+                json.dump({"page": pages, "reviews": chunk}, f, ensure_ascii=False)
+        with open(os.path.join(out_dir, "index.json"), "w", encoding="utf-8") as f:
+            json.dump({"pages": pages, "total": len(wall)}, f)
+
+
+    if __name__ == "__main__":
+        reviews = load_reviews(EXPORT)
+        write_pages(reviews, OUT_DIR)
+        print(f"{len(reviews)} reviews, newest first")
+    ```
+
+    **Green Notes**
+    - **Append, then reverse once, instead of `list.insert(0, x)`** (reduces E): every insert at the front moves all the reviews already in the list one slot to the right. That makes the loop O(n²) overall, so it was fast with a small export and got much slower as the export grew. `append` plus one `reverse()` is O(n). In Green Metrics Tool micro-benchmarks with Python, 1,000,000 × `list.insert(0, x)` used ~1515 J and 1,000,000 × `list.append(x)` used ~1.2 J, an over 1000× difference.
+
+    The output doesn't change. Reviews come out in the same newest-first order, and the page files and `index.json` are the same as before. `collections.deque` with `appendleft` would also avoid the shifting. But `write_pages` slices the result, and a list makes that easier, so append plus reverse is the simpler fix.
+verify:
+  module: true
+  equivalence:
+    driver: |
+      import json, os, tempfile
+      tmp = tempfile.mkdtemp()
+      src = os.path.join(tmp, "reviews.jsonl")
+      with open(src, "w", encoding="utf-8") as f:
+          for i in range(200):
+              f.write(json.dumps({
+                  "display_name": f"user{i}",
+                  "rating": i % 5 + 1,
+                  "hidden": i % 7 == 0,
+                  "text": "great game " * (i % 40),
+                  "created_at": f"2026-0{i % 9 + 1}-1{i % 10}T12:00:00",
+              }) + "\n")
+          f.write("\n")
+      wall = load_reviews(src)
+      print(len(wall))
+      print(json.dumps(wall[:3]))
+      print(json.dumps(wall[-2:]))
+      out = os.path.join(tmp, "out")
+      write_pages(wall, out)
+      for name in sorted(os.listdir(out)):
+          with open(os.path.join(out, name), encoding="utf-8") as f:
+              print(name, f.read())
+  benchmark:
+    driver: |
+      import json, os, tempfile
+      tmp = tempfile.mkdtemp()
+      src = os.path.join(tmp, "reviews.jsonl")
+      with open(src, "w", encoding="utf-8") as f:
+          for i in range(60000):
+              f.write(json.dumps({
+                  "display_name": f"u{i}",
+                  "rating": 5,
+                  "text": "love it",
+                  "created_at": "2026-05-01T10:00:00",
+              }) + "\n")
+      wall = load_reviews(src)
+      print(len(wall), wall[0]["name"], wall[-1]["name"])
+    min_speedup: 1.5

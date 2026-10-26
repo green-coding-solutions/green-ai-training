@@ -1,0 +1,133 @@
+id: gen-2-00364-refactor
+category: refactor
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    ?
+
+    ```nginx
+    upstream orders_api {
+        server 127.0.0.1:8081;
+        keepalive 32;
+    }
+
+    server {
+        listen 443 ssl;
+        http2 on;
+        server_name api.shopfront.example;
+
+        ssl_certificate     /etc/nginx/tls/api.shopfront.crt;
+        ssl_certificate_key /etc/nginx/tls/api.shopfront.key;
+
+        access_log /var/log/nginx/api.access.log;
+        client_max_body_size 2m;
+
+        # API docs portal (Redoc build + openapi.json, regenerated on every deploy)
+        root /srv/api-docs/dist;
+
+        gzip on;
+        gzip_comp_level 9;
+        gzip_min_length 256;
+        gzip_vary on;
+        gzip_proxied any;
+        gzip_types *;
+
+        location / {
+            try_files $uri $uri/ /index.html;
+        }
+
+        location /api/ {
+            proxy_pass http://orders_api;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_read_timeout 30s;
+        }
+
+        # SDK releases (.zip / .tar.gz)
+        location /downloads/ {
+            alias /srv/sdk-releases/;
+            autoindex on;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    The main issue is compression. Every request is compressed at level 9, including static files that never change and archives that are already compressed. Here is the cleaned-up config:
+
+    ```nginx
+    upstream orders_api {
+        server 127.0.0.1:8081;
+        keepalive 32;
+    }
+
+    server {
+        listen 443 ssl;
+        http2 on;
+        server_name api.shopfront.example;
+
+        ssl_certificate     /etc/nginx/tls/api.shopfront.crt;
+        ssl_certificate_key /etc/nginx/tls/api.shopfront.key;
+
+        access_log /var/log/nginx/api.access.log;
+        client_max_body_size 2m;
+
+        # API docs portal (Redoc build + openapi.json, regenerated on every deploy)
+        root /srv/api-docs/dist;
+
+        gzip_vary    on;
+        gzip_proxied any;
+
+        # static docs: serve the .gz files created at deploy time, no per-request compression
+        location / {
+            gzip_static on;
+            try_files $uri $uri/ /index.html;
+        }
+
+        # dynamic API JSON: compressed on the fly at a moderate level
+        location /api/ {
+            gzip            on;
+            gzip_comp_level 5;
+            gzip_min_length 256;
+            gzip_types      application/json application/problem+json;
+
+            proxy_pass http://orders_api;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_read_timeout 30s;
+        }
+
+        # SDK archives are already compressed: send them as they are
+        location /downloads/ {
+            alias /srv/sdk-releases/;
+            autoindex on;
+        }
+    }
+    ```
+
+    Add this to the deploy step that writes the docs build:
+
+    ```bash
+    find /srv/api-docs/dist -type f \
+      \( -name '*.html' -o -name '*.js' -o -name '*.css' -o -name '*.json' -o -name '*.svg' \) \
+      -exec gzip -9 -k -f {} +
+    ```
+
+    **Green Notes**
+    - **Precompress static assets** (reduces E): The docs bundle and `openapi.json` are the same for every visitor, but nginx compressed them again on each request. Now the deploy step compresses them once, and `gzip_static` serves the `.gz` files. In Green Metrics Tool benchmarks of nginx serving 2,000 requests for text assets, gzip level 5 on every request cost about 4× the CPU energy of serving precompressed files. Both sent about 10× fewer bytes than no compression. Level 9 is fine here because it runs only once per deploy.
+    - **Moderate level for dynamic responses** (reduces E, network): API JSON changes per request, so nginx still has to compress it on the fly. Keep that compression on, because on real networks the smaller responses matter. Level 5 instead of 9 avoids paying more CPU on every response for only slightly smaller output.
+    - **No compression for already-compressed files** (reduces E): `gzip_types *` also gzipped the `.zip`/`.tar.gz` SDK releases and any PNG or WOFF2 files in the docs build. That costs CPU on every download and saves almost no bytes.
+
+    Changes in behavior: SDK archives are now sent without `Content-Encoding: gzip`. Clients get the exact file on disk, which also avoids tools unpacking `.tar.gz` downloads by mistake. If the deploy step skips the `find` command, nginx doesn't fail. It just serves the docs uncompressed. The `-f` flag overwrites stale `.gz` files from the previous build.
+verify:
+  static_only: nginx config and deploy shell step, needs a running nginx to test

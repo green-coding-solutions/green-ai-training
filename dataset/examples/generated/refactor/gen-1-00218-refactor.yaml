@@ -1,0 +1,81 @@
+id: gen-1-00218-refactor
+category: refactor
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    We run a model gateway that logs every prediction request/response as JSON lines, one file per hour. This script archives yesterday's files from cron at 02:00 and CPU on the box is pegged for a long time afterwards. Can you refactor it to be cheaper?
+
+    Requirements:
+    - keep the per-day folder layout and the "verify before delete" logic
+    - keep 90 days of archives
+    - zstd 1.5 is installed on the box and on the restore host
+    - the logs are only read again for audits, so ratio is not critical
+
+    ```bash
+    #!/bin/bash
+    # nightly archive of yesterday's prediction logs
+    LOG_DIR="/var/log/infer"
+    ARCHIVE_DIR="/mnt/archive/infer"
+    KEEP_DAYS=90
+    DAY=$(date -d yesterday +%F)
+
+    mkdir -p "$ARCHIVE_DIR/$DAY"
+
+    for f in "$LOG_DIR"/predictions-$DAY-*.jsonl; do
+      [ -e "$f" ] || continue
+      name=$(basename "$f")
+      xz -9e -c "$f" > "$ARCHIVE_DIR/$DAY/$name.xz"
+      if xz -t "$ARCHIVE_DIR/$DAY/$name.xz"; then
+        rm "$f"
+      else
+        echo "archive check failed for $name" >&2
+      fi
+    done
+
+    find "$ARCHIVE_DIR" -type f -name "*.xz" -mtime +$KEEP_DAYS -delete
+    ```
+- role: assistant
+  content: |
+    ```bash
+    #!/bin/bash
+    # nightly archive of yesterday's prediction logs
+    LOG_DIR='/var/log/infer'
+    ARCHIVE_DIR='/mnt/archive/infer'
+    KEEP_DAYS=90
+    DAY=$(date -d yesterday +%F)
+
+    mkdir -p "$ARCHIVE_DIR/$DAY"
+
+    for f in "$LOG_DIR"/predictions-"$DAY"-*.jsonl; do
+      [ -e "$f" ] || continue
+      name=$(basename "$f")
+      out="$ARCHIVE_DIR/$DAY/$name.zst"
+      if zstd -q -3 -f -o "$out" "$f" && zstd -q -t "$out"; then
+        rm "$f"
+      else
+        echo "archive check failed for $name" >&2
+        rm -f "$out"
+      fi
+    done
+
+    # old .xz archives stay readable and expire as before
+    find "$ARCHIVE_DIR" -type f \( -name '*.zst' -o -name '*.xz' \) -mtime +"$KEEP_DAYS" -delete
+    ```
+
+    **Green Notes**
+    - **Fast codec for data compressed every night** (reduces E): `xz -9e` is the most expensive setting of an expensive codec, and it runs on every hourly file, every night. In Green Metrics Tool micro-benchmarks compressing 100 MB of text, xz used ~458 J and zstd at its default level ~16 J, so xz cost about 29× more. I used zstd level 3, which is the default level that was measured.
+    - **Compression still pays off for 90-day storage:** Green Coding Solutions' estimate (not a direct measurement) puts the break-even for zstd at well under a day of storage and for xz at about 7 days. Your logs live far longer than both, so keep compressing, just with the cheaper codec.
+    - The measurements compare energy, not file size. zstd archives will usually be larger than xz ones, so expect somewhat more disk use. If long-term storage cost matters more than nightly CPU, tell me and we can look at it again.
+
+    Behavior changes:
+    - New archives end in `.zst`. Old `.xz` archives are not recompressed (that would cost more than it saves) and are still deleted after 90 days.
+    - A failed compress or check now removes the partial archive, and the original log is kept.
+    - I also single-quoted the literal paths and quoted `$DAY` in the glob, which is harmless for your date format.
+verify:
+  static_only: needs zstd, xz and real log files on disk

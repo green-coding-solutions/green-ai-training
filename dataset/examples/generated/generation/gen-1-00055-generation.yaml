@@ -1,0 +1,62 @@
+id: gen-1-00055-generation
+category: generation
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    Can you write a Dockerfile for `certwatch`, our small internal CLI that checks TLS certificate expiry for a list of hostnames and prints a report? Requirements:
+
+    - Python 3.12
+    - repo layout: `pyproject.toml`, `requirements.txt` (pinned: requests, cryptography, rich), and the package in `src/certwatch/`
+    - the console script `certwatch` is defined in pyproject.toml
+    - it should run as a non-root user
+    - `docker run certwatch hosts.txt` should just work, so the entrypoint is the CLI
+    - tests run in a separate CI job, so they don't need to be in the image
+
+    The image is built by GitHub Actions on every push and then pulled by a Kubernetes CronJob that runs every night.
+- role: assistant
+  content: |-
+    ```dockerfile
+    FROM python:3.12-slim
+
+    ENV PYTHONDONTWRITEBYTECODE=1 \
+        PYTHONUNBUFFERED=1
+
+    WORKDIR /app
+
+    # Dependencies first: this layer is reused until requirements.txt changes
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    # Source last: code changes only rebuild the layers below this line
+    COPY pyproject.toml ./
+    COPY src/ ./src/
+    RUN pip install --no-cache-dir --no-deps .
+
+    RUN useradd --create-home --uid 10001 certwatch
+    USER certwatch
+
+    ENTRYPOINT ["certwatch"]
+    CMD ["--help"]
+    ```
+
+    Add a `.dockerignore` so the build context stays small and tests, `.git` and local caches don't end up in the image:
+
+    ```text
+    .git
+    tests/
+    __pycache__/
+    *.pyc
+    .venv/
+    ```
+
+    Usage: `docker run -v "$PWD/hosts.txt:/data/hosts.txt:ro" certwatch /data/hosts.txt`
+
+    **Green Notes**
+    - **Small container image** (reduces E, M): slim base image, runtime dependencies only, no compilers, no test or dev tools, and `pip --no-cache-dir`. In Green Metrics Tool micro-benchmarks of a small Flask app image built without a build cache, a full `python:3.12` image with dev tools took ~885 J to build and the slim runtime-only image ~124 J, about 7× less. Serving requests cost the same with both. The saving is in every build, pull and stored copy, which is what your push-triggered CI and the nightly pulls repeat.
+    - **Dependency layer before the source** (reduces E, network): a code-only push reuses the cached dependency layer, so it skips the `pip install` and the download of its packages.
+    - **Tests kept out of the image**: pytest and friends stay in the CI job, which keeps the shipped image small.

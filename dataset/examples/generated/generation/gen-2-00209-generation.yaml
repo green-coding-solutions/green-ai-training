@@ -1,0 +1,74 @@
+id: gen-2-00209-generation
+category: generation
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    hi, i need nginx config for our etl export server. our nightly job (runs 02:00) write the exports to /data/exports, it is csv and ndjson files, some are big (200-400 MB), and also a parquet copy of each. other teams download them with curl and pandas, mostly once per day each team, but there is maybe 30 teams. download is very slow for the office in other country, they go over VPN.
+
+    also we have a small flask app on 127.0.0.1:8080 what give the job status as json (/runs and /runs/<id>), should be reachable under /api/ .
+
+    server name is etl-exports.intra , only http inside the network is ok. can you write the server block? we have nginx 1.24 on ubuntu.
+- role: assistant
+  content: |
+    ```nginx
+    server {
+        listen 80;
+        server_name etl-exports.intra;
+
+        # Nightly exports: precompressed once by the job, served many times
+        location /exports/ {
+            alias /data/exports/;
+            autoindex on;
+
+            gzip off;          # never compress 400 MB files on the fly
+            gzip_static on;    # serve file.csv.gz when the client accepts gzip
+            gzip_vary on;
+
+            types {
+                text/csv                          csv;
+                application/x-ndjson              ndjson;
+                application/json                  json;
+                application/vnd.apache.parquet    parquet;
+            }
+            default_type application/octet-stream;
+        }
+
+        # Job status API (small, dynamic JSON)
+        location /api/ {
+            proxy_pass http://127.0.0.1:8080/;   # /api/runs -> /runs
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+            gzip on;
+            gzip_comp_level 4;
+            gzip_min_length 1024;
+            gzip_types application/json;
+            gzip_vary on;
+        }
+    }
+    ```
+
+    Add this as the last step of the nightly job, after the CSV and NDJSON files are written:
+
+    ```bash
+    shopt -s nullglob
+    for f in /data/exports/*.csv /data/exports/*.ndjson; do
+      gzip -c -6 "$f" > "$f.gz.tmp" && mv "$f.gz.tmp" "$f.gz"
+    done
+    ```
+
+    The temp file plus `mv` means nobody downloads a half-written `.gz`. Keep the uncompressed files too. nginx sends them to clients that don't accept gzip. Rewrite the `.gz` whenever the CSV changes, or nginx will keep serving the old one.
+
+    For clients: use `curl --compressed -O http://etl-exports.intra/exports/orders.csv`. In pandas, read the `.gz` URL directly: `pd.read_csv("http://etl-exports.intra/exports/orders.csv.gz")`. pandas sees the extension and decompresses it.
+
+    **Green Notes**
+    - **Precompressed exports with `gzip_static`** (reduces network and E): each file is compressed once per night and then downloaded by about 30 teams, so the slow VPN link carries far fewer bytes. `gzip off` in that location means a missing `.gz` falls back to the plain file and never to compressing hundreds of MB on every request. In Green Metrics Tool benchmarks with nginx serving text assets, compression sent about 10× fewer bytes, and gzip on every request cost about 4× the CPU energy of serving precompressed files.
+    - **On-the-fly gzip only for the status API** (reduces network): these responses change all the time and are small, so a moderate level is cheap. `gzip_min_length` skips tiny responses where compression gains nothing.
+    - *Not applied:* gzip for Parquet. The format is already compressed internally, so compressing it again costs CPU and saves almost no bytes.
+verify:
+  static_only: nginx configuration and a shell step for the export job; needs nginx and the export files to test

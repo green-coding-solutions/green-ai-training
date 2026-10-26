@@ -1,0 +1,69 @@
+id: gen-2-00224-generation
+category: generation
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    hi, im new to ML stuff so sorry if this is basic. we trained a small sentiment model and now i need the preprocessing step before inference. the vocab is in vocab.txt (one word per line, about 40k words). for every review that comes in i need to lowercase it, split it into words and replace every word that is not in the vocab with "<unk>". the model then gets the list of tokens.
+
+    our API gets around 50 reviews per request and each review is 100-300 words. i tried something with a list and `in`, but im not sure i did it right and it feels slow. can you write it? python 3.11
+- role: assistant
+  content: |
+    Load the vocabulary into a set once, when the service starts. Then reuse it for every request.
+
+    ```python
+    UNK = "<unk>"
+
+
+    def load_vocab(path: str) -> frozenset[str]:
+        """Read one word per line. Call this once at startup, not per request."""
+        with open(path, encoding="utf-8") as f:
+            return frozenset(word for line in f if (word := line.strip()))
+
+
+    def tokenize(text: str, vocab: frozenset[str]) -> list[str]:
+        return [tok if tok in vocab else UNK for tok in text.lower().split()]
+
+
+    def tokenize_batch(texts: list[str], vocab: frozenset[str]) -> list[list[str]]:
+        return [tokenize(text, vocab) for text in texts]
+
+
+    # In your API module:
+    # VOCAB = load_vocab("vocab.txt")          # once, at startup
+    #
+    # def handle_request(reviews):
+    #     tokens = tokenize_batch(reviews, VOCAB)
+    #     return model.predict(tokens)
+    ```
+
+    `split()` with no argument splits on any whitespace and skips empty strings, so double spaces or newlines don't produce empty tokens. Your tokenization should match what the model saw during training. If training used a different tokenizer, use the same one here.
+
+    **Green Notes**
+    - **Set for the vocabulary** (reduces E): one request can mean thousands of `in` checks (50 reviews × 100-300 words). With a list, each check may scan all 40k words. With a set, each check is O(1) on average. That is most likely why your list version felt slow.
+    - **Build the set once, not per request** (reduces E): building a set costs one full pass over the words. In Green Metrics Tool micro-benchmarks, converting a 10,000,000-element list to a set and then testing once used about 50% more energy than a single scan of the list. The set only pays off because you build it once and reuse it for many lookups.
+    - **`frozenset`**: the vocab is read-only, so a frozen set also prevents it from being changed by accident while the service runs.
+verify:
+  test: |-
+    import os
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+        f.write("the\nmovie\nwas\ngreat\n\n  \n")
+        path = f.name
+    try:
+        v = load_vocab(path)
+    finally:
+        os.remove(path)
+
+    assert v == frozenset({"the", "movie", "was", "great"})
+    assert isinstance(v, frozenset)
+    assert tokenize("The movie was  AWFUL", v) == ["the", "movie", "was", "<unk>"]
+    assert tokenize("great\nmovie", v) == ["great", "movie"]
+    assert tokenize("", v) == []
+    assert tokenize_batch(["Great", "bad movie"], v) == [["great"], ["<unk>", "movie"]]
+    assert tokenize_batch([], v) == []

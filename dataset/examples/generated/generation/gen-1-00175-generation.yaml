@@ -1,0 +1,55 @@
+id: gen-1-00175-generation
+category: generation
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    hi, i need small python function for our log tool. we read kubernetes logs, every line have a service name like `payment-api-7d9f` or `checkout-worker`, and i must tell which team own this service so we can put the line in the right slack channel. we have around 60 rules like "payment-*" -> payments, "checkout-*" -> shop, "auth-*" -> identity. first rule that match win. if nothing match, team is "platform". we process some millions of lines per day but we have only few hundred different services. sorry for my english
+- role: assistant
+  content: |
+    ```python
+    from fnmatch import fnmatchcase
+    from functools import lru_cache
+
+    # ordered: the first matching rule wins
+    OWNER_RULES = (
+        ("payment-*", "payments"),
+        ("checkout-*", "shop"),
+        ("cart-*", "shop"),
+        ("auth-*", "identity"),
+        ("search-*", "discovery"),
+        # ... the rest of your rules
+    )
+    DEFAULT_OWNER = "platform"
+
+    @lru_cache(maxsize=2048)
+    def owner_for_service(service: str) -> str:
+        name = service.strip().lower()
+        for pattern, team in OWNER_RULES:
+            if fnmatchcase(name, pattern):
+                return team
+        return DEFAULT_OWNER
+    ```
+
+    Use it per line: `team = owner_for_service(service_name)`. If you reload the rules while the process runs, call `owner_for_service.cache_clear()`.
+
+    **Green Notes**
+    - **Memoize a pure function** (reduces E): the answer depends only on the service name, and millions of lines share a few hundred names. After the first line of a service, the rule scan is skipped. In Green Metrics Tool micro-benchmarks with inputs drawn from only 200 distinct values, `lru_cache` used about 9× less energy than recomputing.
+    - **Bounded cache** (`maxsize=2048`): memory stays limited even if pod names with random suffixes create many rare keys.
+    - **Immutable rules:** a tuple of rules means the cached answers cannot go stale by accident.
+
+    *Not applied:* a cache would not help if almost every line had a different name. Then it only adds overhead. If your names include the pod hash (like `payment-api-7d9f`), strip the suffix before the call so the keys repeat.
+verify:
+  test: |-
+    assert owner_for_service("payment-api") == "payments"
+    assert owner_for_service("  Checkout-Worker ") == "shop"
+    assert owner_for_service("unknown-thing") == "platform"
+    for _ in range(5):
+        assert owner_for_service("payment-api") == "payments"
+    info = owner_for_service.cache_info()
+    assert info.hits >= 5, info
+    assert info.misses == 3, info

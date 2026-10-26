@@ -1,0 +1,123 @@
+id: gen-2-00355-review
+category: review
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    hi, I'm doing my master thesis on phase transitions and I wrote this 2D Ising model simulation. For 21 temperatures it runs the whole night on my laptop, and my supervisor wants L=128 next. Also my energy per spin looks strange compared to the values in the papers, I don't know if this is related. Could you review it? I'm not really sure what is wrong.
+
+    ```python
+    import math
+    import random
+    import numpy as np
+
+    L = 64
+    N_SWEEPS = 5000
+    N_EQUIL = 1000
+
+    def init_lattice(L):
+        return np.random.choice([-1, 1], size=(L, L))
+
+    def total_energy(spins):
+        L = spins.shape[0]
+        E = 0
+        for i in range(L):
+            for j in range(L):
+                s = spins[i, j]
+                nb = (spins[(i+1) % L, j] + spins[i-1, j]
+                      + spins[i, (j+1) % L] + spins[i, j-1])
+                E += -s * nb
+        return E
+
+    def metropolis_sweep(spins, T):
+        L = spins.shape[0]
+        for _ in range(L * L):
+            i = random.randint(0, L - 1)
+            j = random.randint(0, L - 1)
+            s = spins[i, j]
+            nb = (spins[(i+1) % L, j] + spins[i-1, j]
+                  + spins[i, (j+1) % L] + spins[i, j-1])
+            dE = 2 * s * nb
+            if dE <= 0 or random.random() < math.exp(-dE / T):
+                spins[i, j] = -s
+
+    def run(T):
+        spins = init_lattice(L)
+        mags, energies = [], []
+        for sweep in range(N_SWEEPS):
+            metropolis_sweep(spins, T)
+            if sweep >= N_EQUIL:
+                mags.append(abs(spins.sum()) / (L * L))
+                energies.append(total_energy(spins) / (L * L))
+        return np.mean(mags), np.mean(energies)
+
+    if __name__ == "__main__":
+        temps = np.linspace(1.5, 3.5, 21)
+        for T in temps:
+            m, e = run(T)
+            print(f"T={T:.2f}  |M|={m:.4f}  E={e:.4f}")
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (CPU-bound simulation, runs for hours)
+
+    #### [Bug] Every bond is counted twice in `total_energy`
+    - **Where:** `total_energy`, the sum over all four neighbours
+    - **Issue:** the bond between sites A and B is added once from A and again from B. Your energy per spin is twice the real value. A fully ordered lattice gives -4 instead of the correct -2. This is why your numbers don't match the papers. Magnetization is not affected.
+    - **Fix:** sum only two neighbours per site (right and down), so each bond is counted once. See the code below.
+
+    #### [High] Pure Python loops over NumPy elements in the hot path
+    - **Where:** `metropolis_sweep` (L² flips per sweep) and `total_energy` (L² sites, called every measured sweep)
+    - **Issue:** for L=64 that is about 4,000 interpreted iterations per sweep, 5,000 sweeps, 21 temperatures. Each `spins[i, j]` creates a NumPy scalar object, and each `random.randint` is a Python function call. Almost all of the night goes into interpreter overhead, not physics. With L=128 the work per sweep grows 4×.
+    - **Fix:** compile both functions with Numba `@njit`. The loop body stays the same. Use `np.random` inside the compiled code, because Numba supports it there.
+    - **Impact:** large reduction in E for the whole run. In Green Metrics Tool micro-benchmarks, a pure Python loop over 10,000,000 samples used about 4× more CPU energy than the same loop with Numba `@njit`. Your loop body is heavier than that benchmark's, so measure your own case: time `run(2.0)` before and after, and call it once first so compilation is not counted.
+
+    ```python
+    import math
+    import numpy as np
+    from numba import njit
+
+    L = 64
+    N_SWEEPS = 5000
+    N_EQUIL = 1000
+
+    def init_lattice(L):
+        return np.random.choice(np.array([-1, 1]), size=(L, L))
+
+    @njit(cache=True)
+    def total_energy(spins):
+        L = spins.shape[0]
+        E = 0
+        for i in range(L):
+            for j in range(L):
+                # right and down neighbour only: each bond counted once
+                E -= spins[i, j] * (spins[(i + 1) % L, j] + spins[i, (j + 1) % L])
+        return E
+
+    @njit(cache=True)
+    def metropolis_sweep(spins, T):
+        L = spins.shape[0]
+        for _ in range(L * L):
+            i = np.random.randint(0, L)   # 0..L-1, same as random.randint(0, L - 1)
+            j = np.random.randint(0, L)
+            s = spins[i, j]
+            nb = (spins[(i + 1) % L, j] + spins[i - 1, j]
+                  + spins[i, (j + 1) % L] + spins[i, j - 1])
+            dE = 2 * s * nb
+            if dE <= 0 or np.random.random() < math.exp(-dE / T):
+                spins[i, j] = -s
+    ```
+
+    `run()` and the main block stay as they are. Two things to know:
+    - Numba has its own random generator. Results agree statistically with the old version, not digit for digit. For reproducible runs, call `np.random.seed(...)` inside a jitted function. Seeding outside does not reach Numba's generator.
+    - `cache=True` stores the compiled code on disk, so the compile cost is paid once, not on every start.
+
+    *Not applied:* vectorizing the sweep with plain NumPy. Single-spin Metropolis is sequential, because each flip depends on the previous ones. A checkerboard update would vectorize, but it changes the update scheme, so check with your supervisor first.
+
+    **Already good:** correct Metropolis acceptance rule, periodic boundaries handled correctly, and equilibration sweeps are discarded before measuring.
+verify:
+  static_only: needs numba

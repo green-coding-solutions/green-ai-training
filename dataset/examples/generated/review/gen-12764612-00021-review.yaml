@@ -1,0 +1,111 @@
+id: gen-12764612-00021-review
+category: review
+language: python
+patterns:
+- vectorize-or-jit
+- simple-conditions
+facts:
+- F-NUMBA
+- F-COND
+messages:
+- role: user
+  content: |
+    Please review this function from our shop's nightly shipping re-quote job. Context and requirements:
+
+    - It runs from cron in a fresh process every night, over about 6 million open parcels (numpy arrays loaded from a parquet export).
+    - Money is in integer cents. The results must stay identical to what we have now, because finance diffs the output against the previous night.
+    - We can add one dependency (numba is already in our base image).
+    - Zone is a one-digit carrier zone code, 0-9. Zone 0 is local, 7-9 are remote.
+    - I'd like the review ranked by importance. Please also tell me if something is wrong, not only slow.
+
+    ```python
+    import numpy as np
+
+    def shipping_costs(weight_g, zone, is_express, subtotal_cents):
+        n = len(weight_g)
+        out = np.zeros(n, dtype=np.int64)
+        for i in range(n):
+            w = weight_g[i]
+            z = zone[i]
+            if 0 < w <= 500:
+                base = 399
+            elif 500 < w <= 2000:
+                base = 599
+            elif 2000 < w <= 10000:
+                base = 999
+            else:
+                base = 1999
+            if z % 10 >= 7 and z % 10 <= 9:
+                base += 450
+            elif z % 10 == 0:
+                base -= 100
+            if is_express[i]:
+                base = base * 2
+            if subtotal_cents[i] >= 5000 and not is_express[i]:
+                base = 0
+            out[i] = base
+        return out
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly batch)
+
+    #### [Bug] Weight 0 or below gets the most expensive tariff
+    - **Where:** `if 0 < w <= 500 ... else: base = 1999`
+    - **Issue:** a parcel with a missing weight (0) or a negative weight fails every band check and falls into `else`. It is quoted as heavier than 10 kg. This is probably bad data, but the job charges for it silently.
+    - **Fix:** reject it before the loop (see the code below). This changes the output for those rows, so decide what finance wants: an error, a flat default, or a skip. Your "identical output" requirement holds for all valid weights.
+
+    #### [High] Pure Python loop over 6 million rows
+    - **Where:** the whole `for i in range(n)` loop
+    - **Issue:** the loop is numeric and CPU-bound. It does integer comparisons and arithmetic on numpy elements, with no I/O and no Python objects. The interpreter pays boxing and dispatch cost on every element. This is the case where JIT compilation fits.
+    - **Fix:** move the loop into an `@njit(cache=True)` function. `cache=True` matters for you: the job starts a fresh process every night, so the compiled code is reused from disk instead of being rebuilt each run.
+    - **Impact:** reduces E on every nightly run. In Green Metrics Tool micro-benchmarks, a pure Python quantization loop over 10,000,000 samples used about 40 J, and the same loop with Numba `@njit` about 9.5 J (about 4× less). That was a different loop on different hardware, so measure yours with `perf stat` or `time`. The first run after a deploy also pays the compile cost once.
+
+    #### [Low] Range and modulo guards where equality is enough
+    - **Where:** `z % 10 >= 7 and z % 10 <= 9`, `z % 10 == 0`, and the `500 < w`, `2000 < w` lower bounds
+    - **Issue:** zone is already 0-9, so the modulo does nothing, and the range check is just three equality tests. The lower bounds in the weight chain are already implied by the earlier branches. In pure Python micro-benchmarks, simple equality branches used about 16% less energy than complex range/modulo conditions over 10,000,000 classifications. Once the loop is compiled the gap is much smaller, so this is mostly about clarity.
+    - **Fix:** use `z == 7 or z == 8 or z == 9`, `z == 0`, and `w <= 2000` instead of `500 < w <= 2000`. Keep the weight bands as ranges, because they are real ranges.
+    - **Impact:** E, small. Do it as part of the rewrite, not as a separate change.
+
+    ```python
+    import numpy as np
+    from numba import njit
+
+    @njit(cache=True)
+    def _costs(weight_g, zone, is_express, subtotal_cents, out):
+        for i in range(len(weight_g)):
+            w = weight_g[i]
+            if w <= 500:
+                base = 399
+            elif w <= 2000:
+                base = 599
+            elif w <= 10000:
+                base = 999
+            else:
+                base = 1999
+
+            z = zone[i]
+            if z == 7 or z == 8 or z == 9:
+                base += 450
+            elif z == 0:
+                base -= 100
+
+            if is_express[i]:
+                base *= 2
+            elif subtotal_cents[i] >= 5000:
+                base = 0
+            out[i] = base
+
+    def shipping_costs(weight_g, zone, is_express, subtotal_cents):
+        if (weight_g <= 0).any():
+            raise ValueError("parcel with weight <= 0")
+        out = np.empty(len(weight_g), dtype=np.int64)
+        _costs(weight_g, zone, is_express, subtotal_cents, out)
+        return out
+    ```
+
+    Pass numpy arrays, not lists, as Numba compiles for array types. The express and free-shipping rules are merged into one `if/elif` with the same result: express parcels are doubled, and non-express parcels with a subtotal of 5000 cents or more ship free.
+
+    **Already good:** integer cents (no float rounding), the output array is allocated once, and the data is already in numpy arrays, so no conversion is needed before compiling.
+verify:
+  static_only: needs numba, which is not in the stdlib

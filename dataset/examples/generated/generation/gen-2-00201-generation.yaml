@@ -1,0 +1,97 @@
+id: gen-2-00201-generation
+category: generation
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # archive-audit-logs.sh — runs hourly from cron on log-collector-01
+    # audit logs from the payment gateway, compliance wants them 400 days
+
+    set -euo pipefail
+
+    SRC=/var/log/paygw/audit
+    ARCHIVE=/mnt/archive/paygw-audit
+    TMP=/tmp/paygw-audit-$$
+    ALERT_MAIL=ops-payments@example.com
+
+    mkdir -p "$TMP"
+
+    # TODO: pick up rotated files (audit-YYYYMMDD-HH.log), skip the one being written (audit.log)
+
+    # TODO: grep for "DECLINED_FRAUD" lines and mail a summary if any
+
+    # TODO: compress + move to $ARCHIVE/YYYY/MM/, verify, delete source
+
+    # TODO: delete archives older than 400 days
+
+    rm -rf "$TMP"
+    ```
+
+    ?
+- role: assistant
+  content: |
+    Here is the script with the TODOs filled in:
+
+    ```bash
+    #!/usr/bin/env bash
+    # archive-audit-logs.sh — runs hourly from cron on log-collector-01
+    # audit logs from the payment gateway, compliance wants them 400 days
+
+    set -euo pipefail
+    shopt -s nullglob
+
+    SRC=/var/log/paygw/audit
+    ARCHIVE=/mnt/archive/paygw-audit
+    TMP=/tmp/paygw-audit-$$
+    ALERT_MAIL=ops-payments@example.com
+    RETENTION_DAYS=400
+
+    mkdir -p "$TMP"
+    trap 'rm -rf "$TMP"' EXIT
+
+    # rotated files only: audit-YYYYMMDD-HH.log (the live audit.log does not match)
+    files=("$SRC"/audit-*.log)
+    if (( ${#files[@]} == 0 )); then
+      exit 0
+    fi
+
+    # fraud summary: scan the files in place, the match list only lives for the mail
+    if grep -H -- 'DECLINED_FRAUD' "${files[@]}" > "$TMP/fraud.txt"; then
+      count=$(wc -l < "$TMP/fraud.txt")
+      mail -s "paygw audit: $count DECLINED_FRAUD lines" "$ALERT_MAIL" < "$TMP/fraud.txt"
+    fi
+
+    for f in "${files[@]}"; do
+      name=${f##*/}                  # audit-20261024-13.log
+      stamp=${name#audit-}           # 20261024-13.log
+      dest="$ARCHIVE/${stamp:0:4}/${stamp:4:2}"
+      mkdir -p "$dest"
+
+      # write under a hidden temp name, test it, then publish and delete the source
+      part="$dest/.$name.part.zst"
+      zstd -q -f -o "$part" -- "$f"
+      zstd -q -t -- "$part"
+      mv -- "$part" "$dest/$name.zst"
+      rm -- "$f"
+    done
+
+    # retention: mtime of each archive is close to the hour of its log
+    find "$ARCHIVE" -type f -name 'audit-*.log.zst' -mtime +"$RETENTION_DAYS" -delete
+    find "$ARCHIVE" -mindepth 1 -type d -empty -delete
+    ```
+
+    **Green Notes**
+    - **Compress stored data** (reduces E and storage): the logs are kept for 400 days, so compression pays off. The script compresses every hour, so it uses zstd at its default level. In Green Metrics Tool benchmarks on 100 MB of text, zstd used ~16 J, gzip ~67 J and xz ~458 J. That is about 4× less than gzip, and xz cost about 29× more than zstd. Decompression is also cheap with zstd (~5.3 J), so later audit lookups stay cheap.
+    - These figures compare energy, not file size. If space on the archive volume over 400 days is the real limit, a higher zstd level gives smaller files for more CPU. Check the sizes on your own logs before you switch.
+    - *Not applied:* compressing `$TMP/fraud.txt`. It exists for a few seconds. Green Coding Solutions estimates that zstd-compressed data has to be kept for at least about 0.15 days before compression pays off, so the file goes into the mail as plain text.
+
+    The script needs the `zstd` package on the collector. To search an archive, use `zstd -dc audit-20261024-13.log.zst | grep DECLINED_FRAUD`. If `mail` fails, `set -e` stops the run before anything is archived, and the next hour picks the files up again.
+verify:
+  static_only: needs zstd, mail and the real log and archive paths on the collector

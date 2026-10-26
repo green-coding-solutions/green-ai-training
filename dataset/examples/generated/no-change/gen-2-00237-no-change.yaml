@@ -1,0 +1,59 @@
+id: gen-2-00237-no-change
+category: no-change
+language: python
+patterns:
+- vectorize-or-jit
+- context-tradeoff
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    Profiler says `reduce_frames` is where our nightly CCD reduction spends most of its time. Stacks are ~15 science frames of 4k×4k, one run per filter per night. Put `@njit` on it, diff only.
+
+    ```python
+    import numpy as np
+
+
+    def load_stack(paths):
+        frames = [np.load(p).astype(np.float32) for p in paths]
+        shapes = {f.shape for f in frames}
+        if len(shapes) != 1:
+            raise ValueError(f"inconsistent frame shapes: {shapes}")
+        return np.stack(frames)
+
+
+    def master_bias(bias_paths):
+        return np.median(load_stack(bias_paths), axis=0)
+
+
+    def master_flat(flat_paths, bias):
+        flats = load_stack(flat_paths) - bias
+        flats /= np.median(flats, axis=(1, 2), keepdims=True)
+        return np.median(flats, axis=0)
+
+
+    def reduce_frames(science, bias, flat, clip=5.0):
+        """Bias/flat correct a science stack and sigma-clip combine it.
+
+        science: (n, ny, nx) float32. Returns (combined image, rejected count per pixel).
+        """
+        sci = (science - bias) / flat
+        med = np.median(sci, axis=0)
+        dev = np.abs(sci - med)
+        sigma = 1.4826 * np.median(dev, axis=0)
+        mask = dev > clip * sigma
+        sci[mask] = np.nan
+        return np.nanmean(sci, axis=0), mask.sum(axis=0)
+    ```
+- role: assistant
+  content: |
+    No diff. I'd leave `reduce_frames` as it is.
+
+    - **There is no interpreted loop to compile.** Every step (subtract, divide, median, mask, `nanmean`) already runs in NumPy's compiled loops over the whole stack. Numba pays off on loops that run in the Python interpreter. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples used ~40 J as a pure Python loop and ~9.5 J with `@njit`, about 4× less. That compares a Python loop with JIT code. It says nothing about JIT code vs. NumPy that is already vectorized, which is your case.
+    - **It won't compile as written.** In nopython mode, `np.median` and `np.nanmean` don't accept `axis`. To get it through `@njit` you would have to rewrite it into explicit per-pixel loops with your own median. That is more code to maintain and gives no clear gain over NumPy's sort-based median.
+    - **Compile cost on every run.** One invocation per filter per night means the JIT compile happens on each process start, unless you add `cache=True`.
+
+    The profiler is pointing at the step where the full stack gets processed, and that is expected. The work there is the medians over the stack and the memory traffic of the float32 cube. Both already run in C.
+verify:
+  static_only: no-change answer without code; user code is plain NumPy and is left unchanged

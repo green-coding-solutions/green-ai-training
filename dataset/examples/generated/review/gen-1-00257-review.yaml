@@ -1,0 +1,93 @@
+id: gen-1-00257-review
+category: review
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    Review this. Gateway access logs, ~20 GB/day, cron at 02:30, we keep the archive 180 days. Diff only please, no essay.
+
+    ```bash
+    #!/usr/bin/env bash
+    # archive gateway logs, cron 02:30
+    LOGDIR=/var/log/gateway
+    ARCHIVE=/srv/archive/gateway
+    KEEP_DAYS=180
+
+    mkdir -p $ARCHIVE
+    cd $LOGDIR
+
+    for f in $(ls *.log); do
+        echo "archiving $f"
+        xz -9e -c $f > $ARCHIVE/$f.xz
+        rm $f
+    done
+
+    find $ARCHIVE -name '*.xz' -mtime +$KEEP_DAYS -delete
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (nightly batch, ~20 GB/day)
+
+    #### [Bug] Today's live log is archived and deleted
+    - **Where:** `for f in $(ls *.log)`, `rm $f`
+    - **Issue:** the glob also matches the file the gateway is still writing. It is compressed mid-write, then removed. Lines written after that are lost or go to a deleted inode.
+    - **Fix:** skip today's file (below). This assumes names like `gateway-YYYY-MM-DD.log`.
+
+    #### [Bug] Source is removed even if compression fails
+    - **Where:** `xz ... > ...; rm $f`
+    - **Issue:** if the disk is full or `xz` is killed, the original is still deleted. Nothing stops the loop.
+    - **Fix:** `set -euo pipefail`, so `rm` only runs after a successful compress.
+
+    #### [Medium] Unquoted variables and `ls` parsing
+    - **Where:** `$(ls *.log)`, `$f`, `$ARCHIVE`, `$KEEP_DAYS`
+    - **Issue:** names with spaces break the loop, and an empty glob passes the literal `*.log`.
+    - **Fix:** glob directly, quote every variable (below).
+
+    #### [High] `xz -9e` for data that is compressed every night
+    - **Where:** `xz -9e -c`
+    - **Issue:** you pay the compression cost on 20 GB every night. In Green Metrics Tool micro-benchmarks compressing 100 MB of text, xz at its default level used ~458 J and zstd at its default level ~16 J, about 29× less. `-9e` is the most expensive xz setting, so expect a larger gap. With 180 days of retention, compressing at all is worth it. A 180-day retention is far beyond the ~7-day break-even estimated for xz. A cheaper codec is enough.
+    - **Fix:** `zstd` at its default level.
+    - **Impact:** E, a large cut on the nightly CPU work. These figures compare energy only, not file size. xz usually produces smaller files, so compare sizes on your own logs. If the extra size matters on the archive volume, that is the trade-off.
+
+    ```text
+    --- archive-logs.sh
+    +++ archive-logs.sh
+    @@
+     #!/usr/bin/env bash
+    +set -euo pipefail
+     # archive gateway logs, cron 02:30
+     LOGDIR=/var/log/gateway
+     ARCHIVE=/srv/archive/gateway
+     KEEP_DAYS=180
+    +today=$(date +%F)
+
+    -mkdir -p $ARCHIVE
+    -cd $LOGDIR
+    +mkdir -p "$ARCHIVE"
+
+    -for f in $(ls *.log); do
+    -    echo "archiving $f"
+    -    xz -9e -c $f > $ARCHIVE/$f.xz
+    -    rm $f
+    +for f in "$LOGDIR"/*.log; do
+    +    [ -e "$f" ] || continue
+    +    case $f in *"$today"*) continue ;; esac
+    +    echo "archiving $f"
+    +    zstd -q -f "$f" -o "$ARCHIVE/${f##*/}.zst"
+    +    rm -- "$f"
+     done
+
+    -find $ARCHIVE -name '*.xz' -mtime +$KEEP_DAYS -delete
+    +find "$ARCHIVE" \( -name '*.xz' -o -name '*.zst' \) -mtime +"$KEEP_DAYS" -delete
+    ```
+
+    The retention `find` matches both suffixes, so the old `.xz` archives still expire on schedule. Keep them as they are. Recompressing them would cost more energy than it saves.
+
+    **Already good:** compressing the logs at all, and a retention cleanup in the same script.
+verify:
+  static_only: bash script working on /var/log and /srv/archive paths; needs zstd and a log directory

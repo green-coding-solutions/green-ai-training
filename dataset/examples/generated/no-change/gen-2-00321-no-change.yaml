@@ -1,0 +1,74 @@
+id: gen-2-00321-no-change
+category: no-change
+language: bash
+patterns:
+- compress-transmitted
+- none
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    We run this from cron every 20 minutes on our shop indexer. It takes the newest product search snapshot (one JSON file, about 400 MB, all product titles, descriptions, facets, prices) and pushes it to our 6 search replicas. The replicas pick up `*.json.zst` from the incoming dir, decompress it and swap the index.
+
+    Requirements:
+    - all 6 replicas must have the new snapshot within ~3 minutes, otherwise search shows stale prices
+    - the replicas are in the same DC as the indexer, 10 GbE between them
+    - the indexer is not idle, it rebuilds the next snapshot right after, so I don't want to burn CPU on it
+
+    In the sprint review two people had opposite ideas. One wants `xz -9` (or brotli) because "smaller files = less traffic". The other wants to drop compression completely because "10 GbE is fast enough anyway". Before I touch it: should I change anything here?
+
+    ```bash
+    #!/usr/bin/env bash
+    # Ship the latest search snapshot from the indexer to the search replicas.
+    # cron: */20 * * * *
+    set -euo pipefail
+
+    SNAP_DIR=/var/lib/shop-indexer/snapshots
+    REPLICAS=(search-01 search-02 search-03 search-04 search-05 search-06)
+    REMOTE_DIR=/srv/search/incoming
+    LOCK=/run/lock/ship-snapshot.lock
+
+    exec 9>"$LOCK"
+    flock -n 9 || { echo 'previous run still active' >&2; exit 0; }
+
+    latest=$(ls -1t "$SNAP_DIR"/products-*.json | head -n 1)
+    name=$(basename "$latest" .json)
+    out="/tmp/$name.json.zst"
+
+    # compress once, send the same file to every replica
+    zstd -q -f -T0 "$latest" -o "$out"
+    sha=$(sha256sum "$out" | cut -d' ' -f1)
+
+    pids=()
+    for host in "${REPLICAS[@]}"; do
+      (
+        scp -q "$out" "$host:$REMOTE_DIR/$name.json.zst.part"
+        ssh "$host" "cd $REMOTE_DIR && echo '$sha  $name.json.zst.part' | sha256sum -c --quiet - && mv $name.json.zst.part $name.json.zst"
+      ) &
+      pids+=($!)
+    done
+
+    fail=0
+    for pid in "${pids[@]}"; do
+      wait "$pid" || fail=1
+    done
+
+    rm -f "$out"
+    exit "$fail"
+    ```
+- role: assistant
+  content: |
+    I would not change it. For your setup this script already uses the efficient approach, and both suggestions would make it worse.
+
+    - **zstd at its default level is the right codec for data you compress this often.** In Green Metrics Tool measurements, compressing 100 MB of text cost about 16 J with zstd, about 458 J with xz and about 3019 J with brotli at maximum quality. So xz used about 29× and brotli about 190× more energy than zstd. These runs used default levels, so `xz -9` would cost even more than the xz figure. That cost lands on the indexer 72 times a day, and that is the box you want to keep free for the next rebuild. It would also put your 3-minute deadline at risk.
+    - **You compress once and send the result to six hosts.** The compression cost does not grow with the number of replicas. Decompression is cheap: about 5.3 J per 100 MB for zstd in the same measurements. The replicas pay that small cost, and in return every copy on the wire is smaller.
+    - **Nothing is compressed twice.** `scp` without `-C` sends the `.zst` file as is. Keep it that way. Compression in ssh would only spend CPU on data that is already compressed.
+
+    About the two ideas from the review:
+    - **xz / brotli:** those measurements compare energy only, not compression ratio. xz and brotli usually produce smaller files. That pays off for data compressed once and sent or stored many times, or over a slow link. On 10 GbE inside one DC, the extra bytes zstd sends are not your bottleneck, so the extra CPU buys you nothing.
+    - **No compression:** you would send the full JSON six times instead of one smaller file six times. The saving would only be the zstd step on the indexer, which is already the cheap part. If you want to settle it with data, time both variants on the indexer with `perf stat` or `/usr/bin/time -v` and compare CPU time and the end-to-end delivery time to all six replicas.
+
+    If the indexer is ever CPU-starved during a run, the knob I would try first is `-T0`. Capping the threads (for example `-T2`) leaves cores for the rebuild and keeps the same codec and output. The script itself can stay as it is.
+verify:
+  static_only: needs ssh access to the replica hosts, zstd and a snapshot directory

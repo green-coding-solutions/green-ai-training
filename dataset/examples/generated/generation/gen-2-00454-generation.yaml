@@ -1,0 +1,45 @@
+id: gen-2-00454-generation
+category: generation
+language: sql
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    Our launch page tracker buffers click and scroll events in the browser and flushes them with `navigator.sendBeacon`. The body is a JSON array, usually 200-500 events per flush:
+
+    ```json
+    [{"sid": "6f1c2c1e-5d0a-4a52-9b1e-0c7f6f3d9a11", "t": 1729851234567, "type": "cta_click", "path": "/launch", "variant": "B"}]
+    ```
+
+    Table (Postgres 16):
+
+    ```sql
+    CREATE TABLE landing_events (
+      session_id  uuid        NOT NULL,
+      occurred_at timestamptz NOT NULL,
+      event_type  text        NOT NULL,
+      path        text        NOT NULL,
+      variant     text
+    );
+    ```
+
+    I need the statement for the handler. `$1` is the raw request body as text. Just the SQL, no explanation.
+- role: assistant
+  content: |
+    ```sql
+    INSERT INTO landing_events (session_id, occurred_at, event_type, path, variant)
+    SELECT e.sid, to_timestamp(e.t / 1000.0), e.type, e.path, e.variant
+    FROM jsonb_to_recordset($1::jsonb) AS e(sid uuid, t bigint, type text, path text, variant text);
+    ```
+
+    The whole flush is one statement and one commit. If one event has a bad uuid or a missing `NOT NULL` field, the whole batch fails. Validate in the handler if you want to keep the good rows.
+
+    **Green Notes**
+    - **Batch database writes** (reduces E): one statement per flush instead of one `INSERT` per event, so 200-500 round trips and commits become 1. In Green Metrics Tool micro-benchmarks with 5,000-row batches, `COPY` used about 22× less energy than one `INSERT` per row. With batches of only about 100 rows the difference was small, so the gain depends on batch size.
+    - *Not applied:* `COPY`. At a few hundred rows per flush, the measured gap between batch methods shrinks. The JSON body maps directly onto this single statement, so `COPY` would add a conversion step for little gain.
+verify:
+  static_only: PostgreSQL-specific jsonb_to_recordset and to_timestamp, not runnable in SQLite

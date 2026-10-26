@@ -1,0 +1,120 @@
+id: gen-2-00104-review
+category: review
+language: javascript
+patterns:
+- css-animations
+- minify-assets
+facts:
+- F-ANIM
+- F-MINIFY
+messages:
+- role: user
+  content: |
+    Landing page entry + build script. Review, diff only.
+
+    ```javascript
+    // landing/src/main.js
+    import { initPricingToggle } from './pricing.js';
+
+    const hero = document.querySelector('.hero-shot');
+    const form = document.querySelector('#waitlist-form');
+    const msg = document.querySelector('#waitlist-msg');
+
+    console.log('[landing] init', performance.now());
+
+    // gentle floating effect on the product screenshot
+    let start = null;
+    function float(ts) {
+      if (start === null) start = ts;
+      const t = (ts - start) / 1000;
+      hero.style.top = `${Math.sin(t * 1.6) * 8}px`;
+      hero.style.boxShadow = `0 ${18 + Math.sin(t * 1.6) * 6}px 40px rgba(15, 23, 42, 0.25)`;
+      requestAnimationFrame(float);
+    }
+    requestAnimationFrame(float);
+
+    form.addEventListener('submit', async () => {
+      const email = form.elements.email.value.trim();
+      console.log('[landing] waitlist submit', email);
+      const res = await fetch('/api/waitlist', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, source: 'hero' }),
+      });
+      msg.textContent = res.ok ? "You're on the list." : 'Something went wrong, try again.';
+    });
+
+    initPricingToggle(document.querySelector('.pricing'));
+    ```
+
+    ```javascript
+    // landing/build.mjs
+    import { cpSync, rmSync, mkdirSync } from 'node:fs';
+
+    rmSync('dist', { recursive: true, force: true });
+    mkdirSync('dist');
+    cpSync('src', 'dist', { recursive: true });
+    cpSync('public', 'dist', { recursive: true });
+    console.log('built dist/');
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (landing page)
+
+    #### [Bug] Waitlist submit reloads the page
+    - **Where:** `form.addEventListener('submit', ...)`
+    - **Issue:** the default submit is never prevented. The browser navigates away, the `fetch` gets cancelled, and the message never shows.
+    - **Fix:** take the event and call `preventDefault()` first:
+      ```javascript
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const email = form.elements.email.value.trim();
+        const res = await fetch('/api/waitlist', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, source: 'hero' }),
+        });
+        msg.textContent = res.ok ? "You're on the list." : 'Something went wrong, try again.';
+      });
+      ```
+
+    #### [Medium] Hero float runs in JS on every frame
+    - **Where:** `float()` / `requestAnimationFrame(float)`
+    - **Issue:** the main thread writes `top` and `box-shadow` on every frame for the whole visit. Changing `top` forces layout each frame. A CSS animation does the same loop without any JS.
+    - **Fix:** delete `start`, `float()` and the `requestAnimationFrame(float)` call, then add this to the stylesheet. It keeps the same amplitude, shadow range and period:
+      ```css
+      .hero-shot {
+        animation: hero-float 1.96s ease-in-out infinite alternate;
+      }
+      @keyframes hero-float {
+        from { transform: translateY(-8px); box-shadow: 0 12px 40px rgba(15, 23, 42, 0.25); }
+        to   { transform: translateY(8px);  box-shadow: 0 24px 40px rgba(15, 23, 42, 0.25); }
+      }
+      ```
+      The curve is ease-in-out instead of a pure sine. You won't see the difference at 8px.
+    - **Impact:** E on the client for every visitor, for as long as the page is open. In Green Metrics Tool browser benchmarks, a 20-second animation with CSS `@keyframes` used about 10% less CPU energy than `requestAnimationFrame` with style updates.
+
+    #### [Low] Build ships unminified sources with debug logs
+    - **Where:** `build.mjs`, `cpSync('src', 'dist', ...)`
+    - **Issue:** `dist/` gets the raw sources, including the `console.log` that prints visitors' emails to the console.
+    - **Fix:**
+      ```javascript
+      import { build } from 'esbuild';
+      import { cpSync, rmSync } from 'node:fs';
+
+      rmSync('dist', { recursive: true, force: true });
+      cpSync('public', 'dist', { recursive: true });
+      await build({
+        entryPoints: ['src/main.js', 'src/styles.css'],
+        bundle: true,
+        minify: true,
+        drop: ['console'],
+        outdir: 'dist',
+      });
+      ```
+      `pricing.js` gets inlined into `dist/main.js`, so the `<script>` tag can stay as it is.
+    - **Impact:** network bytes only. In Green Metrics Tool page-load measurements of a small page, an esbuild build with `--minify --drop:console` used about 2% less client CPU energy, which is within measurement noise.
+
+    **Already good:** the result message uses `textContent`, so nothing user-controlled ends up in `innerHTML`.
+verify:
+  static_only: browser DOM code and an esbuild build script, needs a browser and the esbuild package

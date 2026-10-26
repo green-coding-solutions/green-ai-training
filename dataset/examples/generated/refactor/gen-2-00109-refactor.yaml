@@ -1,0 +1,118 @@
+id: gen-2-00109-refactor
+category: refactor
+language: python
+patterns:
+- torch-no-grad
+- hoist-invariants
+facts:
+- F-NOGRAD
+- F-ATTR
+messages:
+- role: user
+  content: |
+    hi, this job run every night for all our customer (around 400k) and give the size recommendation we show on product page. it take quite long on the CPU node and the memory go high during the run. can you make it more fast and clean? model is torchscript, it output chest, waist, hip in cm.
+
+    ```python
+    import math
+    import torch
+
+    SIZE_CHART = {
+        "XS": (82.0, 66.0, 88.0),
+        "S": (88.0, 72.0, 94.0),
+        "M": (96.0, 80.0, 100.0),
+        "L": (104.0, 88.0, 106.0),
+        "XL": (112.0, 96.0, 112.0),
+        "XXL": (120.0, 106.0, 120.0),
+    }
+
+
+    class FitRecommender:
+        def __init__(self, model_path, size_chart=SIZE_CHART, batch_size=512):
+            self.model = torch.jit.load(model_path, map_location="cpu")
+            self.model.eval()
+            self.size_chart = list(size_chart.items())
+            self.batch_size = batch_size
+
+        def _closest_size(self, chest, waist, hip):
+            best_size = None
+            best_dist = float("inf")
+            for size, (c, w, h) in self.size_chart:
+                dist = math.sqrt((chest - c) ** 2 + (waist - w) ** 2 + (hip - h) ** 2)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_size = size
+            return best_size, best_dist
+
+        def recommend_all(self, customers):
+            # customers: list of dicts with "id" and "features" (14 floats)
+            results = {}
+            for start in range(0, len(customers), self.batch_size):
+                batch = customers[start:start + self.batch_size]
+                x = torch.tensor([c["features"] for c in batch], dtype=torch.float32)
+                preds = self.model(x).tolist()
+                for cust, (chest, waist, hip) in zip(batch, preds):
+                    size, dist = self._closest_size(chest, waist, hip)
+                    results[cust["id"]] = {
+                        "size": size,
+                        "confident": dist < 4.0,
+                    }
+            return results
+    ```
+- role: assistant
+  content: |
+    ```python
+    import math
+    import torch
+
+    SIZE_CHART = {
+        "XS": (82.0, 66.0, 88.0),
+        "S": (88.0, 72.0, 94.0),
+        "M": (96.0, 80.0, 100.0),
+        "L": (104.0, 88.0, 106.0),
+        "XL": (112.0, 96.0, 112.0),
+        "XXL": (120.0, 106.0, 120.0),
+    }
+
+
+    class FitRecommender:
+        def __init__(self, model_path, size_chart=SIZE_CHART, batch_size=512):
+            self.model = torch.jit.load(model_path, map_location="cpu")
+            self.model.eval()
+            self.size_chart = list(size_chart.items())
+            self.batch_size = batch_size
+
+        def _closest_size(self, chest, waist, hip):
+            sqrt = math.sqrt
+            best_size = None
+            best_dist = float("inf")
+            for size, (c, w, h) in self.size_chart:
+                dist = sqrt((chest - c) ** 2 + (waist - w) ** 2 + (hip - h) ** 2)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_size = size
+            return best_size, best_dist
+
+        @torch.no_grad()
+        def recommend_all(self, customers):
+            # customers: list of dicts with "id" and "features" (14 floats)
+            closest_size = self._closest_size
+            results = {}
+            for start in range(0, len(customers), self.batch_size):
+                batch = customers[start:start + self.batch_size]
+                x = torch.tensor([c["features"] for c in batch], dtype=torch.float32)
+                preds = self.model(x).tolist()
+                for cust, (chest, waist, hip) in zip(batch, preds):
+                    size, dist = closest_size(chest, waist, hip)
+                    results[cust["id"]] = {
+                        "size": size,
+                        "confident": dist < 4.0,
+                    }
+            return results
+    ```
+
+    **Green Notes**
+    - **`torch.no_grad()` for inference** (reduces E and M): `model.eval()` only changes layers like dropout. It does not turn off autograd. Without `no_grad`, PyTorch builds a gradient graph for every batch and keeps the intermediate tensors alive, which is part of why memory goes up. In Green Metrics Tool micro-benchmarks, 100,000 PyTorch CPU inferences used about 14% less CPU energy with `torch.no_grad()`. The predictions are the same.
+    - **Hoist the lookups out of the inner loop** (reduces E): `math.sqrt` is now a local, so the inner loop over sizes no longer does a global and attribute lookup on every pass. `self._closest_size` is also bound once, not once per customer. This is a small win: in the same benchmarks, caching `math.sqrt` in a local before a 10,000,000-iteration loop saved about 4-5%. It is only worth it because this code runs for every customer and every size.
+    - Results are the same: same sizes, same `confident` flags, same dict keys and order.
+verify:
+  static_only: needs PyTorch and a TorchScript model file

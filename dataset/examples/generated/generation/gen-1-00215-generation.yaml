@@ -1,0 +1,81 @@
+id: gen-1-00215-generation
+category: generation
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    hi, I am learning python and want to make a small script. I have a file cities.txt with one city name per line (about 25 cities). For each city I want to print the current temperature. I found open-meteo is free and has no key. I dont know how to start, should I use requests? Not sure what is the right way, thank you
+- role: assistant
+  content: |
+    Open-meteo needs coordinates, so each city takes two calls: one to find the city, one to get the temperature. With 25 cities, the script spends almost all its time waiting for the network. This version sends the calls for many cities at once with `httpx` (`pip install httpx`).
+
+    ```python
+    import asyncio
+    import sys
+
+    import httpx
+
+    GEO_URL = "https://geocoding-api.open-meteo.com/v1/search"
+    WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+    MAX_CONCURRENT = 10
+
+
+    async def fetch_temp(client, sem, city):
+        """Return (city, temperature or None, error message or None)."""
+        async with sem:
+            try:
+                geo = await client.get(GEO_URL, params={"name": city, "count": 1})
+                geo.raise_for_status()
+                results = geo.json().get("results")
+                if not results:
+                    return city, None, "city not found"
+
+                place = results[0]
+                weather = await client.get(
+                    WEATHER_URL,
+                    params={
+                        "latitude": place["latitude"],
+                        "longitude": place["longitude"],
+                        "current": "temperature_2m",
+                    },
+                )
+                weather.raise_for_status()
+                return city, weather.json()["current"]["temperature_2m"], None
+            except httpx.HTTPError as exc:
+                return city, None, type(exc).__name__
+
+
+    async def main(path):
+        with open(path, encoding="utf-8") as f:
+            cities = [line.strip() for line in f if line.strip()]
+
+        sem = asyncio.Semaphore(MAX_CONCURRENT)
+        async with httpx.AsyncClient(timeout=10) as client:
+            results = await asyncio.gather(
+                *(fetch_temp(client, sem, city) for city in cities)
+            )
+
+        # gather keeps the order of the input file
+        for city, temp, error in results:
+            if error:
+                print(f"{city:<20} error: {error}")
+            else:
+                print(f"{city:<20} {temp:>5.1f} °C")
+
+
+    if __name__ == "__main__":
+        path = sys.argv[1] if len(sys.argv) > 1 else "cities.txt"
+        asyncio.run(main(path))
+    ```
+
+    Run it with `python weather.py cities.txt`. A city that is not found or a failed call prints an error on its own line. The other cities still work.
+
+    **Green Notes**
+    - **Concurrent network calls** (reduces E, idle wall time): the script waits for the network most of the time, so `asyncio.gather` lets the calls of many cities wait together instead of one after another. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. For a small number of requests the gain is mostly wall time. The semaphore keeps at most 10 calls open at once, so the free API is not flooded.
+    - *Not applied:* async is not worth it for one or two cities. A plain `httpx.get` is simpler there.
+verify:
+  static_only: needs network access and the third-party package httpx

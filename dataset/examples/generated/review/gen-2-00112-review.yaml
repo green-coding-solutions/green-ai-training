@@ -1,0 +1,138 @@
+id: gen-2-00112-review
+category: review
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    hi, this step from our ETL fill the gaps in smart meter readings. when a meter is offline the kwh field is empty, and we take the next valid reading of the same meter. Before it was fine but now the export is around 1.5M rows per day and this step take very long, much more then the rest of pipeline together. can you review it pls? also if you see other problems tell me
+
+    ```python
+    import csv
+    import sys
+    from datetime import datetime
+
+    FIELDS = ["meter_id", "ts", "kwh", "filled"]
+
+
+    def parse_row(raw):
+        kwh = raw["kwh"].strip()
+        return {
+            "meter_id": raw["meter_id"],
+            "ts": datetime.fromisoformat(raw["ts"]),
+            "kwh": float(kwh) if kwh else None,
+        }
+
+
+    def backfill_readings(rows):
+        """rows must be sorted by meter_id, ts. Missing kwh gets the next valid reading of the meter."""
+        out = []
+        next_kwh = None
+        for row in reversed(rows):
+            if not row["kwh"]:
+                filled = dict(row, kwh=next_kwh, filled=next_kwh is not None)
+            else:
+                next_kwh = row["kwh"]
+                filled = dict(row, filled=False)
+            out.insert(0, filled)
+        return out
+
+
+    def main(src, dst):
+        with open(src, newline="") as f:
+            rows = [parse_row(r) for r in csv.DictReader(f)]
+        rows.sort(key=lambda r: (r["meter_id"], r["ts"]))
+
+        result = backfill_readings(rows)
+
+        with open(dst, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=FIELDS)
+            w.writeheader()
+            for r in result:
+                w.writerow({**r, "ts": r["ts"].isoformat()})
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1], sys.argv[2])
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline
+
+    #### [Bug] Zero readings are treated as missing
+    - **Where:** `if not row["kwh"]:` in `backfill_readings`
+    - **Issue:** `not 0.0` is `True`. A real reading of `0.0` kWh (meter online, no consumption) is replaced with the next reading and marked `filled=True`.
+    - **Fix:** `if row["kwh"] is None:`. `parse_row` already uses `None` for empty fields.
+
+    #### [Bug] Gaps at the end of a meter get the next meter's value
+    - **Where:** `next_kwh` in `backfill_readings`
+    - **Issue:** `next_kwh` is never reset when `meter_id` changes. In reverse order, the trailing gap of meter A comes right after meter B's first reading, so A gets B's value.
+    - **Fix:** reset `next_kwh = None` when the meter changes (see the full function below). Trailing gaps then stay `None` with `filled=False`, the same as a gap at the end of the last meter today.
+
+    #### [High] `out.insert(0, ...)` makes the step quadratic
+    - **Where:** `out.insert(0, filled)`
+    - **Issue:** a Python list is an array. Every front insert shifts all rows already in `out` by one slot. With 1.5M rows the total work grows with n², not n. That is why the step was fine on small exports and now takes longer than the rest of the pipeline. In Green Metrics Tool micro-benchmarks, 1,000,000 × `list.insert(0, x)` used ~1515 J of CPU energy and 1,000,000 × `list.append(x)` used ~1.2 J, a difference of over 1000×.
+    - **Fix:** `append` in the loop, then `out.reverse()` once at the end. That is O(n) and keeps the output order the same. `collections.deque.appendleft` would also work, but `DictWriter` and any later steps are happy with a plain list, so append plus reverse is simpler.
+    - **Impact:** E, every daily run. The function goes from quadratic to linear time, and the gap gets bigger as the export grows.
+
+    Fixed function with all three changes:
+
+    ```python
+    def backfill_readings(rows):
+        """rows must be sorted by meter_id, ts. Missing kwh gets the next valid reading of the same meter."""
+        out = []
+        next_kwh = None
+        current_meter = None
+        for row in reversed(rows):
+            if row["meter_id"] != current_meter:
+                current_meter = row["meter_id"]
+                next_kwh = None
+            if row["kwh"] is None:
+                out.append(dict(row, kwh=next_kwh, filled=next_kwh is not None))
+            else:
+                next_kwh = row["kwh"]
+                out.append(dict(row, filled=False))
+        out.reverse()
+        return out
+    ```
+
+    **Already good:** one sort with a tuple key, one pass over the data for the backfill.
+verify:
+  module: true
+  test: |
+    rows = [
+        {"meter_id": "A", "ts": 1, "kwh": 0.0},
+        {"meter_id": "A", "ts": 2, "kwh": None},
+        {"meter_id": "B", "ts": 1, "kwh": 3.5},
+        {"meter_id": "B", "ts": 2, "kwh": None},
+        {"meter_id": "B", "ts": 3, "kwh": 4.0},
+    ]
+    out = backfill_readings(rows)
+    assert [(r["meter_id"], r["ts"]) for r in out] == [("A", 1), ("A", 2), ("B", 1), ("B", 2), ("B", 3)]
+    assert out[0]["kwh"] == 0.0 and out[0]["filled"] is False
+    assert out[1]["kwh"] is None and out[1]["filled"] is False
+    assert out[3]["kwh"] == 4.0 and out[3]["filled"] is True
+    assert out[4]["kwh"] == 4.0 and out[4]["filled"] is False
+    assert rows[1]["kwh"] is None and "filled" not in rows[1]
+  equivalence:
+    driver: |
+      rows = []
+      for m in ("M-001", "M-002", "M-003"):
+          for h in range(48):
+              kwh = None if h % 7 in (2, 3) else round(0.5 + (h * 13 % 17) / 10, 2)
+              rows.append({"meter_id": m, "ts": h, "kwh": kwh})
+      for r in backfill_readings(rows):
+          print(r["meter_id"], r["ts"], r["kwh"], r["filled"])
+  benchmark:
+    driver: |
+      rows = []
+      for m in range(50):
+          for h in range(1000):
+              kwh = None if h % 7 in (2, 3) else round(0.5 + (h * 13 % 17) / 10, 2)
+              rows.append({"meter_id": "M-%03d" % m, "ts": h, "kwh": kwh})
+      out = backfill_readings(rows)
+      print(len(out))
+    min_speedup: 1.5

@@ -1,0 +1,119 @@
+id: gen-2-00197-estimate
+category: estimate
+language: python
+patterns:
+- simple-conditions
+facts:
+- F-COND
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    from dataclasses import dataclass
+
+    ENTITY_TYPES = ("PER", "ORG", "LOC", "MISC")
+
+
+    @dataclass
+    class Span:
+        label: str
+        start: int
+        end: int
+
+
+    # Runs on every token of every request (~40M tokens/day on the NER service).
+    # INFRA-2231: would simplifying decode_tag save energy? how much?
+    def decode_tag(label_id):
+        if label_id == 0:
+            return "O", None
+        elif label_id % 2 == 1 and 1 <= label_id <= 2 * len(ENTITY_TYPES) - 1:
+            return "B", ENTITY_TYPES[(label_id - 1) // 2]
+        elif label_id % 2 == 0 and 2 <= label_id <= 2 * len(ENTITY_TYPES):
+            return "I", ENTITY_TYPES[(label_id - 2) // 2]
+        else:
+            raise ValueError(f"unknown label id {label_id}")
+
+
+    def extract_spans(pred_ids, offsets):
+        """pred_ids: logits.argmax(-1).tolist(), offsets: tokenizer offset_mapping"""
+        spans = []
+        current = None
+        for label_id, (start, end) in zip(pred_ids, offsets):
+            if start == end:  # special tokens ([CLS], [SEP], padding)
+                continue
+            prefix, ent = decode_tag(label_id)
+            if prefix == "B" or (prefix == "I" and (current is None or current.label != ent)):
+                if current is not None:
+                    spans.append(current)
+                current = Span(ent, start, end)
+            elif prefix == "I":
+                current.end = end
+            else:
+                if current is not None:
+                    spans.append(current)
+                current = None
+        if current is not None:
+            spans.append(current)
+        return spans
+    ```
+- role: assistant
+  content: |
+    Short answer: yes, but only a little. The decode step gets cheaper. The saving for the whole service is probably very small.
+
+    `decode_tag` does more work than it needs to. For every entity token it runs a modulo, two range checks, a `len()` call and some index arithmetic. A lookup table built once at import time skips all of that per token:
+
+    ```python
+    ENTITY_TYPES = ("PER", "ORG", "LOC", "MISC")
+
+    # Built once at import: label id -> (prefix, entity type)
+    ID2TAG = {0: ("O", None)}
+    for _i, _ent in enumerate(ENTITY_TYPES):
+        ID2TAG[2 * _i + 1] = ("B", _ent)
+        ID2TAG[2 * _i + 2] = ("I", _ent)
+
+
+    def decode_tag(label_id):
+        tag = ID2TAG.get(label_id)
+        if tag is None:
+            raise ValueError(f"unknown label id {label_id}")
+        return tag
+    ```
+
+    The results are the same, and unknown ids raise the same error. `extract_spans` stays as it is.
+
+    **Measured reference:** Green Metrics Tool micro-benchmarks ran 10,000,000 classifications. Simple equality branches used ~46 J. Complex range/modulo conditions used ~54 J. The simple version used about 16% less. That benchmark compared equality branches, not a dict lookup. Treat it as a direction, not as your number.
+
+    **Why your saving will be smaller:**
+    - In NER output, "O" tokens are usually the majority. They already return at the first `== 0` check. Only entity tokens get cheaper.
+    - The benchmark measured only the classification step. Each request also runs tokenization and the model forward pass, which do far more work than `decode_tag`. The decode step is a small share of the service's energy.
+
+    **How to measure it:**
+    - Time the decode step alone, on a few thousand label ids recorded from production traffic, so the O/B/I mix is real. Run `timeit.timeit(lambda: [decode_tag(i) for i in pred_ids], number=1000)` once with the old `decode_tag` and once with the new one.
+    - Find its share of a request. Profile one request with `cProfile` or py-spy and compare the time in `decode_tag` with the time in the model.
+    - Measure energy. Run a fixed request load against each version as a Green Metrics Tool usage scenario. At minimum, compare `perf stat -e power/energy-pkg/` totals. Multiply only the measured difference per token by your daily token count.
+
+    Rewriting the chain as `match` would not help. In the same benchmarks, `match` and `if/elif` with the same conditions differed by about 1%, which is noise.
+verify:
+  green_block: 0
+  test: |
+    assert decode_tag(0) == ("O", None)
+    assert decode_tag(1) == ("B", "PER")
+    assert decode_tag(3) == ("B", "ORG")
+    assert decode_tag(6) == ("I", "LOC")
+    assert decode_tag(8) == ("I", "MISC")
+    for bad in (-1, 9, 42):
+        try:
+            decode_tag(bad)
+        except ValueError as e:
+            assert str(e) == f"unknown label id {bad}"
+        else:
+            raise AssertionError("expected ValueError")
+  equivalence:
+    driver: |-
+      for i in range(-3, 12):
+          try:
+              print(i, decode_tag(i))
+          except ValueError as e:
+              print(i, "ValueError", e)

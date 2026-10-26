@@ -1,0 +1,187 @@
+id: gen-2-00402-estimate
+category: estimate
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    hi, sorry if this is a dumb question. I'm new on the platform team of our online shop. Sales asks us for a "demo shop" for every big prospect, so they can show the storefront with the customer's logo and products. I copy the setup below for each one and change the names. We have 25 demo namespaces now and some are still from the summer.
+
+    My lead asked: if I cut every demo down to 1 storefront pod and remove redis and the worker, how much energy do we save? I don't know how to calculate that, or if I'm even looking at the right thing.
+
+    ```yaml
+    apiVersion: v1
+    kind: Namespace
+    metadata:
+      name: demo-nordhaus
+      labels:
+        app.kubernetes.io/part-of: sales-demo
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: storefront
+      namespace: demo-nordhaus
+    spec:
+      replicas: 3
+      selector:
+        matchLabels: {app: storefront}
+      template:
+        metadata:
+          labels: {app: storefront}
+        spec:
+          containers:
+            - name: storefront
+              image: registry.shopco.internal/shop/storefront:2.14.0
+              env:
+                - {name: DEMO_TENANT, value: nordhaus}
+                - {name: REDIS_URL, value: redis://redis:6379/0}
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef: {name: demo-db, key: url}
+              resources:
+                requests: {cpu: 250m, memory: 512Mi}
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: order-worker
+      namespace: demo-nordhaus
+    spec:
+      replicas: 1
+      selector:
+        matchLabels: {app: order-worker}
+      template:
+        metadata:
+          labels: {app: order-worker}
+        spec:
+          containers:
+            - name: worker
+              image: registry.shopco.internal/shop/storefront:2.14.0
+              args: ["worker", "--poll-interval=5s"]
+              resources:
+                requests: {cpu: 100m, memory: 256Mi}
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: redis
+      namespace: demo-nordhaus
+    spec:
+      replicas: 1
+      selector:
+        matchLabels: {app: redis}
+      template:
+        metadata:
+          labels: {app: redis}
+        spec:
+          containers:
+            - name: redis
+              image: redis:7-alpine
+    # + postgres StatefulSet with a 10Gi PVC and the Services
+    ```
+- role: assistant
+  content: |
+    You are looking at the right setup, but trimming is the small lever. The big one is how long the demos exist.
+
+    In Green Metrics Tool micro-benchmarks, a per-branch preview environment idled for 60 seconds:
+
+    - 3 app replicas, Postgres, Redis and a polling worker: ~269 J CPU energy
+    - 1 app replica and Postgres: ~262 J, about 3% less
+    - whole-machine energy differed by less than 1% (~1330 J vs ~1320 J), because the idle baseline of the machine dominates
+
+    Your demos look like that setup: they sit idle almost all the time, so the extra pods use little CPU per minute. What costs energy is that the demos exist at all. Each one holds memory requests, so the cluster keeps nodes running for it, hour after hour. A demo from the summer that nobody opens still holds those nodes every hour.
+
+    So the answer for your lead is:
+
+    1. **Delete demos after the sales deal is decided.** Every deleted namespace removes all of its remaining hours. This is where the real saving is.
+    2. **Trimming still helps a bit.** Fewer pods reserve less memory, so the cluster may need fewer nodes. Check first that the storefront works without Redis (sessions, cart). If it does, trim. If it doesn't, keep Redis and drop only the extra replicas and the worker.
+    3. **Optional:** scale demos to zero at night and on weekends if sales only shows them during office hours.
+
+    For step 1, give every demo an expiry date and let a nightly job clean up:
+
+    ```yaml
+    apiVersion: v1
+    kind: Namespace
+    metadata:
+      name: demo-nordhaus
+      labels:
+        app.kubernetes.io/part-of: sales-demo
+        demo-expires: "2026-11-20"   # set when you create the demo
+    ---
+    apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: demo-reaper
+      namespace: platform-tools
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    metadata:
+      name: demo-reaper
+    rules:
+      - apiGroups: [""]
+        resources: ["namespaces"]
+        verbs: ["list", "delete"]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    metadata:
+      name: demo-reaper
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: ClusterRole
+      name: demo-reaper
+    subjects:
+      - kind: ServiceAccount
+        name: demo-reaper
+        namespace: platform-tools
+    ---
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata:
+      name: demo-reaper
+      namespace: platform-tools
+    spec:
+      schedule: "0 3 * * *"
+      concurrencyPolicy: Forbid
+      jobTemplate:
+        spec:
+          backoffLimit: 1
+          template:
+            spec:
+              serviceAccountName: demo-reaper
+              restartPolicy: Never
+              containers:
+                - name: reaper
+                  image: registry.shopco.internal/tools/kubectl:1.30   # any image with kubectl and bash
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |
+                      today=$(date +%F)
+                      kubectl get ns -l app.kubernetes.io/part-of=sales-demo \
+                        -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.labels.demo-expires}{"\n"}{end}' |
+                      while read -r ns expires; do
+                        if [[ -z $expires ]]; then
+                          echo "skip $ns: no demo-expires label"
+                        elif [[ $expires < $today ]]; then
+                          echo "deleting $ns (expired $expires)"
+                          kubectl delete ns "$ns" --wait=false
+                        fi
+                      done
+    ```
+
+    Notes:
+    - Namespaces without the label are skipped, so nothing is deleted by surprise. Ask sales which old demos are still needed, then label the rest with a past date, e.g. `kubectl label ns demo-old demo-expires=2026-10-01`.
+    - Deleting a namespace also deletes its Postgres volume. If sales needs a demo again later, recreate it from your template.
+    - `platform-tools` must exist. Sales can extend a demo by changing the label.
+
+    **How to measure it for your cluster** (don't scale the 3% above, your pods and nodes differ):
+    - Count environment-hours: for each demo namespace, how many days it has existed vs. how many days it was actually used. That shows the size of the saving better than any per-pod number.
+    - Compare node count and summed memory requests before and after cleanup (`kubectl describe nodes`, `kubectl top nodes`). Fewer nodes is the real effect. Your cloud bill for node hours shows the same thing.
+    - For energy per demo, run one demo stack idle in a Green Metrics Tool usage scenario, once full and once trimmed.
+verify:
+  static_only: Kubernetes manifests and CronJob script, need a cluster with kubectl

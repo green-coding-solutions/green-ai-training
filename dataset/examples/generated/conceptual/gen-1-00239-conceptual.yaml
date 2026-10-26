@@ -1,0 +1,59 @@
+id: gen-1-00239-conceptual
+category: conceptual
+language: text
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    Our ETL normalizer has this inner loop. A colleague says to bind `self.null_tokens` and `self.schema.coerce` to locals before the loop. Worth it? Diff only, plus when it's safe.
+
+    ```python
+    class Normalizer:
+        def __init__(self, schema, null_tokens):
+            self.schema = schema
+            self.null_tokens = null_tokens
+
+        def run(self, rows):
+            out = []
+            for row in rows:
+                rec = {}
+                for name, raw in row.items():
+                    if raw in self.null_tokens:
+                        rec[name] = None
+                    else:
+                        rec[name] = self.schema.coerce(name, raw)
+                out.append(rec)
+            return out
+    ```
+- role: assistant
+  content: |
+    The diff:
+
+    ```text
+         def run(self, rows):
+             out = []
+    +        null_tokens = self.null_tokens
+    +        coerce = self.schema.coerce
+             for row in rows:
+                 rec = {}
+                 for name, raw in row.items():
+    -                if raw in self.null_tokens:
+    +                if raw in null_tokens:
+                         rec[name] = None
+                     else:
+    -                    rec[name] = self.schema.coerce(name, raw)
+    +                    rec[name] = coerce(name, raw)
+                 out.append(rec)
+             return out
+    ```
+
+    The gain is small. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local variable before a 10,000,000-iteration loop saved about 4-5%. Your loop does more work per field (`coerce` itself), so the share saved is likely smaller. I would not extrapolate that figure to your pipeline. Measure with a real batch if it matters.
+
+    **When it is safe**
+    - `self.null_tokens` and `self.schema` must not be reassigned while `run` is going. If a callback swaps them mid-run, the locals would keep the old values.
+    - It only matters if a profile shows `run` is hot, for example millions of fields per night. For a small job, skip it and keep the code as it is.
+verify:
+  static_only: conceptual answer

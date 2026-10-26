@@ -1,0 +1,92 @@
+id: gen-2-00059-generation
+category: generation
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    need a func that turns the User-Agent header into a feature tuple for our bot classifier model. called on every request
+- role: assistant
+  content: |
+    ```python
+    import re
+    from functools import lru_cache
+
+    BROWSERS = ("other", "edge", "chrome", "firefox", "safari")
+    OSES = ("other", "windows", "ios", "macos", "android", "linux")
+    MAX_UA = 512
+
+    # order matters: Edge UAs also contain "Chrome", Chrome UAs also contain "Safari"
+    _BROWSER_RULES = (
+        (1, re.compile(r"Edg(?:e|A|iOS)?/(\d+)")),
+        (2, re.compile(r"(?:Chrome|CriOS)/(\d+)")),
+        (3, re.compile(r"(?:Firefox|FxiOS)/(\d+)")),
+        (4, re.compile(r"Version/(\d+).*Safari/")),
+    )
+    # order matters: iOS UAs contain "Mac OS X", Android UAs contain "Linux"
+    _OS_RULES = (
+        (1, "Windows"),
+        (2, "iPhone"),
+        (2, "iPad"),
+        (3, "Macintosh"),
+        (4, "Android"),
+        (5, "Linux"),
+    )
+    _BOT = re.compile(r"bot|crawl|spider|slurp|curl|wget|python-|httpx|headless", re.I)
+
+
+    @lru_cache(maxsize=4096)
+    def _ua_features(ua: str) -> tuple[int, int, int, int, int, int]:
+        browser, major = 0, 0
+        for browser_id, rule in _BROWSER_RULES:
+            m = rule.search(ua)
+            if m:
+                browser, major = browser_id, min(int(m.group(1)), 999)
+                break
+        os_id = next((oid for oid, token in _OS_RULES if token in ua), 0)
+        return (
+            browser,
+            major,
+            os_id,
+            int("Mobi" in ua),
+            int(not ua or _BOT.search(ua) is not None),
+            min(len(ua) // 32, 15),
+        )
+
+
+    def ua_features(user_agent: str | None) -> tuple[int, int, int, int, int, int]:
+        """(browser, major_version, os, is_mobile, looks_like_bot, length_bucket)."""
+        return _ua_features((user_agent or "")[:MAX_UA])
+    ```
+
+    **Green Notes**
+    - **Memoize repeated pure computations** (reduces E): real traffic sends the same few hundred user agents again and again. Most calls are now one dict lookup instead of several regex scans. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations with inputs from only 200 distinct values used about 9× less CPU energy with `lru_cache`. With mostly unique inputs the cache only adds overhead, so check the hit rate with `_ua_features.cache_info()`.
+    - **Bounded cache** (reduces M): `maxsize=4096` plus truncating the header to 512 characters caps memory, even when scanners send random or huge headers. Truncation does not change any feature, because the length bucket already stops at 15.
+    - The result is an immutable tuple, so no caller can modify a cached value. If the model needs an array, convert it at the call site.
+verify:
+  test: |-
+    chrome = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    edge = chrome + " Edg/124.0.2478.80"
+    iphone = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
+    android = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+    firefox = "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0"
+    googlebot = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+    assert ua_features(chrome)[:5] == (2, 124, 1, 0, 0)
+    assert ua_features(edge)[:5] == (1, 124, 1, 0, 0)
+    assert ua_features(iphone)[:5] == (4, 17, 2, 1, 0)
+    assert ua_features(android)[:5] == (2, 124, 4, 1, 0)
+    assert ua_features(firefox)[:5] == (3, 125, 5, 0, 0)
+    assert ua_features(googlebot)[:5] == (0, 0, 0, 0, 1)
+    assert ua_features(None) == (0, 0, 0, 0, 1, 0)
+    assert ua_features("") == (0, 0, 0, 0, 1, 0)
+    assert ua_features("x" * 10000)[5] == 15
+    assert isinstance(ua_features(chrome), tuple)
+    _ua_features.cache_clear()
+    for _ in range(3):
+        ua_features(chrome)
+    info = _ua_features.cache_info()
+    assert info.hits == 2 and info.misses == 1
+    assert info.maxsize == 4096

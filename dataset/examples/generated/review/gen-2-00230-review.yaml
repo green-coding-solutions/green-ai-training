@@ -1,0 +1,147 @@
+id: gen-2-00230-review
+category: review
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    hi, I maintain `tallyctl`, a small Python CLI for our time tracking backend. I added integration tests that run on our self-hosted runner (one VM). At first it worked fine. Now the VM has like 60 containers running and is almost out of memory, and the tests got flaky. Sometimes they find entries that the test never created?? I don't really understand where all the containers come from. Can you look at what I did wrong?
+
+    `.github/workflows/integration.yml`:
+    ```yaml
+    name: integration
+
+    on:
+      push:
+        branches: ['**']
+
+    jobs:
+      cli-integration:
+        runs-on: [self-hosted, linux, docker]
+        env:
+          STACK: tally-${{ github.ref_name }}
+        steps:
+          - uses: actions/checkout@v4
+
+          - name: Start backend stack
+            run: docker compose -f ci/compose.integration.yml -p $STACK up -d
+
+          - name: Wait until API is healthy
+            run: docker compose -f ci/compose.integration.yml -p $STACK run --rm cli ./scripts/wait-for-api.sh
+
+          - name: Run tallyctl integration tests
+            run: docker compose -f ci/compose.integration.yml -p $STACK run --rm cli pytest tests/integration -x
+
+          - name: Tear down
+            run: docker compose -f ci/compose.integration.yml -p $STACK down
+    ```
+
+    `ci/compose.integration.yml`:
+    ```yaml
+    services:
+      postgres:
+        image: postgres:16
+        environment:
+          POSTGRES_PASSWORD: tally
+        volumes:
+          - pgdata:/var/lib/postgresql/data
+
+      redis:
+        image: redis:7
+
+      api:
+        image: registry.internal/tally-api:latest
+        deploy:
+          replicas: 3
+        environment:
+          DATABASE_URL: postgres://postgres:tally@postgres:5432/postgres
+          REDIS_URL: redis://redis:6379/0
+        depends_on: [postgres, redis]
+
+      worker:
+        image: registry.internal/tally-api:latest
+        command: ["tally", "worker"]
+        environment:
+          DATABASE_URL: postgres://postgres:tally@postgres:5432/postgres
+          REDIS_URL: redis://redis:6379/0
+        depends_on: [postgres, redis]
+
+      cli:
+        build: ..
+        profiles: ["tools"]
+        environment:
+          TALLY_API_URL: http://api:8000
+        depends_on: [api]
+
+    volumes:
+      pgdata:
+    ```
+- role: assistant
+  content: |
+    **Workload:** mixed (CI integration tests for a CLI on a self-hosted runner)
+
+    #### [Bug] The database from the last run is reused
+    - **Where:** `pgdata` volume, `Tear down` step (`down` without `-v`)
+    - **Issue:** `docker compose down` removes containers but keeps named volumes. The next push to the same branch uses the same project name, so Postgres starts with the data the previous run left behind. That's where the entries your tests never created come from.
+    - **Fix:** `down -v` plus a unique project name per run (both are in the fixed workflow below).
+
+    #### [Bug] Branch names with `/` break the job
+    - **Where:** `STACK: tally-${{ github.ref_name }}`
+    - **Issue:** Compose project names may only contain lowercase letters, digits, `-` and `_`. A branch like `feature/export-csv` or `Fix-Login` gives an invalid name, so the job fails at the first step.
+    - **Fix:** use `tally-${{ github.run_id }}`. It is always valid and unique per run.
+
+    #### [High] Failed and cancelled runs leave the whole stack running
+    - **Where:** `Tear down` step
+    - **Issue:** a step without an `if:` is skipped once an earlier step fails. So every failed test run, cancelled run or hanging job leaves Postgres, Redis, three API replicas and the worker running. Nothing ever stops them, not even when the branch is deleted. That's your 60 containers.
+    - **Fix:**
+      ```yaml
+      name: integration
+
+      on:
+        push:
+          branches: ['**']
+
+      jobs:
+        cli-integration:
+          runs-on: [self-hosted, linux, docker]
+          timeout-minutes: 20   # a bit above a normal run; GitHub's default is hours
+          env:
+            STACK: tally-${{ github.run_id }}
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Start backend stack
+              run: docker compose -f ci/compose.integration.yml -p "$STACK" up -d
+
+            - name: Wait until API is healthy
+              run: docker compose -f ci/compose.integration.yml -p "$STACK" run --rm cli ./scripts/wait-for-api.sh
+
+            - name: Run tallyctl integration tests
+              run: docker compose -f ci/compose.integration.yml -p "$STACK" run --rm cli pytest tests/integration -x
+
+            - name: Tear down
+              if: always()
+              run: docker compose -f ci/compose.integration.yml -p "$STACK" down -v --remove-orphans
+      ```
+      `if: always()` runs the teardown after failures and cancellations too. `timeout-minutes` stops a hanging test from keeping the stack up for hours.
+    - **Impact:** E and M. Each stack now lives only for the few minutes its job runs, not for days. Idle containers are cheap per minute. In Green Metrics Tool measurements of a preview environment idling for 60 seconds, the full stack and a trimmed one differed by only about 3% in CPU energy, and by less than 1% in machine energy. The real saving is the hours: a stack that doesn't exist costs nothing and holds no memory.
+
+      To clean up the stacks that are already there, run this when no job is running. Check the list before you delete anything:
+      ```bash
+      docker compose ls --all --filter name=tally-
+      for p in $(docker compose ls --all --quiet --filter name=tally-); do
+        docker compose -p "$p" down -v --remove-orphans
+      done
+      docker volume ls --filter name=tally-
+      ```
+      Your earlier successful runs also left `pgdata` volumes behind. The last command lists them. Remove them with `docker volume rm` once you've checked them.
+
+    #### [Low] The stack is bigger than the tests need
+    - **Where:** `api` with `replicas: 3`, `redis`, `worker`
+    - **Issue:** if the `tallyctl` tests only call the API, one API replica and Postgres are probably enough. Keep Redis if the API needs it to start, and keep the worker if your tests cover background jobs.
+    - **Impact:** mostly M. In the same measurement, trimming three replicas, Redis and a worker down to one replica plus Postgres saved only about 3% in CPU energy while idle. On a single VM, though, fewer containers reserve less memory.
+verify:
+  static_only: GitHub Actions workflow and Docker Compose file; needs Docker and a self-hosted runner

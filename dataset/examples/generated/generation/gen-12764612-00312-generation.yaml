@@ -1,0 +1,53 @@
+id: gen-12764612-00312-generation
+category: generation
+language: bash
+patterns:
+- compress-stored
+- bash-quoting
+facts:
+- F-COMPRESS-CODECS
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    bash script: monthly, pack last month's readings-YYYY-MM-DD.csv from /var/lib/gateway/readings into one archive in /var/backups/gateway, delete the originals, keep 12 months
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    src='/var/lib/gateway/readings'
+    dest='/var/backups/gateway'
+    month=$(date -d 'last month' +%Y-%m)
+    archive="$dest/readings-$month.tar.zst"
+
+    mkdir -p "$dest"
+    cd "$src"
+
+    files=(readings-"$month"-*.csv)
+    if [[ ! -e ${files[0]} ]]; then
+      echo "No files for $month, nothing to do."
+      exit 0
+    fi
+
+    # Write to a temp name, check it, then move it into place.
+    tar --zstd -cf "$archive.tmp" -- "${files[@]}"
+    tar --zstd -tf "$archive.tmp" > /dev/null
+    mv -- "$archive.tmp" "$archive"
+
+    # Only delete the originals after the archive passed the check.
+    rm -- "${files[@]}"
+
+    # Keep 12 months of archives.
+    find "$dest" -name 'readings-*.tar.zst' -mtime +365 -delete
+    ```
+
+    Run it from cron on the 1st of each month, for example `0 3 1 * * /usr/local/bin/archive-readings.sh`.
+
+    **Green Notes**
+    - **Fast codec for stored data** (reduces E): the archive is kept for a year, so compressing it is worth it. zstd at its default level is the cheap choice. In Green Metrics Tool micro-benchmarks on 100 MB of text, zstd used about 4× less CPU energy than gzip, and xz used about 29× more than zstd. Those figures compare energy only, not file size. If you need the smallest possible archive, xz gives a stronger ratio at a much higher compression cost.
+    - **Single quotes for literals** (reduces E): paths and patterns without expansion use single quotes, and variables keep their double quotes. In Green Metrics Tool micro-benchmarks, single-quoted literals used about 24% less CPU for the quoting work in a long loop. In a script that runs once a month the saving is tiny.
+    - *Not applied:* a higher zstd level or `xz`. This job runs once a month, but the cheap codec costs nothing in practice, and the extra CPU of a strong codec buys little here.
+verify:
+  static_only: bash script that needs tar with zstd, GNU date and a gateway data directory

@@ -1,0 +1,84 @@
+id: gen-12764612-00227-estimate
+category: estimate
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    I'm doing post-processing for molecular dynamics runs on our group's cluster. Each run writes a whitespace-separated file `energy.dat` with columns `step temp ekin epot`, plus comment lines starting with `#`. A typical file has about 150k lines, and we post-process about 40 runs after every parameter sweep.
+
+    This is the script we use now:
+
+    ```bash
+    #!/bin/bash
+    # usage: summarize.sh energy.dat
+    file="$1"
+    n=0
+    sum="0"
+    max="0"
+    while read -r line; do
+      case "$line" in
+        "#"*) continue ;;
+      esac
+      ekin=$(echo "$line" | cut -d' ' -f3)
+      epot=$(echo "$line" | cut -d' ' -f4)
+      etot=$(echo "$ekin + $epot" | bc -l)
+      sum=$(echo "$sum + $etot" | bc -l)
+      if [ "$(echo "$etot > $max" | bc -l)" = "1" ]; then
+        max="$etot"
+      fi
+      n=$((n + 1))
+    done < "$file"
+    echo "frames: $n"
+    echo "mean total energy: $(echo "$sum / $n" | bc -l)"
+    echo "max total energy: $max"
+    ```
+
+    My PI asks if it is worth rewriting this to something with fewer external commands. Requirements: the output must stay the same (frames, mean, max), no new dependencies on the cluster nodes, and I need an estimate I can put in the group report. How much energy would we save per sweep? Please give me a number if you can.
+- role: assistant
+  content: |
+    I can't give you an honest joule figure for your sweep. I can tell you the direction, how big the effect is in a similar case, and how to measure your own.
+
+    **Why it is expensive.** Every `$(...)` starts a new process, and each pipe adds more. Your loop runs five or six substitutions per data line (two `echo | cut`, three `echo | bc`, one more for the comparison). For a 150k-line file that is close to a million process starts per file, and the arithmetic itself is trivial.
+
+    **What was measured.** In Green Metrics Tool micro-benchmarks, a `while read` loop that ran `$(echo | cut)` and `$(expr)` per field on a 20,000-line log (about 10 processes per line) used about 1302 J and 238 s. The same task with builtins only used about 4.3 J and 0.72 s, roughly 300× less. One `awk` pass used about 1.0 J and 0.21 s, over 1000× less than the subprocess loop and about 4× less than the builtin loop.
+
+    That benchmark did integer string work, not floating point. Your case is the same kind of cost, but I would not copy those ratios onto it. Bash has no float arithmetic, so builtins alone won't work here. One `awk` pass is the right replacement:
+
+    ```bash
+    #!/bin/bash
+    # usage: summarize.sh energy.dat
+    awk '
+      /^#/ { next }
+      {
+        etot = $3 + $4
+        sum += etot
+        if (n == 0 || etot > max) max = etot
+        n++
+      }
+      END {
+        if (n == 0) { print "frames: 0"; exit }
+        printf "frames: %d\n", n
+        printf "mean total energy: %.10g\n", sum / n
+        printf "max total energy: %.10g\n", max
+      }
+    ' "$1"
+    ```
+
+    **Differences to check before you switch:**
+    - `bc -l` uses arbitrary precision, `awk` uses doubles. Over 150k values the last digits of the mean can differ. For MD energies this should not matter, but compare the output on one real file.
+    - `read -r` with default `IFS` trims leading blanks, and `cut -d' '` does not. If your columns are padded with several spaces, your current `cut` picks the wrong field, and `awk` splits on any whitespace. If that happens, the new output is the correct one.
+    - An empty file made the old script divide by zero. The new one prints `frames: 0`.
+    - Your old `max` started at 0, so all-negative energies would report 0. The new version reports the real maximum. Total energies in MD are often negative, so check whether your old results were affected.
+
+    **How to measure for the report.** Run both scripts on the same real `energy.dat`:
+    - Use `perf stat -e power/energy-pkg/ ./summarize.sh energy.dat` where RAPL is available. Otherwise `time` gives a CPU-time proxy.
+    - For a repeatable setup, wrap each script in a Green Metrics Tool usage scenario.
+    - Multiply the measured per-file difference by your own file count. Don't take it from my figures.
+
+    Expect the old script to take minutes per file and the new one a fraction of a second. Since this runs 40 times per sweep, the rewrite is worth doing.
+verify:
+  static_only: bash script with awk and bc; measurement-based estimate answer, no runnable Python

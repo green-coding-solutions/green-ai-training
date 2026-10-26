@@ -1,0 +1,56 @@
+id: gen-2-00432-no-change
+category: no-change
+language: sql
+patterns:
+- batch-db-writes
+- context-tradeoff
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    We run a nightly job for our shop on Postgres 16. A partner fulfilment system drops the day's order lines, about 60k rows, into a staging table `stg_order_lines`. Then this statement moves them into the real table.
+
+    Requirements: it must be idempotent (re-running after a failure must not create duplicates), it must run in one transaction with the rest of the job, and lines for unknown orders or SKUs must be skipped, not fail the job.
+
+    A colleague says we should "use COPY instead of INSERT, it is much more efficient" and load the file straight into `order_lines`. Should we change it?
+
+    ```sql
+    INSERT INTO order_lines (order_id, product_id, qty, unit_price_cents)
+    SELECT o.id, p.id, s.qty, s.unit_price_cents
+    FROM stg_order_lines s
+    JOIN orders o ON o.order_no = s.order_no
+    JOIN products p ON p.sku = s.sku
+    ON CONFLICT (order_id, product_id) DO NOTHING;
+    ```
+- role: assistant
+  content: |
+    No, keep it as it is. This is already the efficient form.
+
+    - **It is one set-based statement.** The 60k rows move inside the server in a single pass. There is no per-row round trip between client and server.
+    - **COPY solves a different problem.** In Green Metrics Tool micro-benchmarks, `COPY ... FROM STDIN` used about 22× less energy than one `INSERT` per row sent from a client, with 5,000-row batches. That compared client loops that send rows. Your rows are already in the database, so there is nothing for COPY to save.
+    - **COPY cannot meet your requirements.** It has no `ON CONFLICT`, no joins and no skipping of unknown orders or SKUs. Loading straight into `order_lines` would break idempotency and the skip rule. You would need a staging table again.
+
+    Your statement:
+
+    ```sql
+    INSERT INTO order_lines (order_id, product_id, qty, unit_price_cents)
+    SELECT o.id, p.id, s.qty, s.unit_price_cents
+    FROM stg_order_lines s
+    JOIN orders o ON o.order_no = s.order_no
+    JOIN products p ON p.sku = s.sku
+    ON CONFLICT (order_id, product_id) DO NOTHING;
+    ```
+
+    Where COPY does fit is the step before this one. If the job fills `stg_order_lines` from the partner file with one `INSERT` per row from a script, switch that step to `COPY stg_order_lines FROM STDIN` (or `\copy`) with batches of thousands of rows. With batches of only about 100 rows, the benchmark differences were small. If you already load the staging table with COPY or a bulk loader, there is nothing to change.
+
+    Make sure `orders(order_no)` and `products(sku)` have indexes, so the two joins stay cheap. That is about correctness of the plan, not a new pattern. I have no measurement for it.
+verify:
+  sql:
+    setup: CREATE TABLE orders (id INTEGER PRIMARY KEY, order_no TEXT UNIQUE); CREATE TABLE products (id INTEGER PRIMARY KEY,
+      sku TEXT UNIQUE); CREATE TABLE stg_order_lines (order_no TEXT, sku TEXT, qty INTEGER, unit_price_cents INTEGER); CREATE
+      TABLE order_lines (order_id INTEGER, product_id INTEGER, qty INTEGER, unit_price_cents INTEGER, PRIMARY KEY (order_id,
+      product_id)); INSERT INTO orders VALUES (1, 'A-100'), (2, 'A-101'); INSERT INTO products VALUES (10, 'SKU-1'), (11,
+      'SKU-2'); INSERT INTO stg_order_lines VALUES ('A-100', 'SKU-1', 2, 1999), ('A-100', 'SKU-2', 1, 500), ('A-101', 'SKU-1',
+      3, 1999), ('A-999', 'SKU-1', 1, 1999), ('A-101', 'SKU-X', 1, 100);
+    compare: true

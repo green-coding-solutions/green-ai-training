@@ -1,0 +1,147 @@
+id: gen-2-00160-estimate
+category: estimate
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    Our ETL has a nightly backfill step that loads sensor exports for each tenant into the warehouse. A colleague flagged the `rows.insert(0, ...)` below and wants to change it. Before it goes into the sprint I need to write a ticket with the expected saving. Requirements:
+
+    - output must stay newest first (the loader dedups on (sensor_id, ts) and keeps the first row it sees)
+    - memory must not double. Some tenant files are 3-4M rows and the worker has little headroom
+    - `to_batches` and the loader stay as they are. They expect a list
+    - 40 tenants run every night
+
+    How much energy/CO2 would this save per night? A rough number is fine.
+
+    ```python
+    import csv
+    from datetime import datetime
+
+    REQUIRED = {"sensor_id", "ts", "value"}
+
+
+    def load_readings(path, tenant_id):
+        """Read one tenant export (oldest first) and return readings newest first.
+
+        The loader dedups on (sensor_id, ts) and keeps the first row it sees,
+        so newest-first order matters.
+        """
+        rows = []
+        skipped = 0
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            missing = REQUIRED - set(reader.fieldnames or [])
+            if missing:
+                raise ValueError(f"{path}: missing columns {sorted(missing)}")
+            for rec in reader:
+                if not rec["value"].strip():
+                    skipped += 1
+                    continue
+                rows.insert(0, {
+                    "tenant_id": tenant_id,
+                    "sensor_id": rec["sensor_id"],
+                    "ts": datetime.fromisoformat(rec["ts"]),
+                    "value": float(rec["value"]),
+                    "unit": rec.get("unit") or "raw",
+                })
+        return rows, skipped
+
+
+    def to_batches(rows, size=5000):
+        for i in range(0, len(rows), size):
+            yield rows[i:i + size]
+    ```
+- role: assistant
+  content: |
+    I can't give you a reliable joule or CO2 figure for your nightly run without measuring it. Here is what you can put in the ticket: the direction, the cause, a measured reference, and how to get your own number.
+
+    **What drives the saving:** `rows.insert(0, ...)` shifts every row already in the list one slot to the right. Each new row costs as many moves as there are rows before it, so the total work grows with the square of the row count. Your biggest tenant files dominate this cost. `append` adds at the end without moving anything. One `reverse()` at the end is a single O(n) pass.
+
+    **Measured reference:** in Green Metrics Tool micro-benchmarks, 1,000,000 × `list.insert(0, x)` used ~1515 J of CPU energy and 1,000,000 × `list.append(x)` used ~1.2 J. That is over 1000× less. The benchmark measured only the list operations. Your loop also parses CSV fields, timestamps and floats, and that cost stays the same. So the saving for the whole job will be smaller than that ratio. Because the cost is quadratic, a file larger than the benchmark list pays more per row for the front inserts. Don't scale the benchmark figure to your row counts. Measure instead.
+
+    **The change** meets all four requirements:
+    - Same newest-first order, so the loader's dedup still keeps the newest row.
+    - `reverse()` works in place, so there is no second list and memory does not double.
+    - It still returns a plain list, so `to_batches` slicing keeps working. A `deque` with `appendleft` would also be O(1) per row, but deques can't be sliced, so `to_batches` would break.
+
+    ```python
+    import csv
+    from datetime import datetime
+
+    REQUIRED = {"sensor_id", "ts", "value"}
+
+
+    def load_readings(path, tenant_id):
+        """Read one tenant export (oldest first) and return readings newest first.
+
+        The loader dedups on (sensor_id, ts) and keeps the first row it sees,
+        so newest-first order matters.
+        """
+        rows = []
+        skipped = 0
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            missing = REQUIRED - set(reader.fieldnames or [])
+            if missing:
+                raise ValueError(f"{path}: missing columns {sorted(missing)}")
+            for rec in reader:
+                if not rec["value"].strip():
+                    skipped += 1
+                    continue
+                rows.append({
+                    "tenant_id": tenant_id,
+                    "sensor_id": rec["sensor_id"],
+                    "ts": datetime.fromisoformat(rec["ts"]),
+                    "value": float(rec["value"]),
+                    "unit": rec.get("unit") or "raw",
+                })
+        rows.reverse()  # in place: newest first, no copy
+        return rows, skipped
+
+
+    def to_batches(rows, size=5000):
+        for i in range(0, len(rows), size):
+            yield rows[i:i + size]
+    ```
+
+    **How to get the number for the ticket:**
+    1. **CPU-time proxy:** run the old and new `load_readings` on your largest real tenant file and compare user time with `perf stat -e task-clock python run_one.py <file>` or `/usr/bin/time -v`. Also check that both return the same rows.
+    2. **Energy:** on a machine with RAPL access, use `perf stat -e power/energy-pkg/`. Or run both versions as Green Metrics Tool usage scenarios on the same machine and compare CPU energy per tenant file. Add up the per-file differences for all tenants to get the nightly figure.
+    3. **CO2:** multiply the measured energy difference by the grid carbon intensity of the region where the worker runs. Without a measured energy figure, any CO2 number would be a guess.
+
+    Write the measured per-night difference into the ticket. The change is small and keeps behavior the same, so it is worth doing before you have the exact figure.
+verify:
+  green_block: 0
+  equivalence:
+    driver: |
+      import os, tempfile
+      d = tempfile.mkdtemp()
+      p = os.path.join(d, "tenant.csv")
+      with open(p, "w", newline="", encoding="utf-8") as f:
+          f.write("sensor_id,ts,value,unit\n")
+          for i in range(300):
+              v = "" if i % 17 == 0 else f"{i * 0.5}"
+              u = "kWh" if i % 3 else ""
+              f.write(f"s{i % 7},2026-01-01T00:{i // 60:02d}:{i % 60:02d},{v},{u}\n")
+      rows, skipped = load_readings(p, "acme")
+      print(skipped, len(rows))
+      for r in rows[:5] + rows[-5:]:
+          print(r["tenant_id"], r["sensor_id"], r["ts"].isoformat(), r["value"], r["unit"])
+      print([len(b) for b in to_batches(rows, 50)])
+      print(rows[0]["ts"] > rows[-1]["ts"])
+  benchmark:
+    driver: |
+      import os, tempfile
+      d = tempfile.mkdtemp()
+      p = os.path.join(d, "tenant.csv")
+      with open(p, "w", newline="", encoding="utf-8") as f:
+          f.write("sensor_id,ts,value,unit\n")
+          for i in range(80000):
+              f.write(f"s{i % 50},2026-01-01T{(i // 3600) % 24:02d}:{(i // 60) % 60:02d}:{i % 60:02d},{i * 0.25},kWh\n")
+      rows, skipped = load_readings(p, "acme")
+      print(len(rows), skipped)
+    min_speedup: 1.5

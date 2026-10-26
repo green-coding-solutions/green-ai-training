@@ -1,0 +1,90 @@
+id: gen-12764612-00192-estimate
+category: estimate
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    hi, im new to python. we have a small gateway (an old industrial pc in the cellar) that listens to bluetooth beacons and tags each one with the room. a friend looked at my code and said "exceptions are slow, use .get". is he right? how much energy would that save? i dont know if my code is wrong
+
+    ```python
+    ROOMS = {
+        "C4:7C:8D:11:22:33": "kitchen",
+        "C4:7C:8D:11:22:34": "hallway",
+        "C4:7C:8D:11:22:35": "garage",
+    }
+
+
+    def label_advert(mac, rssi):
+        try:
+            room = ROOMS[mac]
+        except KeyError:
+            room = "unknown"
+        return {"mac": mac, "room": room, "rssi": rssi}
+
+
+    def process(adverts):
+        out = []
+        for mac, rssi in adverts:
+            out.append(label_advert(mac, rssi))
+        return out
+    ```
+
+    most of the beacons it hears are from the neighbours, so only a few are in ROOMS
+- role: assistant
+  content: |
+    Your code is correct. Your friend is right for your case, because most lookups miss.
+
+    In Green Metrics Tool micro-benchmarks, 10,000,000 dict lookups with about half of the keys missing used ~67 J with `dict.get(key, default)` and ~76 J with `try/except KeyError`. That is about 12% less with `get`. The cost is in raising and catching the exception. A hit costs almost nothing in both versions. If misses are rare, `try/except` is fine.
+
+    Most of your beacons miss, so you are in the expensive case. The fix is small and the behavior stays the same:
+
+    ```python
+    ROOMS = {
+        "C4:7C:8D:11:22:33": "kitchen",
+        "C4:7C:8D:11:22:34": "hallway",
+        "C4:7C:8D:11:22:35": "garage",
+    }
+
+
+    def label_advert(mac, rssi):
+        room = ROOMS.get(mac, "unknown")
+        return {"mac": mac, "room": room, "rssi": rssi}
+
+
+    def process(adverts):
+        out = []
+        for mac, rssi in adverts:
+            out.append(label_advert(mac, rssi))
+        return out
+    ```
+
+    **What to expect**
+    - The 12% is for the lookup step only, measured on one machine with a loop that does little else. Don't apply it to your whole gateway. Radio, parsing and sending the data will likely use much more than this lookup.
+    - Every mac you don't know now skips one raised exception. The saving grows with the number of adverts per second and the share of unknown beacons.
+    - The change is also shorter and easier to read, so it is worth doing.
+
+    **How to measure it:** replay a recorded file of adverts through `process()` with the old and the new version, the same number of times. Compare CPU time with `perf stat` or `time`, or use a Green Metrics Tool usage scenario. Compare the two runs, not my numbers.
+verify:
+  module: true
+  equivalence:
+    driver: |
+      import sys
+      adverts = [
+          ("C4:7C:8D:11:22:33", -60),
+          ("AA:AA:AA:00:00:01", -80),
+          ("C4:7C:8D:11:22:35", -72),
+          ("BB:BB:BB:00:00:02", -91),
+          ("C4:7C:8D:11:22:34", -55),
+          ("AA:AA:AA:00:00:01", -79),
+      ]
+      for row in process(adverts):
+          print(row["mac"], row["room"], row["rssi"])
+  test: |-
+    r = process([("C4:7C:8D:11:22:33", -50), ("00:00:00:00:00:00", -90)])
+    assert r[0]["room"] == "kitchen"
+    assert r[1]["room"] == "unknown"
+    assert r[1]["rssi"] == -90

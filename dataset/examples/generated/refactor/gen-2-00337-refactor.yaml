@@ -1,0 +1,70 @@
+id: gen-2-00337-refactor
+category: refactor
+language: html
+patterns:
+- lazy-load-images
+facts:
+- F-LAZY-IMG
+messages:
+- role: user
+  content: |
+    Ticket view from our support API. `GET /tickets/<id>` renders this Jinja template when the client sends `Accept: text/html`. Agents open it from the Slack notification. Nearly all of them read the first message and its screenshot, then hit reply. Long threads have 30-80 screenshots plus an avatar per message, and all of it loads on open. Just the diff please.
+
+    ```html
+    {% extends "base.html" %}
+    {% block content %}
+    <article class="ticket">
+      <header class="ticket-head">
+        <img class="avatar" src="{{ ticket.customer.avatar_url }}" width="40" height="40" alt="">
+        <h1>#{{ ticket.id }} {{ ticket.subject }}</h1>
+        <span class="status status-{{ ticket.status }}">{{ ticket.status }}</span>
+        <span class="sla">{{ ticket.sla_due|humanize }}</span>
+      </header>
+
+      <section class="first-message">
+        <p>{{ ticket.body }}</p>
+        {% for a in ticket.attachments %}
+        <img class="shot" src="{{ a.url }}" width="{{ a.width }}" height="{{ a.height }}" alt="{{ a.name }}">
+        {% endfor %}
+      </section>
+
+      <form class="reply" method="post" action="/tickets/{{ ticket.id }}/replies">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <textarea name="body" rows="6" required></textarea>
+        <button type="submit">Send reply</button>
+      </form>
+
+      <ol class="thread">
+        {% for msg in ticket.messages|reverse %}
+        <li class="msg msg-{{ msg.author.role }}">
+          <img class="avatar" src="{{ msg.author.avatar_url }}" width="32" height="32" alt="">
+          <strong>{{ msg.author.name }}</strong>
+          <time datetime="{{ msg.created_at.isoformat() }}">{{ msg.created_at|humanize }}</time>
+          <p>{{ msg.body }}</p>
+          {% for a in msg.attachments %}
+          <a href="{{ a.url }}"><img class="shot" src="{{ a.thumb_url }}" width="240" height="160" alt="{{ a.name }}"></a>
+          {% endfor %}
+        </li>
+        {% endfor %}
+      </ol>
+    </article>
+    {% endblock %}
+    ```
+- role: assistant
+  content: |
+    ```html
+    <!-- first-message: keep the first screenshot eager, defer the rest -->
+    <img class="shot" src="{{ a.url }}" width="{{ a.width }}" height="{{ a.height }}" alt="{{ a.name }}"{% if not loop.first %} loading="lazy"{% endif %}>
+
+    <!-- thread -->
+    <img class="avatar" src="{{ msg.author.avatar_url }}" width="32" height="32" alt="" loading="lazy">
+    <a href="{{ a.url }}"><img class="shot" src="{{ a.thumb_url }}" width="240" height="160" alt="{{ a.name }}" loading="lazy"></a>
+    ```
+
+    **Green Notes**
+    - **Defer offscreen images** (reduces E, network): thread avatars and screenshots now load only when an agent scrolls near them. An agent who reads the first message and replies no longer fetches the 30-80 thread images. In Green Metrics Tool browser benchmarks, an article with 15 photos loaded without scrolling used about 12% less CPU energy with `loading="lazy"` below the fold (~368 J vs ~325 J). When visitors scrolled to the end, there was no measurable difference, so agents who read whole threads lose nothing.
+    - **Above the fold stays eager:** the header avatar and the first screenshot are what agents look at first. Lazy there would only delay them.
+
+    The rendered page is unchanged. Every `<img>` already has `width`/`height`, so deferred images reserve their space and the layout does not jump.
+verify:
+  static_only: Jinja HTML template, lazy loading is browser behavior

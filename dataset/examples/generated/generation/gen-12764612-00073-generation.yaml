@@ -1,0 +1,53 @@
+id: gen-12764612-00073-generation
+category: generation
+language: sql
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    I need the SQL for the log search page of our internal ops tool (Postgres 16, psycopg 3 on the backend). The table is `app_logs` with these columns: `id bigint`, `ts timestamptz`, `service text`, `level text`, `host text`, `trace_id text`, `message text`, `stack_trace text`, `raw_payload jsonb`, `request_headers jsonb`, `user_agent text`, `created_at timestamptz`. It has about 80 million rows.
+
+    Requirements:
+    - The list shows time, level, service, host and message. Newest first.
+    - Filter by one service, a time range, and one or more levels.
+    - 100 rows per page, "load more" button, no OFFSET because the table is huge.
+    - When someone clicks a row, a side panel shows everything about that one log line, including the stack trace and the payload.
+
+    Please give me both queries with the parameters marked.
+- role: assistant
+  content: |
+    Two queries: a slim one for the list page and a full one for the side panel. The list uses keyset pagination. Pass `NULL` for the cursor values on the first page, then the `ts` and `id` of the last row you got.
+
+    ```sql
+    -- List page: $1 service, $2 range start, $3 range end (exclusive),
+    --            $4 levels (text[]), $5 cursor ts, $6 cursor id, $7 page size (100)
+    SELECT id, ts, level, service, host, message
+    FROM app_logs
+    WHERE service = $1
+      AND ts >= $2
+      AND ts <  $3
+      AND level = ANY($4::text[])
+      AND ($5::timestamptz IS NULL OR (ts, id) < ($5, $6))
+    ORDER BY ts DESC, id DESC
+    LIMIT $7;
+    ```
+
+    ```sql
+    -- Side panel: $1 log id
+    SELECT id, ts, level, service, host, trace_id, message,
+           stack_trace, raw_payload, request_headers, user_agent
+    FROM app_logs
+    WHERE id = $1;
+    ```
+
+    **Green Notes**
+    - **Select only the needed columns** (reduces E, network): the list query reads 6 of the 12 columns and skips `stack_trace`, `raw_payload` and `request_headers`, which are the large ones. Every page of 100 rows would otherwise carry that data from the database to the app and then to the browser. In Green Metrics Tool micro-benchmarks on a 52-column table with large text columns, `SELECT *` used about 5.5-7× the energy of naming the 10 needed columns. The saving grows with the size of the columns you skip. Your table is narrower, so expect a smaller gap.
+    - **Heavy columns on demand** (reduces E, network): the big columns are read only for the one row a person clicks, not for every row in the list.
+    - **Keyset pagination**: `(ts, id) < (...)` continues where the last page ended, so "load more" does not re-read and throw away earlier rows like `OFFSET` would. `id` breaks ties when two lines share a timestamp.
+verify:
+  static_only: parameterized Postgres queries with row-value comparison and timestamptz casts

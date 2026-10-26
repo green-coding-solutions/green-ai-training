@@ -1,0 +1,80 @@
+id: gen-12764612-00263-estimate
+category: estimate
+language: sql
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    ```sql
+    -- load_lightcurve_sector14.sql
+    -- run: psql -d transits -f load_lightcurve_sector14.sql
+    BEGIN;
+
+    CREATE TABLE IF NOT EXISTS lightcurve_points (
+        star_id    bigint NOT NULL,
+        bjd        double precision NOT NULL,
+        flux       double precision NOT NULL,
+        flux_err   double precision NOT NULL,
+        quality    smallint NOT NULL DEFAULT 0
+    );
+
+    INSERT INTO lightcurve_points (star_id, bjd, flux, flux_err, quality) VALUES (261136679, 2459001.50012, 1.00231, 0.00041, 0);
+    INSERT INTO lightcurve_points (star_id, bjd, flux, flux_err, quality) VALUES (261136679, 2459001.50151, 1.00198, 0.00041, 0);
+    INSERT INTO lightcurve_points (star_id, bjd, flux, flux_err, quality) VALUES (261136679, 2459001.50290, 1.00177, 0.00042, 0);
+    INSERT INTO lightcurve_points (star_id, bjd, flux, flux_err, quality) VALUES (261136679, 2459001.50429, 0.99874, 0.00042, 512);
+    -- ... about 60000 more lines like this
+
+    CREATE INDEX IF NOT EXISTS lightcurve_star_bjd ON lightcurve_points (star_id, bjd);
+
+    COMMIT;
+    ```
+
+    ?
+- role: assistant
+  content: |
+    I read this as: how much would you save if this load script did not send one `INSERT` per row?
+
+    Each `INSERT` line is its own statement. PostgreSQL parses and plans it, and psql waits for the reply before sending the next. For about 60,000 rows that is 60,000 round trips. `COPY` sends all rows as one stream and runs one statement.
+
+    In Green Metrics Tool micro-benchmarks with PostgreSQL 16, 500,000 rows were written in batches of 5,000 rows. One `execute()` per row used ~384 J. `COPY ... FROM STDIN` used ~17 J, about 22× less. With batches of only 100 rows the gap nearly vanished: ~13 J vs ~9.5 J. The saving comes from many rows per batch, and your script has many.
+
+    Don't scale those joules to your file. Your table, row width, index and hardware are different, and the benchmark used a Python client, not psql.
+
+    Same script with `COPY`:
+
+    ```sql
+    -- load_lightcurve_sector14.sql
+    BEGIN;
+
+    CREATE TABLE IF NOT EXISTS lightcurve_points (
+        star_id    bigint NOT NULL,
+        bjd        double precision NOT NULL,
+        flux       double precision NOT NULL,
+        flux_err   double precision NOT NULL,
+        quality    smallint NOT NULL DEFAULT 0
+    );
+
+    COPY lightcurve_points (star_id, bjd, flux, flux_err, quality) FROM STDIN WITH (FORMAT csv);
+    261136679,2459001.50012,1.00231,0.00041,0
+    261136679,2459001.50151,1.00198,0.00041,0
+    261136679,2459001.50290,1.00177,0.00042,0
+    261136679,2459001.50429,0.99874,0.00042,512
+    \.
+
+    CREATE INDEX IF NOT EXISTS lightcurve_star_bjd ON lightcurve_points (star_id, bjd);
+
+    COMMIT;
+    ```
+
+    Notes:
+    - If the file comes from a generator, change it to write CSV lines instead of `INSERT` statements. If the data is already in a CSV file, use `\copy lightcurve_points (...) FROM 'sector14.csv' WITH (FORMAT csv)`.
+    - Behavior is the same: it is still one transaction, and a bad row aborts the whole load.
+    - Keep the index creation after the load, as you already do. That is cheaper than maintaining it row by row.
+    - If a run only loads a few hundred rows, leave it as it is. The difference is small there.
+
+    To measure it, run both scripts on the same data with `time psql -d transits -f ...`, or use `perf stat` as a CPU-time proxy. For energy, run each in a Green Metrics Tool usage scenario.
+verify:
+  static_only: psql script with inline COPY FROM STDIN and psql meta-commands, not runnable in SQLite

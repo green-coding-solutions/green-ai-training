@@ -1,0 +1,82 @@
+id: gen-12764612-00287-no-change
+category: no-change
+language: javascript
+patterns:
+- dom-size
+- context-tradeoff
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```javascript
+    const tbody = document.querySelector('#keys-table tbody');
+    const API = '/api/v2/admin/keys';
+
+    function fmtDate(iso) {
+      return iso ? new Date(iso).toLocaleDateString('en-GB') : 'never';
+    }
+
+    function row(key) {
+      const tr = document.createElement('tr');
+      tr.dataset.id = key.id;
+      const cells = [key.label, key.scope, fmtDate(key.created_at), fmtDate(key.last_used_at)];
+      for (const text of cells) {
+        const td = document.createElement('td');
+        td.textContent = text;
+        tr.appendChild(td);
+      }
+      const td = document.createElement('td');
+      const btn = document.createElement('button');
+      btn.className = 'revoke';
+      btn.textContent = 'Revoke';
+      td.appendChild(btn);
+      tr.appendChild(td);
+      return tr;
+    }
+
+    async function loadKeys(teamId) {
+      const res = await fetch(`${API}?team=${encodeURIComponent(teamId)}&limit=100`);
+      if (!res.ok) throw new Error(`keys request failed: ${res.status}`);
+      const keys = await res.json();
+      const frag = document.createDocumentFragment();
+      keys.forEach(k => frag.appendChild(row(k)));
+      tbody.replaceChildren(frag);
+    }
+
+    tbody.addEventListener('click', async (e) => {
+      if (!e.target.classList.contains('revoke')) return;
+      const tr = e.target.closest('tr');
+      await fetch(`${API}/${tr.dataset.id}`, { method: 'DELETE' });
+      tr.remove();
+    });
+    ```
+- role: assistant
+  content: |
+    The rendering is already efficient. I would not change it, and I would not add pagination.
+
+    - It is a plain `<table>` with one element per cell and no wrapper elements.
+    - All rows are built in a `DocumentFragment` and inserted once with `replaceChildren`.
+    - There is one delegated click listener, not one per button.
+    - The request is capped at 100 rows. In Green Metrics Tool micro-benchmarks, paginating a 10,000-row table (wrappers around every cell, rows appended to the live DOM one by one) to 100 rows per page as a plain table built in a fragment used about 56% less energy. That saving comes from thousands of rows. At 100 rows at most, you have nothing left to remove, and a pager would only add code.
+
+    There is one real bug. The revoke handler removes the row even when the `DELETE` fails, so the UI can show a key as revoked while it is still active:
+
+    ```javascript
+    tbody.addEventListener('click', async (e) => {
+      if (!e.target.classList.contains('revoke')) return;
+      const tr = e.target.closest('tr');
+      const res = await fetch(`${API}/${tr.dataset.id}`, { method: 'DELETE' });
+      if (!res.ok) {
+        alert(`Could not revoke key (${res.status})`);
+        return;
+      }
+      tr.remove();
+    });
+    ```
+
+    Revisit pagination only if the `limit` grows into the thousands.
+verify:
+  static_only: needs a browser DOM and a fetch endpoint

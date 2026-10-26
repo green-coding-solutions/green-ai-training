@@ -1,0 +1,107 @@
+id: gen-12764612-00387-review
+category: review
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    hi, im new to python and made this flask endpoint for our team. load test clients post their latency numbers (often a few hundred thousand per request) and it sends back a histogram. it works but requests with big uploads feel slow and the CPU is busy. not sure what is wrong, can you review it?
+
+    ```python
+    from flask import Flask, request, jsonify
+    import numpy as np
+
+    app = Flask(__name__)
+
+    BINS = 256
+
+
+    def bin_latencies(values, lo, hi):
+        width = (hi - lo) / BINS
+        counts = [0] * BINS
+        for v in values:
+            idx = int((v - lo) / width)
+            if idx < 0:
+                idx = 0
+            elif idx >= BINS:
+                idx = BINS - 1
+            counts[idx] += 1
+        return counts
+
+
+    @app.route("/api/latency-histogram", methods=["POST"])
+    def latency_histogram():
+        body = request.get_json()
+        values = np.asarray(body["values"], dtype=np.float64)
+        lo = float(body.get("lo", 0.0))
+        hi = float(body.get("hi", 1000.0))
+        counts = bin_latencies(values, lo, hi)
+        return jsonify({"lo": lo, "hi": hi, "bins": BINS, "counts": counts})
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (REST API with a CPU-heavy step)
+
+    #### [Bug] Bad input gives a 500 error
+    - **Where:** `bin_latencies`, `int((v - lo) / width)`
+    - **Issue:** if `hi <= lo`, `width` is zero or negative and you get a `ZeroDivisionError` or wrong bins. A `NaN` or `inf` in the upload makes `int()` raise. Both end as a 500 for the client.
+    - **Fix:** check the input once in the endpoint and return 400. The checks below do this.
+
+    #### [Security] No limit on upload size
+    - **Where:** `request.get_json()`
+    - **Issue:** anyone who can reach the endpoint can post a huge body and use up memory and CPU.
+    - **Fix:** set `app.config["MAX_CONTENT_LENGTH"]` to a size that fits your largest real upload.
+
+    #### [High] Pure Python loop over every sample
+    - **Where:** `for v in values` in `bin_latencies`
+    - **Issue:** each sample goes through the Python interpreter: subtract, divide, `int()`, two comparisons, a list update. The cost is linear in the upload size, on every request. This is a CPU-bound numeric loop, so it is a good fit for Numba. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples in a pure Python loop used ~40 J. With Numba `@njit` it used ~9.5 J, about 4× less.
+    - **Fix:** compile the loop with `@njit` and work on the NumPy array directly:
+
+    ```python
+    from flask import Flask, request, jsonify
+    import numpy as np
+    from numba import njit
+
+    app = Flask(__name__)
+    app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024
+
+    BINS = 256
+
+
+    @njit(cache=True)
+    def _bin_latencies(values, lo, width, bins):
+        counts = np.zeros(bins, dtype=np.int64)
+        for i in range(values.shape[0]):
+            idx = int((values[i] - lo) / width)
+            if idx < 0:
+                idx = 0
+            elif idx >= bins:
+                idx = bins - 1
+            counts[idx] += 1
+        return counts
+
+
+    # compile once at startup, not on the first user request
+    _bin_latencies(np.zeros(1), 0.0, 1.0, BINS)
+
+
+    @app.route("/api/latency-histogram", methods=["POST"])
+    def latency_histogram():
+        body = request.get_json()
+        values = np.asarray(body["values"], dtype=np.float64)
+        lo = float(body.get("lo", 0.0))
+        hi = float(body.get("hi", 1000.0))
+        if hi <= lo or not np.isfinite(values).all():
+            return jsonify({"error": "need hi > lo and finite values"}), 400
+        counts = _bin_latencies(values, lo, (hi - lo) / BINS, BINS)
+        return jsonify({"lo": lo, "hi": hi, "bins": BINS, "counts": counts.tolist()})
+    ```
+
+    - **Impact:** reduces E for every large upload. The result is the same for valid input. The first call compiles the function, which costs CPU once. `cache=True` keeps the compiled code on disk and the warm-up call moves the cost to startup. If your workers are short-lived and each one only sees small uploads, the compile cost can cancel the gain.
+
+    **Already good:** the values are converted to a float64 NumPy array once, and out-of-range values are clamped into the first and last bin.
+verify:
+  static_only: needs numba and flask, which are not in the standard test environment

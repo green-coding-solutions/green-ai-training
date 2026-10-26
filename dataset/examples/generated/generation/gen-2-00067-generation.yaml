@@ -1,0 +1,116 @@
+id: gen-2-00067-generation
+category: generation
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    I need a build script for our marketing site. On every deploy we want to pick the customer testimonials shown on the landing page automatically, instead of someone hand-editing a JSON file.
+
+    Setup:
+    - `content/testimonials.json` is a list of objects: `{"id": "t-0412", "author": "...", "text": "...", "rating": 5, "embedding": [384 floats]}`. The embeddings are already computed by another job.
+    - Our data person trained a small quality model and exported it with TorchScript: `models/testimonial_quality.pt`. Input is a float32 tensor `(batch, 384)`, output is `(batch, 1)` raw logits. Higher means "good for the landing page".
+    - The build runs on a CPU-only runner (Netlify build image with torch installed).
+
+    Requirements:
+    - Only testimonials with `rating >= 4` are candidates (make it a flag).
+    - Score the candidates in batches of 64 and turn the logits into probabilities.
+    - Take the top 6 (flag) and write `public/featured_testimonials.json` with `id`, `author`, `text` and `score` rounded to 3 decimals.
+    - The order must be deterministic: score descending, then id ascending.
+    - If fewer than 3 testimonials pass the rating filter, exit non-zero so the deploy fails.
+    - A bad or missing embedding should fail loudly with the testimonial id.
+    - Paths configurable via argparse, the defaults above.
+- role: assistant
+  content: |
+    ```python
+    #!/usr/bin/env python3
+    """Pick the testimonials featured on the landing page. Runs in the site build."""
+    import argparse
+    import json
+    import sys
+    from pathlib import Path
+
+    import torch
+
+    EMBED_DIM = 384
+    MIN_CANDIDATES = 3
+
+
+    def load_candidates(path, min_rating):
+        with open(path, encoding="utf-8") as f:
+            items = json.load(f)
+        candidates = []
+        for item in items:
+            if item.get("rating", 0) < min_rating:
+                continue
+            emb = item.get("embedding")
+            if not isinstance(emb, list) or len(emb) != EMBED_DIM:
+                raise ValueError(
+                    f"testimonial {item.get('id')!r}: expected a {EMBED_DIM}-d embedding"
+                )
+            candidates.append(item)
+        return candidates
+
+
+    def score_candidates(model, candidates, batch_size):
+        scores = []
+        # Inference only: no autograd graph, no saved activations.
+        with torch.no_grad():
+            for start in range(0, len(candidates), batch_size):
+                batch = candidates[start:start + batch_size]
+                x = torch.tensor([c["embedding"] for c in batch], dtype=torch.float32)
+                logits = model(x).reshape(-1)
+                scores.extend(torch.sigmoid(logits).tolist())
+        return scores
+
+
+    def main():
+        p = argparse.ArgumentParser(description=__doc__)
+        p.add_argument("--input", default="content/testimonials.json")
+        p.add_argument("--model", default="models/testimonial_quality.pt")
+        p.add_argument("--output", default="public/featured_testimonials.json")
+        p.add_argument("--top", type=int, default=6)
+        p.add_argument("--min-rating", type=int, default=4)
+        p.add_argument("--batch-size", type=int, default=64)
+        args = p.parse_args()
+
+        candidates = load_candidates(args.input, args.min_rating)
+        if len(candidates) < MIN_CANDIDATES:
+            print(
+                f"only {len(candidates)} testimonials with rating >= {args.min_rating}, "
+                f"need at least {MIN_CANDIDATES}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        model = torch.jit.load(args.model, map_location="cpu")
+        model.eval()
+
+        scores = score_candidates(model, candidates, args.batch_size)
+        ranked = sorted(zip(scores, candidates), key=lambda sc: (-sc[0], sc[1]["id"]))
+
+        featured = [
+            {"id": c["id"], "author": c["author"], "text": c["text"], "score": round(s, 3)}
+            for s, c in ranked[: args.top]
+        ]
+
+        out = Path(args.output)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(featured, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(f"wrote {len(featured)} of {len(candidates)} candidates to {out}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    The sort uses the unrounded score, so two testimonials that both show `0.912` still keep a stable order by id.
+
+    **Green Notes**
+    - **`torch.no_grad()` around the forward pass** (reduces E, M): PyTorch otherwise records an autograd graph and keeps intermediate activations for a backward pass that never happens. In Green Metrics Tool micro-benchmarks, 100,000 CPU inferences used about 14% less CPU energy with `no_grad()`. This script runs on every deploy, so the saving repeats on every build.
+    - **`model.eval()`**: this is not an energy measure. It switches dropout and batch norm to inference behavior, so the scores are deterministic between builds.
+verify:
+  static_only: Needs torch and a TorchScript model file, neither is in stdlib + numpy.

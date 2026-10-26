@@ -1,0 +1,163 @@
+id: gen-2-00251-no-change
+category: no-change
+language: python
+patterns:
+- keep-star-imports
+- none
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    hi, we have this clean step in our ETL. Airflow start it once per input file, around 300 files every hour, each file is own python process. In the PR review my colleage wrote that `from decimal import *` is loading "everything from decimal" and this make the step slower and waste energy, and I should change to normal import. Is this true? please confirm and change it if it make sense.
+
+    ```python
+    import csv
+    import sys
+    from datetime import datetime, timezone
+    from decimal import *
+
+    VALID_STATUS = {"paid", "refunded", "chargeback"}
+    CENT = Decimal("0.01")
+    FIELDS = ["order_id", "status", "amount", "day"]
+
+
+    def parse_amount(raw):
+        try:
+            value = Decimal(raw.replace(",", "."))
+        except InvalidOperation:
+            return None
+        if not value.is_finite():
+            return None
+        return value.quantize(CENT, rounding=ROUND_HALF_UP)
+
+
+    def clean_row(row):
+        status = row.get("status", "").strip().lower()
+        if status not in VALID_STATUS:
+            return None
+        amount = parse_amount(row.get("amount", ""))
+        if amount is None:
+            return None
+        ts = datetime.fromtimestamp(int(row["ts"]), tz=timezone.utc)
+        return {
+            "order_id": row["order_id"].strip(),
+            "status": status,
+            "amount": str(amount),
+            "day": ts.date().isoformat(),
+        }
+
+
+    def main(src, dst):
+        kept = skipped = 0
+        with open(src, newline="", encoding="utf-8") as fin, \
+             open(dst, "w", newline="", encoding="utf-8") as fout:
+            reader = csv.DictReader(fin)
+            writer = csv.DictWriter(fout, fieldnames=FIELDS)
+            writer.writeheader()
+            for row in reader:
+                out = clean_row(row)
+                if out is None:
+                    skipped += 1
+                    continue
+                writer.writerow(out)
+                kept += 1
+        print(f"kept={kept} skipped={skipped}", file=sys.stderr)
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1], sys.argv[2])
+    ```
+- role: assistant
+  content: |
+    No, that's not true. I would leave the import as it is.
+
+    - **The module loads the same way.** `import decimal` and `from decimal import *` both load and run the whole `decimal` module once per process. The star form only binds the public names in your module's namespace. That happens once at startup, not once per row.
+    - **Measured: no difference.** Green Metrics Tool micro-benchmarks started 1,000 Python processes that each imported a module. `from posix import *` and `import posix` both used ~121 J. `from sympy import *` used ~3103 J and `import sympy` ~3093 J, which is within noise. Your setup also starts one process per file, so it is close to that benchmark, and the import style changes nothing there.
+    - **What does cost energy at startup** is loading a heavy library at all. In the same benchmarks, a start that imported sympy used about 25× the energy of a start that imported only a built-in module. `decimal` is part of the standard library, and this script imports nothing heavy, so there is nothing to gain here.
+
+    The rest of the step is fine too. It streams the CSV row by row and writes each row straight away, so memory stays flat however large the file is. If your team wants explicit imports for readability or linting, that is a style decision. Energy is not a reason to change it.
+
+    The file stays unchanged:
+
+    ```python
+    import csv
+    import sys
+    from datetime import datetime, timezone
+    from decimal import *
+
+    VALID_STATUS = {"paid", "refunded", "chargeback"}
+    CENT = Decimal("0.01")
+    FIELDS = ["order_id", "status", "amount", "day"]
+
+
+    def parse_amount(raw):
+        try:
+            value = Decimal(raw.replace(",", "."))
+        except InvalidOperation:
+            return None
+        if not value.is_finite():
+            return None
+        return value.quantize(CENT, rounding=ROUND_HALF_UP)
+
+
+    def clean_row(row):
+        status = row.get("status", "").strip().lower()
+        if status not in VALID_STATUS:
+            return None
+        amount = parse_amount(row.get("amount", ""))
+        if amount is None:
+            return None
+        ts = datetime.fromtimestamp(int(row["ts"]), tz=timezone.utc)
+        return {
+            "order_id": row["order_id"].strip(),
+            "status": status,
+            "amount": str(amount),
+            "day": ts.date().isoformat(),
+        }
+
+
+    def main(src, dst):
+        kept = skipped = 0
+        with open(src, newline="", encoding="utf-8") as fin, \
+             open(dst, "w", newline="", encoding="utf-8") as fout:
+            reader = csv.DictReader(fin)
+            writer = csv.DictWriter(fout, fieldnames=FIELDS)
+            writer.writeheader()
+            for row in reader:
+                out = clean_row(row)
+                if out is None:
+                    skipped += 1
+                    continue
+                writer.writerow(out)
+                kept += 1
+        print(f"kept={kept} skipped={skipped}", file=sys.stderr)
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1], sys.argv[2])
+    ```
+verify:
+  module: true
+  test: |-
+    import os
+    import tempfile
+    from decimal import Decimal as _D
+
+    assert parse_amount("12,345") == _D("12.35")
+    assert parse_amount("abc") is None
+    assert parse_amount("") is None
+    assert parse_amount("NaN") is None
+
+    r = clean_row({"order_id": " A1 ", "status": " Paid ", "amount": "9,99", "ts": "86400"})
+    assert r == {"order_id": "A1", "status": "paid", "amount": "9.99", "day": "1970-01-02"}
+    assert clean_row({"order_id": "A2", "status": "pending", "amount": "1", "ts": "0"}) is None
+
+    d = tempfile.mkdtemp()
+    src = os.path.join(d, "in.csv")
+    dst = os.path.join(d, "out.csv")
+    with open(src, "w", newline="", encoding="utf-8") as f:
+        f.write("order_id,status,amount,ts\nA1,paid,10.5,0\nA2,open,3,0\nA3,refunded,x,0\n")
+    main(src, dst)
+    with open(dst, encoding="utf-8") as f:
+        assert f.read().splitlines() == ["order_id,status,amount,day", "A1,paid,10.50,1970-01-01"]

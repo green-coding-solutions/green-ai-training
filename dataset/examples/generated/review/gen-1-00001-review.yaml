@@ -1,0 +1,77 @@
+id: gen-1-00001-review
+category: review
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    review?
+
+    ```bash
+    #!/usr/bin/env bash
+    # push build telemetry to the collector
+    API=https://telemetry.example.com/v1/events
+    TOKEN=$(cat ~/.telemetry_token)
+    DIR=/var/lib/buildtel/outbox
+
+    for f in $(ls $DIR/*.json); do
+        brotli -q 11 -c $f > /tmp/payload.br
+        curl -s -X POST $API \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -H "Content-Encoding: br" \
+            --data-binary @/tmp/payload.br
+        rm $f
+    done
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (runs per batch of outbox files)
+
+    #### [Bug] Files are deleted even when the upload fails
+    - **Where:** `rm $f` after `curl`
+    - **Issue:** `curl -s` returns 0 for HTTP errors like 500 or 401, and the script never checks the result anyway. A failed upload still deletes the event file, so the data is lost.
+    - **Fix:** use `curl -f` and remove the file only when the upload worked (see code below).
+
+    #### [Bug] Word splitting on file names
+    - **Where:** `for f in $(ls $DIR/*.json)`, and the unquoted `$f`, `$API`
+    - **Issue:** a file name with a space is split into two words. `ls` output is not a safe file list. With no matching files, the loop runs once with a literal pattern or an error.
+    - **Fix:** loop over the glob directly with `nullglob` and quote the variables.
+
+    #### [Security] Fixed temp file in `/tmp`
+    - **Where:** `/tmp/payload.br`
+    - **Issue:** the path is predictable and world-writable. Another local user can plant a symlink there, or read the payload. Two parallel runs also overwrite each other's file.
+    - **Fix:** stream the compressed data into `curl` through a pipe. No temp file is needed.
+
+    #### [High] Brotli at quality 11 for every upload
+    - **Where:** `brotli -q 11 -c`
+    - **Issue:** this is the most expensive setting, and it runs again for every payload. In Green Metrics Tool micro-benchmarks on 100 MB of English text, brotli at its CLI default (quality 11) used about 3019 J to compress, against about 67 J for gzip, roughly 45× more. zstd used about 16 J. That figure compares energy, not compression ratio. Max-quality brotli is meant for static files that are compressed once and served many times, not for data you compress on every send.
+    - **Fix:** use a cheap codec: gzip at its default level works with any HTTP endpoint. zstd is cheaper still (about 4× less than gzip in the same benchmark), but only if your collector accepts `Content-Encoding: zstd`.
+    - **Impact:** E, high. It is CPU work on every run, and it grows with payload size and run frequency.
+
+    ```bash
+    #!/usr/bin/env bash
+    # push build telemetry to the collector
+    API='https://telemetry.example.com/v1/events'
+    TOKEN=$(<~/.telemetry_token)
+    DIR='/var/lib/buildtel/outbox'
+
+    shopt -s nullglob
+    for f in "$DIR"/*.json; do
+        if gzip -c -- "$f" | curl -fsS -X POST "$API" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H 'Content-Type: application/json' \
+            -H 'Content-Encoding: gzip' \
+            --data-binary @-; then
+            rm -- "$f"
+        fi
+    done
+    ```
+
+    Failed files stay in the outbox and are retried on the next run. If the collector also takes zstd, swap `gzip -c --` for `zstd -c --` and the header for `Content-Encoding: zstd`.
+verify:
+  static_only: needs network access to a collector and the brotli CLI

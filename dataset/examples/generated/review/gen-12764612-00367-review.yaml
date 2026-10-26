@@ -1,0 +1,79 @@
+id: gen-12764612-00367-review
+category: review
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    Review this Dockerfile for our inventory REST API (Flask + gunicorn). GitLab builds it on every MR pipeline and pushes to our registry. Diff only please.
+
+    ```dockerfile
+    FROM python:3.12
+
+    ENV PYTHONUNBUFFERED=1 \
+        DATABASE_URL=postgresql://api:hunter2@db:5432/inventory \
+        JWT_SECRET=change-me-please
+
+    RUN apt-get update && apt-get install -y build-essential git curl vim
+
+    WORKDIR /srv/api
+    COPY . .
+
+    RUN pip install -r requirements.txt
+    RUN pip install pytest black mypy ipython
+
+    EXPOSE 8000
+    CMD ["gunicorn", "-b", "0.0.0.0:8000", "app.main:app"]
+    ```
+- role: assistant
+  content: |
+    **Workload:** web / cloud backend (CI image build)
+
+    #### [Security] Credentials baked into the image
+    - **Where:** `ENV DATABASE_URL`, `ENV JWT_SECRET`
+    - **Issue:** anyone who can pull the image can read the DB password and the JWT signing secret with `docker history` or `docker inspect`. They also stay in the layer history.
+    - **Fix:** remove both lines and inject them at runtime (orchestrator secrets or env at `docker run`). Rotate the values that were already pushed.
+
+    #### [High] Fat base image with build and dev tools in the runtime image
+    - **Where:** `FROM python:3.12`, the `apt-get install` line, `pip install pytest black mypy ipython`
+    - **Issue:** the full base plus compilers, git, vim and test/lint tooling is built, pushed, pulled and stored on every pipeline, but the API at runtime needs none of it. Run tests and linters in a separate CI job with a dev requirements file.
+    - **Fix:** slim base, runtime dependencies only (see diff).
+    - **Impact:** E per build, plus M and network for every push, pull and stored copy. In Green Metrics Tool micro-benchmarks, building a small Flask app image without cache used ~885 J with the full base and dev tools, and ~124 J with `python:3.12-slim` and runtime dependencies only, about 7× less. Serving 2,000 requests afterwards cost the same with both (~17 J), so the saving is in the build, pull and storage, not in runtime.
+
+    #### [Medium] Source copied before dependencies
+    - **Where:** `COPY . .` before `pip install`
+    - **Issue:** any source change invalidates the dependency layer, so pip reinstalls everything on every push. The pip download cache is also kept in the layer.
+    - **Fix:** copy `requirements.txt` first, install with `--no-cache-dir`, then copy the source.
+
+    ```diff
+    -FROM python:3.12
+    +FROM python:3.12-slim
+
+    -ENV PYTHONUNBUFFERED=1 \
+    -    DATABASE_URL=postgresql://api:hunter2@db:5432/inventory \
+    -    JWT_SECRET=change-me-please
+    +ENV PYTHONUNBUFFERED=1
+
+    -RUN apt-get update && apt-get install -y build-essential git curl vim
+    -
+     WORKDIR /srv/api
+    -COPY . .
+    -
+    -RUN pip install -r requirements.txt
+    -RUN pip install pytest black mypy ipython
+    +COPY requirements.txt .
+    +RUN pip install --no-cache-dir -r requirements.txt
+    +COPY . .
+
+     EXPOSE 8000
+     CMD ["gunicorn", "-b", "0.0.0.0:8000", "app.main:app"]
+    ```
+
+    If a dependency has no prebuilt wheel for the slim image, install the compiler in a separate builder stage and copy only the installed packages over. Don't put it back in the final image.
+
+    **Already good:** gunicorn instead of the Flask dev server, `PYTHONUNBUFFERED` set.
+verify:
+  static_only: Dockerfile review, needs a container build and registry

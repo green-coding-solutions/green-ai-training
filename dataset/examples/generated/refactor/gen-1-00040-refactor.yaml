@@ -1,0 +1,113 @@
+id: gen-1-00040-refactor
+category: refactor
+language: python
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+messages:
+- role: user
+  content: |
+    hello, can you make this function more clean and faster? it is for the start page of our company website, it show the 3 newest blog posts in a small box under the hero. The page is open very often and I think the database part is slow since we add the editor. table blog_posts have around 35 columns (body_html, body_markdown, seo stuff, revision history json and so on). we use postgres with psycopg 3, the connection is made with dict_row.
+
+    ```python
+    from datetime import datetime
+
+    def get_home_teasers(conn, limit=3):
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM blog_posts "
+                "WHERE status = 'published' "
+                "ORDER BY published_at DESC "
+                "LIMIT %s",
+                (limit,),
+            )
+            rows = cur.fetchall()
+
+        teasers = []
+        for row in rows:
+            published = row["published_at"]
+            teasers.append({
+                "title": row["title"],
+                "slug": row["slug"],
+                "summary": row["summary"],
+                "cover_url": row["cover_url"],
+                "published": published.strftime("%d %b %Y"),
+            })
+        return teasers
+    ```
+
+    thank you!
+- role: assistant
+  content: |
+    ```python
+    POST_TEASER_SQL = """
+        SELECT title, slug, summary, cover_url, published_at
+        FROM blog_posts
+        WHERE status = 'published'
+        ORDER BY published_at DESC
+        LIMIT %s
+    """
+
+    def get_home_teasers(conn, limit=3):
+        with conn.cursor() as cur:
+            cur.execute(POST_TEASER_SQL, (limit,))
+            rows = cur.fetchall()
+
+        return [
+            {
+                "title": row["title"],
+                "slug": row["slug"],
+                "summary": row["summary"],
+                "cover_url": row["cover_url"],
+                "published": row["published_at"].strftime("%d %b %Y"),
+            }
+            for row in rows
+        ]
+    ```
+
+    **Green Notes**
+    - **Select only the needed columns** (reduces E and network between app and database): the old query loaded all ~35 columns, including `body_html`, `body_markdown` and the revision history, and then used only 5 values. Now the database reads and sends only those 5. In Green Metrics Tool micro-benchmarks on a 52-column table with large text columns, naming the needed columns used about 7× less CPU energy than `SELECT *` (2,500 rows read 1,000 times). Your query returns only 3 rows, so the saving per call is smaller. It is still worth it on a page that is loaded all the time, and it grows with the size of the skipped columns.
+    - The output is the same list of dicts in the same order. If the teaser box needs another field later, add it to `POST_TEASER_SQL` too.
+    - The list comprehension and the SQL constant are only for readability, not for energy.
+verify:
+  test: |-
+    import datetime
+
+    class FakeCursor:
+        def __init__(self, conn):
+            self.conn = conn
+        def __enter__(self):
+            return self
+        def __exit__(self, *exc):
+            return False
+        def execute(self, sql, params=None):
+            self.conn.calls.append((sql, params))
+        def fetchall(self):
+            return self.conn.rows
+
+    class FakeConn:
+        def __init__(self, rows):
+            self.rows = rows
+            self.calls = []
+        def cursor(self):
+            return FakeCursor(self)
+
+    rows = [
+        {"title": "B", "slug": "b", "summary": "sb", "cover_url": "/b.jpg",
+         "published_at": datetime.datetime(2026, 3, 9, 10, 0), "body_html": "<p>big</p>"},
+        {"title": "A", "slug": "a", "summary": "sa", "cover_url": "/a.jpg",
+         "published_at": datetime.datetime(2025, 12, 1, 8, 30), "body_html": "<p>big</p>"},
+    ]
+    conn = FakeConn(rows)
+    out = get_home_teasers(conn, limit=2)
+    assert out == [
+        {"title": "B", "slug": "b", "summary": "sb", "cover_url": "/b.jpg", "published": "09 Mar 2026"},
+        {"title": "A", "slug": "a", "summary": "sa", "cover_url": "/a.jpg", "published": "01 Dec 2025"},
+    ]
+    sql, params = conn.calls[0]
+    assert "*" not in sql
+    for col in ["title", "slug", "summary", "cover_url", "published_at"]:
+        assert col in sql
+    assert "body_html" not in sql and "body_markdown" not in sql
+    assert params == (2,)

@@ -1,0 +1,56 @@
+id: gen-1-00108-generation
+category: generation
+language: sql
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    ```sql
+    -- stock_sync.sql, run by cron: psql -f stock_sync.sql
+    CREATE TABLE IF NOT EXISTS stock_counts (
+        sku          text        NOT NULL,
+        location     text        NOT NULL,
+        counted_qty  integer     NOT NULL,
+        counted_at   timestamptz NOT NULL,
+        PRIMARY KEY (sku, location)
+    );
+
+    -- TODO: load /data/inbox/stock_counts.csv (header row, ~150k rows, same 4 columns)
+    -- file is a full snapshot, replace what is there
+    ```
+
+    ?
+- role: assistant
+  content: |-
+    ```sql
+    -- stock_sync.sql, run by cron: psql -f stock_sync.sql
+    CREATE TABLE IF NOT EXISTS stock_counts (
+        sku          text        NOT NULL,
+        location     text        NOT NULL,
+        counted_qty  integer     NOT NULL,
+        counted_at   timestamptz NOT NULL,
+        PRIMARY KEY (sku, location)
+    );
+
+    \set ON_ERROR_STOP on
+
+    BEGIN;
+    TRUNCATE stock_counts;
+    \copy stock_counts (sku, location, counted_qty, counted_at) FROM '/data/inbox/stock_counts.csv' WITH (FORMAT csv, HEADER true)
+    COMMIT;
+    ```
+
+    Notes on the script:
+    - `\copy` reads the file on the machine where `psql` runs. Use plain `COPY` only if the file sits on the database server.
+    - `\copy` must stay on one line.
+    - The `TRUNCATE` and the load are in one transaction. If the load fails, the old snapshot stays in place.
+    - `ON_ERROR_STOP` makes `psql` stop at the first error. A bad row then rolls back the whole load instead of leaving a half-empty table.
+    - The file must not contain duplicate `(sku, location)` pairs. `COPY` fails on the first duplicate, because the primary key is checked.
+
+    **Green Notes**
+    - **Bulk load with COPY** (reduces E, M): the 150k rows go through one `COPY` stream instead of 150k `INSERT` statements. In Green Metrics Tool micro-benchmarks with PostgreSQL 16 and 5,000-row batches, `COPY` used about 22× less CPU energy than one `INSERT` per row and about 8× less than `executemany`. The gap shrinks with small batches, but a 150k-row file is far from that case.
+    - **One transaction** (reduces E): one commit for the whole load, not one per row.

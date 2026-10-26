@@ -1,0 +1,84 @@
+id: gen-2-00386-no-change
+category: no-change
+language: bash
+patterns:
+- compress-transmitted
+- context-tradeoff
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    hi, I'm new to CI stuff. After our Android build there is an upload step and it takes almost 2 minutes on every PR. The debug APK is about 60 MB, the AAB about 45 MB, plus ~30 screenshots from the UI tests and the test result xml files. I read that you should always compress files before you send them over the network, so I wanted to put a `tar czf` in front of the upload. But I'm not sure if something is wrong in my script or if compressing is the right fix. Here it is:
+
+    ```bash
+    #!/usr/bin/env bash
+    # ci/upload-artifacts.sh - runs after the Android build job on every PR
+    set -euo pipefail
+
+    BUILD_DIR="app/build/outputs"
+    REPORT_DIR="app/build/test-results/testDebugUnitTest"
+    SHOTS_DIR="app/build/reports/screenshots"
+
+    SHA="${CI_COMMIT_SHORT_SHA:?missing commit sha}"
+    BRANCH="${CI_COMMIT_REF_SLUG:?missing branch}"
+    DEST="https://artifacts.internal.example/upload/android/${BRANCH}/${SHA}"
+
+    shopt -s nullglob
+
+    upload() {
+      local file="$1"
+      echo "uploading $(basename "$file")"
+      curl --fail --silent --show-error \
+           --retry 3 \
+           -H "Authorization: Bearer ${ARTIFACT_TOKEN}" \
+           -T "$file" \
+           "${DEST}/$(basename "$file")"
+    }
+
+    for f in "$BUILD_DIR"/apk/debug/*.apk \
+             "$BUILD_DIR"/bundle/release/*.aab \
+             "$SHOTS_DIR"/*.png \
+             "$REPORT_DIR"/*.xml; do
+      upload "$f"
+    done
+
+    echo "artifacts: ${DEST}/"
+    ```
+- role: assistant
+  content: |
+    Your script is fine. Adding `tar czf` would not make the upload faster here, so leave it out.
+
+    **Why compression doesn't help with these files**
+    - APK and AAB files are already ZIP archives, and PNG is compressed internally. gzip finds almost nothing left to remove, so the archive ends up about the same size as the files you have now.
+    - gzip still has to read and process every byte on every PR. That adds CPU work and time on the runner, and whoever downloads the artifacts has to unpack them first. Testers also can no longer grab a single APK directly.
+    - The JUnit XML files are text and would compress well, but they are small. An extra step for them isn't worth it.
+
+    You can check this yourself in a few seconds:
+
+    ```bash
+    f=app/build/outputs/apk/debug/app-debug.apk
+    stat -c '%s original' "$f"
+    gzip -c "$f" | wc -c
+    ```
+
+    The two numbers will be almost the same.
+
+    **What the upload time actually is**
+    The time is spent sending bytes that are already compressed. To see where it goes, have curl print the size and speed of each file:
+
+    ```bash
+    curl --fail --silent --show-error -o /dev/null \
+         -w '%{size_upload} bytes, %{speed_upload} B/s\n' \
+         -H "Authorization: Bearer ${ARTIFACT_TOKEN}" \
+         -T "$file" "${DEST}/$(basename "$file")"
+    ```
+
+    **Already good in your script**
+    - `set -euo pipefail` and `curl --fail`, so a failed upload fails the job.
+    - `nullglob`, so a missing screenshot folder doesn't upload a literal `*.png`.
+    - Variables are quoted everywhere.
+
+    Compression does pay off for large text artifacts like logs, HTML coverage reports or JSON. If you add one of those later, use a fast codec. In Green Metrics Tool benchmarks on 100 MB of text, zstd at its default level used about 4× less CPU energy than gzip.
+verify:
+  static_only: bash CI script that needs a network artifact server, CI env vars and Android build outputs

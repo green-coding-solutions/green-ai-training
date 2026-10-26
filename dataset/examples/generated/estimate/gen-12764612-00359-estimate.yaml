@@ -1,0 +1,60 @@
+id: gen-12764612-00359-estimate
+category: estimate
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    we archive ingest logs hourly with this. how much energy would we save by swapping gzip -9 for zstd? files are kept for months. diff only please
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    LOG_DIR=/var/log/ingest
+    ARCHIVE=/archive/ingest
+
+    for f in "$LOG_DIR"/*.log; do
+      [ -e "$f" ] || continue
+      gzip -9 -c "$f" > "$ARCHIVE/$(basename "$f").gz"
+      rm -- "$f"
+    done
+
+    find "$ARCHIVE" -name '*.gz' -mtime +90 -delete
+    ```
+- role: assistant
+  content: |
+    ```diff
+    -  gzip -9 -c "$f" > "$ARCHIVE/$(basename "$f").gz"
+    +  zstd -3 -q -c "$f" > "$ARCHIVE/$(basename "$f").zst"
+    ...
+    -find "$ARCHIVE" -name '*.gz' -mtime +90 -delete
+    +find "$ARCHIVE" \( -name '*.gz' -o -name '*.zst' \) -mtime +90 -delete
+    ```
+
+    The `find` change keeps the old `.gz` files in the cleanup until they age out. Without it they would stay forever.
+
+    **Estimate (direction):** zstd does the same job with less CPU work per byte, and your job compresses every hour, so the saving repeats on every run.
+
+    **Measured reference:** in Green Metrics Tool micro-benchmarks on 100 MB of English text, zstd at its default level used ~16 J to compress and gzip at its default level ~67 J, about 4× less. Decompression was also cheaper: ~5.3 J for zstd and ~9.1 J for gzip.
+
+    Two limits on that number:
+    - The benchmark used gzip's default level, not `-9`. Higher gzip levels do more work, so I would not expect the gap to shrink on your side, but that is not measured.
+    - It compares energy only. Compression ratio was not measured, so check the archive size on your own logs.
+
+    Don't scale the figure to your volume. Log type, file size and hardware all change it.
+
+    **To measure:** take one real hourly batch and run each codec three times:
+
+    ```bash
+    for c in 'gzip -9' 'zstd -3 -q'; do
+      perf stat -e power/energy-pkg/ sh -c "$c -c sample.log > /dev/null"
+    done
+    ```
+
+    If RAPL is not available, `time` gives a CPU-time proxy. For a full comparison, run both variants as a usage scenario in the Green Metrics Tool.
+verify:
+  static_only: bash script needs log dirs, zstd and perf; answer is a diff plus estimate

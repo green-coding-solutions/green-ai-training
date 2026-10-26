@@ -1,0 +1,73 @@
+id: gen-12764612-00324-refactor
+category: refactor
+language: python
+patterns:
+- simple-conditions
+- torch-no-grad
+facts:
+- F-COND
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    hi, i am new to python. this is the part of our shop that checks customer reviews before they show on the product page. a small pytorch model gives a score and then we decide what to do. it works but i think something is wrong or slow, i dont know what. can you clean it up?
+
+    ```python
+    import torch
+
+    model = torch.load("review_model.pt", weights_only=False)
+    model.eval()
+
+
+    def moderate_reviews(batch_features):
+        results = []
+        for feats in batch_features:
+            x = torch.tensor(feats, dtype=torch.float32).unsqueeze(0)
+            score = model(x).item()
+            bucket = int(score * 10)
+            if bucket >= 0 and bucket <= 2:
+                action = "approve"
+            elif bucket >= 3 and bucket <= 6:
+                action = "review"
+            elif bucket >= 7 and bucket <= 9:
+                action = "hold"
+            else:
+                action = "reject"
+            results.append((score, action))
+        return results
+    ```
+- role: assistant
+  content: |
+    ```python
+    import torch
+
+    model = torch.load("review_model.pt", weights_only=False)
+    model.eval()
+
+    ACTIONS = {
+        0: "approve", 1: "approve", 2: "approve",
+        3: "review", 4: "review", 5: "review", 6: "review",
+        7: "hold", 8: "hold", 9: "hold",
+    }
+
+
+    def moderate_reviews(batch_features):
+        results = []
+        with torch.no_grad():
+            for feats in batch_features:
+                x = torch.tensor(feats, dtype=torch.float32).unsqueeze(0)
+                score = model(x).item()
+                action = ACTIONS.get(int(score * 10), "reject")
+                results.append((score, action))
+        return results
+    ```
+
+    The results are the same as before. Scores that fall outside 0 to 9 after `int(score * 10)` still give `"reject"`.
+
+    **Green Notes**
+    - **`torch.no_grad()` for inference** (reduces E): without it, PyTorch builds a gradient graph for every review, and you never train here. In Green Metrics Tool micro-benchmarks with 100,000 CPU inferences, it used ~135 J instead of ~157 J (about 14% less). This is the main fix.
+    - **Simple equality lookup instead of range checks** (reduces E): each review went through up to three `>= and <=` range tests. Now it is one dict lookup on the bucket. In Green Metrics Tool micro-benchmarks with 10,000,000 classifications, simple equality branches used about 16% less than complex range conditions. This part is small next to the model call, but it costs nothing in readability.
+
+    You already call `model.eval()`, which is right for inference. It does not turn off gradient tracking, so `no_grad()` is still needed.
+verify:
+  static_only: needs torch and a saved model file, which are not in stdlib + numpy

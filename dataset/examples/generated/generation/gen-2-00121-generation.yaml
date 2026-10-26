@@ -1,0 +1,90 @@
+id: gen-2-00121-generation
+category: generation
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    hi, i need a python function for our nightly ETL. it must make the import file for our old payroll system, fixed-width format. we have around 200k records per night, so it should not be slow.
+
+    each record is a dict like this:
+
+    ```python
+    {"emp_id": 4711, "name": "Müller, Anna", "amount_cents": 123456, "pay_date": date(2026, 10, 30)}
+    ```
+
+    format per line:
+    - "D" as record type
+    - emp_id 10 chars, zero padded on the left (can come as int or str). if longer then error
+    - name 30 chars, left aligned, filled with spaces, cut when its longer
+    - amount 12 chars: first char is the sign (+ or -, we have corrections with negative), then 11 digits zero padded
+    - pay_date as YYYYMMDD
+
+    at the end one trailer line: "T", count of records in 10 digits zero padded, then the sum of all amounts with same sign format but 16 chars. every line end with CRLF, also the last one. function should return the whole file as one string, a other step uploads it to SFTP.
+- role: assistant
+  content: |
+    ```python
+    from datetime import date
+
+    CRLF = "\r\n"
+
+
+    def _signed(value: int, width: int) -> str:
+        """Sign in the first position, then zero-padded digits."""
+        digits = str(abs(value))
+        if len(digits) > width - 1:
+            raise ValueError(f"{value} does not fit in {width} chars")
+        return ("-" if value < 0 else "+") + digits.zfill(width - 1)
+
+
+    def build_payroll_file(records) -> str:
+        lines = []
+        total = 0
+        for rec in records:
+            emp_id = str(rec["emp_id"])
+            if len(emp_id) > 10:
+                raise ValueError(f"emp_id too long: {emp_id!r}")
+            amount = rec["amount_cents"]
+            name = str(rec["name"])
+            lines.append(
+                f"D{emp_id.zfill(10)}{name:<30.30}{_signed(amount, 12)}{rec['pay_date']:%Y%m%d}"
+            )
+            total += amount
+
+        lines.append(f"T{len(lines):010d}{_signed(total, 16)}")
+        return CRLF.join(lines) + CRLF
+    ```
+
+    `{name:<30.30}` pads and cuts the name in one step. With no records, the file has only the trailer line.
+
+    The widths here count characters. If the payroll system counts bytes, encode the string with the code page it expects (for example `cp1252`) before the upload. In UTF-8, an umlaut takes two bytes and would shift the columns.
+
+    **Green Notes**
+    - **Join strings instead of `+=`** (reduces E): every line goes into a list, and the file is built with a single `join` at the end. A loop like `out += f"..."` can copy the growing string again and again. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces with `+=` used about 260× more CPU energy than `"".join()`. f-strings concatenated in a loop behaved like `+=`. Building each line with an f-string and appending it to the list is fine.
+verify:
+  test: |-
+    from datetime import date
+    recs = [
+        {"emp_id": 42, "name": "Müller, Anna", "amount_cents": 123456, "pay_date": date(2026, 10, 30)},
+        {"emp_id": "0007", "name": "A" * 40, "amount_cents": -500, "pay_date": date(2026, 10, 30)},
+    ]
+    out = build_payroll_file(recs)
+    lines = out.split("\r\n")
+    assert lines[-1] == ""
+    assert len(lines) == 4
+    d1, d2, t = lines[:3]
+    assert len(d1) == 61 and len(d2) == 61
+    assert d1 == "D0000000042" + "Müller, Anna".ljust(30) + "+00000123456" + "20261030"
+    assert d2[1:11] == "0000000007"
+    assert d2[11:41] == "A" * 30
+    assert d2[41:53] == "-00000000500"
+    assert t == "T0000000002" + "+000000000122956"
+    assert build_payroll_file([]) == "T0000000000+000000000000000\r\n"
+    try:
+        build_payroll_file([{"emp_id": "12345678901", "name": "x", "amount_cents": 1, "pay_date": date(2026, 1, 1)}])
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass

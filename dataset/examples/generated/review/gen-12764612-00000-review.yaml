@@ -1,0 +1,100 @@
+id: gen-12764612-00000-review
+category: review
+language: javascript
+patterns:
+- css-animations
+facts:
+- F-ANIM
+messages:
+- role: user
+  content: |
+    hello, i make small cli tool "scanwatch" that scan a repo for secrets. With flag --ui it start local server and open a page where you see the findings live and a radar thing that turn when scan is running. Can you please review the js file? i am not so good in frontend. Scans can take 10 minutes on big repos and people leave the tab open.
+
+    ```javascript
+    // report-ui.js - served by `scanwatch --ui` on localhost:4173
+    const radar = document.getElementById('radar-sweep');
+    const list = document.getElementById('findings');
+    const statusEl = document.getElementById('status');
+    let angle = 0;
+    let last = 0;
+
+    function spin(ts) {
+      const dt = ts - last;
+      last = ts;
+      angle = (angle + dt * 0.12) % 360;
+      radar.style.transform = 'rotate(' + angle + 'deg)';
+      requestAnimationFrame(spin);
+    }
+    requestAnimationFrame(spin);
+
+    const es = new EventSource('/events');
+    es.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'finding') {
+        list.innerHTML += '<li class="' + msg.level + '">' + msg.file + ': ' + msg.text + '</li>';
+      }
+      if (msg.type === 'done') {
+        statusEl.textContent = 'Scan finished';
+        es.close();
+      }
+    };
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (local CLI web UI, tab often open for a long time)
+
+    #### [Security] Scanned content is inserted as HTML
+    - **Where:** `list.innerHTML += ...` in `es.onmessage`
+    - **Issue:** `msg.file` and `msg.text` come from the repo you scan. A file named `<img src=x onerror=...>` runs script in the page. Because the page is served by your tool, that script can call your local server. Also, `msg.level` goes into the `class` attribute without a check.
+    - **Fix:** build the element and use `textContent`. Allow only known levels.
+
+    #### [High] The radar loop never stops
+    - **Where:** `spin` / `requestAnimationFrame(spin)`
+    - **Issue:** the loop runs on every frame for as long as the tab is open. It does not stop when the scan is `done`, so a finished scan still spins the radar and wakes the CPU 60 times per second. Each frame also runs JavaScript and writes a style.
+    - **Fix:** let CSS do the rotation, and remove the class when the scan ends. Then no work runs after `done`.
+    - **Impact:** reduces E on the client. In Green Metrics Tool micro-benchmarks, a 20-second CSS `@keyframes` animation used about 10% less CPU energy than the same animation driven by `requestAnimationFrame` with style updates. The bigger gain for you is that the animation stops completely when the scan is finished.
+
+    ```css
+    #radar-sweep {
+      transform-origin: 50% 50%;
+    }
+    body.scanning #radar-sweep {
+      animation: radar-spin 3s linear infinite;
+    }
+    @keyframes radar-spin {
+      to { transform: rotate(360deg); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      body.scanning #radar-sweep { animation-duration: 12s; }
+    }
+    ```
+
+    ```javascript
+    // report-ui.js - served by `scanwatch --ui` on localhost:4173
+    // The HTML starts with <body class="scanning">
+    const list = document.getElementById('findings');
+    const statusEl = document.getElementById('status');
+    const LEVELS = ['info', 'warn', 'error'];
+
+    const es = new EventSource('/events');
+    es.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'finding') {
+        const li = document.createElement('li');
+        li.className = LEVELS.includes(msg.level) ? msg.level : 'info';
+        li.textContent = msg.file + ': ' + msg.text;
+        list.append(li);
+      }
+      if (msg.type === 'done') {
+        statusEl.textContent = 'Scan finished';
+        document.body.classList.remove('scanning');
+        es.close();
+      }
+    };
+    ```
+
+    The angle is now handled by the browser, so the `angle`, `last` and `dt` code is gone. The radar turns at 3 seconds per round, like your 0.12 degrees per ms. If the connection drops with an error, also remove the `scanning` class in `es.onerror`, so the radar does not turn for a dead scan.
+
+    **Already good:** you close the `EventSource` when the scan is done.
+verify:
+  static_only: browser DOM, EventSource and CSS animation code

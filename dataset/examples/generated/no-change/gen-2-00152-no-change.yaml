@@ -1,0 +1,56 @@
+id: gen-2-00152-no-change
+category: no-change
+language: dockerfile
+patterns:
+- small-container-images
+- none
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    hi, im new to docker so sorry if this is a dumb question. i made the image for our gateway service. it reads sensor values from a serial port (modbus) and pushes them to our MQTT broker. my team lead said i should check that the image is "not wasteful" because CI builds it on every commit and all the gateways in the field pull it on update. i followed a tutorial and it works, but i dont really know what to look for. is something wrong with it?
+
+    ```dockerfile
+    FROM python:3.12-slim
+
+    ENV PYTHONDONTWRITEBYTECODE=1 \
+        PYTHONUNBUFFERED=1
+
+    WORKDIR /app
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY gateway/ ./gateway/
+
+    RUN useradd --create-home --uid 1000 gateway \
+        && usermod -aG dialout gateway
+    USER gateway
+
+    CMD ["python", "-m", "gateway.main"]
+    ```
+
+    requirements.txt:
+    ```text
+    paho-mqtt==2.1.0
+    pyserial==3.5
+    pymodbus==3.6.9
+    ```
+
+    the dev stuff (pytest, ruff) is in requirements-dev.txt and not used in the image.
+- role: assistant
+  content: |
+    Nothing is wrong. Your Dockerfile already follows the practices that make an image cheap to build and ship, so I would leave it as it is.
+
+    - **Slim base image:** `python:3.12-slim` leaves out the compilers and tools that the full `python:3.12` image contains. Your three packages don't need them.
+    - **Runtime dependencies only:** pytest and ruff stay in `requirements-dev.txt`. No `git`, `curl` or editors get installed.
+    - **Dependency layer before the source:** `requirements.txt` is copied and installed before `gateway/`. If a commit only changes your code, Docker can reuse the cached pip layer and only rebuild the last small layers. `--no-cache-dir` also keeps pip's download cache out of the image.
+
+    This is exactly the setup that was measured. In Green Metrics Tool benchmarks of a small Flask app built without cache, a `python:3.12` image with build tools and dev packages used ~885 J to build. A `python:3.12-slim` image with runtime dependencies only, the dependency layer first and `pip --no-cache-dir` used ~124 J, about 7× less. Running the app afterwards cost the same with both images. So the saving is in every build, pull and stored copy. That fits your case well: CI builds often and every gateway pulls the image.
+
+    The non-root user with `dialout` access is good practice too. It lets the service read the serial port without running as root.
+
+    Most of the remaining image size is the Python runtime itself, and you need it. One thing to keep an eye on: if someone later needs a package that must be compiled, keep the compiler out of the final image instead of adding `build-essential` to this Dockerfile.
+verify:
+  static_only: Dockerfile, needs Docker to build

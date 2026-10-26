@@ -1,0 +1,56 @@
+id: gen-12764612-00211-no-change
+category: no-change
+language: python
+patterns:
+- memoize
+- context-tradeoff
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    hello, we have small gateway on raspberry pi, it read temperature sensors over modbus and send to our cloud. my colegue say I must put lru_cache on function `to_celsius` becuase it is called many times and it is pure function. is this good idea for save cpu? the pi is on battery + solar so we want low power
+
+    ```python
+    import struct
+    import time
+
+    CAL_OFFSET = -1.8
+    CAL_GAIN = 0.0625
+    CAL_CURVE = (0.0021, -0.083, 1.12)
+
+    def to_celsius(raw_volts):
+        """Convert the sensor voltage to degrees Celsius with calibration."""
+        a, b, c = CAL_CURVE
+        x = raw_volts * CAL_GAIN + CAL_OFFSET
+        return a * x * x + b * x + c
+
+    def decode_registers(regs):
+        # two 16 bit registers -> one float32
+        packed = struct.pack(">HH", regs[0], regs[1])
+        return struct.unpack(">f", packed)[0]
+
+    def poll_once(client, sensor_ids, publish):
+        now = time.time()
+        for sid in sensor_ids:
+            regs = client.read_holding_registers(sid * 2, 2)
+            volts = decode_registers(regs)
+            publish({
+                "sensor": sid,
+                "ts": now,
+                "celsius": round(to_celsius(volts), 2),
+            })
+    ```
+- role: assistant
+  content: |
+    No, do not add `lru_cache` here. It would cost more than it saves.
+
+    - **The inputs rarely repeat.** `volts` is a float32 from a live sensor. Noise changes the last bits on almost every reading, so most calls would be cache misses. A miss pays for the normal computation plus the cache lookup and bookkeeping. In Green Metrics Tool micro-benchmarks, `lru_cache` gave about 9× less CPU energy, but that test drew its inputs from only 200 distinct values. With mostly unique inputs, caching only adds overhead.
+    - **The function is already tiny.** It does two multiplies, one add and a short polynomial. A cache lookup costs about as much as that work.
+    - **Memory matters on a Pi.** An unbounded cache would grow forever. A bounded one still holds entries that never get hit.
+
+    The time is spent in the Modbus read and the publish, not in `to_celsius`. The code is already lean: no extra allocations, and the constants are unpacked once per call.
+
+    Caching can pay off when the same input comes back often, for example a sensor that reports whole-number steps, or a conversion that does heavy work. If you want to check, wrap a copy of the function with `lru_cache(maxsize=256)` and look at `cache_info()` after a day of real data. Keep it only if the hit rate is high. To compare power, measure CPU time with `perf stat` on the Pi over the same polling run.
+verify:
+  static_only: Answer contains no code; it explains why memoization does not fit mostly unique float inputs.

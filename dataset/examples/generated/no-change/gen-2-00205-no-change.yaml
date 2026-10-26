@@ -1,0 +1,93 @@
+id: gen-2-00205-no-change
+category: no-change
+language: yaml
+patterns:
+- minimize-environments
+- none
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    hi, I'm a junior frontend dev and I don't really know kubernetes yet. Our company is doing an "IT footprint" check this quarter and my lead asked me to look at the staging setup for our landing page. I read that staging/preview environments waste a lot of resources and you should have fewer of them. We only have this one, though. Is something wrong with it? Should I delete it? The designers use it to check changes before we go live.
+
+    ```yaml
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: landing-staging
+      namespace: web-staging
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: landing-staging
+      template:
+        metadata:
+          labels:
+            app: landing-staging
+        spec:
+          containers:
+            - name: web
+              image: registry.example.com/landing:2026-10-22-a1b2c3d
+              ports:
+                - containerPort: 8080
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 32Mi
+                limits:
+                  memory: 64Mi
+    ---
+    # service + ingress are in ingress.yaml, rbac for the "scaler" service account in rbac.yaml
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata:
+      name: staging-sleep
+      namespace: web-staging
+    spec:
+      schedule: "0 20 * * *"
+      timeZone: "Europe/Berlin"
+      jobTemplate:
+        spec:
+          template:
+            spec:
+              serviceAccountName: scaler
+              restartPolicy: OnFailure
+              containers:
+                - name: kubectl
+                  image: registry.example.com/tools/kubectl:1.29
+                  command: ["kubectl", "scale", "deployment/landing-staging", "--replicas=0", "-n", "web-staging"]
+    ---
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata:
+      name: staging-wake
+      namespace: web-staging
+    spec:
+      schedule: "0 7 * * 1-5"
+      timeZone: "Europe/Berlin"
+      jobTemplate:
+        spec:
+          template:
+            spec:
+              serviceAccountName: scaler
+              restartPolicy: OnFailure
+              containers:
+                - name: kubectl
+                  image: registry.example.com/tools/kubectl:1.29
+                  command: ["kubectl", "scale", "deployment/landing-staging", "--replicas=1", "-n", "web-staging"]
+    ```
+- role: assistant
+  content: |
+    Nothing is wrong with it, and you shouldn't delete it. This setup already does what the advice about having fewer environments is aiming for.
+
+    - **One shared environment:** you don't create a new copy for every branch. The designers all share this one.
+    - **Minimal size:** you run one replica of a static web server. There is no database, cache or worker, because a landing page doesn't need them. The requests (10m CPU, 32Mi memory) are tiny, so the pod shares a node with other workloads. It doesn't keep a machine running by itself.
+    - **It sleeps when nobody uses it:** it runs 07:00–20:00 on weekdays and stays at zero overnight and on weekends. That is 65 of 168 hours a week. Cutting the hours an environment exists is where the real saving is.
+
+    Making the running environment even smaller would not do much. In Green Metrics Tool measurements of a preview environment idling for 60 seconds, going from 3 app replicas plus Postgres, Redis and a worker down to 1 replica plus Postgres saved only about 3% CPU energy. Machine energy changed by less than 1%, because the idle machine's baseline power dominates. Your environment is already smaller than the trimmed version in that test.
+
+    Deleting it would save very little and slow down the designers' reviews. Your lead can mark this one as already done. If the team ever adds per-branch previews, that's where to be careful: delete each one when its PR is merged or closed.
+verify:
+  static_only: Kubernetes YAML manifests, needs a cluster

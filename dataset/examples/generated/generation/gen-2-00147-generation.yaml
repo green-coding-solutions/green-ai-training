@@ -1,0 +1,195 @@
+id: gen-2-00147-generation
+category: generation
+language: python
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    ```python
+    import gzip
+    import re
+    from datetime import datetime
+
+    LINE_RE = re.compile(
+        r'(?P<ip>\S+) \S+ \S+ \[(?P<ts>[^\]]+)\] "(?P<method>\S+) (?P<path>\S+) \S+" '
+        r'(?P<status>\d{3}) (?P<bytes>\d+|-) "(?P<referer>[^"]*)" "(?P<agent>[^"]*)" (?P<rt>[\d.]+)'
+    )
+
+
+    def parse_line(line):
+        m = LINE_RE.match(line)
+        if m is None:
+            return None
+        d = m.groupdict()
+        return (
+            datetime.strptime(d["ts"], "%d/%b/%Y:%H:%M:%S %z"),
+            d["ip"],
+            d["method"],
+            d["path"],
+            int(d["status"]),
+            0 if d["bytes"] == "-" else int(d["bytes"]),
+            float(d["rt"]),
+            d["agent"],
+        )
+
+
+    def open_log(path):
+        if path.endswith(".gz"):
+            return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+        return open(path, encoding="utf-8", errors="replace")
+
+
+    def load_file(conn, path):
+        """Load one rotated nginx access log (~400k lines/day) into access_log.
+
+        Table: access_log(ts timestamptz, client_ip inet, method text, path text,
+                          status smallint, bytes bigint, request_time real, user_agent text)
+        Skip lines that don't parse, return (loaded, skipped).
+        Whole file in one transaction, so a crash doesn't leave half a day.
+        conn is a psycopg 3 connection.
+        """
+        # TODO
+    ```
+
+    ?
+- role: assistant
+  content: |
+    Here is `load_file`. It streams the parsed rows into a single `COPY` inside one transaction. The rest of the module is unchanged.
+
+    ```python
+    import gzip
+    import re
+    from datetime import datetime
+
+    LINE_RE = re.compile(
+        r'(?P<ip>\S+) \S+ \S+ \[(?P<ts>[^\]]+)\] "(?P<method>\S+) (?P<path>\S+) \S+" '
+        r'(?P<status>\d{3}) (?P<bytes>\d+|-) "(?P<referer>[^"]*)" "(?P<agent>[^"]*)" (?P<rt>[\d.]+)'
+    )
+
+    COPY_SQL = (
+        "COPY access_log (ts, client_ip, method, path, status, bytes, request_time, user_agent) "
+        "FROM STDIN"
+    )
+
+
+    def parse_line(line):
+        m = LINE_RE.match(line)
+        if m is None:
+            return None
+        d = m.groupdict()
+        return (
+            datetime.strptime(d["ts"], "%d/%b/%Y:%H:%M:%S %z"),
+            d["ip"],
+            d["method"],
+            d["path"],
+            int(d["status"]),
+            0 if d["bytes"] == "-" else int(d["bytes"]),
+            float(d["rt"]),
+            d["agent"],
+        )
+
+
+    def open_log(path):
+        if path.endswith(".gz"):
+            return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+        return open(path, encoding="utf-8", errors="replace")
+
+
+    def load_file(conn, path):
+        """Load one rotated nginx access log into access_log.
+
+        Skips lines that don't parse and returns (loaded, skipped).
+        The whole file is one transaction: on any error nothing is committed.
+        """
+        loaded = skipped = 0
+        with open_log(path) as f, conn.transaction(), conn.cursor() as cur:
+            with cur.copy(COPY_SQL) as copy:
+                for line in f:
+                    row = parse_line(line)
+                    if row is None:
+                        skipped += 1
+                        continue
+                    copy.write_row(row)
+                    loaded += 1
+        return loaded, skipped
+    ```
+
+    **Green Notes**
+    - **Batch database writes** (reduces E): a day's log goes through one `COPY` stream, not one `INSERT` round trip per line. Rows go straight from the file into the stream, so the whole day never sits in memory. In Green Metrics Tool micro-benchmarks (PostgreSQL 16, psycopg 3, batches of 5,000 rows), `COPY` used about 22× less CPU energy than one `execute()` per row and about 8× less than `executemany()`.
+
+    If any row fails, for example a client address that isn't a valid `inet`, the transaction rolls back and the file loads nothing. That matches your "no half day" requirement. Loading the same file twice doubles its rows. If reruns can happen, record each loaded file name and check it before you load.
+verify:
+  module: false
+  test: |-
+    import contextlib
+    import gzip as _gz
+    import os
+    import tempfile
+    from datetime import datetime as _dt, timezone
+
+    class FakeCopy:
+        def __init__(self, sink):
+            self.sink = sink
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def write_row(self, row):
+            self.sink.append(tuple(row))
+
+    class FakeCursor:
+        def __init__(self, conn):
+            self.conn = conn
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def copy(self, sql):
+            self.conn.sql.append(sql)
+            return FakeCopy(self.conn.rows)
+        def execute(self, *a, **k):
+            raise AssertionError("row-by-row execute used")
+        def executemany(self, *a, **k):
+            raise AssertionError("executemany used")
+
+    class FakeConn:
+        def __init__(self):
+            self.rows = []
+            self.sql = []
+            self.tx = 0
+        def cursor(self):
+            return FakeCursor(self)
+        @contextlib.contextmanager
+        def transaction(self):
+            self.tx += 1
+            yield
+
+    lines = (
+        '203.0.113.7 - - [14/Oct/2026:06:25:01 +0000] "GET /api/orders?page=2 HTTP/1.1" 200 5120 "-" "curl/8.5.0" 0.042\n'
+        'garbage line\n'
+        '198.51.100.23 - - [14/Oct/2026:06:25:02 +0000] "POST /api/login HTTP/2.0" 401 - "https://shop.example/" "Mozilla/5.0" 0.003\n'
+        '\n'
+    )
+
+    d = tempfile.mkdtemp()
+    plain = os.path.join(d, "access.log")
+    gzpath = os.path.join(d, "access.log.1.gz")
+    with open(plain, "w", encoding="utf-8") as fh:
+        fh.write(lines)
+    with _gz.open(gzpath, "wt", encoding="utf-8") as fh:
+        fh.write(lines)
+
+    for p in (plain, gzpath):
+        conn = FakeConn()
+        assert load_file(conn, p) == (2, 2)
+        assert conn.tx == 1
+        assert len(conn.sql) == 1 and conn.sql[0].startswith("COPY access_log")
+        assert conn.rows[0][0] == _dt(2026, 10, 14, 6, 25, 1, tzinfo=timezone.utc)
+        assert conn.rows[0][1:6] == ("203.0.113.7", "GET", "/api/orders?page=2", 200, 5120)
+        assert conn.rows[1][4] == 401 and conn.rows[1][5] == 0
+        assert abs(conn.rows[1][6] - 0.003) < 1e-9
+        assert conn.rows[1][7] == "Mozilla/5.0"
+    print("ok")

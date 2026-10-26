@@ -1,0 +1,82 @@
+id: gen-2-00295-generation
+category: generation
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # run_eval.sh <gpu-host> <dataset.jsonl>
+    # copies prompts to the gpu box, runs batch inference there, copies outputs back
+    set -euo pipefail
+
+    HOST=$1
+    DATASET=$2
+    REMOTE_DIR=/scratch/eval
+    RUN_ID=$(date +%Y%m%d-%H%M%S)
+
+    # TODO: send dataset to $HOST:$REMOTE_DIR/$RUN_ID/  (prompts file is ~1.5 GB jsonl, link to the gpu rack is slow-ish)
+    # TODO: run: python -m infer.batch --in prompts.jsonl --out preds.jsonl --model llama-3-8b-q
+    # TODO: get preds.jsonl back to ./results/$RUN_ID/ (also ~1 GB)
+    # TODO: clean up remote dir
+    ```
+
+    ?
+- role: assistant
+  content: |
+    Here is the filled-in script. It streams both files through `zstd` over ssh, so no compressed copies are left on disk.
+
+    ```bash
+    #!/usr/bin/env bash
+    # run_eval.sh <gpu-host> <dataset.jsonl>
+    # copies prompts to the gpu box, runs batch inference there, copies outputs back
+    set -euo pipefail
+
+    if [[ $# -ne 2 ]]; then
+      echo 'usage: run_eval.sh <gpu-host> <dataset.jsonl>' >&2
+      exit 1
+    fi
+
+    HOST=$1
+    DATASET=$2
+    REMOTE_DIR=/scratch/eval
+    RUN_ID=$(date +%Y%m%d-%H%M%S)
+    REMOTE_RUN="$REMOTE_DIR/$RUN_ID"
+    LOCAL_RUN="./results/$RUN_ID"
+
+    [[ -f $DATASET ]] || { echo "no such file: $DATASET" >&2; exit 1; }
+    mkdir -p "$LOCAL_RUN"
+
+    cleanup() {
+      ssh "$HOST" "rm -rf '$REMOTE_RUN'" || true
+    }
+    trap cleanup EXIT
+
+    # prompts: compress here, decompress on the GPU box
+    zstd -q -c -- "$DATASET" \
+      | ssh "$HOST" "mkdir -p '$REMOTE_RUN' && zstd -q -d > '$REMOTE_RUN/prompts.jsonl'"
+
+    # batch inference
+    ssh "$HOST" "cd '$REMOTE_RUN' && python -m infer.batch --in prompts.jsonl --out preds.jsonl --model llama-3-8b-q"
+
+    # predictions: compress on the GPU box, decompress here
+    # write to .part first, so a failed transfer never looks like a finished result
+    ssh "$HOST" "zstd -q -c '$REMOTE_RUN/preds.jsonl'" \
+      | zstd -q -d > "$LOCAL_RUN/preds.jsonl.part"
+    mv "$LOCAL_RUN/preds.jsonl.part" "$LOCAL_RUN/preds.jsonl"
+
+    echo "results in $LOCAL_RUN/preds.jsonl"
+    ```
+
+    `zstd` must be installed on both machines. With `pipefail`, a failure on either side of a pipe stops the script, and the `trap` still removes the remote run directory.
+
+    **Green Notes**
+    - **Compress transmitted data with a fast codec** (reduces network and E): both JSONL files are large text that compresses well, and the link is slow, so far fewer bytes cross it on every run. zstd is cheap on both ends. In Green Metrics Tool compression benchmarks on 100 MB of text, zstd at its default level used ~16 J against ~67 J for gzip, about 4× less, and decompressing took ~5.3 J.
+    - **Stream instead of temp archives** (reduces E and disk I/O): compressing straight into the ssh pipe avoids writing and reading `.zst` files on either machine.
+    - *Not applied:* xz or brotli. Their stronger ratio does not pay off here, because each file is compressed once per run and then thrown away. In the same benchmarks, brotli at its default quality used about 190× more energy than zstd. These benchmarks compare energy, not output size. If the link turns out to be the bottleneck, try a higher zstd level such as `zstd -9` and time one run.
+verify:
+  static_only: needs ssh access to a remote GPU host, zstd on both ends and the infer package

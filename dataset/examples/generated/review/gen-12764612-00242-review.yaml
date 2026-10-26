@@ -1,0 +1,76 @@
+id: gen-12764612-00242-review
+category: review
+language: html
+patterns:
+- modern-image-formats
+facts:
+- F-IMGRENDER
+- F-IMGENC
+messages:
+- role: user
+  content: |
+    hi, i am not sure what is wrong but my page feels slow to open. This is the html that our nightly job make after it load the sensor data from the pumping stations. Can you look at it? thank you
+
+    ```html
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <title>Nightly load report</title>
+      <link rel="stylesheet" href="report.css">
+    </head>
+    <body>
+      <h1>Nightly load report - 2026-10-25</h1>
+      <p>Rows loaded: 1,284,019 | Rejected: 312 | Duration: 14 min</p>
+
+      <h2>Rows per station</h2>
+      <img src="charts/rows_per_station.png" alt="Rows per station" width="900" height="450">
+
+      <h2>Site camera snapshots</h2>
+      <div class="snapshots">
+        <img src="snap/station_north.png" alt="North station" width="1200" height="800">
+        <img src="snap/station_harbor.png" alt="Harbor station" width="1200" height="800">
+        <img src="file:///home/etl/out/snap/station_mill.png" alt="Mill station" width="1200" height="800">
+      </div>
+
+      <h2>Rejected rows</h2>
+      <a href="rejected_2026-10-25.csv">Download CSV</a>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (static report page, opened by people every morning)
+
+    #### [Bug] Third snapshot uses a local file path
+    - **Where:** `<img src="file:///home/etl/out/snap/station_mill.png" ...>`
+    - **Issue:** this only works on the machine that runs the job. For everyone else the image is broken, because browsers do not load `file:///` paths from a served page.
+    - **Fix:** use the same relative path as the other two: `snap/station_mill.png`. Fix it where the job builds the path.
+
+    #### [Medium] Camera photos are PNG
+    - **Where:** the three `snap/station_*.png` images
+    - **Issue:** PNG is made for flat graphics. For photos it keeps every pixel exactly, so the files are large and slow to load. The snapshots are photos, so JPEG or WebP fits them better.
+    - **Fix:** write a smaller copy once, when the job saves each snapshot, and let the browser pick:
+      ```html
+      <picture>
+        <source srcset="snap/station_north.webp" type="image/webp">
+        <img src="snap/station_north.jpg" alt="North station" width="1200" height="800">
+      </picture>
+      ```
+      With Pillow in the pipeline step:
+      ```python
+      from PIL import Image
+
+      img = Image.open("snap/station_north.png").convert("RGB")
+      img.save("snap/station_north.jpg", quality=82)
+      img.save("snap/station_north.webp", quality=80)
+      ```
+      Convert each snapshot once in the job. Do not convert on every page view.
+    - **Impact:** mostly network, fewer bytes per page view. The client also does less work: in Green Metrics Tool micro-benchmarks (50 page loads per format), the browser used about 134 J for JPG, 150 J for WebP and 181 J for PNG.
+
+    #### [Low] AVIF is not needed here
+    - **Issue:** AVIF files are the smallest, but encoding is expensive and decoding costs the browser more. In the same micro-benchmarks, AVIF encoding used about 7× the energy of JPG, and decoding used about 19% more than JPG. For three internal snapshots per day, JPG with WebP is enough.
+
+    **Already good:** `width` and `height` are set on every image, `alt` text is there, and the chart as PNG is fine. A chart is flat graphics, which PNG handles well.
+verify:
+  static_only: html page review, no runnable code

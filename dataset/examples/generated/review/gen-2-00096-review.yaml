@@ -1,0 +1,178 @@
+id: gen-2-00096-review
+category: review
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    Hi, can you review my sync script please? It push all products from our nightly postgres export to elasticsearch, around 2 mio rows. `rows` come from csv.DictReader over the export file. It works but it take long, and sometime the count in ES is lower then in the source, I'm not sure why.
+
+    ```python
+    import json
+    import os
+    import ssl
+    import urllib.request
+
+    ES_URL = os.environ.get("ES_URL", "https://search.internal:9200")
+    INDEX = "products"
+    CHUNK = 5000
+
+
+    def clean_text(text):
+        if not text:
+            return ""
+        out = ""
+        for ch in text:
+            if ch.isprintable() or ch in "\n\t":
+                out += ch
+        return out.strip()
+
+
+    def to_doc(row):
+        return {
+            "sku": row["sku"],
+            "title": clean_text(row["title"]),
+            "description": clean_text(row.get("description")),
+            "price": round(float(row["price"]), 2),
+            "in_stock": int(row["stock"]) > 0,
+        }
+
+
+    def build_bulk_bodies(rows):
+        bodies = []
+        body = ""
+        n = 0
+        for row in rows:
+            action = {"index": {"_index": INDEX, "_id": row["sku"]}}
+            body += json.dumps(action) + "\n"
+            body += json.dumps(to_doc(row), ensure_ascii=False) + "\n"
+            n += 1
+            if n == CHUNK:
+                bodies.append(body)
+                body = ""
+                n = 0
+        return bodies
+
+
+    def send(body):
+        ctx = ssl._create_unverified_context()
+        req = urllib.request.Request(
+            ES_URL + "/_bulk",
+            data=body.encode("utf-8"),
+            headers={"Content-Type": "application/x-ndjson"},
+        )
+        with urllib.request.urlopen(req, context=ctx) as resp:
+            return json.load(resp)
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly ETL, runs per row and per character)
+
+    #### [Bug] Last partial chunk is never sent
+    - **Where:** `build_bulk_bodies`, after the loop
+    - **Issue:** a body is only added to `bodies` when it reaches exactly `CHUNK` documents. The rest at the end, up to 4,999 products, is dropped. That is why ES has fewer documents than the source.
+    - **Fix:** after the loop, add the remaining body if it is not empty (see the code below).
+
+    #### [Security] TLS certificate check is turned off
+    - **Where:** `send`, `ssl._create_unverified_context()`
+    - **Issue:** anyone on the network path can impersonate the ES host and read or change the product data.
+    - **Fix:** use `ssl.create_default_context()`. If the cluster uses an internal CA, pass its file with `cafile=`.
+
+    #### [High] Strings built with `+=` inside loops
+    - **Where:** `clean_text` (once per character, for title and description of every row) and `build_bulk_bodies` (twice per row)
+    - **Issue:** each `+=` can create a new string and copy everything built so far. In `clean_text` this runs for every character of every product. In `build_bulk_bodies` the body grows to 5,000 documents.
+    - **Fix:** collect the parts and call `"".join()` / `"\n".join()` once.
+    - **Impact:** reduces E across the whole nightly run. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces with `+=` used about 260× more CPU energy than `"".join()`. f-strings in a loop behave the same as `+=`, so they are not a fix.
+
+    ```python
+    import json
+    import os
+    import ssl
+    import urllib.request
+
+    ES_URL = os.environ.get("ES_URL", "https://search.internal:9200")
+    ES_CA_CERT = os.environ.get("ES_CA_CERT")  # None = system CA store
+    INDEX = "products"
+    CHUNK = 5000
+
+
+    def clean_text(text):
+        if not text:
+            return ""
+        return "".join(ch for ch in text if ch.isprintable() or ch in "\n\t").strip()
+
+
+    def to_doc(row):
+        return {
+            "sku": row["sku"],
+            "title": clean_text(row["title"]),
+            "description": clean_text(row.get("description")),
+            "price": round(float(row["price"]), 2),
+            "in_stock": int(row["stock"]) > 0,
+        }
+
+
+    def build_bulk_bodies(rows):
+        bodies = []
+        lines = []
+        n = 0
+        for row in rows:
+            action = {"index": {"_index": INDEX, "_id": row["sku"]}}
+            lines.append(json.dumps(action))
+            lines.append(json.dumps(to_doc(row), ensure_ascii=False))
+            n += 1
+            if n == CHUNK:
+                bodies.append("\n".join(lines) + "\n")
+                lines = []
+                n = 0
+        if lines:
+            bodies.append("\n".join(lines) + "\n")
+        return bodies
+
+
+    def send(body):
+        ctx = ssl.create_default_context(cafile=ES_CA_CERT)
+        req = urllib.request.Request(
+            ES_URL + "/_bulk",
+            data=body.encode("utf-8"),
+            headers={"Content-Type": "application/x-ndjson"},
+        )
+        with urllib.request.urlopen(req, context=ctx) as resp:
+            return json.load(resp)
+    ```
+
+    The bulk bodies are byte-for-byte the same as before, including the trailing newline that `_bulk` needs. The only change is the extra last body.
+
+    **Already good:** `rows` is used as an iterator, so only one chunk is in memory at a time.
+verify:
+  green_block: 0
+  test: |
+    rows = [{"sku": f"S{i}", "title": "T\x01", "description": None, "price": "1", "stock": "0"} for i in range(5001)]
+    bodies = build_bulk_bodies(rows)
+    assert len(bodies) == 2
+    assert bodies[1].count("\n") == 2 and bodies[1].endswith("\n")
+    assert json.loads(bodies[1].splitlines()[0])["index"]["_id"] == "S5000"
+    assert json.loads(bodies[1].splitlines()[1])["title"] == "T"
+    assert clean_text(" a\x00b\tc\n ") == "ab\tc"
+    assert clean_text(None) == ""
+    assert build_bulk_bodies([]) == []
+  equivalence:
+    driver: |-
+      import hashlib
+      rows = []
+      for i in range(10000):
+          rows.append({
+              "sku": f"SKU-{i:05d}",
+              "title": f" Mug\x07 {i} ",
+              "description": None if i % 7 == 0 else f"Line1\nTab\there\x00 caf\u00e9 {i}",
+              "price": str(i * 1.237),
+              "stock": str(i % 3),
+          })
+      bodies = build_bulk_bodies(iter(rows))
+      print(len(bodies))
+      for b in bodies:
+          print(len(b), hashlib.sha256(b.encode("utf-8")).hexdigest())
+      print(bodies[0].splitlines()[:4])

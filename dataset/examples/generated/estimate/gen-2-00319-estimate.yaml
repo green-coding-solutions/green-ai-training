@@ -1,0 +1,117 @@
+id: gen-2-00319-estimate
+category: estimate
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    hi, my team lead read somewhere that `list.insert(0, ...)` is slow. She asked me how much energy and CO2 we would save if I change it in our inventory import, because we put numbers like that in our quarterly sustainability report. I don't really understand what is wrong with it, the code works fine. The job runs every hour on the vendor snapshot, and one file is around 600k rows. What number should I write in the report?
+
+    ```python
+    import csv
+    import gzip
+    from datetime import datetime
+
+
+    def load_snapshot(path):
+        records = []
+        with gzip.open(path, "rt", newline="") as f:
+            reader = csv.DictReader(f, delimiter=";")
+            for row in reader:
+                if not row["sku"].strip():
+                    continue
+                rec = {
+                    "sku": row["sku"].strip().upper(),
+                    "warehouse": row["wh_code"],
+                    "qty": int(row["qty"] or 0),
+                    "updated_at": datetime.strptime(row["ts"], "%Y-%m-%d %H:%M:%S"),
+                }
+                # vendor sends oldest first, we want newest first
+                records.insert(0, rec)
+        return records
+
+
+    def latest_per_sku(records):
+        seen = set()
+        out = []
+        for rec in records:
+            key = (rec["sku"], rec["warehouse"])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(rec)
+        return out
+    ```
+- role: assistant
+  content: |
+    I can't give you a trustworthy number for your report without a measurement on your machine. I can tell you why the change helps, what the benchmarks show, and how to get a real number.
+
+    **What is wrong with it:** a Python list keeps its items in one block of memory. `records.insert(0, rec)` has to move every existing item one place to the right before it can put the new one at the front. That is O(n) work per row, so the whole loop is quadratic. The last rows of a big file each move hundreds of thousands of items. `append` adds at the end and moves nothing. One `reverse()` at the end then gives you the same newest-first order in a single linear pass.
+
+    **Measured reference:** in Green Metrics Tool micro-benchmarks, 1,000,000 × `list.insert(0, x)` used ~1515 J of CPU energy and 1,000,000 × `list.append(x)` ~1.2 J. That is over 1000× less for `append`. Your job does more per row (CSV parsing, `strptime`), and that part costs the same in both versions. So your saving per run will be much smaller than this ratio, and I can't scale the benchmark figure to your files. What I can say: the front inserts grow with the square of the row count, so on files of your size they are probably a large share of the runtime.
+
+    **How to get your own number:**
+    1. Quick CPU-time proxy: run both versions on one real snapshot file with `time python import_job.py` or `perf stat python import_job.py`. On Linux with RAPL you can also get CPU package energy with `perf stat -e power/energy-pkg/ python import_job.py`.
+    2. Proper energy figure: run both versions as a Green Metrics Tool usage scenario on the same machine and compare the CPU energy of the import phase.
+    3. For the report: multiply the energy saved per run by the number of runs per quarter, convert to kWh, and multiply by the carbon intensity of the grid where the job runs. Your cloud provider or grid operator publishes that value. Write down the measured value and the method, not an estimate.
+
+    The change itself is small and safe. The output order stays exactly the same (newest first, rows with equal timestamps also keep the same order), so `latest_per_sku` still keeps the newest record per SKU and warehouse:
+
+    ```python
+    import csv
+    import gzip
+    from datetime import datetime
+
+
+    def load_snapshot(path):
+        records = []
+        with gzip.open(path, "rt", newline="") as f:
+            reader = csv.DictReader(f, delimiter=";")
+            for row in reader:
+                if not row["sku"].strip():
+                    continue
+                records.append({
+                    "sku": row["sku"].strip().upper(),
+                    "warehouse": row["wh_code"],
+                    "qty": int(row["qty"] or 0),
+                    "updated_at": datetime.strptime(row["ts"], "%Y-%m-%d %H:%M:%S"),
+                })
+        # vendor sends oldest first, we want newest first
+        records.reverse()
+        return records
+
+
+    def latest_per_sku(records):
+        seen = set()
+        out = []
+        for rec in records:
+            key = (rec["sku"], rec["warehouse"])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(rec)
+        return out
+    ```
+
+    `collections.deque` with `appendleft()` would also avoid the shifting. But then `load_snapshot` would return a deque instead of a list, and append + reverse keeps the return type the same.
+verify:
+  equivalence:
+    driver: |-
+      import gzip, os, tempfile
+      _tmp = os.path.join(tempfile.mkdtemp(), "snap.csv.gz")
+      with gzip.open(_tmp, "wt", newline="") as _f:
+          _f.write("sku;wh_code;qty;ts\n")
+          for _i in range(300):
+              _qty = "" if _i % 7 == 0 else str(_i)
+              _f.write(f"sk{_i % 40};W{_i % 3};{_qty};2026-03-01 10:{_i % 60:02d}:00\n")
+          _f.write(" ;W1;5;2026-03-01 11:00:00\n")
+      _recs = load_snapshot(_tmp)
+      print(len(_recs))
+      print(type(_recs).__name__)
+      for _r in _recs[:5]:
+          print(_r["sku"], _r["warehouse"], _r["qty"], _r["updated_at"].isoformat())
+      for _r in latest_per_sku(_recs):
+          print(_r["sku"], _r["warehouse"], _r["qty"], _r["updated_at"].isoformat())

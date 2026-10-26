@@ -1,0 +1,156 @@
+id: gen-2-00162-review
+category: review
+language: python
+patterns:
+- deque-or-append
+- keep-star-imports
+facts:
+- F-LISTINS
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    orders export step, takes forever on the full dump. review
+
+    ```python
+    import csv
+    import json
+    from datetime import *
+
+    BATCH = 500
+
+
+    def parse_row(raw):
+        ts = datetime.strptime(raw["created_at"], "%Y-%m-%d %H:%M:%S")
+        return {
+            "order_id": int(raw["order_id"]),
+            "customer": raw["customer_id"].strip(),
+            "amount_cents": round(float(raw["amount"]) * 100),
+            "created_at": ts.replace(tzinfo=timezone.utc).isoformat(),
+        }
+
+
+    def load_pending(path):
+        pending = []
+        skipped = 0
+        with open(path, newline="") as f:
+            for raw in csv.DictReader(f):
+                if not raw["order_id"]:
+                    skipped += 1
+                    continue
+                pending.insert(0, parse_row(raw))
+        return pending, skipped
+
+
+    def drain(pending, out):
+        written = 0
+        while len(pending) >= BATCH:
+            batch = [pending.pop() for _ in range(BATCH)]
+            out.write(json.dumps(batch) + "\n")
+            written += len(batch)
+        return written
+
+
+    def run(src, dst):
+        pending, skipped = load_pending(src)
+        with open(dst, "w") as out:
+            written = drain(pending, out)
+        print(f"wrote {written} orders, skipped {skipped}")
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline
+
+    #### [Bug] Last partial batch is never written
+    - **Where:** `drain`, `while len(pending) >= BATCH`
+    - **Issue:** the loop stops when fewer than `BATCH` rows are left. Those rows are dropped silently. The `wrote ...` count only covers the full batches, so the log looks fine.
+    - **Fix:** loop until all rows are written. The last batch can be smaller.
+
+    #### [High] `pending.insert(0, ...)` for every row
+    - **Where:** `load_pending`
+    - **Issue:** inserting at the front shifts every row already in the list. On a full dump, the load time grows quadratically with the row count. The `pop()` from the end only undoes this reversal.
+    - **Fix:** `append` in file order, then write slices of `BATCH` rows. Output order stays the same (file order).
+    - **Impact:** E, per row. O(n) per insert → O(1). In Green Metrics Tool micro-benchmarks, 1,000,000 front inserts used over 1000× more CPU energy than 1,000,000 appends.
+
+    ```python
+    import csv
+    import json
+    from datetime import *
+
+    BATCH = 500
+
+
+    def parse_row(raw):
+        ts = datetime.strptime(raw["created_at"], "%Y-%m-%d %H:%M:%S")
+        return {
+            "order_id": int(raw["order_id"]),
+            "customer": raw["customer_id"].strip(),
+            "amount_cents": round(float(raw["amount"]) * 100),
+            "created_at": ts.replace(tzinfo=timezone.utc).isoformat(),
+        }
+
+
+    def load_pending(path):
+        pending = []
+        skipped = 0
+        with open(path, newline="") as f:
+            for raw in csv.DictReader(f):
+                if not raw["order_id"]:
+                    skipped += 1
+                    continue
+                pending.append(parse_row(raw))
+        return pending, skipped
+
+
+    def drain(pending, out):
+        for start in range(0, len(pending), BATCH):
+            out.write(json.dumps(pending[start:start + BATCH]) + "\n")
+        return len(pending)
+
+
+    def run(src, dst):
+        pending, skipped = load_pending(src)
+        with open(dst, "w") as out:
+            written = drain(pending, out)
+        print(f"wrote {written} orders, skipped {skipped}")
+    ```
+
+    **Left as is:** `from datetime import *`. In Green Metrics Tool micro-benchmarks, star imports and namespace imports showed no measurable energy difference.
+verify:
+  equivalence:
+    driver: |
+      import hashlib
+      import os
+      import tempfile
+
+      d = tempfile.mkdtemp()
+      src = os.path.join(d, "orders.csv")
+      dst = os.path.join(d, "out.jsonl")
+      with open(src, "w", newline="") as f:
+          f.write("order_id,customer_id,amount,created_at\n")
+          for i in range(1, 1506):
+              oid = "" if i % 251 == 0 else str(i)
+              f.write(f"{oid}, c{i % 37} ,{(i * 7) % 1000}.25,2026-03-{1 + i % 28:02d} 08:{i % 60:02d}:00\n")
+      run(src, dst)
+      with open(dst) as f:
+          data = f.read()
+      print(len(data.splitlines()), hashlib.sha256(data.encode()).hexdigest())
+  test: |-
+    import json as _json
+    import os as _os
+    import tempfile as _tempfile
+
+    _d = _tempfile.mkdtemp()
+    _src = _os.path.join(_d, "o.csv")
+    _dst = _os.path.join(_d, "o.jsonl")
+    with open(_src, "w", newline="") as _f:
+        _f.write("order_id,customer_id,amount,created_at\n")
+        for _i in range(1203):
+            _f.write(f"{_i},c{_i},1.50,2026-01-01 00:00:00\n")
+    run(_src, _dst)
+    with open(_dst) as _f:
+        _batches = [_json.loads(line) for line in _f]
+    assert [len(b) for b in _batches] == [500, 500, 203]
+    assert [r["order_id"] for b in _batches for r in b] == list(range(1203))
+    assert _batches[0][0]["created_at"] == "2026-01-01T00:00:00+00:00"
+    assert _batches[0][0]["amount_cents"] == 150

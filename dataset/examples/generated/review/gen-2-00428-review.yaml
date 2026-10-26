@@ -1,0 +1,116 @@
+id: gen-2-00428-review
+category: review
+language: html
+patterns:
+- remove-unused-css
+facts:
+- F-UNUSED-CSS
+messages:
+- role: user
+  content: |
+    Can you review this page? It is `digest.html`, served as a static file from the same box that runs our nightly log rollup. About fifteen people on the platform team open it each morning to see which services logged the most errors overnight. The rollup job writes `/api/digest.json`.
+
+    What I need:
+    - findings ranked by severity
+    - no build tools, we want to keep it as one file
+    - the layout must stay the same
+
+    ```html
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <title>Overnight error digest</title>
+      <style>
+        * { box-sizing: border-box; }
+        body { font: 14px/1.5 system-ui, sans-serif; margin: 0; background: #f6f7f9; color: #222; }
+        header { background: #1f2937; color: #fff; padding: 12px 20px; }
+        main { padding: 20px; max-width: 960px; margin: 0 auto; }
+        table { width: 100%; border-collapse: collapse; background: #fff; }
+        th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #e5e7eb; }
+        .sev-error { color: #b91c1c; font-weight: 600; }
+        .sev-warn { color: #b45309; }
+        #status { margin: 10px 0; color: #555; }
+        .btn { display: inline-block; padding: 6px 12px; border-radius: 4px; border: 0; cursor: pointer; }
+        .btn-primary { background: #2563eb; color: #fff; }
+        .btn-group > .btn + .btn { margin-left: 2px; }
+        .badge { padding: 2px 6px; border-radius: 8px; background: #e5e7eb; font-size: 12px; }
+        .modal { position: fixed; inset: 0; background: rgba(0,0,0,.5); display: none; }
+        .modal.open { display: block; }
+        .tooltip { position: absolute; background: #000; color: #fff; padding: 4px 8px; }
+        .dropdown-menu { position: absolute; background: #fff; border: 1px solid #ddd; }
+        .pagination { display: flex; gap: 4px; list-style: none; padding: 0; }
+        .carousel-item { display: none; }
+        .carousel-item.active { display: block; }
+      </style>
+    </head>
+    <body>
+      <header><h1>Overnight error digest</h1></header>
+      <main>
+        <div id="status">Loading...</div>
+        <table>
+          <thead><tr><th>Service</th><th>Level</th><th>Count</th><th>Sample message</th></tr></thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </main>
+      <script>
+        fetch('/api/digest.json')
+          .then(r => r.json())
+          .then(data => {
+            const rows = document.getElementById('rows');
+            data.entries.forEach(e => {
+              rows.innerHTML += '<tr><td>' + e.service + '</td>' +
+                '<td class="sev-' + e.level + '">' + e.level + '</td>' +
+                '<td>' + e.count + '</td>' +
+                '<td>' + e.sample + '</td></tr>';
+            });
+            document.getElementById('status').textContent = data.entries.length + ' entries';
+          });
+      </script>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (small internal page, static file plus one JSON fetch)
+
+    #### [Security] Log text is inserted as HTML
+    - **Where:** the `rows.innerHTML += ...` line in the script
+    - **Issue:** `e.service` and `e.sample` come from log lines. A log message that contains `<img src=x onerror=...>` runs as code in the browser of everyone who opens the digest. Log text is attacker-influenced input.
+    - **Fix:** build the cells with `textContent`:
+      ```javascript
+      const rows = document.getElementById('rows');
+      data.entries.forEach(e => {
+        const tr = rows.insertRow();
+        tr.insertCell().textContent = e.service;
+        const level = tr.insertCell();
+        level.textContent = e.level;
+        level.className = 'sev-' + e.level;
+        tr.insertCell().textContent = e.count;
+        tr.insertCell().textContent = e.sample;
+      });
+      ```
+      This also builds each row once. The old `+=` on `innerHTML` re-parses the whole table on every entry.
+    - **Impact:** security. The layout does not change.
+
+    #### [Bug] Failed fetch leaves "Loading..." forever
+    - **Where:** `fetch('/api/digest.json').then(r => r.json())`
+    - **Issue:** if the rollup did not run, the server returns a 404 or an error page. `r.json()` then throws, there is no `catch`, and the status line never changes. Someone could read an empty table as "no errors overnight".
+    - **Fix:**
+      ```javascript
+      fetch('/api/digest.json')
+        .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+        .then(render)
+        .catch(err => { document.getElementById('status').textContent = 'Digest not available: ' + err.message; });
+      ```
+      Here `render` is the loop from the fix above, wrapped in a function.
+
+    #### [Low] About half of the stylesheet is unused
+    - **Where:** `.btn`, `.btn-primary`, `.btn-group`, `.badge`, `.modal`, `.tooltip`, `.dropdown-menu`, `.pagination`, `.carousel-item`
+    - **Issue:** the markup uses none of these classes. They look pasted from a UI kit. Removing them is safe and keeps the file easier to read. Do not expect an energy win. In Green Metrics Tool micro-benchmarks of 50 cold page loads, a 16 KB stylesheet with mostly unused rules used ~783 J, and the purged, minified 0.75 KB version used ~764 J, about 2% less. That is within measurement noise. Your stylesheet is much smaller, so the saving is a few bytes on the wire, not CPU.
+    - **Fix:** delete those rules by hand. Keep `*`, `body`, `header`, `main`, `table`, `th, td`, `.sev-error`, `.sev-warn` and `#status`. No PurgeCSS or other build step is needed for one file.
+    - **Impact:** bytes only, negligible at fifteen users.
+
+    **Already good:** the system font stack means no font download, and the page is one small file with no framework.
+verify:
+  static_only: HTML page with inline CSS and browser JavaScript (needs DOM and fetch)

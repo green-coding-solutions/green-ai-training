@@ -1,0 +1,104 @@
+id: gen-1-00038-review
+category: review
+language: bash
+patterns:
+- bash-quoting
+- compress-stored
+facts:
+- F-BASH-QUOTES
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    hello, this is my script for night job in our data pipline. it take the csv files what partners put in /data/incoming, check the rows, and make a archive. we keep archives 30 days. files have around 400k rows each night. can you review pls, I am not sure if all is ok. sorry for my english
+
+    ```bash
+    #!/bin/bash
+    # nightly_crm.sh <staging dir>
+    STAGE=$1
+    ARCH=/data/archive
+    DAY=$(date +%Y%m%d)
+
+    cd $STAGE
+    rm -rf $STAGE/*
+    cp /data/incoming/crm_*.csv $STAGE/
+
+    bad=0
+    for f in $STAGE/*.csv; do
+      while IFS=, read -r id email qty price; do
+        msg="REJECTED row: expected id,email,qty,price with numeric qty and price. Rows are dropped, not repaired. Contact the partner team if the same file fails twice in a row, see the feed contract v3 section 4 for the full field rules"
+        if [ -z "$id" ] || [ "$qty" -lt 0 ]; then
+          echo "$msg" >> $STAGE/rejects.log
+          bad=$((bad+1))
+        fi
+      done < $f
+    done
+
+    echo "rejected rows: $bad"
+    tar -cf - . | xz -9e > $ARCH/crm_$DAY.tar.xz
+    find $ARCH -name 'crm_*.tar.xz' -mtime +30 -delete
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly batch, about 400k rows per file)
+
+    #### [Bug] `rm -rf $STAGE/*` can delete the wrong files
+    - **Where:** `STAGE=$1`, `cd $STAGE`, `rm -rf $STAGE/*`
+    - **Issue:** if the script is started without an argument, `$STAGE` is empty and the command becomes `rm -rf /*`. A path with a space also breaks all the unquoted `$STAGE` uses. And if `cd` fails, the script just continues in the wrong folder.
+    - **Fix:** require the argument, stop on errors, quote the variable, and delete relative to the folder you just entered (see the full script below).
+
+    #### [Bug] Bad quantity is not rejected
+    - **Where:** `[ "$qty" -lt 0 ]`
+    - **Issue:** if `qty` is text or empty, `[` prints "integer expression expected" and returns false. The bad row is counted as good, although your message says qty must be numeric.
+    - **Fix:** check the digits with `case`, no extra process needed. Rows with a non-numeric qty are now rejected, which is what the message already promises.
+
+    #### [Medium] `xz -9e` for an archive you create every night
+    - **Where:** `tar -cf - . | xz -9e > ...`
+    - **Issue:** `xz` at its strongest level is one of the most expensive codecs, and you pay it again every night. In Green Metrics Tool micro-benchmarks on 100 MB of English text, `xz` at its default level used about 29× the energy of `zstd` at its default level (~458 J vs ~16 J), and gzip used about 4× the energy of `zstd`. The benchmark measured energy only, not file size. `xz` usually gives smaller files, and `-9e` is even slower than the default level that was measured.
+    - **Fix:** use `zstd` at its default level. Compressing is still right here, because you keep the archives for 30 days. The estimated break-even is about 0.15 days for `zstd` and about 7 days for `xz`, so both pay off, but `zstd` gets there much cheaper. If disk space matters more than the nightly CPU, keep `xz`, but then drop `-e`.
+    - **Impact:** E, a large drop in compression energy each night, at the cost of somewhat larger archives.
+
+    #### [Low] Long message assigned with double quotes inside the row loop
+    - **Where:** `msg="REJECTED row: ..."`
+    - **Issue:** the text has no `$`, backtick or backslash, so double quotes only make bash scan it for expansions, and it does that for every row. The text never changes, so it can be set once before the loops, in single quotes. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal in a loop used about 24% less CPU energy with single quotes. Your text is much shorter, so the absolute saving here is small.
+    - **Fix:** one assignment with single quotes, before the loops.
+
+    Here is the script with all fixes:
+
+    ```bash
+    #!/bin/bash
+    # nightly_crm.sh <staging dir>
+    set -eu
+    STAGE=${1:?usage: nightly_crm.sh STAGE_DIR}
+    ARCH=/data/archive
+    DAY=$(date +%Y%m%d)
+    MSG='REJECTED row: expected id,email,qty,price with numeric qty and price. Rows are dropped, not repaired. Contact the partner team if the same file fails twice in a row, see the feed contract v3 section 4 for the full field rules'
+
+    cd "$STAGE"
+    rm -rf -- ./*
+    cp /data/incoming/crm_*.csv .
+
+    bad=0
+    for f in ./*.csv; do
+      while IFS=, read -r id email qty price; do
+        ok=1
+        [ -n "$id" ] || ok=0
+        case $qty in ''|*[!0-9]*) ok=0 ;; esac
+        if [ "$ok" = 0 ]; then
+          echo "$MSG" >> rejects.log
+          bad=$((bad+1))
+        fi
+      done < "$f"
+    done
+
+    echo "rejected rows: $bad"
+    tar -cf - . | zstd -3 -q -o "$ARCH/crm_$DAY.tar.zst"
+    find "$ARCH" -name 'crm_*.tar.*' -mtime +30 -delete
+    ```
+
+    The new archives end in `.tar.zst`, so restore them with `zstd -dc file | tar -xf -`. The `find` pattern also removes your old `.tar.xz` files after 30 days.
+
+    **Already good:** `read -r` and `IFS=,` split the fields with no subprocess per row. `$((bad+1))` is a builtin. The `-name 'crm_*.tar.xz'` pattern already uses single quotes. Variables are quoted in the loop.
+verify:
+  static_only: needs /data paths, tar and zstd; script is a nightly file pipeline with no deterministic stdout

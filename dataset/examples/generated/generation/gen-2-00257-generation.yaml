@@ -1,0 +1,131 @@
+id: gen-2-00257-generation
+category: generation
+language: python
+patterns:
+- regex-precompile
+- set-membership
+facts:
+- F-REGEX
+- F-MEMB
+messages:
+- role: user
+  content: |
+    I need a small tool for our support team. Every morning they export the order IDs that failed in checkout the day before. That's a text file with one ID per line, usually a few thousand. They want every app log line for those orders.
+
+    Our checkout service writes plain text logs, a few GB per day. Older files are rotated and gzipped. Lines look like this:
+
+    ```text
+    2026-10-23T14:02:11.512Z INFO  [checkout] req=7f3a9c2e order=ORD-2026-0048123 msg="payment authorized" amount=49.90
+    2026-10-23T14:02:12.004Z INFO  [cart] req=7f3a9c31 msg="cart updated" items=3
+    2026-10-23T14:02:13.870Z ERROR [payment] req=7f3a9c2e order=ORD-2026-0048123 msg="capture failed: \"timeout\"" psp=adyen
+    ```
+
+    Requirements:
+    - function `collect_order_lines(log_paths, order_ids)` returns a dict: order_id -> list of `(timestamp, level, component, msg)` tuples, in file order
+    - every requested ID shows up in the result, with an empty list if nothing was found
+    - `.gz` files are read transparently
+    - lines without `order=` or with an unknown order are skipped
+    - CLI: `python order_trace.py ids.txt app.log app.log.1.gz ...` prints the dict as JSON
+    - Python 3.11, stdlib only
+- role: assistant
+  content: |
+    The tool reads the logs once and streams them line by line. Each line is matched against a few fixed patterns that are compiled once.
+
+    ```python
+    #!/usr/bin/env python3
+    """Collect checkout log lines for a list of order IDs."""
+    import gzip
+    import json
+    import re
+    import sys
+    from collections.abc import Iterable, Iterator
+    from pathlib import Path
+
+    LINE_RE = re.compile(r'(\S+)\s+([A-Z]+)\s+\[([^\]]+)\]\s+(.*)')
+    ORDER_RE = re.compile(r'\border=(\S+)')
+    MSG_RE = re.compile(r'msg="((?:[^"\\]|\\.)*)"')
+
+
+    def _open_log(path: str | Path):
+        path = Path(path)
+        if path.suffix == ".gz":
+            return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+        return open(path, encoding="utf-8", errors="replace")
+
+
+    def _lines(paths: Iterable[str | Path]) -> Iterator[str]:
+        for path in paths:
+            with _open_log(path) as fh:
+                yield from fh
+
+
+    def collect_order_lines(
+        log_paths: Iterable[str | Path], order_ids: Iterable[str]
+    ) -> dict[str, list[tuple[str, str, str, str]]]:
+        result: dict[str, list[tuple[str, str, str, str]]] = {oid: [] for oid in order_ids}
+        for line in _lines(log_paths):
+            order = ORDER_RE.search(line)
+            if order is None or order.group(1) not in result:
+                continue
+            head = LINE_RE.match(line)
+            if head is None:
+                continue
+            ts, level, component, rest = head.groups()
+            msg = MSG_RE.search(rest)
+            result[order.group(1)].append(
+                (ts, level, component, msg.group(1) if msg else rest.strip())
+            )
+        return result
+
+
+    def main(argv: list[str]) -> int:
+        if len(argv) < 3:
+            print("usage: order_trace.py IDS_FILE LOG [LOG ...]", file=sys.stderr)
+            return 2
+        ids_text = Path(argv[1]).read_text(encoding="utf-8")
+        ids = [s.strip() for s in ids_text.splitlines() if s.strip()]
+        found = collect_order_lines(argv[2:], ids)
+        json.dump(found, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main(sys.argv))
+    ```
+
+    Escaped quotes inside `msg` are returned as they appear in the log (`capture failed: \"timeout\"`). JSON prints the tuples as lists.
+
+    **Green Notes**
+    - **Compile regex once, one fixed pattern for all IDs** (reduces E): the obvious version runs one `re.search(f"order={oid}", line)` per ID on every line. With a few thousand IDs, that is a few thousand distinct patterns. `re`'s internal cache can't hold that many, so it keeps recompiling them. In Green Metrics Tool micro-benchmarks, forcing a recompile on every call cost about 200× more per match. Here, three fixed patterns are compiled at import time. For a fixed pattern alone, precompiling is only a small win (about 18% less in the same benchmarks), because `re` caches it anyway.
+    - **Dict for repeated membership tests** (reduces E): the extracted order ID is checked against the result dict, which costs O(1) per line instead of a scan over thousands of IDs. The dict is built once and used for millions of lines, so building it pays off.
+verify:
+  module: true
+  test: |-
+    import gzip as _gz
+    import os as _os
+    import tempfile as _tf
+
+    _d = _tf.mkdtemp()
+    _p1 = _os.path.join(_d, "app.log")
+    _p2 = _os.path.join(_d, "app.log.1.gz")
+    with open(_p1, "w", encoding="utf-8") as _f:
+        _f.write('2026-10-23T14:02:11.512Z INFO  [checkout] req=7f3a order=ORD-1 msg="payment authorized" amount=49.90\n')
+        _f.write('2026-10-23T14:02:12.004Z INFO  [cart] req=7f3b msg="cart updated" items=3\n')
+        _f.write('2026-10-23T14:02:13.870Z ERROR [payment] req=7f3c order=ORD-2 msg="capture failed: \\"timeout\\"" psp=adyen\n')
+        _f.write('2026-10-23T14:02:14.000Z WARN  [checkout] req=7f3d order=ORD-9 msg="retry"\n')
+    with _gz.open(_p2, "wt", encoding="utf-8") as _f:
+        _f.write('2026-10-23T15:00:00.000Z ERROR [payment] req=8a00 order=ORD-1 msg="capture failed"\n')
+
+    _r = collect_order_lines([_p1, _p2], ["ORD-1", "ORD-2", "ORD-3"])
+    assert list(_r) == ["ORD-1", "ORD-2", "ORD-3"]
+    assert _r["ORD-1"] == [
+        ("2026-10-23T14:02:11.512Z", "INFO", "checkout", "payment authorized"),
+        ("2026-10-23T15:00:00.000Z", "ERROR", "payment", "capture failed"),
+    ]
+    assert _r["ORD-2"] == [
+        ("2026-10-23T14:02:13.870Z", "ERROR", "payment", 'capture failed: \\"timeout\\"'),
+    ]
+    assert _r["ORD-3"] == []
+    assert "ORD-9" not in _r
+    print("ok")

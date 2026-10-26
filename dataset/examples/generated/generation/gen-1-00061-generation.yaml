@@ -1,0 +1,85 @@
+id: gen-1-00061-generation
+category: generation
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    ```python
+    from collections import defaultdict
+
+
+    def stage_order(downstream: dict[str, list[str]]) -> list[str]:
+        """Return all pipeline stages in a valid run order.
+
+        downstream maps a stage to the stages that must run AFTER it,
+        e.g. {"build": ["test", "lint"], "test": ["deploy"]}.
+        Stages that only appear as targets must be included too.
+        Raise ValueError if the graph has a cycle.
+
+        Monorepo pipelines are generated, one stage per package,
+        so 10k+ stages is normal. Must not hit the recursion limit.
+        """
+        ...
+    ```
+
+    ?
+- role: assistant
+  content: |
+    A depth-first search finishes a stage only after everything downstream of it. Reversing that finish order gives a valid run order. The search is iterative, so deep chains don't hit the recursion limit.
+
+    ```python
+    def stage_order(downstream: dict[str, list[str]]) -> list[str]:
+        nodes = set(downstream)
+        for targets in downstream.values():
+            nodes.update(targets)
+
+        state: dict[str, int] = {}  # 1 = on the current path, 2 = finished
+        finished: list[str] = []
+
+        for root in sorted(nodes):
+            if root in state:
+                continue
+            state[root] = 1
+            stack = [(root, iter(downstream.get(root, ())))]
+            while stack:
+                node, targets = stack[-1]
+                for nxt in targets:
+                    seen = state.get(nxt)
+                    if seen == 1:
+                        raise ValueError(f"cycle detected at stage {nxt!r}")
+                    if seen is None:
+                        state[nxt] = 1
+                        stack.append((nxt, iter(downstream.get(nxt, ()))))
+                        break
+                else:
+                    state[node] = 2
+                    finished.append(node)
+                    stack.pop()
+
+        finished.reverse()
+        return finished
+    ```
+
+    **Green Notes**
+    - **Append, then reverse once** (reduces E): the code collects finished stages with `append` and reverses the list a single time at the end. Putting each stage at the front with `insert(0, stage)` would shift the whole list every time, which is O(n²) for n stages. In Green Metrics Tool micro-benchmarks, 1,000,000 front inserts used over 1000× more CPU energy than 1,000,000 appends.
+    - The order is deterministic, because roots are visited in sorted order. Stages that don't depend on each other keep a stable position between runs.
+verify:
+  test: |-
+    order = stage_order({"build": ["test", "lint"], "test": ["deploy"], "lint": ["deploy"]})
+    assert sorted(order) == ["build", "deploy", "lint", "test"]
+    pos = {s: i for i, s in enumerate(order)}
+    assert pos["build"] < pos["test"] < pos["deploy"]
+    assert pos["build"] < pos["lint"] < pos["deploy"]
+    assert stage_order({}) == []
+    chain = {f"s{i}": [f"s{i+1}"] for i in range(30000)}
+    big = stage_order(chain)
+    assert len(big) == 30001 and big[0] == "s0" and big[-1] == "s30000"
+    try:
+        stage_order({"a": ["b"], "b": ["c"], "c": ["a"]})
+        raise AssertionError("expected cycle error")
+    except ValueError:
+        pass

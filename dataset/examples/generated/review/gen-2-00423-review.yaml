@@ -1,0 +1,125 @@
+id: gen-2-00423-review
+category: review
+language: bash
+patterns:
+- bash-quoting
+facts:
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    Hello, can you please look at my script and tell me what is wrong or can be better? I use it after my parameter sweep of the diffusion simulation, we have around 40000 result files and I run it every time when a new sweep is finished. Sometimes it make strange errors but I dont understand why.
+
+    ```bash
+    #!/bin/bash
+    # add_headers.sh - put a header on every result file of the parameter sweep
+    # usage: ./add_headers.sh results_dir out_dir
+    RESULTS=$1
+    OUT=$2
+
+    mkdir -p $OUT
+    count=0
+    for f in $RESULTS/run_*.dat; do
+        name=${f##*/}
+        name=${name%.dat}
+        target="$OUT/$name.txt"
+        echo "# Output of the diffusion sweep. Units: time [s], position [m], velocity [m/s], energy [J]." > "$target"
+        echo "# Columns: t x y z vx vy vz E_kin E_pot. Fixed timestep, periodic boundaries, no thermostat." >> "$target"
+        echo "# Do not edit by hand. Rerun add_headers.sh to regenerate this file from the raw .dat file." >> "$target"
+        echo "# source: $f" >> "$target"
+        cat $f >> "$target"
+        count=$((count + 1))
+    done
+    echo "Done, $count files"
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (run after each sweep, ~40000 files)
+
+    #### [Bug] Unquoted variables break on spaces and empty values
+    - **Where:** `mkdir -p $OUT`, `for f in $RESULTS/run_*.dat`, `cat $f`
+    - **Issue:** if a path has a space (for example `my results/`), bash splits it into two words. Then `mkdir` or `cat` gets the wrong arguments, which is probably your strange errors. If no `run_*.dat` file exists, the loop runs once with the literal text `run_*.dat` and `cat` fails.
+    - **Fix:** put double quotes around every variable, and use `nullglob` so an empty match runs the loop zero times.
+
+    #### [Low] Double quotes around fixed text
+    - **Where:** the three header `echo` lines inside the loop
+    - **Issue:** these strings have nothing to expand, but bash still scans double-quoted text for `$`, backticks and backslashes. That happens again for every file. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal in a loop used about 24% less CPU energy with single quotes. Your lines are about 100 characters, so the absolute saving here is small. That is why this is Low. Single quotes are still the better default, and they also stop accidental expansion.
+    - **Fix:** single quotes for the three fixed lines. Keep double quotes for `"# source: $f"`, because it needs the variable.
+    - **Impact:** E, small. It grows with the length of the text and the number of files.
+
+    Fixed script:
+
+    ```bash
+    #!/bin/bash
+    # add_headers.sh - put a header on every result file of the parameter sweep
+    # usage: ./add_headers.sh results_dir out_dir
+    RESULTS=$1
+    OUT=$2
+
+    mkdir -p "$OUT"
+    shopt -s nullglob
+    count=0
+    for f in "$RESULTS"/run_*.dat; do
+        name=${f##*/}
+        name=${name%.dat}
+        target="$OUT/$name.txt"
+        echo '# Output of the diffusion sweep. Units: time [s], position [m], velocity [m/s], energy [J].' > "$target"
+        echo '# Columns: t x y z vx vy vz E_kin E_pot. Fixed timestep, periodic boundaries, no thermostat.' >> "$target"
+        echo '# Do not edit by hand. Rerun add_headers.sh to regenerate this file from the raw .dat file.' >> "$target"
+        echo "# source: $f" >> "$target"
+        cat -- "$f" >> "$target"
+        count=$((count + 1))
+    done
+    echo "Done, $count files"
+    ```
+
+    The output files are the same as before. The only change is for an empty or missing results directory: the script now prints `Done, 0 files` instead of an error from `cat`.
+
+    **Already good:** `${f##*/}` and `${name%.dat}` do the file name work without starting `basename` for each file.
+verify:
+  lang: bash
+  setup: |
+    d="$(mktemp -d)"
+    mkdir -p "$d/res"
+    for i in 1 2 3 4 5; do printf '0 1 2 3\n%s 4 5 6\n' "$i" > "$d/res/run_$i.dat"; done
+    cd "$d"
+    set -- res out
+  original_code: |
+    RESULTS=$1
+    OUT=$2
+
+    mkdir -p $OUT
+    count=0
+    for f in $RESULTS/run_*.dat; do
+        name=${f##*/}
+        name=${name%.dat}
+        target="$OUT/$name.txt"
+        echo "# Output of the diffusion sweep. Units: time [s], position [m], velocity [m/s], energy [J]." > "$target"
+        echo "# Columns: t x y z vx vy vz E_kin E_pot. Fixed timestep, periodic boundaries, no thermostat." >> "$target"
+        echo "# Do not edit by hand. Rerun add_headers.sh to regenerate this file from the raw .dat file." >> "$target"
+        echo "# source: $f" >> "$target"
+        cat $f >> "$target"
+        count=$((count + 1))
+    done
+    echo "Done, $count files"
+  green_code: |
+    RESULTS=$1
+    OUT=$2
+
+    mkdir -p "$OUT"
+    shopt -s nullglob
+    count=0
+    for f in "$RESULTS"/run_*.dat; do
+        name=${f##*/}
+        name=${name%.dat}
+        target="$OUT/$name.txt"
+        echo '# Output of the diffusion sweep. Units: time [s], position [m], velocity [m/s], energy [J].' > "$target"
+        echo '# Columns: t x y z vx vy vz E_kin E_pot. Fixed timestep, periodic boundaries, no thermostat.' >> "$target"
+        echo '# Do not edit by hand. Rerun add_headers.sh to regenerate this file from the raw .dat file.' >> "$target"
+        echo "# source: $f" >> "$target"
+        cat -- "$f" >> "$target"
+        count=$((count + 1))
+    done
+    echo "Done, $count files"
+  equivalence:
+    driver: cat out/*.txt

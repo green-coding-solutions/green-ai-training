@@ -1,0 +1,166 @@
+id: gen-2-00173-refactor
+category: refactor
+language: python
+patterns:
+- regex-precompile
+- hoist-invariants
+facts:
+- F-REGEX
+- F-ATTR
+messages:
+- role: user
+  content: |
+    A small Python script builds our marketing landing page in CI. It runs on every push to main and for every PR preview. It renders 12 page templates for 25 locales, and each locale JSON has around 800 translation keys. The build now takes several minutes and the frontend team keeps complaining.
+
+    Requirements:
+    - Python 3.11, stdlib only. No Jinja, we already had that discussion.
+    - Output in `dist/` must stay byte-identical. CI diffs it against the last release.
+    - Keep the function names and signatures. Two other scripts import `fill()` and `hero_dots()`.
+
+    Can you optimize it?
+
+    ```python
+    import json
+    import math
+    import random
+    import re
+    from pathlib import Path
+
+    TEMPLATES = Path("site/templates")
+    LOCALES = Path("site/locales")
+    DIST = Path("dist")
+
+
+    def fill(template, strings):
+        html = template
+        for key, value in strings.items():
+            html = re.sub(r"\{\{\s*" + re.escape(key) + r"\s*\}\}", value, html)
+        return html
+
+
+    def strip_comments(html):
+        # keep IE conditional comments, drop everything else
+        return re.sub(r"<!--(?!\[if).*?-->", "", html, flags=re.S)
+
+
+    def hero_dots(seed, count=4000, width=1440, height=640):
+        rnd = random.Random(seed)
+        parts = []
+        for i in range(count):
+            angle = rnd.random() * 2 * math.pi
+            r = math.sqrt(rnd.random()) * height / 2
+            x = width / 2 + r * math.cos(angle)
+            y = height / 2 + r * math.sin(angle)
+            parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="1.2"/>')
+        return "".join(parts)
+
+
+    def build():
+        pages = {p.name: p.read_text(encoding="utf-8") for p in sorted(TEMPLATES.glob("*.html"))}
+        for loc_file in sorted(LOCALES.glob("*.json")):
+            locale = loc_file.stem
+            strings = json.loads(loc_file.read_text(encoding="utf-8"))
+            out_dir = DIST / locale
+            out_dir.mkdir(parents=True, exist_ok=True)
+            for name, tpl in pages.items():
+                page_strings = {**strings, "hero.dots": hero_dots(f"{locale}/{name}")}
+                html = strip_comments(fill(tpl, page_strings))
+                (out_dir / name).write_text(html, encoding="utf-8")
+            print(f"{locale}: {len(pages)} pages")
+
+
+    if __name__ == "__main__":
+        build()
+    ```
+- role: assistant
+  content: |
+    ```python
+    import json
+    import math
+    import random
+    import re
+    from pathlib import Path
+
+    TEMPLATES = Path("site/templates")
+    LOCALES = Path("site/locales")
+    DIST = Path("dist")
+
+    PLACEHOLDER_RE = re.compile(r"\{\{\s*([\w.-]+)\s*\}\}")
+    COMMENT_RE = re.compile(r"<!--(?!\[if).*?-->", re.S)  # keeps IE conditional comments
+
+
+    def fill(template, strings):
+        def replace(m):
+            return strings.get(m.group(1), m.group(0))  # unknown keys stay as they are
+        return PLACEHOLDER_RE.sub(replace, template)
+
+
+    def strip_comments(html):
+        return COMMENT_RE.sub("", html)
+
+
+    def hero_dots(seed, count=4000, width=1440, height=640):
+        rand = random.Random(seed).random
+        sqrt, sin, cos = math.sqrt, math.sin, math.cos
+        full_turn = 2 * math.pi
+        half_w, half_h = width / 2, height / 2
+        parts = []
+        append = parts.append
+        for _ in range(count):
+            angle = rand() * full_turn
+            r = sqrt(rand()) * half_h
+            append(f'<circle cx="{half_w + r * cos(angle):.1f}" cy="{half_h + r * sin(angle):.1f}" r="1.2"/>')
+        return "".join(parts)
+
+
+    def build():
+        pages = {p.name: p.read_text(encoding="utf-8") for p in sorted(TEMPLATES.glob("*.html"))}
+        for loc_file in sorted(LOCALES.glob("*.json")):
+            locale = loc_file.stem
+            strings = json.loads(loc_file.read_text(encoding="utf-8"))
+            out_dir = DIST / locale
+            out_dir.mkdir(parents=True, exist_ok=True)
+            for name, tpl in pages.items():
+                page_strings = {**strings, "hero.dots": hero_dots(f"{locale}/{name}")}
+                html = strip_comments(fill(tpl, page_strings))
+                (out_dir / name).write_text(html, encoding="utf-8")
+            print(f"{locale}: {len(pages)} pages")
+
+
+    if __name__ == "__main__":
+        build()
+    ```
+
+    **Green Notes**
+    - **One precompiled placeholder regex instead of one pattern per key** (reduces E): this is the main cost. `fill()` built a new pattern for each of the ~800 keys. Python's `re` caches only 512 compiled patterns, so the keys kept pushing each other out of the cache and every `re.sub` compiled its pattern again. Each page was also scanned once per key. Now each page is scanned once, with a dict lookup per placeholder. In Green Metrics Tool micro-benchmarks, recompiling a regex on every call cost about 200× more per match than a cached pattern.
+    - **Comment regex compiled once at module level** (reduces E, small): this pattern never changes, so `re` would normally keep it cached. Precompiling saved about 18% over 1,000,000 matches in the same micro-benchmarks. In your build the per-key patterns kept pushing it out of the cache too, so it was being recompiled on every call.
+    - **Loop-invariant lookups hoisted in `hero_dots()`** (reduces E, minor): `rand`, `sqrt`, `sin`, `cos`, `append` and the half sizes are now set up once before the loop. Caching `math.sqrt` in a local saved about 4-5% over a 10,000,000-iteration loop in micro-benchmarks. You have 300 pages with 4,000 dots each, so this is a small extra next to the `fill()` change. The float math is unchanged, so the SVG output is the same.
+
+    **Behavior:** `dist/` stays byte-identical as long as no translation value contains a backslash or a `{{ ... }}` placeholder:
+    - Before, `re.sub` treated backslashes in translations as escapes: `\n` became a newline and `\d` crashed the build. Values are now inserted literally. That is a bug fix.
+    - Before, a placeholder inside a value was filled if its key came later in the dict. Now values are not scanned again.
+    - Placeholder keys must match `[\w.-]+` (letters, digits, `_`, `.`, `-`).
+
+    Grep the locale files for `\\` and `{{` once before you merge.
+verify:
+  module: true
+  test: |
+    assert fill("<p>{{ a }}</p>", {"a": "C:\\docs\\d"}) == "<p>C:\\docs\\d</p>"
+    assert fill("{{ x.y }}|{{z}}", {"x.y": "1"}) == "1|{{z}}"
+    assert strip_comments("a<!-- c -->b<!--[if IE]>x<![endif]-->") == "ab<!--[if IE]>x<![endif]-->"
+    assert hero_dots("t", count=10).count("<circle") == 10
+  equivalence:
+    driver: |-
+      import hashlib
+      strings = {f"sec{i}.label": f"Label {i} & more <b>{i}</b>" for i in range(800)}
+      strings["cta-primary"] = "Start free trial"
+      tpl = "<!-- build banner -->\n<!--[if IE]><p>old browser</p><![endif]-->\n"
+      tpl += "".join(f"<p>{{{{ sec{i}.label }}}}</p><span>{{{{sec{i}.label}}}}</span>\n" for i in range(0, 800, 7))
+      tpl += "<a>{{ cta-primary }}</a>{{ missing.key }}<!--\nmulti\nline\n-->{{  hero.dots  }}"
+      for page in ["en/index.html", "de/pricing.html"]:
+          s = {**strings, "hero.dots": hero_dots(page, count=500)}
+          html = strip_comments(fill(tpl, s))
+          print(page, len(html), hashlib.sha256(html.encode()).hexdigest())
+          print(html[:300])
+      print(hero_dots("fr/index.html", count=5))
+      print(hero_dots(42))

@@ -1,0 +1,132 @@
+id: gen-2-00168-review
+category: review
+language: javascript
+patterns:
+- dom-size
+- minify-assets
+facts:
+- F-DOM-SIZE
+- F-MINIFY
+messages:
+- role: user
+  content: |
+    review this, eval page for our classifier hangs on big runs
+
+    ```javascript
+    // build.mjs
+    import * as esbuild from "esbuild";
+
+    await esbuild.build({
+      entryPoints: ["src/eval-viewer.js"],
+      bundle: true,
+      outfile: "public/eval-viewer.js",
+      sourcemap: true,
+    });
+    ```
+
+    ```javascript
+    // src/eval-viewer.js
+    const tbody = document.querySelector("#results tbody");
+
+    async function loadRun(runId) {
+      const res = await fetch(`/api/runs/${runId}/predictions`);
+      const preds = await res.json(); // ~20k rows for the full test set
+      tbody.innerHTML = "";
+      for (const p of preds) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td><div class="cell"><span class="id">${p.sample_id}</span></div></td>
+          <td><div class="cell"><span class="text">${p.input_text}</span></div></td>
+          <td><div class="cell"><span class="label">${p.label}</span></div></td>
+          <td><div class="cell"><span class="pred">${p.predicted}</span></div></td>
+          <td><div class="cell"><span class="conf">${(p.confidence * 100).toFixed(1)}%</span></div></td>`;
+        if (p.label !== p.predicted) tr.classList.add("miss");
+        tbody.appendChild(tr);
+      }
+      document.querySelector("#count").textContent = preds.length;
+    }
+
+    document.querySelector("#run-select").addEventListener("change", (e) => {
+      loadRun(e.target.value);
+    });
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (ML evaluation dashboard)
+
+    #### [Security] Model inputs injected as HTML
+    - **Where:** `tr.innerHTML = ...` with `${p.input_text}` (and the label fields)
+    - **Issue:** `input_text` comes from the test set. Any sample that contains `<`, `&` or a tag breaks the table. A sample like `<img src=x onerror=...>` runs script in the page of whoever opens the run.
+    - **Fix:** create the cells with `document.createElement` and set `textContent`, as in the code below.
+
+    #### [High] Whole test set rendered at once, with wrappers around every cell
+    - **Where:** the `for (const p of preds)` loop
+    - **Issue:** every prediction becomes a row. Each cell has three elements (`td`, `div`, `span`), and each row is appended to the live table one by one. On a full run the browser has to build, style and lay out a huge table. That is the hang.
+    - **Fix:** show 100 rows per page, use plain `<td>` cells, and build each page in a `DocumentFragment`. Then swap it into the table in one step.
+    - **Impact:** reduces client E on every load of a run. In Green Metrics Tool micro-benchmarks, a 10,000-row table with wrappers around every cell, appended row by row, used about 56% less CPU energy when it was paginated to 100 rows per page as a plain table built in a `DocumentFragment`.
+
+    ```javascript
+    // src/eval-viewer.js
+    const PAGE_SIZE = 100;
+    const tbody = document.querySelector("#results tbody");
+    const pageInfo = document.querySelector("#page");
+    let preds = [];
+    let page = 0;
+
+    async function loadRun(runId) {
+      const res = await fetch(`/api/runs/${runId}/predictions`);
+      preds = await res.json();
+      page = 0;
+      document.querySelector("#count").textContent = preds.length;
+      renderPage();
+    }
+
+    function renderPage() {
+      const frag = document.createDocumentFragment();
+      const start = page * PAGE_SIZE;
+      for (const p of preds.slice(start, start + PAGE_SIZE)) {
+        const tr = document.createElement("tr");
+        if (p.label !== p.predicted) tr.className = "miss";
+        for (const [cls, value] of [
+          ["id", p.sample_id],
+          ["text", p.input_text],
+          ["label", p.label],
+          ["pred", p.predicted],
+          ["conf", `${(p.confidence * 100).toFixed(1)}%`],
+        ]) {
+          const td = document.createElement("td");
+          td.className = cls;
+          td.textContent = value;
+          tr.appendChild(td);
+        }
+        frag.appendChild(tr);
+      }
+      tbody.replaceChildren(frag);
+      const pages = Math.max(1, Math.ceil(preds.length / PAGE_SIZE));
+      pageInfo.textContent = `${page + 1} / ${pages}`;
+    }
+
+    function goTo(delta) {
+      const last = Math.max(0, Math.ceil(preds.length / PAGE_SIZE) - 1);
+      page = Math.min(last, Math.max(0, page + delta));
+      renderPage();
+    }
+
+    document.querySelector("#prev").addEventListener("click", () => goTo(-1));
+    document.querySelector("#next").addEventListener("click", () => goTo(1));
+    document.querySelector("#run-select").addEventListener("change", (e) => {
+      loadRun(e.target.value);
+    });
+    ```
+
+    You need `#prev`, `#next` and `#page` elements in the HTML. Change the CSS selectors from `.cell span.text` and similar to `td.text`. Browser search (Ctrl+F) now only finds rows on the current page.
+
+    #### [Low] Bundle not minified
+    - **Where:** `build.mjs`, no `minify` option
+    - **Issue:** the production bundle ships with whitespace and full identifiers.
+    - **Fix:** add `minify: true` to the `esbuild.build` options. Keep `sourcemap: true` for debugging.
+    - **Impact:** fewer transferred bytes only. In Green Metrics Tool micro-benchmarks, an esbuild-minified build of a small page used about 2% less client CPU energy, which is within measurement noise. This won't help with the hang.
+
+    **Already good:** the rows are fetched once per run selection, and esbuild is already in the build.
+verify:
+  static_only: needs a browser DOM and the esbuild package

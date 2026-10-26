@@ -1,0 +1,111 @@
+id: gen-12764612-00308-review
+category: review
+language: python
+patterns:
+- avoid-exception-flow
+- torch-no-grad
+facts:
+- F-EXC
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    ```python
+    import sys
+    import json
+    import torch
+    import torch.nn as nn
+
+
+    class LineClassifier(nn.Module):
+        def __init__(self, vocab_size, dim=32):
+            super().__init__()
+            self.emb = nn.EmbeddingBag(vocab_size, dim)
+            self.drop = nn.Dropout(0.3)
+            self.fc = nn.Linear(dim, 2)
+
+        def forward(self, ids, offsets):
+            return self.fc(self.drop(self.emb(ids, offsets)))
+
+
+    def load(vocab_path, weights_path):
+        with open(vocab_path) as f:
+            vocab = json.load(f)
+        model = LineClassifier(len(vocab) + 1)
+        model.load_state_dict(torch.load(weights_path, map_location="cpu"))
+        return vocab, model
+
+
+    def encode(line, vocab):
+        ids = []
+        for tok in line.lower().split():
+            try:
+                ids.append(vocab[tok])
+            except KeyError:
+                ids.append(0)
+        return ids or [0]
+
+
+    def classify(lines, vocab, model, batch_size=256):
+        results = []
+        for start in range(0, len(lines), batch_size):
+            batch = lines[start:start + batch_size]
+            encoded = [encode(l, vocab) for l in batch]
+            offsets = torch.tensor([0] + [len(e) for e in encoded[:-1]]).cumsum(0)
+            ids = torch.tensor([i for e in encoded for i in e])
+            logits = model(ids, offsets)
+            probs = torch.softmax(logits, dim=1)[:, 1]
+            results.extend(probs.tolist())
+        return results
+
+
+    if __name__ == "__main__":
+        vocab, model = load(sys.argv[1], sys.argv[2])
+        lines = [l.rstrip("\n") for l in sys.stdin]
+        for line, p in zip(lines, classify(lines, vocab, model)):
+            if p > 0.9:
+                print(f"{p:.3f} {line}")
+    ```
+
+    ?
+- role: assistant
+  content: |
+    **Workload:** data pipeline (AI/ML inference on log lines)
+
+    #### [Bug] Model is still in training mode
+    - **Where:** `load()`, the model is never switched to eval mode
+    - **Issue:** `nn.Dropout` is active until you call `model.eval()`. Each run randomly drops features, so the same log line can get a different score each time. Lines near your `0.9` threshold will appear and disappear between runs.
+    - **Fix:**
+      ```python
+      model.load_state_dict(torch.load(weights_path, map_location="cpu"))
+      model.eval()
+      return vocab, model
+      ```
+    - **Impact:** correctness. Scores become stable and deterministic.
+
+    #### [High] Inference builds an autograd graph
+    - **Where:** `logits = model(ids, offsets)` in `classify()`
+    - **Issue:** the forward pass records operations for a backward pass that never happens. This costs CPU time and memory for every batch. In Green Metrics Tool micro-benchmarks, 100,000 PyTorch CPU inferences used ~157 J without `torch.no_grad()` and ~135 J with it, about 14% less.
+    - **Fix:** wrap the batch loop (or the whole function) in a no-grad context:
+      ```python
+      @torch.inference_mode()
+      def classify(lines, vocab, model, batch_size=256):
+          ...
+      ```
+      `torch.no_grad()` works the same way here. `inference_mode` is slightly stricter, so don't use its output tensors in autograd later. You only call `.tolist()`, so that is fine.
+    - **Impact:** E and M, on every batch of every run.
+
+    #### [Medium] `try/except KeyError` for vocabulary misses
+    - **Where:** `encode()`
+    - **Issue:** log lines are full of tokens that are not in the vocabulary, such as IDs, IPs, paths and timestamps. So misses are common here, and every miss raises and catches an exception. In Green Metrics Tool micro-benchmarks with about half of the keys missing, 10,000,000 lookups used ~67 J with `dict.get` and ~76 J with `try/except KeyError`, about 12% less. If misses were rare, the `try` would be cheap. The cost is in raising.
+    - **Fix:** the behavior stays the same:
+      ```python
+      def encode(line, vocab):
+          ids = [vocab.get(tok, 0) for tok in line.lower().split()]
+          return ids or [0]
+      ```
+    - **Impact:** E, per token of every line. It is shorter, too.
+
+    **Already good:** lines are classified in batches, and `EmbeddingBag` with offsets avoids padding.
+verify:
+  static_only: needs PyTorch and model weights

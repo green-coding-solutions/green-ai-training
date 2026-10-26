@@ -1,0 +1,69 @@
+id: gen-1-00005-generation
+category: generation
+language: sql
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    I need the SQL for the category page of our shop (Postgres 16). Requirements:
+
+    - Products of one category, only active ones that are in stock
+    - 24 products per page, page number comes from the URL
+    - Best sellers first. Pages must be stable, so no product shows up twice when people click through
+    - Each card shows: name, brand, price, sale price (if any), thumbnail, rating and number of ratings, and it links to the product by slug
+
+    The `products` table has about 55 columns. These are the ones I know we need:
+
+    ```sql
+    -- products (excerpt)
+    id bigint primary key,
+    slug text,
+    name text,
+    brand text,
+    category_id int,
+    price_cents int,
+    sale_price_cents int,
+    thumbnail_url text,
+    rating_avg numeric(3,2),
+    rating_count int,
+    sales_rank int,
+    stock_qty int,
+    is_active boolean,
+    description_html text,   -- long marketing text
+    specs jsonb,             -- can be several KB
+    seo_json jsonb,
+    ...
+    ```
+
+    I will bind `category_id`, `limit` and `offset` from the app as named parameters. Just give me the query.
+- role: assistant
+  content: |-
+    ```sql
+    SELECT
+        id,
+        slug,
+        name,
+        brand,
+        price_cents,
+        sale_price_cents,
+        thumbnail_url,
+        rating_avg,
+        rating_count
+    FROM products
+    WHERE category_id = :category_id
+      AND is_active = TRUE
+      AND stock_qty > 0
+    ORDER BY sales_rank ASC, id ASC
+    LIMIT :limit OFFSET :offset;
+    ```
+
+    `id ASC` is the tie-breaker. Without it, products with the same `sales_rank` can switch places between requests, and a product can then appear on two pages or on none. Bind `limit` as 24 and `offset` as `(page - 1) * 24`.
+
+    **Green Notes**
+    - **Select only the needed columns** (reduces E, network): the query names the nine columns the card shows, so the large `description_html`, `specs` and `seo_json` values are not read or sent to the app for every card. In Green Metrics Tool micro-benchmarks on a 52-column products table with large text columns, naming 10 needed columns instead of `SELECT *` used about 7× less energy when reading 2,500 rows. The saving grows with the size of the columns you skip.
+    - If you add a field to the card later, add it to the column list on purpose. Don't switch back to `SELECT *`.

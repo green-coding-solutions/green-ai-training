@@ -1,0 +1,126 @@
+id: gen-12764612-00146-multi-turn
+category: multi-turn
+language: javascript
+patterns:
+- css-animations
+facts:
+- F-ANIM
+messages:
+- role: user
+  content: |
+    I'm building a demo page for our in-browser speech recognition model (onnxruntime-web, runs in a worker). While the model is transcribing I want a small "listening" indicator: 5 vertical bars that bounce up and down. When the model is idle, the bars should sit low and still.
+
+    Requirements:
+    - plain JS, no libraries
+    - two functions `startMeter(el)` and `stopMeter(el)` that I call from the worker message handler
+    - bars are 6px wide, 32px max height, green
+    - should respect `prefers-reduced-motion`
+    - needs to work in Chrome and Firefox
+
+    Users keep this page open for a few minutes while they dictate, so it will run for a long time.
+- role: assistant
+  content: |
+    The bounce does not depend on any data, so CSS can run it. JS only switches a class.
+
+    ```html
+    <div class="meter" id="meter" aria-hidden="true">
+      <span></span><span></span><span></span><span></span><span></span>
+    </div>
+    ```
+
+    ```css
+    .meter {
+      display: flex;
+      align-items: flex-end;
+      gap: 4px;
+      height: 32px;
+    }
+
+    .meter span {
+      width: 6px;
+      height: 100%;
+      background: #2b7;
+      border-radius: 2px;
+      transform: scaleY(0.2);
+      transform-origin: bottom;
+    }
+
+    .meter.is-listening span {
+      animation: bounce 900ms ease-in-out infinite;
+    }
+    .meter.is-listening span:nth-child(2) { animation-delay: -150ms; }
+    .meter.is-listening span:nth-child(3) { animation-delay: -300ms; }
+    .meter.is-listening span:nth-child(4) { animation-delay: -450ms; }
+    .meter.is-listening span:nth-child(5) { animation-delay: -600ms; }
+
+    @keyframes bounce {
+      0%, 100% { transform: scaleY(0.2); }
+      50%      { transform: scaleY(1); }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .meter.is-listening span {
+        animation: none;
+        transform: scaleY(0.6);
+      }
+    }
+    ```
+
+    ```javascript
+    export function startMeter(el) {
+      el.classList.add('is-listening');
+    }
+
+    export function stopMeter(el) {
+      el.classList.remove('is-listening');
+    }
+    ```
+
+    **Green Notes**
+    - **CSS keyframes instead of a JS animation loop** (reduces E): the page runs this animation for minutes, so per-frame JS work adds up. The animation only changes `transform`, and the browser runs it without calling your code on every frame. In Green Metrics Tool micro-benchmarks of a 20-second animation, CSS `@keyframes` used about 10% less CPU energy than a `requestAnimationFrame` loop with style updates.
+- role: user
+  content: |
+    ok, but the product owner wants the bars to show the real input level, not a fake bounce. The worker posts an array of 5 band levels (0 to 1) every 100 ms from the voice activity model. Keyframes can't do that, so I guess we need requestAnimationFrame with interpolation between the updates?
+- role: assistant
+  content: |
+    No loop needed. Keyframes are out, but CSS can still do the smoothing. JS sets a custom property when new data arrives, about 10 times a second. A CSS transition fills the gap between updates.
+
+    ```css
+    .meter span {
+      width: 6px;
+      height: 100%;
+      background: #2b7;
+      border-radius: 2px;
+      transform: scaleY(var(--level, 0.05));
+      transform-origin: bottom;
+      transition: transform 100ms linear;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .meter span { transition: none; }
+    }
+    ```
+
+    Remove the `.is-listening` keyframe rules and the `@keyframes bounce` block. The container and the span styles stay as they were.
+
+    ```javascript
+    export function setLevels(el, levels) {
+      const bars = el.children;
+      for (let i = 0; i < bars.length; i++) {
+        const level = Math.min(1, Math.max(0.05, levels[i] ?? 0));
+        bars[i].style.setProperty('--level', level);
+      }
+    }
+
+    export function stopMeter(el) {
+      setLevels(el, []);
+    }
+    ```
+
+    Call `setLevels(meterEl, levels)` in the worker `message` handler. The transition is 100 ms, the same as your update interval, so the bars move smoothly without any extra code.
+
+    **Green Notes**
+    - **Transition instead of an rAF interpolation loop** (reduces E): your JS now runs only when the worker sends data, not on every frame. The browser does the in-between frames. Only `transform` changes, so layout is not recalculated.
+    - The clamp keeps a bad level value from stretching a bar outside the 32px box. `stopMeter` drops all bars back to the low resting height.
+verify:
+  static_only: needs a browser DOM, CSS animation and a worker message handler

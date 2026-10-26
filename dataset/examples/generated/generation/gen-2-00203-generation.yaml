@@ -1,0 +1,50 @@
+id: gen-2-00203-generation
+category: generation
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    py fn: diff test durations current run vs baseline (both dict test_id -> secs), flag tests >50% slower and >1s slower. ~40k tests, lots of ids missing from baseline (new tests, parametrized ids change), just skip those
+- role: assistant
+  content: |
+    ```python
+    def find_slow_tests(
+        current: dict[str, float],
+        baseline: dict[str, float],
+        rel_threshold: float = 0.5,
+        min_increase: float = 1.0,
+    ) -> list[tuple[str, float, float]]:
+        """Return (test_id, baseline_secs, current_secs) for tests that got slower.
+
+        A test is flagged when it is more than rel_threshold slower (0.5 = 50%)
+        and more than min_increase seconds slower. Tests without a baseline
+        are skipped. Biggest absolute increase comes first.
+        """
+        slower = []
+        for test_id, new in current.items():
+            old = baseline.get(test_id)
+            if old is None:
+                continue  # new or renamed test, nothing to compare against
+            if new - old > min_increase and new > old * (1 + rel_threshold):
+                slower.append((test_id, old, new))
+        slower.sort(key=lambda t: t[2] - t[1], reverse=True)
+        return slower
+    ```
+
+    **Green Notes**
+    - **`dict.get` instead of `try/except KeyError`** (reduces E): many test ids have no baseline, so a miss is a normal case here, not an error. Raising and catching an exception for each miss costs more than a plain lookup. In Green Metrics Tool micro-benchmarks with 10,000,000 dict lookups where about half of the keys were missing, `dict.get` used about 12% less CPU energy than `try/except KeyError`. An `if test_id in baseline` check performed about the same as `get`.
+    - **One pass, O(1) lookup per test:** the loop goes over the 40k tests once. Only the flagged tests get sorted, not the whole run.
+verify:
+  test: |-
+    cur = {"a": 3.0, "b": 1.2, "c": 10.0, "d": 5.0, "e": 2.0}
+    base = {"a": 1.5, "b": 0.1, "c": 9.5, "x": 1.0}
+    assert find_slow_tests(cur, base) == [("a", 1.5, 3.0), ("b", 0.1, 1.2)]
+    assert find_slow_tests(cur, {}) == []
+    assert find_slow_tests({}, base) == []
+    assert find_slow_tests(cur, base, min_increase=0.4) == [("a", 1.5, 3.0), ("b", 0.1, 1.2)]
+    assert find_slow_tests(cur, base, rel_threshold=0.0, min_increase=0.4) == [("a", 1.5, 3.0), ("b", 0.1, 1.2), ("c", 9.5, 10.0)]
+    print("ok")

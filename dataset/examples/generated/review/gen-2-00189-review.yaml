@@ -1,0 +1,139 @@
+id: gen-2-00189-review
+category: review
+language: python
+patterns:
+- set-membership
+- keep-star-imports
+facts:
+- F-MEMB
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    from datetime import *
+
+    FEED_WINDOW = timedelta(days=7)
+
+
+    def build_feed(viewer, posts, muted_ids, seen_ids, limit=50):
+        """Assemble the home feed for GET /api/v1/feed. Called on every request.
+
+        posts:     recent posts from the DB, newest first (a few thousand rows)
+        muted_ids: list of user ids the viewer muted
+        seen_ids:  list of post ids the viewer already opened (thousands for active users)
+        """
+        cutoff = datetime.now() - FEED_WINDOW
+        feed = []
+        for post in posts:
+            if post["author_id"] in muted_ids:
+                continue
+            if post["id"] in seen_ids:
+                continue
+            created = datetime.fromisoformat(post["created_at"])
+            if created < cutoff:
+                break
+            feed.append({
+                "id": post["id"],
+                "author": post["author_name"],
+                "title": post["title"],
+                "age_hours": int((datetime.now(timezone.utc) - created).total_seconds() // 3600),
+                "own": post["author_id"] == viewer["id"],
+            })
+            if len(feed) >= limit:
+                break
+        return feed
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (REST endpoint, runs on every feed request)
+
+    #### [Bug] Naive and aware datetimes are mixed
+    - **Where:** `cutoff = datetime.now() - FEED_WINDOW` and the `age_hours` line
+    - **Issue:** `cutoff` is naive local time. The age calculation uses aware UTC. Python refuses to compare or subtract naive and aware datetimes. If `created_at` has an offset (`+00:00`), `created < cutoff` raises `TypeError`. If it is naive, the `age_hours` line raises it. Either way the request fails at the first post that passes the filters. The naive cutoff is also shifted by the server's UTC offset.
+    - **Fix:** take one aware `now = datetime.now(timezone.utc)`, use it for both the cutoff and the age, and treat naive DB timestamps as UTC.
+
+    #### [High] List membership tests inside the per-post loop
+    - **Where:** `post["author_id"] in muted_ids` and `post["id"] in seen_ids`
+    - **Issue:** both are lists, so every `in` scans the list. With a few thousand posts and thousands of seen ids, that is millions of comparisons per request. It grows as users open more posts.
+    - **Fix:** convert both to sets once before the loop. A set lookup is O(1), so the request goes from O(posts × seen) to O(posts + seen). Better still, have the data layer return sets directly.
+    - **Impact:** reduces E on every request, and the saving grows with each user's history. Building a set costs one full pass. That only pays off because of the many lookups here. In Green Metrics Tool micro-benchmarks, converting a list to a set for a *single* lookup cost about 50% more than one scan of the list.
+
+    ```python
+    from datetime import *
+
+    FEED_WINDOW = timedelta(days=7)
+
+
+    def build_feed(viewer, posts, muted_ids, seen_ids, limit=50):
+        """Assemble the home feed for GET /api/v1/feed. Called on every request.
+
+        posts:     recent posts from the DB, newest first (a few thousand rows)
+        muted_ids: user ids the viewer muted
+        seen_ids:  post ids the viewer already opened (thousands for active users)
+        """
+        now = datetime.now(timezone.utc)
+        cutoff = now - FEED_WINDOW
+        muted = set(muted_ids)
+        seen = set(seen_ids)
+        feed = []
+        for post in posts:
+            if post["author_id"] in muted or post["id"] in seen:
+                continue
+            created = datetime.fromisoformat(post["created_at"])
+            if created.tzinfo is None:  # treat naive DB timestamps as UTC
+                created = created.replace(tzinfo=timezone.utc)
+            if created < cutoff:
+                break
+            feed.append({
+                "id": post["id"],
+                "author": post["author_name"],
+                "title": post["title"],
+                "age_hours": int((now - created).total_seconds() // 3600),
+                "own": post["author_id"] == viewer["id"],
+            })
+            if len(feed) >= limit:
+                break
+        return feed
+    ```
+
+    All ages are now measured against the same instant. Before, each post called `now()` again.
+
+    **Already good:**
+    - The early `break` on the cutoff and on `limit` stops the scan as soon as the page is full. This relies on `posts` staying sorted newest first.
+
+    *Left as is:* `from datetime import *`. Switching it to `import datetime` or explicit names makes no measurable energy difference. Star and namespace imports measured the same in Green Metrics Tool micro-benchmarks.
+verify:
+  test: |-
+    from datetime import datetime, timedelta, timezone
+
+    _now = datetime.now(timezone.utc)
+
+    def _iso(h, aware=True):
+        t = _now - timedelta(hours=h)
+        return t.isoformat() if aware else t.replace(tzinfo=None).isoformat()
+
+    posts = [
+        {"id": 1, "author_id": 10, "author_name": "ana", "title": "a", "created_at": _iso(1)},
+        {"id": 2, "author_id": 11, "author_name": "bo", "title": "b", "created_at": _iso(2)},
+        {"id": 3, "author_id": 12, "author_name": "cy", "title": "c", "created_at": _iso(5, aware=False)},
+        {"id": 4, "author_id": 7, "author_name": "me", "title": "d", "created_at": _iso(30)},
+        {"id": 5, "author_id": 10, "author_name": "ana", "title": "e", "created_at": _iso(24 * 8)},
+        {"id": 6, "author_id": 13, "author_name": "di", "title": "f", "created_at": _iso(24 * 9)},
+    ]
+
+    feed = build_feed({"id": 7}, posts, [11], [3])
+    assert [p["id"] for p in feed] == [1, 4], feed
+    assert feed[0]["age_hours"] == 1 and feed[1]["age_hours"] == 30
+    assert feed[0]["own"] is False and feed[1]["own"] is True
+
+    assert [p["id"] for p in build_feed({"id": 7}, posts, [], [], limit=2)] == [1, 2]
+
+    full = build_feed({"id": 7}, posts, (), ())
+    assert [p["id"] for p in full] == [1, 2, 3, 4]
+    assert full[2]["age_hours"] == 5
+
+    assert build_feed({"id": 7}, posts, [10, 11, 12, 7], []) == []
+    print("ok")

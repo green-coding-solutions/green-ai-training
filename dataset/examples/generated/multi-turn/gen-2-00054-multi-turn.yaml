@@ -1,0 +1,230 @@
+id: gen-2-00054-multi-turn
+category: multi-turn
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    slow on the yearly ticket export (couple GB). fix?
+
+    ```python
+    #!/usr/bin/env python3
+    """Expand shorthand in support ticket exports.
+
+    usage: expand.py abbrevs.tsv < tickets.txt > expanded.txt
+    """
+    import sys
+
+
+    def load_abbrevs(path):
+        table = {}
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                short, full = line.split("\t", 1)
+                table[short.lower()] = full
+        return table
+
+
+    def expand_line(line, table):
+        words = []
+        for word in line.split():
+            try:
+                words.append(table[word.lower()])
+            except KeyError:
+                words.append(word)
+        return " ".join(words)
+
+
+    def main():
+        if len(sys.argv) != 2:
+            sys.exit(__doc__)
+        table = load_abbrevs(sys.argv[1])
+        for line in sys.stdin:
+            print(expand_line(line, table))
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    ```python
+    #!/usr/bin/env python3
+    """Expand shorthand in support ticket exports.
+
+    usage: expand.py abbrevs.tsv < tickets.txt > expanded.txt
+    """
+    import sys
+
+
+    def load_abbrevs(path):
+        table = {}
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                short, full = line.split("\t", 1)
+                table[short.lower()] = full
+        return table
+
+
+    def expand_line(line, table):
+        return " ".join(table.get(word.lower(), word) for word in line.split())
+
+
+    def main():
+        if len(sys.argv) != 2:
+            sys.exit(__doc__)
+        table = load_abbrevs(sys.argv[1])
+        for line in sys.stdin:
+            print(expand_line(line, table))
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **No exceptions for expected misses** (reduces E): most words in a ticket are not abbreviations, so the old loop raised and caught a `KeyError` for almost every word. `dict.get(key, default)` handles the miss without raising. In Green Metrics Tool micro-benchmarks with about half of the keys missing, `dict.get` used about 12% less CPU energy than `try/except KeyError`. The cost is in raising, so with more misses the gap grows.
+    - Output is identical. Expect a steady per-word gain, not an order of magnitude.
+- role: user
+  content: |
+    also need how many words got expanded, at the end on stderr
+- role: assistant
+  content: |
+    ```python
+    #!/usr/bin/env python3
+    """Expand shorthand in support ticket exports.
+
+    usage: expand.py abbrevs.tsv < tickets.txt > expanded.txt
+    """
+    import sys
+
+
+    def load_abbrevs(path):
+        table = {}
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                short, full = line.split("\t", 1)
+                table[short.lower()] = full
+        return table
+
+
+    def expand_line(line, table):
+        words = []
+        expanded = 0
+        for word in line.split():
+            full = table.get(word.lower())
+            if full is None:
+                words.append(word)
+            else:
+                words.append(full)
+                expanded += 1
+        return " ".join(words), expanded
+
+
+    def main():
+        if len(sys.argv) != 2:
+            sys.exit(__doc__)
+        table = load_abbrevs(sys.argv[1])
+        total = 0
+        for line in sys.stdin:
+            text, n = expand_line(line, table)
+            print(text)
+            total += n
+        print(f"expanded {total} words", file=sys.stderr)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    `expand_line` now returns the text and the count. `.get()` without a default returns `None` on a miss, which works here because every value in the table is a string. stdout is unchanged, so the redirect into `expanded.txt` stays clean.
+- role: user
+  content: |
+    team style guide says EAFP. put the try/except back pls
+- role: assistant
+  content: |
+    Sure, here it is with `try/except` and the counter:
+
+    ```python
+    #!/usr/bin/env python3
+    """Expand shorthand in support ticket exports.
+
+    usage: expand.py abbrevs.tsv < tickets.txt > expanded.txt
+    """
+    import sys
+
+
+    def load_abbrevs(path):
+        table = {}
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                short, full = line.split("\t", 1)
+                table[short.lower()] = full
+        return table
+
+
+    def expand_line(line, table):
+        words = []
+        expanded = 0
+        for word in line.split():
+            try:
+                full = table[word.lower()]
+            except KeyError:
+                words.append(word)
+            else:
+                words.append(full)
+                expanded += 1
+        return " ".join(words), expanded
+
+
+    def main():
+        if len(sys.argv) != 2:
+            sys.exit(__doc__)
+        table = load_abbrevs(sys.argv[1])
+        total = 0
+        for line in sys.stdin:
+            text, n = expand_line(line, table)
+            print(text)
+            total += n
+        print(f"expanded {total} words", file=sys.stderr)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    The `else` branch keeps the `try` body to the lookup alone, so only a missing key is caught. If the export run time ever matters again, the `.get()` version from before is a drop-in swap.
+verify:
+  module: true
+  test: |-
+    import os
+    import tempfile
+
+    table = {"asap": "as soon as possible", "pls": "please", "thx": "thanks"}
+    assert expand_line("pls reply ASAP thx", table) == ("please reply as soon as possible thanks", 3)
+    assert expand_line("no shorthand here\n", table) == ("no shorthand here", 0)
+    assert expand_line("   ", table) == ("", 0)
+    assert expand_line("Pls  check   logs", table) == ("please check logs", 1)
+
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "abbrevs.tsv")
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("# comment\n\nASAP\tas soon as possible\nfyi\tfor your information\n")
+        t = load_abbrevs(p)
+        assert t == {"asap": "as soon as possible", "fyi": "for your information"}
+        assert expand_line("FYI deploy asap", t) == ("for your information deploy as soon as possible", 2)

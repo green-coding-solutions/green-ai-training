@@ -1,0 +1,67 @@
+id: gen-12764612-00056-estimate
+category: estimate
+language: sql
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    We run a Postgres 16 database for our spectrometer lab. The `spectra` table has about 50 columns. Most are small (ids, floats, timestamps), but there are also `raw_trace` and `instrument_log`, which hold big text blobs, around 200 KB each.
+
+    Our plotting service runs this for every chart request, about 40,000 times a day:
+
+    ```sql
+    SELECT * FROM spectra
+    WHERE sample_id = %s
+    ORDER BY acquired_at DESC
+    LIMIT 500;
+    ```
+
+    The chart only uses `id`, `acquired_at`, `wavelength_nm`, `intensity` and `quality_flag`.
+
+    Requirements for your answer:
+    1. Tell me roughly how much energy we would save if we list the columns.
+    2. I need a number I can put in a report. Please give me kWh per year.
+    3. Tell me how I can check it myself.
+- role: assistant
+  content: |
+    I can't give you a kWh per year figure. Any such number would be invented, because it depends on your hardware, your row sizes and your cache hit rate. I can tell you the direction, a measured reference, and how to get your own number.
+
+    **Direction:** yes, it is a clear saving in your case. `SELECT *` reads, sends and decodes the two ~200 KB text columns for all 500 rows, and the chart never uses them. Naming five columns skips that work in the database, on the network and in the client.
+
+    ```sql
+    SELECT id, acquired_at, wavelength_nm, intensity, quality_flag
+    FROM spectra
+    WHERE sample_id = %s
+    ORDER BY acquired_at DESC
+    LIMIT 500;
+    ```
+
+    **Measured reference:** in Green Metrics Tool micro-benchmarks on PostgreSQL 16, a 52-column products table with large text columns was read 1,000 times:
+
+    - 500 rows: `SELECT *` ~95 J, 10 needed columns ~17 J (about 5.5× less)
+    - 2,500 rows: ~470 J vs ~64 J (about 7× less)
+    - cost scaled with the data each column carries: 1 column ~13 J, 8 columns ~58 J, all 52 columns ~465 J
+
+    The saving grows with the size of the skipped columns. Your blobs are large, so you should expect a gap in that direction. Do not scale those joules to 40,000 requests a day, though. The server, table and columns are different from yours.
+
+    **How to measure it yourself:**
+    1. Run both queries against a copy of your data with a typical `sample_id`.
+    2. Compare the bytes returned and the time:
+
+       ```sql
+       EXPLAIN (ANALYZE, BUFFERS, VERBOSE) SELECT ...;
+       ```
+
+       The `width` in the plan shows the row size each version carries.
+    3. For energy, replay a few thousand real chart requests with each query as a Green Metrics Tool usage scenario. Or use `perf stat` or RAPL on the database host and the plotting service as a CPU proxy.
+
+    Multiply the measured difference per request by your request count. That gives you a defensible number for the report.
+
+    One check before you change it: make sure nothing else reads other columns from this result, such as an export feature that shares the query.
+verify:
+  static_only: needs a Postgres table with large text columns; query is a single statement using Postgres placeholders

@@ -1,0 +1,69 @@
+id: gen-1-00234-generation
+category: generation
+language: python
+patterns:
+- keep-star-imports
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    I need to add a `battery_percent(voltage_mv)` function to power.py in our solar sensor gateway (Python 3.11, stdlib only). The gateway reads the voltage of a single Li-ion cell once every 30 s and sends the percent with the heartbeat.
+
+    Requirements:
+    - input: integer millivolts from the ADC
+    - output: int from 0 to 100
+    - use a piecewise-linear curve through these points (mV -> %): 3300 -> 0, 3500 -> 5, 3600 -> 15, 3700 -> 30, 3800 -> 50, 3900 -> 65, 4000 -> 80, 4100 -> 92, 4200 -> 100
+    - below 3300 give 0, above 4200 give 100 (the ADC overshoots when the charger is on)
+    - negative values mean a broken reading, so raise ValueError
+
+    The file starts with `from bisect import *`. It was like that before I joined, so please leave it.
+- role: assistant
+  content: |
+    ```python
+    from bisect import *
+
+    # Resting voltage of a 1S Li-ion cell (mV) and the matching charge (%).
+    _CURVE_MV = (3300, 3500, 3600, 3700, 3800, 3900, 4000, 4100, 4200)
+    _CURVE_PCT = (0, 5, 15, 30, 50, 65, 80, 92, 100)
+
+
+    def battery_percent(voltage_mv: int) -> int:
+        if voltage_mv < 0:
+            raise ValueError(f"invalid battery reading: {voltage_mv} mV")
+        if voltage_mv <= _CURVE_MV[0]:
+            return 0
+        if voltage_mv >= _CURVE_MV[-1]:
+            return 100
+
+        i = bisect_right(_CURVE_MV, voltage_mv)
+        lo_mv, hi_mv = _CURVE_MV[i - 1], _CURVE_MV[i]
+        lo_pct, hi_pct = _CURVE_PCT[i - 1], _CURVE_PCT[i]
+        return round(lo_pct + (hi_pct - lo_pct) * (voltage_mv - lo_mv) / (hi_mv - lo_mv))
+    ```
+
+    The curve is two tuples built once at import time. Between two points the result is a straight line, and `round()` gives the nearest whole percent.
+
+    **Green Notes**
+    - **Star import left unchanged** (no change in E): replacing `from bisect import *` with `import bisect` or an explicit name would not save energy. In Green Metrics Tool micro-benchmarks, star imports and namespace imports showed no measurable energy difference. What costs energy is loading a heavy module at all, and `bisect` is small.
+    - Nothing else to optimize here: this runs once every 30 s, so clarity matters more than speed.
+verify:
+  test: |-
+    assert battery_percent(3300) == 0
+    assert battery_percent(3000) == 0
+    assert battery_percent(0) == 0
+    assert battery_percent(4200) == 100
+    assert battery_percent(4350) == 100
+    assert battery_percent(3500) == 5
+    assert battery_percent(3800) == 50
+    assert battery_percent(3750) == 40
+    assert battery_percent(4150) == 96
+    assert battery_percent(3333) == 1
+    assert all(isinstance(battery_percent(v), int) for v in range(3200, 4300, 7))
+    vals = [battery_percent(v) for v in range(3200, 4300)]
+    assert vals == sorted(vals)
+    try:
+        battery_percent(-1)
+        raise SystemExit("expected ValueError")
+    except ValueError:
+        pass

@@ -1,0 +1,177 @@
+id: gen-2-00172-review
+category: review
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    Hi, can you review my ETL step please? We get app events from kafka dump as jsonl, one file per hour, around 400k events per file. Kafka deliver at-least-once so we must remove the duplicates before load to warehouse. It work, but the job take longer and longer when traffic grow, now almost 40 minutes for one file. Is something wrong in the code?
+
+    ```python
+    import csv
+    import json
+    import logging
+    import sys
+    from datetime import datetime
+
+    log = logging.getLogger("events_etl")
+
+    INTERNAL_USERS = ["u_qa_01", "u_qa_02", "u_demo", "u_loadtest"]
+    FIELDS = ["event_id", "user_id", "event_type", "event_time_utc", "platform", "app_version"]
+
+
+    def load_events(path):
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                yield json.loads(line)
+
+
+    def transform(events):
+        seen_ids = []
+        out = []
+        dupes = 0
+        for ev in events:
+            if ev["user_id"] in INTERNAL_USERS:
+                continue
+            if ev["event_id"] in seen_ids:
+                dupes += 1
+                continue
+            seen_ids.append(ev["event_id"])
+            out.append({
+                "event_id": ev["event_id"],
+                "user_id": ev["user_id"],
+                "event_type": ev["type"].lower(),
+                "event_time_utc": datetime.fromtimestamp(ev["ts_ms"] / 1000).strftime("%Y-%m-%d %H:%M:%S"),
+                "platform": ev.get("platform", "unknown"),
+                "app_version": ev.get("app_version", ""),
+            })
+        log.info("kept %d events, dropped %d duplicates", len(out), dupes)
+        return out
+
+
+    def write_csv(rows, path):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=FIELDS)
+            w.writeheader()
+            w.writerows(rows)
+
+
+    if __name__ == "__main__":
+        logging.basicConfig(level=logging.INFO)
+        write_csv(transform(load_events(sys.argv[1])), sys.argv[2])
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline
+
+    #### [Bug] `event_time_utc` is not UTC
+    - **Where:** `transform`, `datetime.fromtimestamp(ev["ts_ms"] / 1000)`
+    - **Issue:** Without `tz`, `fromtimestamp` converts to the server's local time zone. On a host that is not set to UTC, the warehouse gets shifted hours. Around DST changes, some hours repeat or go missing.
+    - **Fix:** Pass `tz=timezone.utc` and import `timezone` from `datetime`. On a host already set to UTC, the output stays the same.
+
+    ```python
+    datetime.fromtimestamp(ev["ts_ms"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    ```
+
+    #### [High] Duplicate check scans a growing list
+    - **Where:** `transform`, `if ev["event_id"] in seen_ids`
+    - **Issue:** `in` on a list compares against every element. `seen_ids` grows by one for each kept event, so the work per event grows with the file size. The whole file costs O(n²) comparisons. That is why the job gets much slower as traffic grows.
+    - **Fix:** Keep the seen ids in a set. Each lookup becomes O(1) on average. `out` is still built in input order, so the output does not change. The full function with both fixes is below.
+    - **Impact:** E, large, and it grows with traffic. Converting to a set is not always a win. In Green Metrics Tool micro-benchmarks, building a set from a 10,000,000-element list for one single lookup used about 50% more energy than scanning the list once. Here you do one lookup per event, hundreds of thousands per file, so the set pays for itself many times over.
+
+    ```python
+    import logging
+    from datetime import datetime, timezone
+
+    log = logging.getLogger("events_etl")
+
+    INTERNAL_USERS = ["u_qa_01", "u_qa_02", "u_demo", "u_loadtest"]
+
+
+    def transform(events):
+        seen_ids = set()
+        out = []
+        dupes = 0
+        for ev in events:
+            if ev["user_id"] in INTERNAL_USERS:
+                continue
+            event_id = ev["event_id"]
+            if event_id in seen_ids:
+                dupes += 1
+                continue
+            seen_ids.add(event_id)
+            out.append({
+                "event_id": event_id,
+                "user_id": ev["user_id"],
+                "event_type": ev["type"].lower(),
+                "event_time_utc": datetime.fromtimestamp(ev["ts_ms"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                "platform": ev.get("platform", "unknown"),
+                "app_version": ev.get("app_version", ""),
+            })
+        log.info("kept %d events, dropped %d duplicates", len(out), dupes)
+        return out
+    ```
+
+    **Already good:**
+    - `INTERNAL_USERS` can stay a list. With 4 entries, the scan per event is cheap, and the list does not grow.
+    - `load_events` streams the file line by line instead of reading it all into memory.
+    - The CSV is written in one `writerows` call, with `newline=""` set correctly.
+verify:
+  module: true
+  green_block: 1
+  test: |
+    import os, time
+    os.environ["TZ"] = "America/New_York"
+    time.tzset()
+    rows = transform([
+        {"event_id": "a", "user_id": "u1", "type": "Click", "ts_ms": 0},
+        {"event_id": "a", "user_id": "u1", "type": "Click", "ts_ms": 0},
+        {"event_id": "b", "user_id": "u_demo", "type": "Click", "ts_ms": 0},
+        {"event_id": "c", "user_id": "u2", "type": "View", "ts_ms": 3600000, "platform": "ios"},
+    ])
+    assert len(rows) == 2
+    assert rows[0]["event_time_utc"] == "1970-01-01 00:00:00"
+    assert rows[0]["event_type"] == "click" and rows[0]["platform"] == "unknown"
+    assert rows[1]["event_time_utc"] == "1970-01-01 01:00:00" and rows[1]["platform"] == "ios"
+  equivalence:
+    driver: |
+      import os, time
+      os.environ["TZ"] = "UTC"
+      time.tzset()
+      users = ["u_1", "u_qa_01", "u_7", "u_demo", "u_42", "u_loadtest", "u_9"]
+      events = []
+      for i in range(3000):
+          ev = {
+              "event_id": f"e{(i * 7) % 1700}",
+              "user_id": users[i % 7],
+              "type": "Screen_View" if i % 3 else "PURCHASE",
+              "ts_ms": 1760000000000 + i * 61733,
+          }
+          if i % 4 == 0:
+              ev["platform"] = "ios"
+          if i % 5 == 0:
+              ev["app_version"] = f"3.{i % 11}.0"
+          events.append(ev)
+      rows = transform(iter(events))
+      print(len(rows))
+      for r in rows:
+          print(r)
+  benchmark:
+    driver: |
+      import os, time
+      os.environ["TZ"] = "UTC"
+      time.tzset()
+      events = [
+          {"event_id": f"evt-{i:08d}", "user_id": f"u_{i % 997}", "type": "Screen_View", "ts_ms": 1760000000000 + i * 1000}
+          for i in range(12000)
+      ]
+      events += events[:2000]
+      rows = transform(events)
+      print(len(rows))
+    min_speedup: 1.5

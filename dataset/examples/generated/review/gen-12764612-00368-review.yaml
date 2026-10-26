@@ -1,0 +1,166 @@
+id: gen-12764612-00368-review
+category: review
+language: html
+patterns:
+- dom-size
+- remove-unused-css
+facts:
+- F-DOM-SIZE
+- F-UNUSED-CSS
+messages:
+- role: user
+  content: |
+    hi, i made this page to show the results of our image classifier batch job. it gets slow when there are many images (we have about 10000 per run) and my laptop fan gets loud. i dont know what is wrong, can you look at it?
+
+    ```html
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <title>Batch results</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 20px; }
+      .results-table { border-collapse: collapse; width: 100%; }
+      .cell { padding: 4px 8px; border-bottom: 1px solid #ddd; }
+      .cell-inner { display: block; }
+      .label { font-weight: bold; }
+      .conf-high { color: #0a7a2f; }
+      .conf-low { color: #b00020; }
+      .navbar { background: #222; color: #fff; padding: 10px; }
+      .navbar a { color: #fff; }
+      .card { border: 1px solid #ccc; border-radius: 6px; padding: 12px; }
+      .modal { display: none; position: fixed; top: 0; left: 0; }
+      .btn { padding: 6px 12px; border: 0; }
+      .btn-primary { background: #0366d6; color: #fff; }
+      .tooltip { position: absolute; background: #333; color: #fff; }
+      .sidebar { width: 200px; float: left; }
+      .footer { text-align: center; margin-top: 40px; }
+    </style>
+    </head>
+    <body>
+    <h1>Batch results</h1>
+    <div id="summary"></div>
+    <table class="results-table">
+      <thead><tr><th>File</th><th>Label</th><th>Confidence</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <script>
+    fetch('/api/batch/latest')
+      .then(r => r.json())
+      .then(items => {
+        document.getElementById('summary').textContent = items.length + ' images';
+        const body = document.getElementById('rows');
+        items.forEach(item => {
+          const tr = document.createElement('tr');
+          const cls = item.conf >= 0.8 ? 'conf-high' : 'conf-low';
+          tr.innerHTML =
+            '<td class="cell"><div class="cell-inner"><span>' + item.file + '</span></div></td>' +
+            '<td class="cell"><div class="cell-inner"><span class="label">' + item.label + '</span></div></td>' +
+            '<td class="cell"><div class="cell-inner"><span class="' + cls + '">' + (item.conf * 100).toFixed(1) + '%</span></div></td>';
+          body.appendChild(tr);
+        });
+      });
+    </script>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (client-side rendering of a large result set)
+
+    #### [Security] Filenames and labels go into `innerHTML`
+    - **Where:** the `tr.innerHTML = ...` string in the `forEach`
+    - **Issue:** `item.file` is a filename from the batch input. A file named like `<img src=x onerror=...>` would run as HTML in the page. Building HTML from strings also makes the browser parse 10000 small fragments.
+    - **Fix:** create the cells with `createElement` and set `textContent`. This is shown in the code below.
+
+    #### [High] 10000 rows in the DOM, each with about 10 elements
+    - **Where:** the `forEach` that appends every item to `#rows`
+    - **Issue:** each row has a `<tr>`, three `<td>`, plus a `<div>` and a `<span>` inside every cell. That is about 100000 elements for the browser to build, style and lay out, and rows are added to the live table one at a time. This is most likely why the page is slow and the fan spins up.
+    - **Fix:** show 100 rows per page, drop the `div` and `span` wrappers (put the class on the `<td>`), and build the rows in a `DocumentFragment` before inserting them once.
+    - **Impact:** reduces E on the client. In Green Metrics Tool micro-benchmarks, 30 page loads of a 10,000-row table with wrappers around every cell used about 56% less CPU energy when the same data was paginated to 100 rows per page as a plain table built in a `DocumentFragment`.
+
+    #### [Low] Unused CSS rules
+    - **Where:** `.navbar`, `.card`, `.modal`, `.btn`, `.btn-primary`, `.tooltip`, `.sidebar`, `.footer`, `.cell-inner`
+    - **Issue:** nothing in the page uses these rules. They look left over from a template.
+    - **Fix:** delete them. For a stylesheet this small this saves a few bytes, not measurable CPU. In Green Metrics Tool micro-benchmarks, removing unused CSS from a 16 KB stylesheet changed client energy by about 2%, which is within noise. It is only worth it because it also makes the file easier to read.
+
+    ```html
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <title>Batch results</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 20px; }
+      .results-table { border-collapse: collapse; width: 100%; }
+      th, td { padding: 4px 8px; border-bottom: 1px solid #ddd; text-align: left; }
+      .label { font-weight: bold; }
+      .conf-high { color: #0a7a2f; }
+      .conf-low { color: #b00020; }
+    </style>
+    </head>
+    <body>
+    <h1>Batch results</h1>
+    <div id="summary"></div>
+    <table class="results-table">
+      <thead><tr><th>File</th><th>Label</th><th>Confidence</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <p>
+      <button id="prev">Previous</button>
+      <span id="page"></span>
+      <button id="next">Next</button>
+    </p>
+    <script>
+    const PAGE_SIZE = 100;
+    let items = [];
+    let page = 0;
+
+    function cell(text, className) {
+      const td = document.createElement('td');
+      if (className) td.className = className;
+      td.textContent = text;
+      return td;
+    }
+
+    function render() {
+      const pages = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
+      const frag = document.createDocumentFragment();
+      for (const item of items.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)) {
+        const tr = document.createElement('tr');
+        tr.append(
+          cell(item.file),
+          cell(item.label, 'label'),
+          cell((item.conf * 100).toFixed(1) + '%', item.conf >= 0.8 ? 'conf-high' : 'conf-low')
+        );
+        frag.append(tr);
+      }
+      document.getElementById('rows').replaceChildren(frag);
+      document.getElementById('page').textContent = 'Page ' + (page + 1) + ' of ' + pages;
+      document.getElementById('prev').disabled = page === 0;
+      document.getElementById('next').disabled = page >= pages - 1;
+    }
+
+    document.getElementById('prev').onclick = () => { page--; render(); };
+    document.getElementById('next').onclick = () => { page++; render(); };
+
+    fetch('/api/batch/latest')
+      .then(r => r.json())
+      .then(data => {
+        items = data;
+        document.getElementById('summary').textContent = items.length + ' images';
+        render();
+      });
+    </script>
+    </body>
+    </html>
+    ```
+
+    The row order is unchanged. The browser's "find in page" now only searches the 100 rows on screen. If people need to search all results, add a filter box that narrows `items` before `render()`.
+
+    **Green Notes**
+    - **Smaller DOM** (reduces E): 100 plain rows per page instead of 10000 rows with wrappers.
+    - **DocumentFragment** (reduces E): one insert per page instead of one per row.
+    - **Unused CSS** (saves network bytes only): removed for clarity, with no measurable CPU effect at this size.
+verify:
+  static_only: Browser page that needs fetch, a backend API and a real DOM; no stdlib-only runtime check possible.

@@ -1,0 +1,75 @@
+id: gen-2-00063-no-change
+category: no-change
+language: html
+patterns:
+- modern-image-formats
+- context-tradeoff
+facts:
+- F-IMGENC
+- F-IMGRENDER
+messages:
+- role: user
+  content: |
+    We have a small internal tool (`alertlens`) that runs when one of our log alerts fires. It parses the last 30 minutes of the affected service's logs and renders two charts with matplotlib (error rate and p95 latency). It saves them as JPEG (quality 85, about 120-180 KB each) and writes a static HTML report to our internal file server. The link goes into the on-call Slack channel.
+
+    Some context:
+    - about 40 reports per day
+    - each report is opened by 1-3 engineers, mostly on laptops over VPN
+    - reports are deleted after 14 days
+
+    A colleague opened a PR that adds an AVIF + WebP encode step (pillow-avif-plugin) and switches the template to `<picture>` with a JPEG fallback. He says it's "greener and faster". My requirements: no extra dependencies on the alert host if we can avoid it, the report must be ready a few seconds after the alert, and it must render in Firefox and Chrome. Should we merge it? This is the current template:
+
+    ```html
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>{{ alert.name }} – {{ alert.fired_at }}</title>
+      <link rel="stylesheet" href="/static/report.css">
+    </head>
+    <body>
+      <header>
+        <h1>{{ alert.name }}</h1>
+        <p class="meta">{{ alert.service }} · fired {{ alert.fired_at }} · window {{ window.start }}–{{ window.end }}</p>
+      </header>
+
+      <section class="charts">
+        <figure>
+          <img src="error-rate.jpg" width="960" height="360" alt="Error rate per minute for {{ alert.service }}">
+          <figcaption>Error rate (5xx / total), 1-minute buckets</figcaption>
+        </figure>
+        <figure>
+          <img src="latency-p95.jpg" width="960" height="360" alt="p95 latency per minute for {{ alert.service }}">
+          <figcaption>p95 latency (ms), 1-minute buckets</figcaption>
+        </figure>
+      </section>
+
+      <section class="top-errors">
+        <h2>Top error messages</h2>
+        <table>
+          <thead><tr><th>Count</th><th>Message</th><th>First seen</th></tr></thead>
+          <tbody>
+          {% for e in top_errors %}
+            <tr><td>{{ e.count }}</td><td><code>{{ e.message }}</code></td><td>{{ e.first_seen }}</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </section>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    I wouldn't merge it. For this workload, keep the template and the JPEGs as they are.
+
+    Why modern formats don't pay off here:
+    - **You encode once per report, but each report is viewed only a few times.** Modern formats save energy by sending fewer bytes on every view. Encoding them costs more up front. In Green Metrics Tool benchmarks, encoding 50 images cost about 89 J as JPG, about 290 J as WebP and about 658 J as AVIF, so AVIF was about 7× JPG. The PR keeps the JPEG fallback, so every chart is now encoded three times instead of once.
+    - **The viewer gains little.** Each report sends a few hundred KB to 1-3 laptops over VPN, so smaller files save only a little transfer. Decoding is also not cheaper: in page-load benchmarks, AVIF decoding cost about 19% more CPU than JPG.
+    - **It breaks your requirements.** The PR adds a dependency on the alert host and extra encoding time before the report is ready. It also stores three files per chart on the file server for 14 days.
+
+    Modern formats would pay off if these images were viewed many times, for example on a busy status page that many people open. Then you would encode each image once when the report is generated and serve it on every view. With 1-3 views per report, the extra encoding costs more than the smaller files save.
+
+    One unrelated issue: `{{ e.message }}` puts raw log text into the page. Log messages often contain client input, such as paths or user agents. If you render with a plain Jinja2 `Environment`, autoescaping is off by default, so someone could inject HTML into the report. Turn it on: `Environment(loader=..., autoescape=select_autoescape(["html"]))`.
+verify:
+  static_only: HTML template answer with no executable code; the recommendation is to keep the template unchanged.

@@ -1,0 +1,190 @@
+id: gen-2-00132-review
+category: review
+language: python
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import json
+    import logging
+    import sqlite3
+    import time
+
+    log = logging.getLogger("gw.uplink")
+
+    DB_PATH = "/var/lib/gateway/devices.db"
+
+    SCHEMA = """
+    CREATE TABLE IF NOT EXISTS devices (
+        dev_eui           TEXT PRIMARY KEY,
+        name              TEXT NOT NULL,
+        site_id           TEXT NOT NULL,
+        model             TEXT,
+        enabled           INTEGER NOT NULL DEFAULT 1,
+        gain              REAL NOT NULL DEFAULT 1.0,
+        bias              REAL NOT NULL DEFAULT 0.0,
+        firmware_version  TEXT,
+        firmware_image    BLOB,   -- staged OTA image, 200-400 KB
+        calibration_json  TEXT,   -- full factory calibration report
+        provisioning_cert TEXT,
+        last_uplink_raw   BLOB,
+        notes             TEXT
+    );
+    """
+
+
+    def open_db(path=DB_PATH):
+        conn = sqlite3.connect(path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.executescript(SCHEMA)
+        return conn
+
+
+    def lookup_device(conn, dev_eui):
+        cur = conn.execute(f"SELECT * FROM devices WHERE dev_eui = '{dev_eui}'")
+        return cur.fetchone()
+
+
+    def handle_uplink(conn, topic, payload):
+        # called from the MQTT on_message callback, topic: gw/uplink/<dev_eui>
+        dev_eui = topic.rsplit("/", 1)[-1]
+        dev = lookup_device(conn, dev_eui)
+        if dev is None:
+            log.warning("unknown device %s", dev_eui)
+            return None
+        if not dev["enabled"]:
+            return None
+
+        msg = json.loads(payload)
+        readings = []
+        for ch, raw in msg["ch"].items():
+            value = raw * dev["gain"] + dev["bias"]
+            readings.append({
+                "site": dev["site_id"],
+                "sensor": f"{dev['name']}.{ch}",
+                "value": round(value, 3),
+                "ts": msg.get("ts", int(time.time())),
+            })
+        return readings
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (IoT gateway, runs for every uplink message)
+
+    #### [Security] SQL injection through the MQTT topic
+    - **Where:** `lookup_device`, the f-string query
+    - **Issue:** `dev_eui` comes straight from the topic. Any client that can publish to `gw/uplink/...` controls the SQL. For example, the topic `gw/uplink/x' OR '1'='1` returns the first device in the table, and its readings get forwarded under that device's name.
+    - **Fix:** use a `?` placeholder and pass `dev_eui` as a parameter. It is in the code below.
+
+    #### [High] `SELECT *` loads the OTA image on every uplink
+    - **Where:** `lookup_device`
+    - **Issue:** `handle_uplink` uses only `name`, `site_id`, `enabled`, `gain` and `bias`. `SELECT *` also reads `firmware_image` (a few hundred KB), the calibration report, the certificate and the last raw frame. Python's `sqlite3` copies every selected column into the row object, so each message reads and allocates that data and then throws it away. This happens per message, on every device, all day.
+    - **Fix:** name the five columns you use. `sqlite3.Row` keeps the `dev["gain"]` access working, so nothing else changes.
+    - **Impact:** E and M on the gateway, more so as the blobs grow. In Green Metrics Tool micro-benchmarks on PostgreSQL, reading 500 rows 1,000 times from a 52-column table with large text columns used about 5.5× less energy with 10 named columns than with `SELECT *`. That was PostgreSQL, not SQLite. The mechanism is the same: the saving grows with the size of the columns you skip.
+
+    ```python
+    import json
+    import logging
+    import sqlite3
+    import time
+
+    log = logging.getLogger("gw.uplink")
+
+    DB_PATH = "/var/lib/gateway/devices.db"
+
+    SCHEMA = """
+    CREATE TABLE IF NOT EXISTS devices (
+        dev_eui           TEXT PRIMARY KEY,
+        name              TEXT NOT NULL,
+        site_id           TEXT NOT NULL,
+        model             TEXT,
+        enabled           INTEGER NOT NULL DEFAULT 1,
+        gain              REAL NOT NULL DEFAULT 1.0,
+        bias              REAL NOT NULL DEFAULT 0.0,
+        firmware_version  TEXT,
+        firmware_image    BLOB,   -- staged OTA image, 200-400 KB
+        calibration_json  TEXT,   -- full factory calibration report
+        provisioning_cert TEXT,
+        last_uplink_raw   BLOB,
+        notes             TEXT
+    );
+    """
+
+
+    def open_db(path=DB_PATH):
+        conn = sqlite3.connect(path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.executescript(SCHEMA)
+        return conn
+
+
+    def lookup_device(conn, dev_eui):
+        cur = conn.execute(
+            "SELECT name, site_id, enabled, gain, bias FROM devices WHERE dev_eui = ?",
+            (dev_eui,),
+        )
+        return cur.fetchone()
+
+
+    def handle_uplink(conn, topic, payload):
+        # called from the MQTT on_message callback, topic: gw/uplink/<dev_eui>
+        dev_eui = topic.rsplit("/", 1)[-1]
+        dev = lookup_device(conn, dev_eui)
+        if dev is None:
+            log.warning("unknown device %s", dev_eui)
+            return None
+        if not dev["enabled"]:
+            return None
+
+        msg = json.loads(payload)
+        readings = []
+        for ch, raw in msg["ch"].items():
+            value = raw * dev["gain"] + dev["bias"]
+            readings.append({
+                "site": dev["site_id"],
+                "sensor": f"{dev['name']}.{ch}",
+                "value": round(value, 3),
+                "ts": msg.get("ts", int(time.time())),
+            })
+        return readings
+    ```
+
+    **Already good:** named access through `sqlite3.Row`, so the column list can change without breaking index-based code. Unknown devices are logged and skipped instead of crashing the callback.
+verify:
+  test: |
+    import json as _json
+    _c = open_db(":memory:")
+    _c.execute(
+        "INSERT INTO devices (dev_eui, name, site_id, enabled, gain, bias, firmware_image) VALUES (?,?,?,?,?,?,?)",
+        ("a1b2c3", "boiler-temp", "plant-3", 1, 0.1, -40.0, b"\x00" * 300000),
+    )
+    _p = _json.dumps({"ts": 1700000000, "ch": {"t1": 612}})
+    assert handle_uplink(_c, "gw/uplink/x' OR '1'='1", _p) is None
+    _r = handle_uplink(_c, "gw/uplink/a1b2c3", _p)
+    assert _r == [{"site": "plant-3", "sensor": "boiler-temp.t1", "value": 21.2, "ts": 1700000000}]
+    assert set(lookup_device(_c, "a1b2c3").keys()) == {"name", "site_id", "enabled", "gain", "bias"}
+  equivalence:
+    driver: |-
+      import json
+      conn = open_db(":memory:")
+      conn.execute(
+          "INSERT INTO devices (dev_eui, name, site_id, enabled, gain, bias, firmware_image, calibration_json) VALUES (?,?,?,?,?,?,?,?)",
+          ("a1b2c3", "boiler-temp", "plant-3", 1, 0.1, -40.0, b"\x00" * 300000, "{}"),
+      )
+      conn.execute(
+          "INSERT INTO devices (dev_eui, name, site_id, enabled, gain, bias) VALUES (?,?,?,?,?,?)",
+          ("dead01", "pump-flow", "plant-3", 0, 2.0, 0.0),
+      )
+      conn.execute(
+          "INSERT INTO devices (dev_eui, name, site_id, enabled, gain, bias, notes) VALUES (?,?,?,?,?,?,?)",
+          ("77aa01", "tank-level", "plant-7", 1, 0.5, 1.25, "replaced 2025"),
+      )
+      payload = json.dumps({"ts": 1700000000, "ch": {"t1": 612, "t2": 598}})
+      for topic in ["gw/uplink/a1b2c3", "gw/uplink/dead01", "gw/uplink/ffff00", "gw/uplink/77aa01"]:
+          print(topic, handle_uplink(conn, topic, payload))

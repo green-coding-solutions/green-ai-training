@@ -1,0 +1,127 @@
+id: gen-12764612-00255-refactor
+category: refactor
+language: javascript
+patterns:
+- dom-size
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    hi, I am a physics student and I made a small page to look at the output of my molecular dynamics runs. It loads a json file with about 20000 time steps and shows them in a table. But the page is very slow and the browser freezes for some seconds. I don't know what is wrong, can you make it better?
+
+    ```javascript
+    async function showResults() {
+      const res = await fetch('/data/md_run_42.json');
+      const steps = await res.json(); // [{step, time_ps, temp_K, pressure_bar, epot}, ...]
+
+      const box = document.getElementById('results');
+      const table = document.createElement('table');
+      box.appendChild(table);
+
+      for (let i = 0; i < steps.length; i++) {
+        const s = steps[i];
+        const tr = document.createElement('tr');
+        table.appendChild(tr);
+
+        const vals = [
+          s.step,
+          s.time_ps.toFixed(3),
+          s.temp_K.toFixed(2),
+          s.pressure_bar.toFixed(1),
+          s.epot.toFixed(4),
+        ];
+        for (let j = 0; j < vals.length; j++) {
+          const td = document.createElement('td');
+          const wrap = document.createElement('div');
+          wrap.className = 'cell';
+          const span = document.createElement('span');
+          span.textContent = vals[j];
+          wrap.appendChild(span);
+          td.appendChild(wrap);
+          tr.appendChild(td);
+        }
+      }
+
+      document.getElementById('count').textContent = steps.length + ' steps';
+    }
+
+    showResults();
+    ```
+- role: assistant
+  content: |
+    The page builds about 20000 rows with three elements around every value, and it adds each row to the live page one at a time. That makes a very large DOM, and the browser has to lay it out again and again. Show one page of rows at a time instead:
+
+    ```javascript
+    const PAGE_SIZE = 100;
+
+    function renderPage(steps, page, tbody, info) {
+      const start = page * PAGE_SIZE;
+      const end = Math.min(start + PAGE_SIZE, steps.length);
+      const frag = document.createDocumentFragment();
+
+      for (let i = start; i < end; i++) {
+        const s = steps[i];
+        const tr = document.createElement('tr');
+        const vals = [
+          s.step,
+          s.time_ps.toFixed(3),
+          s.temp_K.toFixed(2),
+          s.pressure_bar.toFixed(1),
+          s.epot.toFixed(4),
+        ];
+        for (const v of vals) {
+          const td = document.createElement('td');
+          td.textContent = v;
+          tr.appendChild(td);
+        }
+        frag.appendChild(tr);
+      }
+
+      tbody.replaceChildren(frag);
+      info.textContent = `steps ${start + 1}-${end} of ${steps.length}`;
+    }
+
+    async function showResults() {
+      const res = await fetch('/data/md_run_42.json');
+      const steps = await res.json();
+
+      const box = document.getElementById('results');
+      const table = document.createElement('table');
+      const tbody = document.createElement('tbody');
+      table.appendChild(tbody);
+
+      const prev = document.createElement('button');
+      prev.textContent = 'Previous';
+      const next = document.createElement('button');
+      next.textContent = 'Next';
+      const info = document.createElement('span');
+
+      const lastPage = Math.max(0, Math.ceil(steps.length / PAGE_SIZE) - 1);
+      let page = 0;
+      const update = () => {
+        renderPage(steps, page, tbody, info);
+        prev.disabled = page === 0;
+        next.disabled = page === lastPage;
+      };
+      prev.addEventListener('click', () => { page--; update(); });
+      next.addEventListener('click', () => { page++; update(); });
+
+      box.append(prev, info, next, table);
+      document.getElementById('count').textContent = steps.length + ' steps';
+      update();
+    }
+
+    showResults();
+    ```
+
+    If your CSS styles `.cell`, change those rules to target `td` directly.
+
+    **Green Notes**
+    - **Smaller DOM through pagination** (reduces E on the client): the page now holds 100 rows, about 500 cells, instead of 20000 rows. In Green Metrics Tool browser benchmarks, a 10,000-row table with wrapper elements around every cell used ~1036 J over 30 page loads. The same data paginated to 100 rows as a plain table used ~457 J, about 56% less.
+    - **No wrapper elements** (reduces E and M): each value is now one `td` with text. Before, it was `td`, `div` and `span`.
+    - **One DocumentFragment per page** (reduces E): rows are added to the live page in a single step, so the browser lays it out once per page and not once per row.
+
+    Behavior changes: you only see 100 steps at a time, and the browser's find (Ctrl+F) only searches the current page. If you need to find a step number, add a small "go to step" input that calls `renderPage` with the right page.
+verify:
+  static_only: Needs a browser DOM and a fetch endpoint.

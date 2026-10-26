@@ -1,0 +1,137 @@
+id: gen-2-00092-review
+category: review
+language: bash
+patterns:
+- bash-builtins
+- bash-quoting
+facts:
+- F-BASH-SUBPROC
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    Could you review this script? Cron runs it every hour on our GPU inference box. It reads the prediction log from the model server for the last hour and writes metrics for the node_exporter textfile collector. It also adds low-confidence predictions to a queue for human review.
+
+    Traffic grew. The hourly log now has around 300k lines, and the script takes most of the hour. Sometimes it is still running when the next run starts.
+
+    Requirements:
+    - Plain bash and standard tools only. We don't want Python on the host.
+    - Metric names and format must stay the same. Dashboards and alerts depend on them.
+    - Review queue lines must stay `request_id label confidence`.
+
+    Please put the important stuff first.
+
+    ```bash
+    #!/usr/bin/env bash
+    # Hourly cron on the inference box. Turns the prediction log of the last hour
+    # into metrics for the node_exporter textfile collector.
+    # predictions.tsv: timestamp<TAB>request_id<TAB>model<TAB>label<TAB>confidence<TAB>latency_ms
+
+    set -u
+
+    LOG=/var/log/inference/predictions.$(date -d '1 hour ago' +%Y%m%d%H).tsv
+    OUT=/var/lib/node_exporter/textfile/inference.prom
+    REVIEW=/var/spool/inference/review_queue.txt
+    THRESHOLD=0.5
+
+    declare -A count
+    total=0
+    low=0
+    lat_sum=0
+
+    while read line; do
+        req=$(echo "$line" | cut -f2)
+        label=$(echo "$line" | cut -f4)
+        conf=$(echo "$line" | cut -f5)
+        lat=$(echo "$line" | cut -f6)
+
+        count[$label]=$(( ${count[$label]:-0} + 1 ))
+        total=$(expr $total + 1)
+        lat_sum=$(expr $lat_sum + $lat)
+
+        if [ $(echo "$conf < $THRESHOLD" | bc) -eq 1 ]; then
+            low=$(expr $low + 1)
+            echo "$req $label $conf" >> "$REVIEW"
+        fi
+    done < "$LOG"
+
+    echo "# HELP inference_predictions_total Predictions in the last hour, per label." > "$OUT"
+    echo "# TYPE inference_predictions_total gauge" >> "$OUT"
+    for l in "${!count[@]}"; do
+        echo "inference_predictions_total{label=\"$l\"} ${count[$l]}" >> "$OUT"
+    done
+    echo "# HELP inference_low_confidence_total Predictions below the confidence threshold." >> "$OUT"
+    echo "# TYPE inference_low_confidence_total gauge" >> "$OUT"
+    echo "inference_low_confidence_total $low" >> "$OUT"
+    echo "# HELP inference_latency_ms_avg Average model latency in ms." >> "$OUT"
+    echo "# TYPE inference_latency_ms_avg gauge" >> "$OUT"
+    echo "inference_latency_ms_avg $(expr $lat_sum / $total)" >> "$OUT"
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (hourly cron, about 300k lines per run, on the inference host)
+
+    #### [Bug] Empty hour breaks the metrics file
+    - **Where:** `expr $lat_sum / $total`
+    - **Issue:** an hour with no traffic gives `total=0`. Then `expr` fails with division by zero and writes the line `inference_latency_ms_avg ` with no value. That line is not valid exposition format, so the collector rejects the whole file and every metric disappears for that hour.
+    - **Fix:** guard the division. The rewrite below reports 0 for an empty hour.
+
+    #### [Bug] node_exporter can read a half-written file
+    - **Where:** the `echo ... >> "$OUT"` lines
+    - **Issue:** the `.prom` file is cleared and then filled over many separate writes. A scrape in between sees missing or partial metrics. It is likely here, because the loop before it is slow.
+    - **Fix:** write to a temp file in the same directory, then `mv` it into place. `mv` is atomic on the same filesystem.
+
+    #### [High] About a dozen process starts per log line
+    - **Where:** the `while read` loop
+    - **Issue:** each line runs four `$(echo | cut)` pipelines, two `expr` calls and an `echo | bc` pipeline. That is about a dozen forks and execs per line, several million per hourly run. Starting processes is what eats the hour, and it takes CPU away from the model server on the same box. In Green Metrics Tool micro-benchmarks, a 20,000-line log summary with `$(echo | cut)` and `$(expr)` per field used ~1302 J. One `awk` pass with identical output used ~1.0 J, over 1000× less.
+    - **Fix:** one `awk` pass does the counting, the threshold check and the review queue. It prints a short summary: first `low avg`, then one `count label` line per label. Bash then writes the report from these few lines with builtins only. The rewrite also fixes both bugs above:
+      ```bash
+      #!/usr/bin/env bash
+      # predictions.tsv: timestamp<TAB>request_id<TAB>model<TAB>label<TAB>confidence<TAB>latency_ms
+      set -euo pipefail
+
+      LOG=/var/log/inference/predictions.$(date -d '1 hour ago' +%Y%m%d%H).tsv
+      OUT=/var/lib/node_exporter/textfile/inference.prom
+      REVIEW=/var/spool/inference/review_queue.txt
+      THRESHOLD=0.5
+
+      summary=$(awk -F'\t' -v thr="$THRESHOLD" -v review="$REVIEW" '
+          { count[$4]++; total++; lat_sum += $6 }
+          $5 < thr { low++; print $2, $4, $5 >> review }
+          END {
+              print low + 0, (total ? int(lat_sum / total) : 0)
+              for (l in count) print count[l], l
+          }' "$LOG")
+
+      tmp=$(mktemp "$OUT.XXXXXX")
+      trap 'rm -f "$tmp"' EXIT
+
+      {
+          read -r low avg
+          printf '%s\n' '# HELP inference_predictions_total Predictions in the last hour, per label.' \
+                        '# TYPE inference_predictions_total gauge'
+          while read -r n l; do
+              printf 'inference_predictions_total{label="%s"} %s\n' "$l" "$n"
+          done
+          printf '%s\n' '# HELP inference_low_confidence_total Predictions below the confidence threshold.' \
+                        '# TYPE inference_low_confidence_total gauge'
+          printf 'inference_low_confidence_total %s\n' "$low"
+          printf '%s\n' '# HELP inference_latency_ms_avg Average model latency in ms.' \
+                        '# TYPE inference_latency_ms_avg gauge'
+          printf 'inference_latency_ms_avg %s\n' "$avg"
+      } <<< "$summary" > "$tmp"
+
+      chmod 644 "$tmp"
+      mv "$tmp" "$OUT"
+      ```
+    - **Impact:** E and CPU time on the inference host, every hour. A run should take seconds instead of most of the hour, so runs no longer overlap. The report loop only runs once per label, not per log line. Metric names, HELP/TYPE lines and the review queue format (`request_id label confidence`) stay the same. The average is still truncated to an integer, like `expr` did. Label lines can come out in a different order, as before with the bash array, and Prometheus ignores the order. The temp name `inference.prom.XXXXXX` doesn't end in `.prom`, so the collector skips it until the `mv`. `chmod 644` is needed because `mktemp` creates the file readable only by its owner, and node_exporter may run as a different user. With `set -e`, a missing log file now stops the run, and the old metrics file stays in place.
+
+    #### [Low] Double quotes around fixed literals
+    - **Where:** the `# HELP` / `# TYPE` echo lines
+    - **Issue:** these strings have nothing to expand, but bash still scans double-quoted text for `$`, backticks and backslashes. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal 1,000,000 times used about 24% less CPU energy with single quotes. Here the lines run once per hour, so the absolute saving is tiny.
+    - **Fix:** use single quotes for literals that need no expansion, and keep double quotes around variables like `"$OUT"`. The rewrite does this in all `printf` calls.
+
+    **Already good:** `date -d '1 hour ago'` is single-quoted, the paths are quoted, and `set -u` catches typos in variable names.
+verify:
+  static_only: needs the hourly inference log and node_exporter textfile directory; bash script with an awk program, syntax
+    checked only

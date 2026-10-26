@@ -1,0 +1,149 @@
+id: gen-2-00065-refactor
+category: refactor
+language: python
+patterns:
+- string-join
+- async-concurrent-io
+facts:
+- F-STRCAT
+- F-HTTP
+messages:
+- role: user
+  content: |
+    feed cron takes ages, fix this
+
+    ```python
+    import json
+    import urllib.request
+
+    SUPPLIERS = {
+        "nordlager": "https://api.nordlager.example/v2/stock",
+        "brightparts": "https://stock.brightparts.example/export.json",
+        "kessler": "https://b2b.kessler.example/api/inventory",
+        "tradepoint": "https://feeds.tradepoint.example/stock",
+        "midway": "https://midway.example/api/v1/levels",
+    }
+
+
+    def fetch_stock(name, url):
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = json.load(resp)
+        except OSError as exc:
+            print(f"warning: {name} unavailable ({exc})")
+            return {}
+        return {item["sku"]: int(item["qty"]) for item in data["items"]}
+
+
+    def build_feed(products):
+        stock = {}
+        for name, url in SUPPLIERS.items():
+            for sku, qty in fetch_stock(name, url).items():
+                stock[sku] = stock.get(sku, 0) + qty
+
+        feed = "id\ttitle\tprice\tavailability\tlink\n"
+        for p in products:
+            qty = stock.get(p["sku"], 0)
+            availability = "in_stock" if qty > 0 else "out_of_stock"
+            feed += f"{p['sku']}\t{p['title']}\t{p['price_cents'] / 100:.2f} EUR\t{availability}\t{p['url']}\n"
+        return feed
+    ```
+- role: assistant
+  content: |
+    ```python
+    import asyncio
+    import json
+    import urllib.request
+
+    SUPPLIERS = {
+        "nordlager": "https://api.nordlager.example/v2/stock",
+        "brightparts": "https://stock.brightparts.example/export.json",
+        "kessler": "https://b2b.kessler.example/api/inventory",
+        "tradepoint": "https://feeds.tradepoint.example/stock",
+        "midway": "https://midway.example/api/v1/levels",
+    }
+
+
+    def fetch_stock(url):
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.load(resp)
+        return {item["sku"]: int(item["qty"]) for item in data["items"]}
+
+
+    async def fetch_all_stock():
+        results = await asyncio.gather(
+            *(asyncio.to_thread(fetch_stock, url) for url in SUPPLIERS.values()),
+            return_exceptions=True,
+        )
+        stock = {}
+        for name, result in zip(SUPPLIERS, results):
+            if isinstance(result, OSError):
+                print(f"warning: {name} unavailable ({result})")
+                continue
+            if isinstance(result, BaseException):
+                raise result
+            for sku, qty in result.items():
+                stock[sku] = stock.get(sku, 0) + qty
+        return stock
+
+
+    def build_feed(products):
+        stock = asyncio.run(fetch_all_stock())
+
+        lines = ["id\ttitle\tprice\tavailability\tlink\n"]
+        for p in products:
+            qty = stock.get(p["sku"], 0)
+            availability = "in_stock" if qty > 0 else "out_of_stock"
+            lines.append(f"{p['sku']}\t{p['title']}\t{p['price_cents'] / 100:.2f} EUR\t{availability}\t{p['url']}\n")
+        return "".join(lines)
+    ```
+
+    **Green Notes**
+    - **`"".join()` instead of `+=`** (reduces E): the feed grows by one line per product, and `+=` keeps rebuilding the whole string. Collecting lines in a list and joining once does the work a single time. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces used ~469 J with `+=` and ~1.8 J with `join`, roughly 260× less. f-strings appended with `+=` behaved the same as plain `+=` (~455 J).
+    - **Supplier calls run concurrently** (reduces wall time, slightly E): the five requests now run at the same time. The job waits for the slowest supplier instead of all five in a row. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async used about 7% less CPU energy and about 17% less wall time. So the main gain here is the shorter run, not CPU.
+
+    Behavior is unchanged. Warnings still print in supplier order. An unexpected error, such as a malformed payload, is still raised, but only after all fetches have finished. If you ever call `build_feed` from code that already runs an event loop, such as an async web handler, use `await fetch_all_stock()` there instead of `asyncio.run`.
+verify:
+  green_block: 0
+  equivalence:
+    driver: |-
+      import hashlib
+      import io
+      import json as _json
+      import urllib.error
+      import urllib.request
+
+      _DATA = {
+          "https://api.nordlager.example/v2/stock": {"items": [{"sku": "A-100", "qty": 3}, {"sku": "B-200", "qty": 0}]},
+          "https://stock.brightparts.example/export.json": {"items": [{"sku": "A-100", "qty": "2"}, {"sku": "C-300", "qty": 5}]},
+          "https://b2b.kessler.example/api/inventory": None,
+          "https://feeds.tradepoint.example/stock": {"items": [{"sku": f"P-{i}", "qty": i % 3} for i in range(2000)]},
+          "https://midway.example/api/v1/levels": {"items": []},
+      }
+
+      def _fake_urlopen(req, timeout=None):
+          payload = _DATA[req.full_url]
+          if payload is None:
+              raise urllib.error.URLError("connection refused")
+          return io.BytesIO(_json.dumps(payload).encode())
+
+      urllib.request.urlopen = _fake_urlopen
+
+      products = [
+          {"sku": "A-100", "title": "Trail Runner 2", "price_cents": 8999, "url": "https://shop.example/p/a-100"},
+          {"sku": "B-200", "title": "Merino Socks", "price_cents": 1490, "url": "https://shop.example/p/b-200"},
+          {"sku": "C-300", "title": "Rain Shell", "price_cents": 12900, "url": "https://shop.example/p/c-300"},
+          {"sku": "D-400", "title": "Headlamp", "price_cents": 3450, "url": "https://shop.example/p/d-400"},
+      ]
+      products += [
+          {"sku": f"P-{i}", "title": f"Item {i}", "price_cents": 100 + i, "url": f"https://shop.example/p/{i}"}
+          for i in range(3000)
+      ]
+
+      feed = build_feed(products)
+      print(len(feed))
+      print(feed[:300])
+      print(feed[-200:])
+      print(hashlib.sha256(feed.encode()).hexdigest())

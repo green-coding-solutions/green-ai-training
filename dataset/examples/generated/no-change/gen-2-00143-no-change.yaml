@@ -1,0 +1,86 @@
+id: gen-2-00143-no-change
+category: no-change
+language: html
+patterns:
+- dom-size
+- none
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    ?
+
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <title>ETL runs</title>
+      <style>
+        table { border-collapse: collapse; width: 100%; font: 14px system-ui, sans-serif; }
+        th, td { padding: 4px 8px; border-bottom: 1px solid #ddd; text-align: left; }
+        td.failed { color: #b00020; font-weight: 600; }
+      </style>
+    </head>
+    <body>
+      <h1>Nightly ETL runs</h1>
+      <table>
+        <thead><tr><th>Job</th><th>Started</th><th>Rows loaded</th><th>Status</th></tr></thead>
+        <tbody id="runs"></tbody>
+      </table>
+      <button id="prev">Previous</button>
+      <span id="page"></span>
+      <button id="next">Next</button>
+
+      <script>
+        const PAGE_SIZE = 100;
+        let offset = 0;
+
+        async function loadPage() {
+          const res = await fetch(`/api/runs?limit=${PAGE_SIZE}&offset=${offset}`);
+          const { total, runs } = await res.json();
+
+          const frag = document.createDocumentFragment();
+          for (const run of runs) {
+            const tr = document.createElement('tr');
+            for (const value of [run.job, run.started_at, run.rows_loaded ?? '', run.status]) {
+              const td = document.createElement('td');
+              td.textContent = value;
+              tr.appendChild(td);
+            }
+            if (run.status === 'failed') tr.lastChild.className = 'failed';
+            frag.appendChild(tr);
+          }
+          document.getElementById('runs').replaceChildren(frag);
+
+          document.getElementById('page').textContent = total
+            ? `${offset + 1}-${Math.min(offset + PAGE_SIZE, total)} of ${total}`
+            : 'No runs';
+          document.getElementById('prev').disabled = offset === 0;
+          document.getElementById('next').disabled = offset + PAGE_SIZE >= total;
+        }
+
+        document.getElementById('prev').onclick = () => { offset -= PAGE_SIZE; loadPage(); };
+        document.getElementById('next').onclick = () => { offset += PAGE_SIZE; loadPage(); };
+        loadPage();
+      </script>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    This page is fine as it is. I don't see anything worth changing for performance, and no bugs either.
+
+    Why it is already efficient:
+    - **Server-side pagination:** the API returns only 100 runs per request (`limit`/`offset`). The DOM stays small no matter how many runs pile up in the history.
+    - **Flat markup:** one `<tr>` with four plain `<td>` cells per run, with no wrapper elements around the cells.
+    - **One DOM update per page:** rows are built in a `DocumentFragment` and swapped in with a single `replaceChildren`, not appended to the live table one by one.
+
+    This matches the efficient variant in Green Metrics Tool browser benchmarks. Over 30 page loads, a 10,000-row table with wrappers around every cell, appended to the live DOM row by row, used ~1036 J. The same data paginated to 100 rows per page as a plain `<table>` built in a `DocumentFragment` used ~457 J, about 56% less. Your page already does what the cheaper version does.
+
+    It is also safe: values go in through `textContent`, so a job name with HTML in it can't inject markup.
+
+    One thing to keep in mind: if someone later asks for a "show all runs" button, keep the page size instead. Rendering the whole history at once is where the DOM cost would come back.
+verify:
+  static_only: HTML page that fetches /api/runs; needs a browser and the backend API

@@ -1,0 +1,155 @@
+id: gen-2-00147-multi-turn
+category: multi-turn
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    ?
+
+    ```nginx
+    server {
+        listen 443 ssl http2;
+        server_name data.climlab.example.org;
+
+        ssl_certificate     /etc/ssl/climlab/fullchain.pem;
+        ssl_certificate_key /etc/ssl/climlab/privkey.pem;
+
+        root /srv/portal/www;
+        index index.html;
+
+        gzip on;
+        gzip_comp_level 9;
+        gzip_proxied any;
+        gzip_types text/plain text/css text/csv application/javascript application/json
+                   application/x-netcdf application/x-hdf5 application/zip
+                   application/octet-stream image/png;
+
+        location / {
+            try_files $uri $uri/ /index.html;
+        }
+
+        # nightly model run outputs, rsynced from the cluster at 02:00
+        location /runs/ {
+            alias /data/runs/;
+            autoindex on;
+        }
+
+        # metadata search, small JSON
+        location /api/ {
+            proxy_pass http://127.0.0.1:8081;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    The config works. The main cost is that every static file gets compressed again on every download, at the highest level, including binary formats.
+
+    ```nginx
+    server {
+        listen 443 ssl http2;
+        server_name data.climlab.example.org;
+
+        ssl_certificate     /etc/ssl/climlab/fullchain.pem;
+        ssl_certificate_key /etc/ssl/climlab/privkey.pem;
+
+        root /srv/portal/www;
+        index index.html;
+
+        # serve file.gz written once at build/sync time
+        gzip_static on;
+
+        # on-the-fly gzip only for text without a .gz file (mainly /api/)
+        gzip on;
+        gzip_comp_level 5;
+        gzip_vary on;
+        gzip_proxied any;
+        gzip_types text/plain text/css text/csv application/javascript application/json;
+
+        location / {
+            try_files $uri $uri/ /index.html;
+        }
+
+        # nightly model run outputs, rsynced from the cluster at 02:00
+        location /runs/ {
+            alias /data/runs/;
+            autoindex on;
+        }
+
+        # metadata search, small JSON
+        location /api/ {
+            proxy_pass http://127.0.0.1:8081;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+    }
+    ```
+
+    Create the `.gz` files after the frontend build and after the nightly rsync:
+
+    ```bash
+    find /srv/portal/www "/data/runs/$(date +%F)" -type f \
+      \( -name '*.html' -o -name '*.css' -o -name '*.js' -o -name '*.json' -o -name '*.csv' -o -name '*.txt' \) \
+      -exec gzip -k -f {} +
+    ```
+
+    **Green Notes**
+    - **Precompressed static files** (reduces E): the frontend and the run outputs don't change between requests, but nginx compressed them again for every download. With `gzip_static`, nginx serves the `.gz` file that was written once. In Green Metrics Tool measurements of nginx serving 2,000 text-asset requests, gzip level 5 per request cost about 4× the CPU energy of serving precompressed files. Both sent about 10× fewer bytes than no compression.
+    - **Moderate level for on-the-fly compression** (reduces E): only the dynamic `/api/` JSON still gets compressed per request. Level 9 does more work per response and makes text only slightly smaller.
+    - **No gzip for binary types** (reduces E): PNG and ZIP are already compressed. NetCDF4/HDF5 files are usually compressed internally. `application/octet-stream` matched large downloads where gzip spends CPU on every request and gains little.
+
+    Things to watch: nginx serves a stale `.gz` if the source file changes and the `.gz` is not rewritten. `gzip -f` overwrites it. Files without a `.gz` still get compressed on the fly, so a missed file doesn't break anything. `gzip_vary on` adds `Vary: Accept-Encoding`, so caches don't send gzip to clients that didn't ask for it. Check that your build has the module: `nginx -V 2>&1 | grep gzip_static`.
+- role: user
+  content: |
+    cant touch the rsync, its owned by HPC ops. and nobody rebuilds the frontend anymore, the student who made it left. so keep it on the fly. and why not keep level 9, smaller files = less traffic?
+- role: assistant
+  content: |
+    Fine, on the fly it is. Replace the gzip block with this:
+
+    ```nginx
+    gzip on;
+    gzip_comp_level 5;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_types text/plain text/css text/csv application/javascript application/json;
+    ```
+
+    On level 9: for text like CSV and JSON, the files are only slightly smaller than at a middle level, and nginx pays the extra CPU on every download of every file. Level 5 is the usual trade-off when compressing per request. Dropping the binary types matters more than the level, because those large files gain little from gzip.
+
+    One optional step, since nobody rebuilds the frontend: run `gzip -k` once over `/srv/portal/www` and add `gzip_static on;`. The files never change, so the `.gz` copies can't go stale. The run outputs stay on the fly.
+- role: user
+  content: |
+    ok. most of the big csv pulls come from our jupyterhub in the same rack anyway. compressing those is kinda pointless right?
+- role: assistant
+  content: |
+    Mostly, yes. On a fast link inside the rack, transferring the bytes is nearly free. Gzip there is CPU work on the server and on the notebook side. In the Green Metrics Tool nginx measurement on a local network, serving uncompressed used about 7× less CPU energy than gzip level 5 per request.
+
+    `gzip` can't be switched per client IP, so give the hub its own server name with compression off:
+
+    ```nginx
+    # internal name for JupyterHub: same files, no compression
+    server {
+        listen 10.20.0.5:8080;
+        server_name data-internal.climlab.example.org;
+
+        gzip off;
+
+        location /runs/ {
+            alias /data/runs/;
+            autoindex on;
+        }
+    }
+    ```
+
+    The notebooks then read from `http://data-internal.climlab.example.org:8080/runs/...`. External collaborators keep using the public name with gzip on, where the byte saving counts.
+
+    Two checks:
+    - Plain HTTP is only fine if the rack network is trusted. Otherwise use `listen ... ssl` with a certificate for the internal name.
+    - Clients only get gzip if they send `Accept-Encoding: gzip`. `requests` does by default, Python's plain `urllib` does not. Some of the hub's downloads may already be uncompressed. The access log or one test request will tell you.
+verify:
+  static_only: nginx configuration, needs a running nginx to test

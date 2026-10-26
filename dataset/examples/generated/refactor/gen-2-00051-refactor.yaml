@@ -1,0 +1,141 @@
+id: gen-2-00051-refactor
+category: refactor
+language: bash
+patterns:
+- compress-transmitted
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    Hi, I took over this script from a colleague who left. It sends our new shop orders and the shipping labels to the warehouse partner. Cron runs it every 15 minutes. Lately the warehouse says some files come late, and in the logs I see sometimes two runs at the same time. My boss says "the script is bad" but I don't really know which part. Can you clean it up?
+
+    ```bash
+    #!/bin/bash
+    # cron: */15 * * * *  /opt/shop/bin/send_to_warehouse.sh
+    # sends new orders + shipping labels to the warehouse (Nordlager) sftp
+    set -e
+
+    STAMP=$(date +%Y%m%d-%H%M)
+    WORK=/tmp/warehouse-$STAMP
+    ARCHIVE=/var/archive/warehouse
+    LABELS=/srv/labels
+
+    mkdir -p $WORK $ARCHIVE
+
+    # 1. all paid orders that were not sent yet
+    psql -h db01 -U shop -d shop -c "
+      COPY (
+        SELECT o.id, o.created_at, c.email, a.name, a.street, a.zip, a.city, a.country,
+               oi.sku, oi.qty
+        FROM orders o
+        JOIN customers c ON c.id = o.customer_id
+        JOIN addresses a ON a.id = o.shipping_address_id
+        JOIN order_items oi ON oi.order_id = o.id
+        WHERE o.exported_at IS NULL AND o.status = 'paid'
+        ORDER BY o.id
+      ) TO STDOUT WITH (FORMAT csv)" > $WORK/orders.csv
+
+    # 2. shipping labels from the label service (png, one per order)
+    cp $LABELS/pending/*.png $WORK/
+
+    # 3. pack it, xz -9 because it makes the smallest file
+    tar -cf $WORK.tar -C $WORK .
+    xz -9 $WORK.tar
+
+    # 4. upload
+    curl -sS --fail --netrc -T $WORK.tar.xz sftp://sftp.nordlager.example/inbox/
+
+    # 5. keep a copy for 90 days (in case warehouse loses something)
+    cp $WORK.tar.xz $ARCHIVE/
+    find $ARCHIVE -name '*.tar.xz' -mtime +90 -delete
+
+    # 6. mark as sent
+    psql -h db01 -U shop -d shop -c "UPDATE orders SET exported_at = now() WHERE exported_at IS NULL AND status = 'paid'"
+    mv $LABELS/pending/*.png $LABELS/sent/
+
+    rm -rf $WORK $WORK.tar.xz
+    ```
+- role: assistant
+  content: |
+    The slow part is the compression step. The script also has two race conditions that can lose orders and labels. Both are fixed below.
+
+    ```bash
+    #!/bin/bash
+    # cron: */15 * * * *  /opt/shop/bin/send_to_warehouse.sh
+    # sends new orders + shipping labels to the warehouse (Nordlager) sftp
+    set -eo pipefail
+    shopt -s nullglob
+
+    # only one run at a time: a slow run must not overlap with the next one
+    exec 9>/var/lock/send_to_warehouse.lock
+    flock -n 9 || exit 0
+
+    STAMP=$(date +%Y%m%d-%H%M)
+    WORK=/tmp/warehouse-$STAMP
+    ARCHIVE=/var/archive/warehouse
+    LABELS=/srv/labels
+    PSQL=(psql -h db01 -U shop -d shop -v ON_ERROR_STOP=1)
+
+    mkdir -p "$WORK" "$ARCHIVE"
+
+    # 1. all paid orders that were not sent yet
+    "${PSQL[@]}" <<'SQL' >"$WORK/orders.csv"
+    COPY (
+      SELECT o.id, o.created_at, c.email, a.name, a.street, a.zip, a.city, a.country,
+             oi.sku, oi.qty
+      FROM orders o
+      JOIN customers c ON c.id = o.customer_id
+      JOIN addresses a ON a.id = o.shipping_address_id
+      JOIN order_items oi ON oi.order_id = o.id
+      WHERE o.exported_at IS NULL AND o.status = 'paid'
+      ORDER BY o.id
+    ) TO STDOUT WITH (FORMAT csv)
+    SQL
+
+    # remember exactly which orders are in this file (id is the first column)
+    IDS=$(cut -d, -f1 "$WORK/orders.csv" | sort -un | paste -sd, -)
+
+    # 2. shipping labels: remember exactly which files we send
+    labels=("$LABELS"/pending/*.png)
+    if (( ${#labels[@]} > 0 )); then
+      cp "${labels[@]}" "$WORK/"
+    fi
+
+    # 3. pack and compress in one pass (zstd, default level)
+    tar -cf - -C "$WORK" . | zstd -q -o "$WORK.tar.zst"
+
+    # 4. upload
+    curl -sS --fail --netrc -T "$WORK.tar.zst" sftp://sftp.nordlager.example/inbox/
+
+    # 5. keep a copy for 90 days (old .tar.xz files expire too)
+    cp "$WORK.tar.zst" "$ARCHIVE/"
+    find "$ARCHIVE" \( -name '*.tar.zst' -o -name '*.tar.xz' \) -mtime +90 -delete
+
+    # 6. mark only what was actually sent
+    if [[ -n $IDS ]]; then
+      "${PSQL[@]}" -c "UPDATE orders SET exported_at = now() WHERE id IN ($IDS)"
+    fi
+    for f in "${labels[@]}"; do
+      mv "$f" "$LABELS/sent/"
+    done
+
+    rm -rf "$WORK" "$WORK.tar.zst"
+    ```
+
+    **Green Notes**
+    - **zstd instead of xz at maximum level** (reduces E on every run): this archive is built every 15 minutes, so the codec cost repeats all day. In Green Metrics Tool benchmarks on 100 MB of text, xz at its *default* level used ~458 J and zstd ~16 J, about 29× less. The maximum level you used is slower than xz's default. That step is why runs take long enough to overlap and files reach the warehouse late.
+    - **The 90-day archive stays compressed** (reduces storage): compressing kept data is worth it here. A Green Coding Solutions estimate puts the break-even at about 0.15 days for zstd and about 7 days for xz, and your copies are kept 90 days. These figures compare energy only. xz still gives smaller files, so the archive will need somewhat more disk.
+    - **PNG labels are already compressed:** no codec shrinks them much. xz at its maximum level spent most of its CPU on them for almost no gain. Any size saving comes from the CSV.
+
+    **Check before deploying:** the warehouse now gets `.tar.zst` instead of `.tar.xz`. Ask them if they can unpack it (`zstd` installed, or GNU tar 1.31+). If they can only read gzip, use `gzip` instead. It still used far less energy than xz in the same benchmark (~67 J).
+
+    **Bugs fixed:**
+    - **Lost orders:** the old `UPDATE` marked *every* unsent paid order, including orders paid while the export and upload were running. Those orders were never sent. It now marks only the ids in the uploaded CSV.
+    - **Lost labels:** `mv pending/*.png` also moved labels that arrived after the copy step. Now only the files that were sent get moved.
+    - **Overlapping runs:** `flock` skips a run while the previous one is still going. Otherwise both runs could send the same orders.
+    - `cp` no longer fails when there are no labels. `pipefail` and `ON_ERROR_STOP` stop the script on a failed `tar` or SQL error. Variables are quoted. The export query now comes from a quoted heredoc, so the shell does not touch the SQL text.
+verify:
+  static_only: needs PostgreSQL, an SFTP server, zstd and flock; bash script with external services

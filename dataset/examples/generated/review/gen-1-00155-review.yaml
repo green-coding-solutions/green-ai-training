@@ -1,0 +1,126 @@
+id: gen-1-00155-review
+category: review
+language: python
+patterns:
+- async-concurrent-io
+- hoist-invariants
+facts:
+- F-HTTP
+- F-ATTR
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import csv
+    import math
+    import requests
+
+    SITE_URLS = [
+        f"https://{site}.example-logistics.net/api/v2/readings?day=yesterday"
+        for site in ("ham", "ber", "muc", "fra", "dus", "lej",
+                     "nue", "stu", "bre", "han", "dre", "kol")
+    ]
+
+
+    def fetch_site(url):
+        try:
+            resp = requests.get(url)
+            return resp.json()["readings"]
+        except Exception:
+            return []
+
+
+    def normalize(readings, cfg):
+        out = []
+        for r in readings:
+            mag = math.sqrt(r["x"] ** 2 + r["y"] ** 2 + r["z"] ** 2)
+            out.append((r["sensor"], r["ts"], mag * cfg.scale + cfg.offset))
+        return out
+
+
+    def run(cfg, path):
+        rows = []
+        for url in SITE_URLS:
+            rows.extend(normalize(fetch_site(url), cfg))
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["sensor", "ts", "magnitude"])
+            w.writerows(rows)
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly ETL)
+
+    #### [Bug] Failures are swallowed silently
+    - **Where:** `fetch_site`, `except Exception: return []`
+    - **Issue:** a timeout, a 500 error or a changed JSON shape gives an empty list. The CSV is written without that site and nobody notices. There is also no timeout, so one hanging server blocks the whole job forever.
+    - **Fix:** set a timeout, check the status code, catch only the expected errors and log which site failed.
+
+    #### [Medium] Requests run one after another
+    - **Where:** `for url in SITE_URLS` in `run`
+    - **Issue:** the job waits for each site before it asks the next one. The sites are independent, so the total wait is the sum of all response times. Most of that time the process only waits on the network.
+    - **Fix:** fetch all sites concurrently with `httpx.AsyncClient` and `asyncio.gather`. `gather` keeps the order of `SITE_URLS`, so the CSV rows stay in the same order.
+    - **Impact:** reduces idle wall time, so the job holds its machine for less time. CPU savings are modest at this size. In Green Metrics Tool micro-benchmarks, 10 requests with async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`.
+
+    #### [Low] Repeated lookups in the per-reading loop
+    - **Where:** `normalize`, `math.sqrt`, `cfg.scale`, `cfg.offset`, `out.append`
+    - **Issue:** the same attribute lookups run for every reading. If a site returns many readings, this adds up a little.
+    - **Fix:** bind them to locals once before the loop, or use a list comprehension.
+    - **Impact:** small. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local before a 10,000,000-iteration loop saved about 4-5%. It only matters because this loop is the hot part of the job.
+
+    ```python
+    import asyncio
+    import csv
+    import logging
+    import math
+
+    import httpx
+
+    log = logging.getLogger(__name__)
+
+    SITE_URLS = [
+        f"https://{site}.example-logistics.net/api/v2/readings?day=yesterday"
+        for site in ("ham", "ber", "muc", "fra", "dus", "lej",
+                     "nue", "stu", "bre", "han", "dre", "kol")
+    ]
+
+
+    async def fetch_site(client, url):
+        try:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            return resp.json()["readings"]
+        except (httpx.HTTPError, KeyError, ValueError) as exc:
+            log.warning("site failed: %s (%s)", url, exc)
+            return []
+
+
+    def normalize(readings, cfg):
+        sqrt = math.sqrt
+        scale, offset = cfg.scale, cfg.offset
+        return [
+            (r["sensor"], r["ts"],
+             sqrt(r["x"] ** 2 + r["y"] ** 2 + r["z"] ** 2) * scale + offset)
+            for r in readings
+        ]
+
+
+    async def fetch_all():
+        async with httpx.AsyncClient(timeout=10) as client:
+            return await asyncio.gather(*(fetch_site(client, u) for u in SITE_URLS))
+
+
+    def run(cfg, path):
+        batches = asyncio.run(fetch_all())
+        rows = [row for batch in batches for row in normalize(batch, cfg)]
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["sensor", "ts", "magnitude"])
+            w.writerows(rows)
+    ```
+
+    A failed site still gives no rows, as before, but it is now logged. If a missing site should fail the job, raise after `gather` when any batch came from a failure. `run` calls `asyncio.run`, so call it from plain sync code, not from inside a running event loop.
+verify:
+  static_only: needs httpx and network access

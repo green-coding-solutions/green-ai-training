@@ -1,0 +1,66 @@
+id: gen-2-00283-review
+category: review
+language: sql
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+messages:
+- role: user
+  content: |
+    hi, can you review this query pls? It is from the materials database of our research group (Postgres). Our web app use it to draw the convex hull / phase diagram for one chemical system. It run every time somebody open a system or change the filter, and our students do this a lot (few thousand times per day i guess). In the app the chemsys and functional are parameters, here i put them as values for testing.
+
+    Table `calculations` has 48 columns. Some are big: `input_deck` (text, ~5-20 KB), `stdout_log` (text, can be some MB), `final_structure_cif` (text) and `dos_data` (jsonb). For the plot we only need `id` (for the tooltip link), `formula`, `energy_per_atom` and `nsites`.
+
+    Also the plot sometimes show points from other systems. I think its a frontend problem but maby you see something.
+
+    ```sql
+    -- hull points for one chemical system
+    SELECT *
+    FROM calculations
+    WHERE status = 'converged' OR status = 'finished'
+      AND chemsys = 'Fe-Li-O'
+      AND functional = 'PBE'
+    ORDER BY energy_per_atom;
+
+    -- number of calculations in the side panel
+    SELECT count(*)
+    FROM calculations
+    WHERE chemsys = 'Fe-Li-O';
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (scientific data app, runs on every page view)
+
+    #### [Bug] `OR` breaks the filter, so points from other systems show up
+    - **Where:** `WHERE status = 'converged' OR status = 'finished' AND ...`
+    - **Issue:** `AND` binds tighter than `OR`. The condition is read as `status = 'converged' OR (status = 'finished' AND chemsys = ... AND functional = ...)`. So every converged calculation is returned, from every chemical system and every functional. That is the cause of the stray points, not the frontend. Mixing functionals also makes the hull itself wrong.
+    - **Fix:** `WHERE status IN ('converged', 'finished') AND chemsys = ... AND functional = ...`
+
+    #### [High] `SELECT *` on a wide table with large text columns
+    - **Where:** hull query, `SELECT *`
+    - **Issue:** the plot needs 4 columns, but each row also brings `stdout_log` (up to some MB), `input_deck`, `final_structure_cif`, `dos_data` and about 40 more. Postgres stores large values out of line, so it has to fetch and decompress them, send them to the app, and the app has to parse them. All of this happens for every row on every page view. With the bug above there are also far more rows than needed, so each problem makes the other worse.
+    - **Fix:** name the columns: `SELECT id, formula, energy_per_atom, nsites`. Before you change it, check that the frontend does not read other fields from the row (for example the tooltip). If it does, add them to the list.
+    - **Impact:** reduces E and network for each request. In Green Metrics Tool micro-benchmarks on a 52-column table with large text columns, naming 10 columns instead of `SELECT *` used about 5.5× to 7× less CPU energy (500 to 10,000 rows, each query run 1,000 times). The bigger the skipped columns, the bigger the saving, and `stdout_log` is very big.
+
+    ```sql
+    -- hull points for one chemical system
+    SELECT id, formula, energy_per_atom, nsites
+    FROM calculations
+    WHERE status IN ('converged', 'finished')
+      AND chemsys = 'Fe-Li-O'
+      AND functional = 'PBE'
+    ORDER BY energy_per_atom;
+    ```
+
+    **Already good:** the side-panel query uses `count(*)`, so no wide columns are read. Sorting happens in the database, not in the app.
+verify:
+  sql:
+    setup: CREATE TABLE calculations (id INTEGER PRIMARY KEY, formula TEXT, chemsys TEXT, functional TEXT, status TEXT, energy_per_atom
+      REAL, nsites INTEGER, input_deck TEXT, stdout_log TEXT, final_structure_cif TEXT, dos_data TEXT); INSERT INTO calculations
+      VALUES (1, 'LiFeO2', 'Fe-Li-O', 'PBE', 'converged', -6.12, 16, 'ENCUT=520', 'log text', 'data_LiFeO2', '{}'), (2, 'Li2O',
+      'Li-O', 'PBE', 'converged', -4.80, 12, 'ENCUT=520', 'log text', 'data_Li2O', '{}'), (3, 'Fe2O3', 'Fe-O', 'PBE', 'finished',
+      -7.01, 10, 'ENCUT=520', 'log text', 'data_Fe2O3', '{}'), (4, 'Li5FeO4', 'Fe-Li-O', 'PBE', 'finished', -5.55, 20, 'ENCUT=520',
+      'log text', 'data_Li5FeO4', '{}'), (5, 'LiFeO2', 'Fe-Li-O', 'SCAN', 'converged', -8.90, 16, 'ENCUT=600', 'log text',
+      'data_LiFeO2', '{}'), (6, 'LiFe5O8', 'Fe-Li-O', 'PBE', 'failed', NULL, 28, 'ENCUT=520', 'log text', NULL, NULL);
+    compare: false

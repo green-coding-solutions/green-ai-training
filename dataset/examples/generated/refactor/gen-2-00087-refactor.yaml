@@ -1,0 +1,157 @@
+id: gen-2-00087-refactor
+category: refactor
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import json
+    import logging
+
+    log = logging.getLogger("feed_sync")
+
+    VALID_OPS = {"upsert", "delete"}
+
+
+    def parse_line(line):
+        op, sku, payload = line.rstrip("\n").split("\t", 2)
+        return op.strip().lower(), sku.strip().upper(), payload
+
+
+    def build_batch(lines):
+        """Turn a supplier feed diff into the batch the loader applies in order.
+        Deletes must run before upserts (a SKU can be deleted and re-created
+        in the same diff)."""
+        batch = []
+        stats = {"upsert": 0, "delete": 0, "skipped": 0}
+        for lineno, line in enumerate(lines, 1):
+            if not line.strip() or line.startswith("#"):
+                continue
+            try:
+                op, sku, payload = parse_line(line)
+            except ValueError:
+                log.warning("line %d: malformed, skipped", lineno)
+                stats["skipped"] += 1
+                continue
+            if op not in VALID_OPS:
+                log.warning("line %d: unknown op %r", lineno, op)
+                stats["skipped"] += 1
+                continue
+            if op == "delete":
+                batch.insert(0, {"op": op, "sku": sku})
+            else:
+                batch.append({"op": op, "sku": sku, "data": json.loads(payload)})
+            stats[op] += 1
+        return batch, stats
+    ```
+- role: assistant
+  content: |
+    ```python
+    import json
+    import logging
+
+    log = logging.getLogger("feed_sync")
+
+    VALID_OPS = {"upsert", "delete"}
+
+
+    def parse_line(line):
+        op, sku, payload = line.rstrip("\n").split("\t", 2)
+        return op.strip().lower(), sku.strip().upper(), payload
+
+
+    def build_batch(lines):
+        """Turn a supplier feed diff into the batch the loader applies in order.
+        Deletes must run before upserts (a SKU can be deleted and re-created
+        in the same diff)."""
+        deletes = []
+        upserts = []
+        stats = {"upsert": 0, "delete": 0, "skipped": 0}
+        for lineno, line in enumerate(lines, 1):
+            if not line.strip() or line.startswith("#"):
+                continue
+            try:
+                op, sku, payload = parse_line(line)
+            except ValueError:
+                log.warning("line %d: malformed, skipped", lineno)
+                stats["skipped"] += 1
+                continue
+            if op not in VALID_OPS:
+                log.warning("line %d: unknown op %r", lineno, op)
+                stats["skipped"] += 1
+                continue
+            if op == "delete":
+                deletes.append({"op": op, "sku": sku})
+            else:
+                upserts.append({"op": op, "sku": sku, "data": json.loads(payload)})
+            stats[op] += 1
+        deletes.reverse()  # same order as before: last delete in the file comes first
+        return deletes + upserts, stats
+    ```
+
+    **Green Notes**
+    - **Append instead of front insertion** (reduces E): every `batch.insert(0, ...)` shifts all elements already in the batch, including every upsert appended so far. A large diff with many deletes therefore does quadratic work. Now each row is one constant-time `append`, and the `reverse()` and the concatenation run once at the end, each in linear time. In Green Metrics Tool micro-benchmarks, 1,000,000 front inserts used ~1515 J and 1,000,000 appends used ~1.2 J.
+
+    The batch is the same as before. Deletes come first, in reverse file order, and upserts follow in file order. If the loader doesn't care about the order of the deletes, you can remove the `reverse()` line.
+verify:
+  test: |
+    lines = [
+        'upsert\ta1\t{"p": 1}\n',
+        'delete\tb2\t\n',
+        '# comment\n',
+        'delete\tc3\t\n',
+        'upsert\tA1\t{"p": 2}\n',
+        'bad\n',
+        'move\tx\t{}\n',
+        '\n',
+    ]
+    batch, stats = build_batch(lines)
+    assert batch == [
+        {"op": "delete", "sku": "C3"},
+        {"op": "delete", "sku": "B2"},
+        {"op": "upsert", "sku": "A1", "data": {"p": 1}},
+        {"op": "upsert", "sku": "A1", "data": {"p": 2}},
+    ]
+    assert stats == {"upsert": 2, "delete": 2, "skipped": 2}
+    assert build_batch([]) == ([], {"upsert": 0, "delete": 0, "skipped": 0})
+  equivalence:
+    driver: |
+      import hashlib
+      import json as _json
+      import logging as _logging
+      _logging.disable(_logging.CRITICAL)
+      lines = []
+      for i in range(3000):
+          if i % 7 == 0:
+              lines.append(f"delete\tsku-{i}\t\n")
+          elif i % 50 == 1:
+              lines.append("# comment\n")
+          elif i % 61 == 2:
+              lines.append("broken line\n")
+          elif i % 97 == 3:
+              lines.append(f"archive\tsku-{i}\t{{}}\n")
+          else:
+              lines.append(f"upsert\t sku-{i} \t{{\"price\": {i}, \"qty\": {i % 13}}}\n")
+      lines.append("\n")
+      batch, stats = build_batch(lines)
+      print(len(batch), stats)
+      print(batch[:3])
+      print(batch[-3:])
+      print(hashlib.sha256(_json.dumps(batch, sort_keys=True).encode()).hexdigest())
+  benchmark:
+    driver: |
+      import logging as _logging
+      _logging.disable(_logging.CRITICAL)
+      lines = []
+      for i in range(40000):
+          lines.append(f"delete\tsku-d{i}\t\n")
+          lines.append(f"upsert\tsku-u{i}\t{{\"q\": {i % 9}}}\n")
+      batch, stats = build_batch(lines)
+      print(len(batch), stats["delete"], stats["upsert"])
+    min_speedup: 1.5

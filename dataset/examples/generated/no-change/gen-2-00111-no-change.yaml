@@ -1,0 +1,93 @@
+id: gen-2-00111-no-change
+category: no-change
+language: python
+patterns:
+- set-membership
+- context-tradeoff
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    hi, i'm quite new to python and data stuff. i wrote this loader for our sensor ETL. a file watcher starts it once for every new export file that lands in the inbox folder (a few hundred per day). it checks a ledger so we never load the same file twice. the ledger has around 1.5 million file names by now.
+
+    a colleague looked at it and said "`in` on a list is O(n), you must use a set there". but i'm not sure what is wrong exactly, it runs fine. do i need to change it?
+
+    ```python
+    import csv
+    import json
+    import sys
+    from pathlib import Path
+
+    LEDGER = Path("/data/etl/loaded_files.json")
+    STAGING = Path("/data/etl/staging/readings.csv")
+
+
+    def load_ledger():
+        if not LEDGER.exists():
+            return []
+        with LEDGER.open() as f:
+            return json.load(f)
+
+
+    def save_ledger(names):
+        tmp = LEDGER.with_suffix(".tmp")
+        with tmp.open("w") as f:
+            json.dump(names, f)
+        tmp.replace(LEDGER)
+
+
+    def stage_file(path):
+        count = 0
+        with path.open(newline="") as src, STAGING.open("a", newline="") as dst:
+            writer = csv.writer(dst)
+            for row in csv.DictReader(src):
+                if not row["value"]:
+                    continue
+                writer.writerow([row["station_id"], row["ts"], float(row["value"])])
+                count += 1
+        return count
+
+
+    def main():
+        path = Path(sys.argv[1])
+        loaded = load_ledger()
+        if path.name in loaded:
+            print(f"{path.name} already loaded, skipping")
+            return
+        rows = stage_file(path)
+        loaded.append(path.name)
+        save_ledger(loaded)
+        print(f"staged {rows} rows from {path.name}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    Nothing is wrong here, and I would keep the list.
+
+    Your colleague's rule is true when you look things up many times. A set gives O(1) lookups, but building it is O(n): Python must read and hash all 1.5 million names first. Your script does **one** `in` check per run. So `set(loaded)` would do all of that hashing work to save one linear scan, and the scan is cheaper. In Green Metrics Tool micro-benchmarks, one membership test on a 10,000,000-element list was cheaper than converting the list to a set and testing once. The set version used about 50% more CPU energy.
+
+    The list also fits the rest of your code. You append the new name and write the ledger back in the same order. A set has no order, so you would need to convert it back anyway.
+
+    A set becomes the right choice if one run ever checks many names, for example if you change the watcher to process the whole inbox folder in one go. Then build the set once, before the loop:
+
+    ```python
+    def new_files(paths, loaded):
+        seen = set(loaded)  # built once, then O(1) per check
+        return [p for p in paths if p.name not in seen]
+    ```
+
+    For one file per run, your current code is the efficient version.
+verify:
+  green_block: 0
+  test: |-
+    from pathlib import Path
+    loaded = ["a.csv", "b.csv", "c.csv"]
+    paths = [Path("/in/b.csv"), Path("/in/d.csv"), Path("/in/a.csv"), Path("/in/e.csv")]
+    assert new_files(paths, loaded) == [Path("/in/d.csv"), Path("/in/e.csv")]
+    assert new_files([], loaded) == []
+    assert new_files(paths, []) == paths
+    assert loaded == ["a.csv", "b.csv", "c.csv"]

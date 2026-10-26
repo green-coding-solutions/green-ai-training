@@ -1,0 +1,85 @@
+id: gen-2-00134-no-change
+category: no-change
+language: python
+patterns:
+- hoist-invariants
+- context-tradeoff
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    We have a size-budget gate in our GitLab CI. It runs on every merge request, right after the frontend build. `dist/` usually has around 1,200 files and `size-budgets.json` has about 15 glob patterns.
+
+    A teammate's review comment on my MR says to bind `os.path.join`, `os.path.relpath`, `os.path.getsize` and `fnmatch.fnmatch` to local names at the top of `check()` and `find_artifacts()`, "because attribute lookups in loops are slow". He links an old Python performance tips page.
+
+    What I need:
+    - a clear yes or no on his suggestion
+    - if no, a short reason I can paste into the MR thread
+    - no other refactoring suggestions unless something is actually broken. The team cares a lot about readability in CI scripts.
+
+    ```python
+    #!/usr/bin/env python3
+    """Fail the pipeline if a built artifact exceeds its size budget."""
+    import fnmatch
+    import json
+    import os
+    import sys
+
+
+    def load_budgets(path):
+        # {"assets/*.js": 250000, "assets/*.css": 60000, "*.html": 30000, ...}
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+
+
+    def find_artifacts(root):
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for name in filenames:
+                yield os.path.join(dirpath, name)
+
+
+    def check(root, budgets):
+        violations = []
+        for path in find_artifacts(root):
+            rel = os.path.relpath(path, root)
+            size = os.path.getsize(path)
+            for pattern, limit in budgets.items():
+                if fnmatch.fnmatch(rel, pattern):
+                    if size > limit:
+                        violations.append((rel, size, limit))
+                    break  # first matching pattern decides
+        return violations
+
+
+    def main():
+        root = sys.argv[1] if len(sys.argv) > 1 else "dist"
+        if not os.path.isdir(root):
+            sys.exit(f"size check: build output '{root}' not found")
+        budgets = load_budgets(os.environ.get("SIZE_BUDGETS", "size-budgets.json"))
+        violations = check(root, budgets)
+        for rel, size, limit in violations:
+            print(f"FAIL {rel}: {size} bytes (budget {limit})")
+        if violations:
+            sys.exit(1)
+        print(f"size check passed for {root}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    No. Keep `check()` and `find_artifacts()` as they are.
+
+    - **The best-case gain is small.** In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local variable before a 10,000,000-iteration loop of pure arithmetic saved about 4-5%. That is the ideal case for this trick: a tight loop that does almost nothing besides the lookup.
+    - **Your loop is not that case.** `fnmatch.fnmatch` runs at most about 18,000 times per pipeline (1,200 files × 15 patterns), and usually fewer because of the `break`. Each file also costs a `stat` system call and its share of the directory walk. Those calls, the Python start-up and the CI job itself dominate the run. The attribute lookups are a tiny share of it.
+    - **It costs readability.** `getsize(path)` hides where the function comes from, so readers have to scroll up to check. On a cold path that is the worse trade.
+
+    Reply you can paste:
+
+    > Binding module functions to locals only helps in very tight loops. In micro-benchmarks it saved a few percent over 10 million iterations of pure arithmetic. This loop runs a few thousand times per pipeline and is dominated by filesystem calls, so the gain would not be measurable. I'm keeping the explicit `os.path.*` and `fnmatch.*` calls for readability.
+
+    I didn't find anything broken. The missing-`dist/` case fails loudly, and "first matching pattern wins" is applied consistently. If someone wants proof, run `time python check_sizes.py dist` with and without the aliases. The difference should be within run-to-run noise.
+verify:
+  static_only: 'no-change answer: the user''s script stays as it is, so the answer has no code block to execute'

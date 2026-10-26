@@ -1,0 +1,105 @@
+id: gen-2-00032-generation
+category: generation
+language: html
+patterns:
+- modern-image-formats
+facts:
+- F-IMGRENDER
+- F-IMGENC
+messages:
+- role: user
+  content: |
+    We have a nightly ETL job that pulls product feeds from about 30 suppliers. After each import it renders a review page per supplier with Jinja2. The merchandising team uses it to check the new items before they go live. Right now the page just hotlinks the supplier's original images. Most are PNGs and some are 4000px wide, so the page is painfully slow on the tablets the team uses.
+
+    I'm rewriting the image step anyway. Each image will get a stable `image_key` and we store whatever variants we need under `{{ image_base }}/{{ image_key }}/` on our S3/CloudFront bucket.
+
+    Can you write the Jinja2 HTML template? Requirements:
+    - context: `image_base`, and `batch` with `supplier`, `imported_at`, `items`
+    - each item has `sku`, `name`, `status` ("ok" / "warning" / "error"), `issues` (list of strings), `image_key`
+    - responsive grid of cards, works on laptops and tablets
+    - header with supplier, import time, and a count per status
+    - click on the thumbnail opens a large version of the image
+    - plain HTML/CSS, no JS framework
+    - tell me which image files the pipeline should write
+- role: assistant
+  content: |
+    The pipeline should write these files once per image in the ingest step:
+
+    ```text
+    {image_key}/400.avif    thumbnail, fit inside 400x400 on a white background
+    {image_key}/400.webp
+    {image_key}/400.jpg     fallback
+    {image_key}/1600.webp   large view for the click-through
+    ```
+
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Import review: {{ batch.supplier }} ({{ batch.imported_at }})</title>
+      <style>
+        body { font-family: system-ui, sans-serif; margin: 1rem; color: #222; }
+        header { display: flex; flex-wrap: wrap; gap: .5rem 1.5rem; align-items: baseline; }
+        header h1 { margin: 0; font-size: 1.4rem; }
+        .grid { list-style: none; padding: 0; display: grid; gap: 1rem;
+                grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
+        .card { border: 1px solid #ddd; border-radius: 6px; padding: .5rem; }
+        .card img { display: block; width: 100%; height: auto; aspect-ratio: 1;
+                    object-fit: contain; background: #fff; }
+        .sku { font-family: ui-monospace, monospace; font-size: .85rem; margin-top: .4rem; }
+        .badge { display: inline-block; padding: 0 .4rem; border-radius: 3px;
+                 font-size: .8rem; font-weight: 600; }
+        .ok { background: #d8f0dc; color: #1d5e2a; }
+        .warning { background: #fdf0c8; color: #7a5a00; }
+        .error { background: #f8d7d7; color: #8a1c1c; }
+        .issues { margin: .25rem 0 0; padding-left: 1.1rem; font-size: .85rem; }
+      </style>
+    </head>
+    <body>
+      <header>
+        <h1>{{ batch.supplier }}</h1>
+        <span>Imported {{ batch.imported_at }} · {{ batch.items|length }} items</span>
+        <span>
+          {% for status, group in batch.items|groupby('status') %}
+            <span class="badge {{ status }}">{{ status }}: {{ group|length }}</span>
+          {% endfor %}
+        </span>
+      </header>
+
+      <ul class="grid">
+      {% for item in batch.items %}
+        {% set base = image_base ~ '/' ~ item.image_key %}
+        <li class="card">
+          <a href="{{ base }}/1600.webp">
+            <picture>
+              <source type="image/avif" srcset="{{ base }}/400.avif">
+              <source type="image/webp" srcset="{{ base }}/400.webp">
+              <img src="{{ base }}/400.jpg" width="400" height="400"
+                   alt="{{ item.name }}" decoding="async">
+            </picture>
+          </a>
+          <div class="sku">{{ item.sku }}</div>
+          <div>{{ item.name }}</div>
+          <span class="badge {{ item.status }}">{{ item.status }}</span>
+          {% if item.issues %}
+          <ul class="issues">
+            {% for issue in item.issues %}<li>{{ issue }}</li>{% endfor %}
+          </ul>
+          {% endif %}
+        </li>
+      {% endfor %}
+      </ul>
+    </body>
+    </html>
+    ```
+
+    Render it with autoescaping on (`Environment(autoescape=select_autoescape(["html"]))`), because names and issues come from supplier feeds. The 400px thumbnails stay sharp on double-density tablets at the ~200px card width. Every current browser opens WebP directly, so the large view needs no fallback.
+
+    **Green Notes**
+    - **Modern formats with a fallback** (reduces network): the browser takes the first `<source>` it supports, so the tablets get AVIF or WebP thumbnails instead of multi-MB supplier PNGs. The saving is in transferred bytes, not decoding. In Green Metrics Tool page-load benchmarks, AVIF decoding cost about 19% more CPU energy than JPG, and PNG was the most expensive format to decode.
+    - **Encode once in the pipeline, not per view** (reduces E): AVIF encoding is expensive. In Green Metrics Tool measurements it cost about 7× the energy of JPG encoding. Write the variants in the ingest step only when `image_key` is new or the source image changed. Nightly re-renders of the page then reuse the existing files, and nothing is converted when someone opens the page.
+    - **Status as text and CSS** (reduces network): the badges need no icon images at all.
+verify:
+  static_only: Jinja2 HTML template, needs the jinja2 package and image files on a CDN

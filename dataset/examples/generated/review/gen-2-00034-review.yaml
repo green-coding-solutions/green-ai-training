@@ -1,0 +1,154 @@
+id: gen-2-00034-review
+category: review
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import csv
+    import gzip
+    from datetime import datetime
+
+    EXPORT_FIELDS = ["order_id", "created_at", "amount", "currency", "country"]
+
+
+    def load_orders(path):
+        """Read the nightly shop export (oldest order first) and return newest first."""
+        orders = []
+        with gzip.open(path, "rt", encoding="utf-8", newline="") as f:
+            for raw in csv.DictReader(f):
+                if raw["status"] in ("test", "cancelled"):
+                    continue
+                orders.insert(0, {
+                    "order_id": int(raw["order_id"]),
+                    "created_at": datetime.fromisoformat(raw["created_at"]),
+                    "amount": int(raw["amount_cents"]) / 100,
+                    "currency": raw["currency"],
+                    "country": raw["country"].strip().upper(),
+                })
+        return orders
+
+
+    def write_report(orders, out_path):
+        with open(out_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(orders[0].keys()))
+            writer.writeheader()
+            for o in orders:
+                writer.writerow({**o, "created_at": o["created_at"].isoformat()})
+
+
+    def run(export_path, out_path):
+        orders = load_orders(export_path)
+        write_report(orders, out_path)
+        print(f"wrote {len(orders)} orders to {out_path}")
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly batch ETL)
+
+    #### [Bug] Crash on an empty export
+    - **Where:** `write_report`, `fieldnames=list(orders[0].keys())`
+    - **Issue:** if a night has no orders, or all of them are test or cancelled, `orders` is empty and `orders[0]` raises `IndexError`. The job fails instead of writing an empty report.
+    - **Fix:** use `fieldnames=EXPORT_FIELDS`. The constant is already defined and has the same column order. An empty export then gives a report with only the header.
+
+    #### [High] Front insertion for every row
+    - **Where:** `orders.insert(0, {...})` in `load_orders`
+    - **Issue:** each `insert(0, ...)` shifts every element already in the list one slot to the right. The loop gets slower with every row, and the total work is O(n²) in the number of orders. On a large export, most of the time goes into moving pointers, not parsing.
+    - **Fix:** `append` in the loop and call `orders.reverse()` once at the end. The output is the same newest-first order, and the total work is O(n). A `collections.deque` with `appendleft` would also work, but callers get a list here, so append plus reverse is simpler.
+    - **Impact:** E (CPU), and it grows quadratically with export size. In Green Metrics Tool micro-benchmarks, 1,000,000 × `list.insert(0, x)` used ~1515 J, while 1,000,000 × `list.append(x)` used ~1.2 J. That is more than a 1000× difference.
+
+    ```python
+    import csv
+    import gzip
+    from datetime import datetime
+
+    EXPORT_FIELDS = ["order_id", "created_at", "amount", "currency", "country"]
+
+
+    def load_orders(path):
+        """Read the nightly shop export (oldest order first) and return newest first."""
+        orders = []
+        with gzip.open(path, "rt", encoding="utf-8", newline="") as f:
+            for raw in csv.DictReader(f):
+                if raw["status"] in ("test", "cancelled"):
+                    continue
+                orders.append({
+                    "order_id": int(raw["order_id"]),
+                    "created_at": datetime.fromisoformat(raw["created_at"]),
+                    "amount": int(raw["amount_cents"]) / 100,
+                    "currency": raw["currency"],
+                    "country": raw["country"].strip().upper(),
+                })
+        orders.reverse()  # export is oldest first, report wants newest first
+        return orders
+
+
+    def write_report(orders, out_path):
+        with open(out_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=EXPORT_FIELDS)
+            writer.writeheader()
+            for o in orders:
+                writer.writerow({**o, "created_at": o["created_at"].isoformat()})
+
+
+    def run(export_path, out_path):
+        orders = load_orders(export_path)
+        write_report(orders, out_path)
+        print(f"wrote {len(orders)} orders to {out_path}")
+    ```
+
+    **Already good:** the gzip export is read as a stream, and both CSV files are opened with `newline=""`.
+verify:
+  test: |
+    import os, tempfile, gzip, csv
+    _d = tempfile.mkdtemp()
+    _p = os.path.join(_d, "empty.csv.gz")
+    with gzip.open(_p, "wt", encoding="utf-8", newline="") as _f:
+        _f.write("order_id,created_at,amount_cents,currency,country,status\n")
+    _o = os.path.join(_d, "report.csv")
+    run(_p, _o)
+    with open(_o, encoding="utf-8") as _f:
+        assert _f.read().splitlines() == ["order_id,created_at,amount,currency,country"]
+    _p2 = os.path.join(_d, "small.csv.gz")
+    with gzip.open(_p2, "wt", encoding="utf-8", newline="") as _f:
+        _w = csv.writer(_f)
+        _w.writerow(["order_id", "created_at", "amount_cents", "currency", "country", "status"])
+        _w.writerow([1, "2026-10-22T08:00:00", 1000, "EUR", " de", "paid"])
+        _w.writerow([2, "2026-10-22T09:00:00", 500, "EUR", "at", "test"])
+        _w.writerow([3, "2026-10-22T10:00:00", 250, "EUR", "ch ", "paid"])
+    _rows = load_orders(_p2)
+    assert [r["order_id"] for r in _rows] == [3, 1]
+    assert _rows[0]["country"] == "CH" and _rows[1]["amount"] == 10.0
+  equivalence:
+    driver: |
+      import os, tempfile, gzip, csv
+      os.chdir(tempfile.mkdtemp())
+      with gzip.open("export.csv.gz", "wt", encoding="utf-8", newline="") as f:
+          w = csv.writer(f)
+          w.writerow(["order_id", "created_at", "amount_cents", "currency", "country", "status"])
+          statuses = ["paid", "test", "paid", "cancelled", "paid", "refunded"]
+          countries = [" de", "at ", "Ch"]
+          for i in range(1, 301):
+              w.writerow([1000 + i, f"2026-10-22T{i % 24:02d}:{i % 60:02d}:00", 199 * i + 5,
+                          "EUR", countries[i % 3], statuses[i % 6]])
+      run("export.csv.gz", "report.csv")
+      with open("report.csv", encoding="utf-8") as f:
+          print(f.read())
+  benchmark:
+    driver: |
+      import os, tempfile, gzip, csv
+      _p = os.path.join(tempfile.mkdtemp(), "big.csv.gz")
+      with gzip.open(_p, "wt", encoding="utf-8", newline="") as f:
+          w = csv.writer(f)
+          w.writerow(["order_id", "created_at", "amount_cents", "currency", "country", "status"])
+          for i in range(150000):
+              w.writerow([i, "2026-10-22T08:15:00", 1999, "EUR", "de", "paid"])
+      rows = load_orders(_p)
+      print(len(rows), rows[0]["order_id"])
+    min_speedup: 1.5

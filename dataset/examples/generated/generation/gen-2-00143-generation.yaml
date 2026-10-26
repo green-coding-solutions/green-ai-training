@@ -1,0 +1,46 @@
+id: gen-2-00143-generation
+category: generation
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    Need `to_conll(docs)` in our NER postprocess module. `docs` is the batch output from the tagger: a list of dicts with `id`, `tokens`, `labels`, `scores` (parallel lists). Output format: a `# doc_id = <id>` line, then one `token<TAB>label<TAB>score` line per token (score with 4 decimals), then a blank line after each doc. Batches are ~2k docs / ~400k tokens and the result goes straight into the response body. Just the function, no walkthrough.
+- role: assistant
+  content: |
+    ```python
+    def to_conll(docs: list[dict]) -> str:
+        parts: list[str] = []
+        append = parts.append
+        for doc in docs:
+            append(f"# doc_id = {doc['id']}\n")
+            for token, label, score in zip(
+                doc["tokens"], doc["labels"], doc["scores"], strict=True
+            ):
+                append(f"{token}\t{label}\t{score:.4f}\n")
+            append("\n")
+        return "".join(parts)
+    ```
+
+    `strict=True` (Python 3.10+) raises `ValueError` if the three lists of a doc differ in length. Without it, `zip` would silently drop tokens.
+
+    **Green Notes**
+    - **Join strings instead of `+=`** (reduces E): the output has one piece per token, so the pieces are collected in a list and joined once. Growing the result with `+=` or `result = result + f"..."` copies it over and over. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces used ~469 J with `+=` and ~1.8 J with `"".join()`, roughly 260× less. f-strings appended with `+=` behaved the same as plain `+=` (~455 J), so the f-strings here only format single lines.
+verify:
+  test: |-
+    docs = [
+        {"id": "a", "tokens": ["Berlin", "is"], "labels": ["B-LOC", "O"], "scores": [0.98761, 0.5]},
+        {"id": "b", "tokens": [], "labels": [], "scores": []},
+    ]
+    expected = "# doc_id = a\nBerlin\tB-LOC\t0.9876\nis\tO\t0.5000\n\n# doc_id = b\n\n"
+    assert to_conll(docs) == expected, repr(to_conll(docs))
+    assert to_conll([]) == ""
+    try:
+        to_conll([{"id": "x", "tokens": ["a", "b"], "labels": ["O"], "scores": [0.1, 0.2]}])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("length mismatch not detected")

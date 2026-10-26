@@ -1,0 +1,233 @@
+id: gen-2-00083-multi-turn
+category: multi-turn
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    fix this, gateway cpu sits at 80% and most adverts arent even ours
+
+    ```python
+    import struct
+    import time
+
+    # BLE sensors in the warehouse, keyed by MAC
+    SENSORS = {
+        "C4:7C:8D:6A:11:02": {"room": "cold-room-1", "kind": "temp_hum"},
+        "C4:7C:8D:6A:11:7F": {"room": "cold-room-2", "kind": "temp_hum"},
+        "E8:31:CD:0F:42:9A": {"room": "loading-dock", "kind": "door"},
+    }
+
+    last_seen = {}
+
+
+    def decode_temp_hum(data):
+        temp, hum, batt = struct.unpack("<hHB", data[:5])
+        return {"temp_c": temp / 100, "humidity": hum / 100, "battery": batt}
+
+
+    def decode_door(data):
+        return {"open": bool(data[0]), "battery": data[1]}
+
+
+    DECODERS = {"temp_hum": decode_temp_hum, "door": decode_door}
+
+
+    def handle_advert(mac, rssi, data, publish):
+        """Called by the scanner for every BLE advertisement it sees."""
+        try:
+            sensor = SENSORS[mac]
+        except KeyError:
+            return  # phones, headphones, forklifts...
+
+        now = time.monotonic()
+        try:
+            if now - last_seen[mac] < 10:
+                return  # rate limit: one reading per sensor every 10 s
+        except KeyError:
+            pass
+        last_seen[mac] = now
+
+        reading = DECODERS[sensor["kind"]](data)
+        reading["rssi"] = rssi
+        publish(f"site/{sensor['room']}/{sensor['kind']}", reading)
+    ```
+- role: assistant
+  content: |
+    ```python
+    import struct
+    import time
+
+    # BLE sensors in the warehouse, keyed by MAC
+    SENSORS = {
+        "C4:7C:8D:6A:11:02": {"room": "cold-room-1", "kind": "temp_hum"},
+        "C4:7C:8D:6A:11:7F": {"room": "cold-room-2", "kind": "temp_hum"},
+        "E8:31:CD:0F:42:9A": {"room": "loading-dock", "kind": "door"},
+    }
+
+    last_seen = {}
+
+
+    def decode_temp_hum(data):
+        temp, hum, batt = struct.unpack("<hHB", data[:5])
+        return {"temp_c": temp / 100, "humidity": hum / 100, "battery": batt}
+
+
+    def decode_door(data):
+        return {"open": bool(data[0]), "battery": data[1]}
+
+
+    DECODERS = {"temp_hum": decode_temp_hum, "door": decode_door}
+
+
+    def handle_advert(mac, rssi, data, publish):
+        """Called by the scanner for every BLE advertisement it sees."""
+        sensor = SENSORS.get(mac)
+        if sensor is None:
+            return  # phones, headphones, forklifts...
+
+        now = time.monotonic()
+        try:
+            if now - last_seen[mac] < 10:
+                return  # rate limit: one reading per sensor every 10 s
+        except KeyError:
+            pass
+        last_seen[mac] = now
+
+        reading = DECODERS[sensor["kind"]](data)
+        reading["rssi"] = rssi
+        publish(f"site/{sensor['room']}/{sensor['kind']}", reading)
+    ```
+
+    **Green Notes**
+    - **`SENSORS.get(mac)` instead of `try/except KeyError`** (reduces E): every advertisement hits this lookup, and most of them are misses. Each miss used to create, raise and catch an exception. Now a miss is a plain `None` check. In Green Metrics Tool micro-benchmarks with about half the keys missing, `dict.get` used about 12% less CPU energy than `try/except KeyError`. With mostly foreign adverts, your miss rate is higher than that.
+
+    *Not changed:* the `last_seen` `try/except` misses only once per sensor, on its first advert. Exceptions are cheap when they are rarely raised, so it can stay.
+
+    The BLE scan itself also costs CPU. If the gateway is still busy after this, check whether your scanner library can filter by MAC or manufacturer data before calling `handle_advert`.
+- role: user
+  content: |
+    ok. also need count of foreign adverts per minute for the dashboard
+- role: assistant
+  content: |
+    Count them in the miss branch and let your once-a-minute publish job read and reset the counter:
+
+    ```python
+    unknown_adverts = 0
+
+
+    def take_unknown_count():
+        """Return foreign adverts seen since the last call and reset the counter."""
+        global unknown_adverts
+        count, unknown_adverts = unknown_adverts, 0
+        return count
+
+
+    def handle_advert(mac, rssi, data, publish):
+        """Called by the scanner for every BLE advertisement it sees."""
+        global unknown_adverts
+        sensor = SENSORS.get(mac)
+        if sensor is None:
+            unknown_adverts += 1
+            return
+        # ... rest unchanged
+    ```
+
+    In the minute job: `publish("site/gateway/unknown_adverts", {"count": take_unknown_count()})`.
+
+    This works as-is if the scanner callbacks and the minute job run on the same asyncio loop (e.g. with bleak). If they run on different threads, guard the read-and-reset with a `threading.Lock`.
+- role: user
+  content: |
+    lead wants the try/except back, says EAFP is the python way. just do it
+- role: assistant
+  content: |
+    ```python
+    import struct
+    import time
+
+    # BLE sensors in the warehouse, keyed by MAC
+    SENSORS = {
+        "C4:7C:8D:6A:11:02": {"room": "cold-room-1", "kind": "temp_hum"},
+        "C4:7C:8D:6A:11:7F": {"room": "cold-room-2", "kind": "temp_hum"},
+        "E8:31:CD:0F:42:9A": {"room": "loading-dock", "kind": "door"},
+    }
+
+    last_seen = {}
+    unknown_adverts = 0
+
+
+    def decode_temp_hum(data):
+        temp, hum, batt = struct.unpack("<hHB", data[:5])
+        return {"temp_c": temp / 100, "humidity": hum / 100, "battery": batt}
+
+
+    def decode_door(data):
+        return {"open": bool(data[0]), "battery": data[1]}
+
+
+    DECODERS = {"temp_hum": decode_temp_hum, "door": decode_door}
+
+
+    def take_unknown_count():
+        """Return foreign adverts seen since the last call and reset the counter."""
+        global unknown_adverts
+        count, unknown_adverts = unknown_adverts, 0
+        return count
+
+
+    def handle_advert(mac, rssi, data, publish):
+        """Called by the scanner for every BLE advertisement it sees."""
+        global unknown_adverts
+        try:
+            sensor = SENSORS[mac]
+        except KeyError:
+            unknown_adverts += 1
+            return  # phones, headphones, forklifts...
+
+        now = time.monotonic()
+        try:
+            if now - last_seen[mac] < 10:
+                return  # rate limit: one reading per sensor every 10 s
+        except KeyError:
+            pass
+        last_seen[mac] = now
+
+        reading = DECODERS[sensor["kind"]](data)
+        reading["rssi"] = rssi
+        publish(f"site/{sensor['room']}/{sensor['kind']}", reading)
+    ```
+
+    I kept the `try` around the lookup only, so a `KeyError` from a decoder still surfaces instead of being counted as a foreign advert. If gateway CPU becomes a problem again, swapping that one lookup back to `.get` is a two-line change.
+verify:
+  equivalence:
+    driver: |
+      def pub(topic, reading):
+          print(topic, sorted(reading.items()))
+
+      adverts = [
+          ("11:22:33:44:55:66", -80, b"\x00"),
+          ("C4:7C:8D:6A:11:02", -61, struct.pack("<hHB", 412, 5530, 87)),
+          ("AA:BB:CC:DD:EE:FF", -90, b""),
+          ("C4:7C:8D:6A:11:02", -60, struct.pack("<hHB", 415, 5520, 87)),
+          ("E8:31:CD:0F:42:9A", -70, bytes([1, 64])),
+          ("C4:7C:8D:6A:11:7F", -66, struct.pack("<hHB", -150, 9000, 50)),
+          ("01:02:03:04:05:06", -95, b"\xff\xff"),
+      ]
+      for mac, rssi, data in adverts:
+          handle_advert(mac, rssi, data, pub)
+  test: |-
+    seen = []
+    handle_advert("00:00:00:00:00:01", -80, b"", lambda t, r: seen.append((t, r)))
+    handle_advert("00:00:00:00:00:02", -80, b"", lambda t, r: seen.append((t, r)))
+    assert seen == []
+    assert take_unknown_count() == 2
+    assert take_unknown_count() == 0
+    handle_advert("C4:7C:8D:6A:11:02", -60, struct.pack("<hHB", -150, 9000, 50), lambda t, r: seen.append((t, r)))
+    assert seen[0][0] == "site/cold-room-1/temp_hum"
+    assert seen[0][1] == {"temp_c": -1.5, "humidity": 90.0, "battery": 50, "rssi": -60}
+    handle_advert("C4:7C:8D:6A:11:02", -60, struct.pack("<hHB", -140, 9000, 50), lambda t, r: seen.append((t, r)))
+    assert len(seen) == 1
+    assert take_unknown_count() == 0

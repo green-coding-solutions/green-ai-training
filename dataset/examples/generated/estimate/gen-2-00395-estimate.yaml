@@ -1,0 +1,144 @@
+id: gen-2-00395-estimate
+category: estimate
+language: python
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    We have an hourly ETL job that loads the web analytics session export into a Postgres 16 staging table. A later SQL step merges staging into the warehouse tables. Each export is a gzipped CSV with roughly 300k to 600k rows. The job runs every hour, all year.
+
+    Our sustainability team wants a figure for the annual report: how much energy (ideally kWh per year) we would save by switching this loader from row-by-row INSERTs to COPY. Before I touch it, I need to know what that figure would look like.
+
+    Requirements if we change it:
+    - psycopg 3, no new dependencies
+    - keep the commit every 5,000 rows, so the log shows progress and a crash leaves the committed batches in place
+    - same parsing and NULL handling as now
+    - staging table only, nothing else changes
+
+    ```python
+    import csv
+    import gzip
+    import logging
+    from datetime import datetime
+
+    import psycopg
+
+    log = logging.getLogger("sessions_etl")
+
+    BATCH_SIZE = 5000
+
+    INSERT_SQL = """
+        INSERT INTO stg_sessions
+            (session_id, user_id, started_at, duration_ms, page_views, referrer, country)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """
+
+
+    def parse(row):
+        return (
+            row["session_id"],
+            int(row["user_id"]) if row["user_id"] else None,
+            datetime.fromisoformat(row["started_at"]),
+            int(row["duration_ms"]),
+            int(row["page_views"]),
+            row["referrer"] or None,
+            row["country"].upper() or None,
+        )
+
+
+    def load_export(path, dsn):
+        loaded = 0
+        with psycopg.connect(dsn) as conn, gzip.open(path, "rt", newline="") as fh:
+            with conn.cursor() as cur:
+                cur.execute("TRUNCATE stg_sessions")
+                conn.commit()
+                batch = 0
+                for row in csv.DictReader(fh):
+                    cur.execute(INSERT_SQL, parse(row))
+                    batch += 1
+                    loaded += 1
+                    if batch == BATCH_SIZE:
+                        conn.commit()
+                        log.info("committed %d rows", loaded)
+                        batch = 0
+                conn.commit()
+        return loaded
+    ```
+- role: assistant
+  content: |
+    Your loader matches the measured case closely: many rows, one `execute()` per row, a commit every 5,000 rows. Green Metrics Tool micro-benchmarks tested this setup. They inserted 500,000 rows into PostgreSQL 16 with psycopg 3, as 100 batches of 5,000 rows with one commit per batch. Client and server ran on the same machine. CPU energy:
+
+    - one `execute()` per row: ~384 J, 60 s
+    - `executemany()`: ~139 J, about 2.8× less
+    - `COPY ... FROM STDIN`: ~17 J, 3.1 s, about 22× less than the loop and about 8× less than `executemany`
+
+    With batches of 1,000 rows, COPY used about 5× less than the loop. With 100-row batches the three variants were close (~13 J, ~15 J, ~9.5 J). Your 5,000-row batches are where the large gap was measured.
+
+    I can't give you kWh per year from this. The benchmark used one machine, one table shape and a local database, and its figures don't scale to your job. Your rows, indexes, network and database host all change the result. If the database is remote, each per-row `execute()` also waits one network round trip. COPY streams the whole batch, so that cost drops too. But the size of that saving has to be measured, not estimated.
+
+    Here is the COPY version. It keeps the parsing and NULL handling, the 5,000-row commits and the progress log:
+
+    ```python
+    import csv
+    import gzip
+    import logging
+    from datetime import datetime
+    from itertools import islice
+
+    import psycopg
+
+    log = logging.getLogger("sessions_etl")
+
+    BATCH_SIZE = 5000
+
+    COPY_SQL = (
+        "COPY stg_sessions "
+        "(session_id, user_id, started_at, duration_ms, page_views, referrer, country) "
+        "FROM STDIN"
+    )
+
+
+    def parse(row):
+        return (
+            row["session_id"],
+            int(row["user_id"]) if row["user_id"] else None,
+            datetime.fromisoformat(row["started_at"]),
+            int(row["duration_ms"]),
+            int(row["page_views"]),
+            row["referrer"] or None,
+            row["country"].upper() or None,
+        )
+
+
+    def load_export(path, dsn):
+        loaded = 0
+        with psycopg.connect(dsn) as conn, gzip.open(path, "rt", newline="") as fh:
+            with conn.cursor() as cur:
+                cur.execute("TRUNCATE stg_sessions")
+                conn.commit()
+                rows = csv.DictReader(fh)
+                while batch := [parse(r) for r in islice(rows, BATCH_SIZE)]:
+                    with cur.copy(COPY_SQL) as copy:
+                        for rec in batch:
+                            copy.write_row(rec)
+                    conn.commit()
+                    loaded += len(batch)
+                    log.info("committed %d rows", loaded)
+        return loaded
+    ```
+
+    Behavior notes:
+    - `write_row` sends `None` as SQL NULL, the same as the INSERT parameters did.
+    - Errors are handled the same way. A bad row rolls back only its open batch, and the committed batches stay. With COPY, a database-side error shows up when the batch's COPY ends, not at the exact row.
+    - The last partial batch is now logged too.
+
+    How to get a real figure for the report:
+    1. Write a Green Metrics Tool usage scenario that starts a Postgres 16 container with your `stg_sessions` schema and indexes. It should run the old loader and then the new one on the same real export file.
+    2. Read CPU and machine energy per run for each version. The database server's share counts too, so measure where you can see both client and server. A managed database usually exposes no energy data.
+    3. If you can't use Green Metrics Tool, `perf stat -e power/energy-pkg/` or RAPL counters on a local test box give a CPU-energy proxy, and `time` gives CPU time.
+    4. Multiply your measured saving per run by your yearly run count. That figure comes from your own measurement, so you can report it with its method.
+verify:
+  static_only: needs a PostgreSQL server and psycopg 3

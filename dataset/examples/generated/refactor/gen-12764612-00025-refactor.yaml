@@ -1,0 +1,86 @@
+id: gen-12764612-00025-refactor
+category: refactor
+language: sql
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    Hello, our gateways in the cold storage warehouses go offline sometimes and when they come back they send one big csv with all readings they missed, mostly 200-300k rows. I wrote this script for load them to postgres but it take very long time and CPU is high on the db server. Can you make it more better? Please dont change the result, we need the same rows in the table.
+
+    ```sql
+    -- backlog_load.sql, run with: psql -f backlog_load.sql
+    BEGIN;
+
+    CREATE TEMP TABLE stg_backlog (
+        device_id   text,
+        read_ts     timestamptz,
+        temp_raw    integer,
+        hum_raw     integer,
+        battery_mv  integer
+    );
+
+    \copy stg_backlog FROM 'backlog.csv' WITH (FORMAT csv, HEADER true)
+
+    DO $$
+    DECLARE
+        r record;
+    BEGIN
+        FOR r IN SELECT * FROM stg_backlog ORDER BY read_ts LOOP
+            -- -32768 means sensor error
+            IF r.temp_raw IS NULL OR r.temp_raw = -32768 THEN
+                CONTINUE;
+            END IF;
+
+            INSERT INTO sensor_readings (device_id, read_ts, temp_c, humidity_pct, battery_v)
+            VALUES (r.device_id, r.read_ts, r.temp_raw / 100.0, r.hum_raw / 10.0, r.battery_mv / 1000.0)
+            ON CONFLICT (device_id, read_ts) DO NOTHING;
+        END LOOP;
+    END $$;
+
+    COMMIT;
+    ```
+- role: assistant
+  content: |
+    The `\copy` into the staging table is already the right way to load the file. The slow part is the `DO` loop, which runs one `INSERT` per row. Replace it with one `INSERT ... SELECT`:
+
+    ```sql
+    -- backlog_load.sql, run with: psql -f backlog_load.sql
+    BEGIN;
+
+    CREATE TEMP TABLE stg_backlog (
+        device_id   text,
+        read_ts     timestamptz,
+        temp_raw    integer,
+        hum_raw     integer,
+        battery_mv  integer
+    );
+
+    \copy stg_backlog FROM 'backlog.csv' WITH (FORMAT csv, HEADER true)
+
+    INSERT INTO sensor_readings (device_id, read_ts, temp_c, humidity_pct, battery_v)
+    SELECT device_id,
+           read_ts,
+           temp_raw / 100.0,
+           hum_raw / 10.0,
+           battery_mv / 1000.0
+    FROM stg_backlog
+    WHERE temp_raw IS NOT NULL
+      AND temp_raw <> -32768   -- -32768 means sensor error
+    ON CONFLICT (device_id, read_ts) DO NOTHING;
+
+    COMMIT;
+    ```
+
+    **Green Notes**
+    - **Batch database writes** (reduces E): 300k loop iterations, each with its own `INSERT` and conflict check, become one statement that the database runs in a single pass. The same rows go into `sensor_readings`. In Green Metrics Tool micro-benchmarks with PostgreSQL 16, inserting 500,000 rows in batches of 5,000 used about 384 J with one `execute()` per row and about 17 J with `COPY`, about 22× less. That test used a Python client loop, not a `DO` block, so treat it as the direction, not a promise for your script. Measure your own load with `time` or `perf stat` on the server.
+    - **Error filter in `WHERE`:** the `IF ... CONTINUE` is now a `WHERE` condition, so the sensor-error rows are skipped as before. The `NULL` check is kept.
+
+    Behavior differences:
+    - I removed `ORDER BY read_ts`, so the insert order is not guaranteed. The final rows are the same. If `sensor_readings` has an identity `id` that should follow time order, add `ORDER BY read_ts` back to the `SELECT`.
+    - Duplicate `(device_id, read_ts)` pairs inside the CSV are still skipped by `ON CONFLICT DO NOTHING`. If two duplicates have different values, which one is kept can differ from before, as it did before with `ORDER BY` ties.
+verify:
+  static_only: PL/pgSQL DO block and psql \copy need PostgreSQL, not SQLite

@@ -1,0 +1,64 @@
+id: gen-2-00100-generation
+category: generation
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    need a func that filters top-k model predictions down to labels in allowed_labels (list of ~3k strings, loaded once at startup). runs on every inference request
+- role: assistant
+  content: |
+    Build the set once at startup and reuse it for every request:
+
+    ```python
+    from collections.abc import Iterable, Sequence
+
+
+    class AllowedLabelFilter:
+        """Keeps only predictions whose label is in the allowlist."""
+
+        def __init__(self, allowed_labels: Iterable[str]) -> None:
+            # Built once at startup, reused for every request.
+            self._allowed = frozenset(allowed_labels)
+
+        def __call__(
+            self, predictions: Sequence[tuple[str, float]], k: int = 5
+        ) -> list[tuple[str, float]]:
+            """predictions: (label, score) pairs sorted by score, highest first.
+
+            Returns the first k allowed predictions, order unchanged.
+            """
+            if k <= 0:
+                return []
+            out: list[tuple[str, float]] = []
+            for label, score in predictions:
+                if label in self._allowed:
+                    out.append((label, score))
+                    if len(out) == k:
+                        break
+            return out
+
+
+    # At startup:
+    #   label_filter = AllowedLabelFilter(allowed_labels)
+    # Per request:
+    #   top = label_filter(predictions, k=5)
+    ```
+
+    **Green Notes**
+    - **Set for repeated membership tests** (reduces E): each `in` check is O(1) instead of scanning ~3k strings. You check many predictions per request and many requests per process, so the one-time set build pays off quickly.
+    - **Build once, not per call** (reduces E): converting the list inside the function would add an O(n) build to every request. In Green Metrics Tool micro-benchmarks, converting a 10,000,000-element list to a set for a single lookup cost about 50% more energy than one linear scan. The set only wins because it is reused.
+    - **Early exit at k** (reduces E): the loop stops as soon as it has k allowed labels and does not walk the rest of the predictions.
+verify:
+  test: |-
+    f = AllowedLabelFilter(["cat", "dog", "bird"])
+    preds = [("car", 0.9), ("dog", 0.8), ("tree", 0.7), ("cat", 0.6), ("bird", 0.5)]
+    assert f(preds, k=2) == [("dog", 0.8), ("cat", 0.6)]
+    assert f(preds, k=5) == [("dog", 0.8), ("cat", 0.6), ("bird", 0.5)]
+    assert f(preds, k=0) == []
+    assert f([], k=3) == []
+    assert f([("car", 0.9)], k=3) == []
+    assert isinstance(f._allowed, frozenset)

@@ -1,0 +1,113 @@
+id: gen-2-00416-review
+category: review
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    review pls, diff only. ArgoCD ApplicationSet for PR previews of our spectrum reduction portal (astro lab, ~15 open PRs most of the time, some sit open for weeks)
+
+    ```yaml
+    apiVersion: argoproj.io/v1alpha1
+    kind: ApplicationSet
+    metadata:
+      name: spectra-preview
+      namespace: argocd
+    spec:
+      generators:
+        - pullRequest:
+            github:
+              owner: stellar-lab
+              repo: spectra-portal
+              tokenRef:
+                secretName: github-token
+                key: token
+            requeueAfterSeconds: 120
+      template:
+        metadata:
+          name: 'spectra-pr-{{number}}'
+        spec:
+          project: previews
+          source:
+            repoURL: https://github.com/stellar-lab/spectra-portal.git
+            targetRevision: '{{head_sha}}'
+            path: deploy/chart
+            helm:
+              valuesObject:
+                image:
+                  tag: 'pr-{{number}}'
+                api:
+                  replicas: 3
+                postgres:
+                  enabled: true
+                  storage: 5Gi
+                redis:
+                  enabled: true
+                worker:
+                  enabled: true
+                  pollSeconds: 5
+                ingress:
+                  host: 'pr-{{number}}.preview.stellar-lab.example'
+          destination:
+            server: https://kubernetes.default.svc
+            namespace: 'preview-{{branch}}'
+          syncPolicy:
+            automated:
+              prune: true
+              selfHeal: true
+            syncOptions:
+              - CreateNamespace=true
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (per-PR preview environments)
+
+    #### [Bug] Namespace built from the branch name
+    - **Where:** `namespace: 'preview-{{branch}}'`
+    - **Issue:** branch names like `feature/rebin-fix` or `Fix_Calib` contain `/`, `_` or uppercase letters. These are not valid namespace names, so the sync fails for those PRs. You already use `{{number}}` everywhere else.
+    - **Fix:**
+      ```diff
+      -            namespace: 'preview-{{branch}}'
+      +            namespace: 'preview-pr-{{number}}'
+      ```
+
+    #### [High] Every open PR gets a full environment
+    - **Where:** `generators[0].pullRequest.github`
+    - **Issue:** the environment exists as long as the PR is open. PRs that sit open for weeks (drafts, docs, dependency bumps) keep a full stack running with nobody looking at it.
+    - **Fix:** make previews opt-in with a label. Removing the label removes the environment:
+      ```diff
+               repo: spectra-portal
+      +        labels:
+      +          - preview
+               tokenRef:
+      ```
+    - **Impact:** E and M. Fewer environments, and fewer hours for each one. In Green Metrics Tool micro-benchmarks an idle preview environment cost little per minute, so the saving comes from environments that do not exist, not from trimming a running one. Closing PRs promptly and scaling previews to zero overnight add to this.
+
+    #### [Medium] Preview is sized like production
+    - **Where:** `valuesObject`: `api.replicas`, `redis`, `worker`
+    - **Issue:** 3 API replicas, Redis and a worker polling every 5 seconds are not needed to check a UI or API change by hand.
+    - **Fix:**
+      ```diff
+                   api:
+      -              replicas: 3
+      +              replicas: 1
+                   postgres:
+                     enabled: true
+                     storage: 5Gi
+                   redis:
+      -              enabled: true
+      +              enabled: false
+                   worker:
+      -              enabled: true
+      -              pollSeconds: 5
+      +              enabled: false
+      ```
+    - **Impact:** M mostly, E slightly. In Green Metrics Tool micro-benchmarks, 1 app replica plus Postgres used about 3% less CPU energy over an idle minute than 3 replicas, Postgres, Redis and a polling worker. Machine energy differed by less than 1%, because the idle baseline dominates. The gain is smaller memory reservations and a smaller node pool.
+    - **Behavior change:** reductions queued in a preview will not run. Check that the API starts without Redis. If a PR touches the worker, give it a separate values file with those two flags on.
+
+    **Already good:** token from a secret via `tokenRef`, `prune: true` so closed PRs clean up, and image tag and host derived from the PR number.
+verify:
+  static_only: ArgoCD ApplicationSet YAML, needs a Kubernetes cluster and ArgoCD

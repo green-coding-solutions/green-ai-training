@@ -1,0 +1,93 @@
+id: gen-2-00216-generation
+category: generation
+language: sql
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    Hi, i build a REST API for our B2B shop (FastAPI + psycopg 3, Postgres 16). Dealers can upload there own price list as CSV on `POST /api/dealers/{dealer_id}/prices`. Files are normaly 5.000 to 40.000 lines, header is `sku,price,currency,valid_from`. My colleague started with a loop that make one `INSERT ... ON CONFLICT` per line, but its very slow for the big dealers and the request run into timeout.
+
+    Can you write me the SQL? I need:
+    - the table (one price per dealer and sku)
+    - the statements the handler run for one upload
+    - if the sku already exist for this dealer, update the price. Rows not in the file stay like they are
+    - when the file is broken, nothing should be changed
+    - sometimes same sku is two times in the file, then the later line should win
+- role: assistant
+  content: |
+    Table:
+
+    ```sql
+    CREATE TABLE dealer_prices (
+        dealer_id  bigint        NOT NULL,
+        sku        text          NOT NULL,
+        price      numeric(12,2) NOT NULL CHECK (price >= 0),
+        currency   char(3)       NOT NULL,
+        valid_from date          NOT NULL,
+        updated_at timestamptz   NOT NULL DEFAULT now(),
+        PRIMARY KEY (dealer_id, sku)
+    );
+    ```
+
+    Statements for one upload, all in one transaction:
+
+    ```sql
+    BEGIN;
+
+    -- staging table, exists only in this transaction
+    CREATE TEMP TABLE price_upload (
+        line_no    bigint GENERATED ALWAYS AS IDENTITY,  -- numbered in file order
+        sku        text          NOT NULL,
+        price      numeric(12,2) NOT NULL,
+        currency   char(3)       NOT NULL,
+        valid_from date          NOT NULL
+    ) ON COMMIT DROP;
+
+    -- the whole file in one stream; HEADER MATCH rejects files with wrong column names
+    COPY price_upload (sku, price, currency, valid_from)
+        FROM STDIN WITH (FORMAT csv, HEADER MATCH);
+
+    -- one set-based upsert; DISTINCT ON keeps the last line per sku
+    INSERT INTO dealer_prices AS p (dealer_id, sku, price, currency, valid_from)
+    SELECT %(dealer_id)s::bigint, u.sku, u.price, u.currency, u.valid_from
+    FROM (
+        SELECT DISTINCT ON (sku) sku, price, currency, valid_from
+        FROM price_upload
+        ORDER BY sku, line_no DESC
+    ) AS u
+    ON CONFLICT (dealer_id, sku) DO UPDATE
+    SET price      = EXCLUDED.price,
+        currency   = EXCLUDED.currency,
+        valid_from = EXCLUDED.valid_from,
+        updated_at = now();
+
+    COMMIT;
+    ```
+
+    In the handler, psycopg 3 streams the upload into the COPY. `conn.transaction()` does the `BEGIN`/`COMMIT`:
+
+    ```python
+    def import_prices(conn, dealer_id: int, fileobj) -> int:
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute(CREATE_UPLOAD_SQL)
+            with cur.copy(COPY_UPLOAD_SQL) as copy:
+                while chunk := fileobj.read(64 * 1024):
+                    copy.write(chunk)
+            cur.execute(UPSERT_SQL, {"dealer_id": dealer_id})
+            return cur.rowcount  # inserted + updated prices
+    ```
+
+    Behavior:
+    - A bad line (wrong price, bad date, missing column) aborts the COPY. The transaction rolls back and no price changes. Return a 400 with the Postgres error message, which names the line.
+    - Duplicate SKUs: the later line wins, like with the row-by-row loop. Without the `DISTINCT ON`, Postgres would fail with "cannot affect row a second time".
+    - Prices that are not in the file stay untouched.
+
+    **Green Notes**
+    - **Batch database writes (COPY + one upsert)** (reduces E): a 40,000-line file is now one COPY stream and one statement, not 40,000 separate statements and round trips. In Green Metrics Tool micro-benchmarks on PostgreSQL with batches of 5,000 rows, COPY used about 22× less CPU energy than one INSERT per row, and about 8× less than `executemany`.
+    - For tiny uploads of around 100 rows the measured difference was small. Still keep this one code path for every file size, a second path for small files is not worth it.
+verify:
+  static_only: PostgreSQL-specific SQL (COPY FROM STDIN with HEADER MATCH, DISTINCT ON, ON CONFLICT) and psycopg 3; not SQLite-compatible

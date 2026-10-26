@@ -1,0 +1,101 @@
+id: gen-2-00249-generation
+category: generation
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    need a script: csv on stdin -> stdout with an extra iso_week column. date col is booked_at, formats are mixed (2026-10-24, 24.10.2026, 10/24/2026). exports are a few million rows
+- role: assistant
+  content: |
+    The script picks the date format by its separator: `-` is ISO, `.` is day.month.year, and `/` is US month/day/year.
+
+    ```python
+    #!/usr/bin/env python3
+    """Read CSV on stdin, write it to stdout with an added iso_week column."""
+    import csv
+    import sys
+    from datetime import datetime
+    from functools import lru_cache
+
+    _FORMATS = {"-": "%Y-%m-%d", ".": "%d.%m.%Y", "/": "%m/%d/%Y"}
+
+
+    @lru_cache(maxsize=4096)
+    def iso_week(raw: str) -> str:
+        value = raw.strip()
+        for sep, fmt in _FORMATS.items():
+            if sep in value:
+                year, week, _ = datetime.strptime(value, fmt).isocalendar()
+                return f"{year}-W{week:02d}"
+        raise ValueError(f"unknown date format: {raw!r}")
+
+
+    def main() -> int:
+        reader = csv.DictReader(sys.stdin)
+        if reader.fieldnames is None or "booked_at" not in reader.fieldnames:
+            sys.exit("input has no 'booked_at' column")
+        writer = csv.DictWriter(
+            sys.stdout, fieldnames=[*reader.fieldnames, "iso_week"], lineterminator="\n"
+        )
+        writer.writeheader()
+        for row in reader:
+            try:
+                row["iso_week"] = iso_week(row["booked_at"] or "")
+            except ValueError as exc:
+                sys.exit(f"line {reader.line_num}: {exc}")
+            writer.writerow(row)
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+
+    Usage: `python add_iso_week.py < export.csv > export_weeks.csv`. If a date is invalid, the script stops and prints the line number.
+
+    **Green Notes**
+    - **Memoize the date parsing** (reduces E): an export has millions of rows but only a few hundred distinct dates, so `strptime` runs once per distinct date instead of once per row. In Green Metrics Tool micro-benchmarks, `functools.lru_cache` on a computation repeated 1,000,000 times over only 200 distinct inputs used about 9× less CPU energy than computing it every time. The cache has a size limit, so memory stays flat.
+    - *Not applied elsewhere:* the cache only helps because the values repeat. If `booked_at` ever holds full timestamps, almost every value is unique. Then the cache only adds overhead, so remove the decorator.
+verify:
+  module: true
+  test: |-
+    import io
+    import sys
+
+    iso_week.cache_clear()
+    assert iso_week("2026-10-24") == "2026-W43"
+    assert iso_week(" 24.10.2026 ") == "2026-W43"
+    assert iso_week("10/24/2026") == "2026-W43"
+    assert iso_week("2027-01-01") == "2026-W53"
+
+    iso_week.cache_clear()
+    iso_week("2026-10-24")
+    iso_week("2026-10-24")
+    assert iso_week.cache_info().hits == 1
+
+    try:
+        iso_week("20261024")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError")
+
+    _in, _out = sys.stdin, sys.stdout
+    sys.stdin = io.StringIO("id,booked_at,amount\n1,2026-10-24,9.90\n2,24.10.2026,5.00\n3,10/24/2026,1.50\n")
+    sys.stdout = io.StringIO()
+    try:
+        rc = main()
+        out = sys.stdout.getvalue()
+    finally:
+        sys.stdin, sys.stdout = _in, _out
+    assert rc == 0
+    assert out == (
+        "id,booked_at,amount,iso_week\n"
+        "1,2026-10-24,9.90,2026-W43\n"
+        "2,24.10.2026,5.00,2026-W43\n"
+        "3,10/24/2026,1.50,2026-W43\n"
+    ), out

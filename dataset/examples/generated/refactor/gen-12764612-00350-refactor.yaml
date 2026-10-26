@@ -1,0 +1,74 @@
+id: gen-12764612-00350-refactor
+category: refactor
+language: python
+patterns:
+- avoid-exception-flow
+- string-join
+facts:
+- F-EXC
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    hi, im new to python and i dont know whats wrong. i have a small gateway box that gets packets from lora temperature nodes and writes a csv report that we upload every minute. it works but my colleague says it is "slow and ugly". can you make it better?
+
+    ```python
+    NODE_NAMES = {
+        17: "cellar-boiler",
+        23: "cellar-pump",
+        31: "hall-north",
+        42: "roof-vent",
+    }
+
+    def format_report(packets):
+        report = "node,temp_c,battery_pct\n"
+        for p in packets:
+            try:
+                name = NODE_NAMES[p["node"]]
+            except KeyError:
+                name = "unknown-" + str(p["node"])
+            report += name + "," + "%.1f" % p["temp"] + "," + str(p["battery"]) + "\n"
+        return report
+    ```
+
+    Most of our nodes are not in the table yet, only a few are named.
+- role: assistant
+  content: |
+    ```python
+    NODE_NAMES = {
+        17: "cellar-boiler",
+        23: "cellar-pump",
+        31: "hall-north",
+        42: "roof-vent",
+    }
+
+    def format_report(packets):
+        lines = ["node,temp_c,battery_pct"]
+        for p in packets:
+            node = p["node"]
+            name = NODE_NAMES.get(node)
+            if name is None:
+                name = f"unknown-{node}"
+            lines.append(f"{name},{p['temp']:.1f},{p['battery']}")
+        return "\n".join(lines) + "\n"
+    ```
+
+    The output is the same as before, byte for byte.
+
+    **Green Notes**
+    - **`dict.get` instead of `try/except KeyError`** (reduces E): you said most nodes are not in the table, so the `except` branch runs for most packets, and raising an exception is the expensive part. In Green Metrics Tool micro-benchmarks with about half of the keys missing, `dict.get` used about 12% less CPU energy than `try/except KeyError`. When misses are rare, `try/except` is cheap, so this change matters here because misses are common.
+    - **`"".join` instead of `+=`** (reduces E): the report is now collected in a list and joined once. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces with `+=` used roughly 260× more CPU energy than `join`. Your report is much smaller, so the gap will be smaller too, but the list and `join` pattern costs nothing in readability and scales with the number of nodes.
+
+    The code assumes no node name is `None`. That holds for your table. The f-strings are used only to format each line, not to grow the report.
+verify:
+  equivalence:
+    driver: |-
+      PACKETS = [
+          {"node": 17, "temp": 61.25, "battery": 88},
+          {"node": 99, "temp": 19.0, "battery": 54},
+          {"node": 42, "temp": -3.449, "battery": 100},
+          {"node": 7, "temp": 21.5, "battery": 12},
+          {"node": 31, "temp": 18.04, "battery": 76},
+      ]
+      print(format_report(PACKETS), end="")
+      print(repr(format_report([])))

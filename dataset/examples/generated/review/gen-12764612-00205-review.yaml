@@ -1,0 +1,115 @@
+id: gen-12764612-00205-review
+category: review
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    hi, im new to pytorch. this script is our quality gate in GitHub Actions, it runs on every push and fails the pipeline when accuracy is under 90%. two things are strange: the accuracy is a little different each time for the same checkpoint, and once the runner died with out of memory. can you look at it? i dont know what is wrong
+
+    ```python
+    import sys
+    import torch
+    from torch.utils.data import DataLoader
+
+    from app.model import TicketNet
+    from app.data import ValDataset
+
+    THRESHOLD = 0.90
+
+
+    def main(ckpt_path):
+        model = TicketNet()
+        model.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
+
+        loader = DataLoader(ValDataset("data/val.parquet"), batch_size=64)
+        loss_fn = torch.nn.CrossEntropyLoss(reduction="sum")
+
+        correct = 0
+        total = 0
+        total_loss = 0
+        for x, y in loader:
+            out = model(x)
+            loss = loss_fn(out, y)
+            total_loss += loss
+            correct += (out.argmax(dim=1) == y).sum().item()
+            total += len(y)
+
+        acc = correct / total
+        print(f"acc={acc:.3f} loss={float(total_loss) / total:.3f}")
+        if acc < THRESHOLD:
+            sys.exit(1)
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1])
+    ```
+- role: assistant
+  content: |
+    **Workload:** AI/ML (model quality gate in CI)
+
+    #### [Bug] Model is still in training mode
+    - **Where:** `model = TicketNet()` ... `model(x)`, no `model.eval()`
+    - **Issue:** a new model starts in training mode. Dropout then switches off random neurons on every batch, and batch norm layers use the statistics of the current batch. That is why the accuracy changes between runs for the same checkpoint. It can also let a good model fail the gate, or a weak one pass.
+    - **Fix:** call `model.eval()` after loading the weights.
+    - **Impact:** correct and repeatable gate result.
+
+    #### [High] Autograd graph is built for every validation batch
+    - **Where:** the `for x, y in loader` loop
+    - **Issue:** outside `torch.no_grad()`, PyTorch records every operation so it could run a backward pass later. You never call `backward()`, so this work is wasted. It runs for every batch on every push. In Green Metrics Tool micro-benchmarks, 100,000 PyTorch CPU inferences used ~157 J without `torch.no_grad()` and ~135 J with it, about 14% less.
+    - **Fix:** wrap the loop in `torch.no_grad()`.
+    - **Impact:** E on every pipeline run, and less memory (see next finding).
+
+    #### [Medium] `total_loss += loss` keeps all graphs alive
+    - **Where:** `total_loss += loss`
+    - **Issue:** `loss` is a tensor that points to the whole graph of its batch. Adding it to `total_loss` keeps the graph of every batch in memory until the loop ends. On a big validation set this can fill the runner memory, which is the likely cause of your crash.
+    - **Fix:** with `no_grad` no graph is kept. Use `.item()` anyway, so `total_loss` is a plain Python number.
+    - **Impact:** M, memory stays flat for any validation size.
+
+    Fixed version:
+
+    ```python
+    import sys
+    import torch
+    from torch.utils.data import DataLoader
+
+    from app.model import TicketNet
+    from app.data import ValDataset
+
+    THRESHOLD = 0.90
+
+
+    def main(ckpt_path):
+        model = TicketNet()
+        model.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
+        model.eval()
+
+        loader = DataLoader(ValDataset("data/val.parquet"), batch_size=64)
+        loss_fn = torch.nn.CrossEntropyLoss(reduction="sum")
+
+        correct = 0
+        total = 0
+        total_loss = 0.0
+        with torch.no_grad():
+            for x, y in loader:
+                out = model(x)
+                total_loss += loss_fn(out, y).item()
+                correct += (out.argmax(dim=1) == y).sum().item()
+                total += len(y)
+
+        acc = correct / total
+        print(f"acc={acc:.3f} loss={total_loss / total:.3f}")
+        if acc < THRESHOLD:
+            sys.exit(1)
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1])
+    ```
+
+    **Already good:** the loss uses `reduction="sum"`, so dividing by `total` gives the right average. The script fails the job with a non-zero exit code, which is what a CI gate needs.
+verify:
+  static_only: needs torch and the project's app package

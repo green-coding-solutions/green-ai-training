@@ -1,0 +1,66 @@
+id: gen-1-00288-no-change
+category: no-change
+language: javascript
+patterns:
+- dom-size
+- context-tradeoff
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    Hello, I make a live log tail for our ops dashboard, the lines come from websocket. My colleague say "your DOM will grow too big, you must do virtual scroll or pagination, is bad for energy". I am not sure he is right. Can you check my code pls?
+
+    ```javascript
+    const MAX_LINES = 300;
+    const logEl = document.getElementById('log');
+    const pending = [];
+    let scheduled = false;
+
+    function levelClass(line) {
+      if (line.includes(' ERROR ')) return 'lvl-error';
+      if (line.includes(' WARN ')) return 'lvl-warn';
+      return 'lvl-info';
+    }
+
+    function flush() {
+      scheduled = false;
+      const stick = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 20;
+      const frag = document.createDocumentFragment();
+      for (const line of pending.splice(0)) {
+        const div = document.createElement('div');
+        div.className = levelClass(line);
+        div.textContent = line;
+        frag.appendChild(div);
+      }
+      logEl.appendChild(frag);
+      while (logEl.childElementCount > MAX_LINES) {
+        logEl.firstElementChild.remove();
+      }
+      if (stick) logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    const ws = new WebSocket(`wss://${location.host}/logs/stream`);
+    ws.onmessage = (ev) => {
+      pending.push(ev.data);
+      if (!scheduled) {
+        scheduled = true;
+        requestAnimationFrame(flush);
+      }
+    };
+    ```
+- role: assistant
+  content: |
+    Your colleague is right in general, but not for this code. Keep it as it is.
+
+    The DOM never grows. You cap it at `MAX_LINES = 300`, and you remove the oldest lines after each flush. That is already the main thing that virtual scroll or pagination would give you.
+
+    - **Small and flat DOM:** one `div` per line, with text set by `textContent`. There are no wrapper elements around cells.
+    - **Batched updates:** new lines are collected and added once per frame with a `DocumentFragment`. A burst of 1,000 messages causes one DOM update, not 1,000.
+    - **Safe output:** `textContent` does not parse the log text as HTML.
+
+    The measured saving for DOM size came from a very different case. In Green Metrics Tool browser benchmarks, a table with 10,000 rows and 14 elements per row used about 56% more energy than the same data paginated to 100 rows. Your widget holds about 300 simple nodes, so it is far from that case. Virtual scroll would add code and bugs (scroll position, text search, copy and paste) for no measurable gain.
+
+    Look at it again only if you raise `MAX_LINES` to thousands of lines, or if you start to wrap each line in more elements. Then cap the DOM or window it.
+verify:
+  static_only: needs a browser DOM and a websocket server

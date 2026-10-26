@@ -1,0 +1,91 @@
+id: gen-12764612-00296-generation
+category: generation
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    We run a small dashboard for our sediment transport simulations and I need the nginx server block (nginx 1.24, Ubuntu 22.04, TLS is terminated by a load balancer so plain port 80 is fine).
+
+    Requirements:
+    - Static site in /srv/sedlab/public. It is built in CI (HTML, JS, CSS, SVG icons, PNG plots). Fingerprinted files live under /assets/.
+    - /data/ holds JSON summaries (a few MB each). A nightly job rewrites them.
+    - /downloads/ holds raw model output as .nc and .h5 files, 200 MB to 2 GB. People download them with curl. Support range requests / resume.
+    - /api/ goes to a Flask app on 127.0.0.1:8000. It returns JSON, sometimes large time series.
+    - Server name is sedlab.example.org.
+
+    About 30 people use it, mostly researchers on the campus network and some from home.
+- role: assistant
+  content: |-
+    ```nginx
+    server {
+        listen 80;
+        server_name sedlab.example.org;
+
+        root /srv/sedlab/public;
+        index index.html;
+
+        sendfile on;
+        tcp_nopush on;
+
+        # Serve ready-made .gz files next to the originals (HTML, JS, CSS, SVG, JSON).
+        # No gzip work per request for static files.
+        gzip_static on;
+        gzip_vary on;
+
+        location / {
+            try_files $uri $uri/ =404;
+            add_header Cache-Control "no-cache";
+        }
+
+        location /assets/ {
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+        }
+
+        # Rewritten nightly, so keep the cache time short.
+        location /data/ {
+            expires 1h;
+        }
+
+        # .nc and .h5 are already compressed. Do not compress them again.
+        # Range requests work by default for static files.
+        location /downloads/ {
+            gzip off;
+            gzip_static off;
+            add_header Accept-Ranges bytes;
+        }
+
+        # Dynamic JSON: no .gz file exists, so compress per request, with a cheap level.
+        location /api/ {
+            proxy_pass http://127.0.0.1:8000;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_read_timeout 120s;
+
+            gzip on;
+            gzip_comp_level 3;
+            gzip_min_length 1024;
+            gzip_proxied any;
+            gzip_types application/json;
+        }
+    }
+    ```
+
+    Add this step to the end of your CI build, and to the end of the nightly job that rewrites `/data/`:
+
+    ```bash
+    find /srv/sedlab/public -type f \
+      \( -name '*.html' -o -name '*.js' -o -name '*.css' -o -name '*.svg' -o -name '*.json' \) \
+      -exec gzip -9 -k -f {} +
+    ```
+
+    `gzip_static` does not check timestamps. If the nightly job writes a new JSON file and leaves the old `.gz`, nginx serves the stale data. Always regenerate the `.gz` in the same job. PNG plots are not in the list because they are already compressed.
+
+    **Green Notes**
+    - **Precompressed static text** (reduces E, network): HTML, JS, CSS, SVG and the JSON summaries are compressed once at build time, not on every request. In Green Metrics Tool nginx benchmarks with 2,000 text requests, compressing on every request used about 4× the CPU energy of serving precompressed files. Text sent about 10× fewer bytes with compression. On a local network the byte saving was almost free, so for your home users it matters more than the benchmark shows.
+    - **Cheap level for dynamic JSON** (reduces E): `/api/` cannot be precompressed, so it uses gzip level 3 and skips tiny responses. In the same benchmark, per-request gzip level 5 cost about 7× the CPU energy of no compression, so keep the level low there.
+    - **No compression for `.nc` / `.h5`** (reduces E): these formats are already compressed, so gzip would spend CPU and save almost nothing. It would also get in the way of resumed downloads.

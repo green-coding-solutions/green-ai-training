@@ -1,0 +1,148 @@
+id: refactor-py-polar-hot-loop-lookups-001
+category: refactor
+language: python
+patterns: [hoist-invariants]
+facts: [F-ATTR]
+messages:
+  - role: user
+    content: |
+      this runs over ~50 million lidar points per scan and is our hottest function according to the profiler. any quick wins without rewriting it in numpy?
+
+      ```python
+      import math
+
+
+      def to_polar(points):
+          result = []
+          for x, y in points:
+              r = math.sqrt(x * x + y * y)
+              theta = math.atan2(y, x)
+              result.append((r, theta))
+          return result
+      ```
+  - role: assistant
+    content: |
+      ```python
+      import math
+
+
+      def to_polar(points):
+          sqrt, atan2 = math.sqrt, math.atan2
+          result = []
+          append = result.append
+          for x, y in points:
+              append((sqrt(x * x + y * y), atan2(y, x)))
+          return result
+      ```
+
+      **Green Notes**
+      - **Hoist loop-invariant attribute lookups** (reduces E): `math.sqrt`, `math.atan2` and `result.append` are looked up once instead of 50 million times each. Expect a small gain: in Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local variable before a 10,000,000-iteration loop saved about 4-5%. Since this is your hottest function, that is one of the few places where the trick is worth the extra lines.
+
+      The output is identical. For a bigger change you would have to leave the pure Python loop, which you wanted to avoid.
+verify:
+  test: |
+    import math
+    assert to_polar([(3.0, 4.0)]) == [(5.0, math.atan2(4.0, 3.0))]
+    assert to_polar([]) == []
+    assert to_polar([(0.0, -2.0), (1.0, 0.0)]) == [(2.0, math.atan2(-2.0, 0.0)), (1.0, 0.0)]
+---
+id: refactor-py-blocked-customers-lookup-001
+category: refactor
+language: python
+patterns: [set-membership]
+facts: [F-MEMB]
+messages:
+  - role: user
+    content: |
+      nightly job, orders is ~2M dicts, blocked_customer_ids is a list of ~30k ids from the fraud service. it's slow, help?
+
+      ```python
+      def filter_orders(orders, blocked_customer_ids):
+          kept = []
+          for order in orders:
+              if order["customer_id"] not in blocked_customer_ids:
+                  kept.append(order)
+          return kept
+      ```
+  - role: assistant
+    content: |
+      ```python
+      def filter_orders(orders, blocked_customer_ids):
+          blocked = set(blocked_customer_ids)
+          return [order for order in orders if order["customer_id"] not in blocked]
+      ```
+
+      **Green Notes**
+      - **Set for repeated membership tests** (reduces E): each `not in` on the list scanned up to 30k ids, 2 million times. The set is built once, and each lookup is then a hash check. Building a set only pays off when you look up many times: in Green Metrics Tool micro-benchmarks, a single test on a 10,000,000-element list (~6.9 J) was cheaper than converting it to a set first (~10.5 J). With 2 million lookups, you are far on the other side of that trade-off.
+
+      The result is the same list in the same order. The ids must be hashable, which ints and strings are.
+verify:
+  test: |
+    orders = [{"id": 1, "customer_id": 5}, {"id": 2, "customer_id": 7}, {"id": 3, "customer_id": 5}]
+    assert filter_orders(orders, [7]) == [{"id": 1, "customer_id": 5}, {"id": 3, "customer_id": 5}]
+    assert filter_orders(orders, []) == orders
+    assert filter_orders([], [1, 2]) == []
+---
+id: refactor-py-sequential-rate-fetch-async-001
+category: refactor
+language: python
+patterns: [async-concurrent-io]
+facts: [F-HTTP]
+messages:
+  - role: user
+    content: |
+      Our pricing service fetches exchange rates from 8 providers on startup and every 5 minutes. Can this be faster?
+
+      ```python
+      import requests
+
+      PROVIDERS = [
+          "https://rates-a.example.com/latest",
+          "https://rates-b.example.com/latest",
+          # ... 6 more
+      ]
+
+
+      def fetch_rates():
+          rates = []
+          for url in PROVIDERS:
+              resp = requests.get(url, timeout=5)
+              resp.raise_for_status()
+              rates.append(resp.json())
+          return rates
+      ```
+  - role: assistant
+    content: |
+      ```python
+      import asyncio
+
+      import httpx
+
+      PROVIDERS = [
+          "https://rates-a.example.com/latest",
+          "https://rates-b.example.com/latest",
+          # ... 6 more
+      ]
+
+
+      async def _fetch(client, url):
+          resp = await client.get(url)
+          resp.raise_for_status()
+          return resp.json()
+
+
+      async def fetch_rates_async():
+          async with httpx.AsyncClient(timeout=5) as client:
+              return await asyncio.gather(*(_fetch(client, url) for url in PROVIDERS))
+
+
+      def fetch_rates():
+          return asyncio.run(fetch_rates_async())
+      ```
+
+      **Green Notes**
+      - **Use async network calls** (reduces E, mostly wall time): the 8 requests now wait on the network at the same time, so a refresh takes about as long as the slowest provider instead of the sum of all. In Green Metrics Tool micro-benchmarks with Python, 10 HTTP requests used about 7% less CPU energy and about 17% less wall time with async `httpx` than with sync `urllib`. The gain is mostly the shorter wait.
+
+      `fetch_rates()` keeps its signature for callers that are not async. If the service already runs an event loop (FastAPI, aiohttp), call `fetch_rates_async()` directly instead, because `asyncio.run` fails inside a running loop. Like before, one failing provider makes the whole call fail. Pass `return_exceptions=True` to `gather` if you would rather keep the rates that did arrive.
+verify:
+  static_only: "needs network access and httpx"

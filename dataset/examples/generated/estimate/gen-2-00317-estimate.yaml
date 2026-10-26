@@ -1,0 +1,89 @@
+id: gen-2-00317-estimate
+category: estimate
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    Our platform team has to put numbers in the quarterly sustainability report, and someone pointed at this script. It runs at the end of every test job in our CI. It packs the test reports and uploads them to our artifact server.
+
+    ```bash
+    #!/usr/bin/env bash
+    # ci/pack-reports.sh: runs at the end of every test job
+    set -euo pipefail
+
+    JOB_ID="${CI_JOB_ID:?}"
+    OUT="reports-${JOB_ID}.tar.xz"
+    BUCKET_URL="${ARTIFACT_URL:?}/test-reports"
+
+    mkdir -p build/reports
+    cp test-results/*.xml build/reports/ 2>/dev/null || true
+    cp coverage/coverage-final.json build/reports/
+    cp -r logs build/reports/logs
+
+    tar -cf - -C build reports | xz -9e -T1 > "$OUT"
+
+    curl --fail --silent --show-error \
+      -H "Authorization: Bearer ${ARTIFACT_TOKEN:?}" \
+      --upload-file "$OUT" \
+      "${BUCKET_URL}/${OUT}"
+
+    rm -f "$OUT"
+    ```
+
+    Context and what I need:
+    - About 600 test jobs per day. Each archive is 150-300 MB uncompressed, almost all JUnit XML, coverage JSON and plain text logs.
+    - The merge request dashboard job downloads the archive a few minutes later. The artifact server keeps it for 14 days.
+    - The proposal is to switch to zstd. How much energy per day would that save? I need a figure I can defend in the report, not a guess.
+- role: assistant
+  content: |
+    I can't give you a daily figure you could defend. Any number I gave would be scaled from a different machine and different data. I can tell you the direction, which is clear and large, and how to get your own figure.
+
+    **What was measured**
+
+    In Green Metrics Tool benchmarks, CLI tools with default settings compressed 100 MB of English text:
+    - zstd: ~16 J, xz: ~458 J. That is about 29× more CPU energy for xz.
+    - Decompressing 100 MB: zstd ~5.3 J, xz ~11.7 J. This is what your dashboard job pays.
+
+    Your script uses `xz -9e`. That is a stronger setting than the default `-6` that was benchmarked, so expect the gap to be at least this big, not smaller. This was not measured, though.
+
+    **What drives your saving**
+    - Bytes compressed per job times jobs per day. Compression is the only part that changes. `cp`, `tar` and the upload stay the same.
+    - The compression level. Most of the cost is in `-9e`.
+    - Your data. XML, JSON and logs are text like the benchmark corpus, but they are not the same data.
+
+    **Trade-off to report honestly:** the benchmark compares energy only, not compression ratio. `xz -9e` usually makes smaller files than zstd at its default level. So you will upload a bit more and store a bit more for the 14 days. Measure the size difference too (see below).
+
+    **The change**
+
+    ```bash
+    OUT="reports-${JOB_ID}.tar.zst"
+    # ...
+    tar -cf - -C build reports | zstd -q > "$OUT"
+    ```
+
+    The dashboard job has to unpack it with `zstd -dc "$f" | tar -xf -` (or `tar --zstd -xf "$f"`), and the runner images need the `zstd` package.
+
+    **How to get a figure for the report**
+
+    Take one real `reports` directory from a CI job and run this on an otherwise idle machine:
+
+    ```bash
+    tar -cf reports.tar -C build reports
+
+    # CPU package energy (RAPL). Needs root or a low perf_event_paranoid. Repeat a few times.
+    perf stat -e power/energy-pkg/ -- sh -c 'xz -9e -T1 -c reports.tar > /dev/null'
+    perf stat -e power/energy-pkg/ -- sh -c 'zstd -q -c reports.tar > /dev/null'
+
+    # Compressed sizes, for the upload and storage side
+    xz -9e -T1 -c reports.tar | wc -c
+    zstd -q -c reports.tar | wc -c
+    ```
+
+    CI runners often don't expose RAPL. If yours don't, `/usr/bin/time -f '%U %S'` gives you CPU seconds as a proxy. For a figure that goes in a report, put both variants into a Green Metrics Tool usage scenario on the runner hardware you actually use. Then multiply your measured per-job difference by your job count. That number comes from your own data, so you can defend it.
+verify:
+  static_only: CI script that needs xz/zstd CLIs, a CI environment and an artifact server; measurement commands need RAPL
+    access

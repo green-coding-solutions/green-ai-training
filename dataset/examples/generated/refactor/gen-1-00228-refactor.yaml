@@ -1,0 +1,66 @@
+id: gen-1-00228-refactor
+category: refactor
+language: python
+patterns:
+- hoist-invariants
+- keep-star-imports
+facts:
+- F-ATTR
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    hello, our CI step who stage the build artifacts for upload is slow when the monorepo have around 2 million files. can you make it more efficent? my colleague also say the `from os.path import *` is bad and I should remove it, is it true?
+
+    ```python
+    import os
+    from os.path import *
+
+    SKIP_EXT = ('.map', '.log', '.tmp')
+
+
+    def stage_artifacts(paths, prefix):
+        staged = []
+        for p in paths:
+            if p.lower().endswith(SKIP_EXT):
+                continue
+            name = basename(p)
+            staged.append(os.path.join(prefix, name))
+        return staged
+    ```
+- role: assistant
+  content: |
+    ```python
+    import os
+    from os.path import *
+
+    SKIP_EXT = ('.map', '.log', '.tmp')
+
+
+    def stage_artifacts(paths, prefix):
+        join = os.path.join
+        staged = []
+        append = staged.append
+        for p in paths:
+            if p.lower().endswith(SKIP_EXT):
+                continue
+            append(join(prefix, basename(p)))
+        return staged
+    ```
+
+    **Green Notes**
+    - **Hoist loop-invariant attribute lookups** (reduces E): `os.path.join` and `staged.append` are looked up once, not 2 million times each. Expect a small gain. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local variable before a 10,000,000-iteration loop saved about 4-5%. With this many paths it is worth the two extra lines.
+    - **Star import left as is** (no change): in Green Metrics Tool micro-benchmarks, `from sympy import *` and `import sympy` used the same energy over 1,000 process starts (about 3103 J vs 3093 J). So your colleague's change would not make this script use less energy. You can remove it for style reasons, but not for energy.
+
+    The output is identical, in the same order.
+verify:
+  test: |
+    assert stage_artifacts(['a/b/app.js', 'x/app.js.map', 'build.LOG', 'c/tool'], 'out') == ['out/app.js', 'out/tool']
+    assert stage_artifacts([], 'out') == []
+    assert stage_artifacts(['z/file.tmp'], 'out') == []
+  equivalence:
+    driver: |-
+      paths = ['a/b/app.js', 'x/app.js.map', 'build.LOG', 'c/tool', 'd/e/index.html', 'q/a.TMP', 'r/data.json']
+      print(stage_artifacts(paths, 'out'))
+      print(stage_artifacts(paths * 3, '/srv/up'))
+      print(stage_artifacts([], 'out'))

@@ -1,0 +1,131 @@
+id: gen-2-00019-refactor
+category: refactor
+language: python
+patterns:
+- batch-db-writes
+- deque-or-append
+facts:
+- F-LISTINS
+- F-PG-INSERT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    Hi, I wrote a small script that imports the meter export from our vendor portal into Postgres. A yearly file has about 600k lines and the script takes very long, more than half an hour I think. Even the reading part is already slow before the inserts start. I am new to Python and databases and I don't know what is wrong. The export comes newest first, but I want the old readings first in the table so the ids go up with time.
+
+    ```python
+    import csv
+    import sys
+    from datetime import datetime
+
+    import psycopg
+
+    DSN = "dbname=meters user=meters"
+
+
+    def read_export(path):
+        readings = []
+        with open(path, newline="") as f:
+            reader = csv.DictReader(f, delimiter=";")
+            for line in reader:
+                if not line["kwh"]:
+                    continue  # meter was offline
+                readings.insert(0, (
+                    line["meter_id"],
+                    datetime.strptime(line["timestamp"], "%d.%m.%Y %H:%M"),
+                    float(line["kwh"].replace(",", ".")),
+                ))
+        return readings
+
+
+    def main():
+        if len(sys.argv) != 2:
+            print("usage: import_readings.py EXPORT.csv")
+            sys.exit(1)
+        readings = read_export(sys.argv[1])
+        print(f"read {len(readings)} readings")
+
+        with psycopg.connect(DSN) as conn:
+            with conn.cursor() as cur:
+                for i, (meter_id, ts, kwh) in enumerate(readings):
+                    cur.execute(
+                        "INSERT INTO readings (meter_id, read_at, kwh) VALUES (%s, %s, %s)",
+                        (meter_id, ts, kwh),
+                    )
+                    if i % 10000 == 0:
+                        print(f"{i} rows...")
+            conn.commit()
+        print("done")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    The table:
+
+    ```sql
+    CREATE TABLE readings (
+        id       bigserial PRIMARY KEY,
+        meter_id text NOT NULL,
+        read_at  timestamp NOT NULL,
+        kwh      numeric(10,3) NOT NULL
+    );
+    ```
+- role: assistant
+  content: |
+    ```python
+    import csv
+    import sys
+    from datetime import datetime
+
+    import psycopg
+
+    DSN = "dbname=meters user=meters"
+
+
+    def read_export(path):
+        readings = []
+        with open(path, newline="") as f:
+            reader = csv.DictReader(f, delimiter=";")
+            for line in reader:
+                if not line["kwh"]:
+                    continue  # meter was offline
+                readings.append((
+                    line["meter_id"],
+                    datetime.strptime(line["timestamp"], "%d.%m.%Y %H:%M"),
+                    float(line["kwh"].replace(",", ".")),
+                ))
+        readings.reverse()  # export is newest first, the table should be oldest first
+        return readings
+
+
+    def main():
+        if len(sys.argv) != 2:
+            print("usage: import_readings.py EXPORT.csv")
+            sys.exit(1)
+        readings = read_export(sys.argv[1])
+        print(f"read {len(readings)} readings")
+
+        with psycopg.connect(DSN) as conn:
+            with conn.cursor() as cur:
+                with cur.copy("COPY readings (meter_id, read_at, kwh) FROM STDIN") as copy:
+                    for i, row in enumerate(readings):
+                        copy.write_row(row)
+                        if i % 10000 == 0:
+                            print(f"{i} rows...")
+            conn.commit()
+        print("done")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **Avoid `list.insert(0)`** (reduces E): this is why reading was slow. Each front insert shifts every row already in the list, so the work grows quadratically with the file size. Now each row is appended, and one `reverse()` at the end gives the same order. In Green Metrics Tool micro-benchmarks, 1,000,000 × `list.insert(0, x)` used ~1515 J and 1,000,000 × `append` used ~1.2 J, a difference of over 1000×. A `collections.deque` with `appendleft` would also work, but one `reverse()` is simpler here.
+    - **Batch database writes with COPY** (reduces E): before, every row was its own `INSERT` statement and its own round trip to the server. Now the whole file goes in as one `COPY` stream. In Green Metrics Tool micro-benchmarks with PostgreSQL, inserting 500,000 rows in batches of 5,000, `COPY ... FROM STDIN` used ~17 J against ~384 J for one `execute()` per row. That is about 22× less, and about 8× less than `executemany()`. A file this size is the case where COPY pays off.
+
+    Nothing else changes. You get the same rows in the same order. `COPY` inserts rows in the order they are written, so the `bigserial` ids still go up with time. Everything is still committed once at the end, so if one row fails, nothing is imported, just like before. The progress lines now count rows sent to the COPY stream.
+verify:
+  static_only: needs a running PostgreSQL server and the psycopg package

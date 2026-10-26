@@ -1,0 +1,110 @@
+id: gen-12764612-00191-review
+category: review
+language: html
+patterns:
+- remove-unused-css
+facts:
+- F-UNUSED-CSS
+messages:
+- role: user
+  content: |
+    We have an internal developer portal page for our Orders REST API. It's one static HTML file that Flask serves at `/docs/orders`, and about 40 developers use it. It lists the endpoints and has a small "try it" box for GET requests.
+
+    Requirements: no build step (we don't want npm for one file), it must work in our company browsers, and it must stay a single file. Can you review it before we release? I care about bugs and security first, and then anything that makes the page heavy.
+
+    ```html
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <title>Orders API</title>
+      <style>
+        * { box-sizing: border-box; }
+        body { font-family: system-ui, sans-serif; margin: 0; color: #222; }
+        .container { max-width: 960px; margin: 0 auto; padding: 24px; }
+        h1 { font-size: 1.6rem; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { text-align: left; padding: 8px; border-bottom: 1px solid #ddd; }
+        code, pre { background: #f5f5f5; padding: 2px 4px; }
+        pre { padding: 12px; overflow-x: auto; }
+        .method { font-weight: 700; }
+        .method.get { color: #0a7a3d; }
+        .method.post { color: #b25e00; }
+        .method.delete { color: #b00020; }
+        .carousel { position: relative; overflow: hidden; }
+        .carousel-item { display: none; }
+        .carousel-item.active { display: block; }
+        .modal { position: fixed; inset: 0; background: rgba(0,0,0,.5); display: none; }
+        .modal.open { display: flex; align-items: center; justify-content: center; }
+        .modal-body { background: #fff; padding: 24px; border-radius: 6px; }
+        .tooltip { position: absolute; background: #333; color: #fff; padding: 4px 8px; }
+        .badge { display: inline-block; padding: 2px 6px; border-radius: 10px; font-size: .75rem; }
+        .badge-info { background: #cfe8ff; }
+        .badge-warn { background: #ffe9b3; }
+        .navbar { display: flex; gap: 16px; padding: 12px 24px; background: #111; }
+        .navbar a { color: #fff; text-decoration: none; }
+        .btn { padding: 6px 12px; border: 1px solid #888; background: #fff; cursor: pointer; }
+        .btn-primary { background: #0b57d0; color: #fff; border-color: #0b57d0; }
+        .btn-lg { padding: 10px 20px; font-size: 1.1rem; }
+        .alert { padding: 12px; border-radius: 4px; }
+        .alert-danger { background: #fde0e0; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <h1>Orders API</h1>
+        <table>
+          <tr><th>Method</th><th>Path</th><th>Description</th></tr>
+          <tr><td class="method get">GET</td><td><code>/api/v1/orders/{id}</code></td><td>Get one order</td></tr>
+          <tr><td class="method post">POST</td><td><code>/api/v1/orders</code></td><td>Create an order</td></tr>
+          <tr><td class="method delete">DELETE</td><td><code>/api/v1/orders/{id}</code></td><td>Cancel an order</td></tr>
+        </table>
+
+        <h2>Try it</h2>
+        <input id="order-id" placeholder="order id">
+        <button class="btn btn-primary" onclick="loadOrder()">GET</button>
+        <pre id="out"></pre>
+      </div>
+
+      <script>
+        function loadOrder() {
+          var id = document.getElementById('order-id').value;
+          fetch('/api/v1/orders/' + id)
+            .then(function (r) { return r.text(); })
+            .then(function (t) { document.getElementById('out').innerHTML = t; });
+        }
+      </script>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (small internal page)
+
+    #### [Security] Response is written with `innerHTML`
+    - **Where:** `document.getElementById('out').innerHTML = t;`
+    - **Issue:** the API response is treated as HTML. If any order field holds markup (a customer name, a note), it runs as script in the portal page. The `id` is also put into the URL without encoding, so input like `1/../../x` or `1?x=y` changes which path is called.
+    - **Fix:** write the response as text and encode the id:
+      ```javascript
+      function loadOrder() {
+        var id = document.getElementById('order-id').value;
+        fetch('/api/v1/orders/' + encodeURIComponent(id))
+          .then(function (r) { return r.text(); })
+          .then(function (t) { document.getElementById('out').textContent = t; });
+      }
+      ```
+
+    #### [Bug] Errors are not shown
+    - **Where:** the `fetch(...)` chain in `loadOrder`
+    - **Issue:** a network failure gives an unhandled promise rejection and the box stays empty. A 404 body is printed like a normal result, so the user can't tell them apart.
+    - **Fix:** add `.catch(function (e) { document.getElementById('out').textContent = 'Request failed: ' + e.message; })` at the end of the chain, and show `r.status` before the body.
+
+    #### [Low] About 15 CSS rules are never used
+    - **Where:** `.carousel*`, `.modal*`, `.tooltip`, `.badge*`, `.navbar*`, `.btn-lg`, `.alert*`
+    - **Issue:** nothing in the page uses these classes. They look copied from a UI kit. In Green Metrics Tool micro-benchmarks (50 cold page loads), a 16 KB stylesheet with mostly unused rules used ~783 J of client CPU energy, and the same page purged down to 0.75 KB used ~764 J. That is about 2% less, which is within measurement noise. So removing them saves bytes, not measurable CPU.
+    - **Fix:** delete the dead blocks by hand and keep `.btn` and `.btn-primary`. Don't add PurgeCSS or any build step for this: it would break your single-file requirement for no measurable gain.
+    - **Impact:** network bytes only, tiny. On an internal network with 40 users, treat it as cleanup.
+
+    **Already good:** system font stack (no web fonts to download), one inline stylesheet (no extra request), no images or external scripts.
+verify:
+  static_only: html page with browser JS, review only

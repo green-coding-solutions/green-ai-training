@@ -1,0 +1,108 @@
+id: gen-2-00111-refactor
+category: refactor
+language: bash
+patterns:
+- compress-stored
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    hi, this script is from our clickstream ETL. cron run it every 15 minute on the etl worker. Lately the box is on 100% cpu a lot and i think sometimes two runs are overlaping. can you optimize and clean it up? the warehouse team say ingest can read xz, gz and zst files.
+
+    ```bash
+    #!/bin/bash
+    # ship_batches.sh - runs every 15 min from cron on etl-worker-01
+    # takes new export batches from the extractor, cleans them and sends to warehouse ingest
+    set -e
+
+    SRC_DIR=/data/extract/outbox
+    WORK_DIR=/data/extract/work
+    ARCHIVE_DIR=/data/extract/archive
+    INGEST_HOST=ingest.dwh.internal
+    INGEST_PATH=/incoming/clickstream
+    LOG=/var/log/ship_batches.log
+
+    mkdir -p $WORK_DIR $ARCHIVE_DIR
+
+    for f in $SRC_DIR/*.jsonl; do
+        [ -e "$f" ] || continue
+        name=$(basename "$f" .jsonl)
+        echo "$(date '+%F %T') start $name" >> $LOG
+
+        # stage raw copy (compressed to save disk)
+        bzip2 -9 -c "$f" > $WORK_DIR/$name.raw.bz2
+        bunzip2 -c $WORK_DIR/$name.raw.bz2 | grep -v '"bot":true' > $WORK_DIR/$name.clean.jsonl
+        rm $WORK_DIR/$name.raw.bz2
+
+        # compress for sending
+        xz -9 -k $WORK_DIR/$name.clean.jsonl
+        scp -q $WORK_DIR/$name.clean.jsonl.xz $INGEST_HOST:$INGEST_PATH/
+
+        # keep archive copy 90 days
+        xz -9 -c $WORK_DIR/$name.clean.jsonl > $ARCHIVE_DIR/$name.jsonl.xz
+
+        rm $WORK_DIR/$name.clean.jsonl $WORK_DIR/$name.clean.jsonl.xz
+        rm "$f"
+        echo "$(date '+%F %T') done $name" >> $LOG
+    done
+
+    find $ARCHIVE_DIR -name '*.xz' -mtime +90 -delete
+    ```
+- role: assistant
+  content: |
+    ```bash
+    #!/bin/bash
+    # ship_batches.sh - runs every 15 min from cron on etl-worker-01
+    # takes new export batches from the extractor, cleans them and sends to warehouse ingest
+    set -euo pipefail
+
+    SRC_DIR='/data/extract/outbox'
+    WORK_DIR='/data/extract/work'
+    ARCHIVE_DIR='/data/extract/archive'
+    INGEST_HOST='ingest.dwh.internal'
+    INGEST_PATH='/incoming/clickstream'
+    LOG='/var/log/ship_batches.log'
+
+    mkdir -p "$WORK_DIR" "$ARCHIVE_DIR"
+
+    # skip this run if the previous one is still busy
+    exec 9>"$WORK_DIR/.ship_batches.lock"
+    flock -n 9 || exit 0
+
+    shopt -s nullglob
+    for f in "$SRC_DIR"/*.jsonl; do
+        name=$(basename "$f" .jsonl)
+        out="$WORK_DIR/$name.jsonl.zst"
+        echo "$(date '+%F %T') start $name" >> "$LOG"
+
+        # filter and compress in one pass; grep exit 1 only means "no lines left"
+        { grep -v '"bot":true' "$f" || [ $? -eq 1 ]; } | zstd -q -f -o "$out"
+
+        scp -q "$out" "$INGEST_HOST:$INGEST_PATH/"
+
+        # the file we just sent is also the archive copy
+        mv "$out" "$ARCHIVE_DIR/"
+        rm "$f"
+        echo "$(date '+%F %T') done $name" >> "$LOG"
+    done
+
+    # also expire the old .xz archives
+    find "$ARCHIVE_DIR" \( -name '*.jsonl.xz' -o -name '*.jsonl.zst' \) -mtime +90 -delete
+    ```
+
+    **Green Notes**
+    - **No compression for the staging copy** (reduces E): the script wrote the raw `bzip2 -9` file and unpacked it again a few seconds later. Data that only lives for seconds or minutes should not be compressed. bzip2 was also the most expensive codec to decompress in Green Metrics Tool measurements. Now `grep` reads the batch directly.
+    - **Compress once, with zstd** (reduces E, network): the old script ran `xz -9` twice on the same data, once for sending and once for the archive. Now one `zstd` pass writes the file. That file is sent and then moved into the archive. In Green Metrics Tool measurements on 100 MB of text at default levels, xz used about 29× more CPU energy than zstd, and `-9` is heavier than xz's default. Most of your CPU load probably comes from this.
+    - **Archive stays compressed** (reduces storage): 90 days is far beyond the break-even point. A Green Coding Solutions estimate puts it at about 0.15 days for zstd. The measurements compare energy, not file size, and `xz -9` usually makes smaller files. If archive disk space is tight, compare the sizes for one day of batches before you decide.
+
+    **Fixes**
+    - **Overlapping runs:** with `flock -n`, a new run exits if the previous one still holds the lock. Before, two runs could pick up the same batch and send it to ingest twice. Slow `xz -9` runs made this more likely.
+    - **Batch with only bots stopped the script:** `grep -v` exits with 1 when no line is left, and `set -e` then aborted the whole loop. Now exit 1 is accepted. Real grep errors (exit 2) still stop the script.
+    - Variables are quoted, and `nullglob` replaces the `[ -e ]` check.
+
+    **Behavior changes:** ingest now gets `<name>.jsonl.zst` instead of `<name>.clean.jsonl.xz`, and new archive files are `.jsonl.zst`. The cleanup matches both extensions, so the existing `.xz` archives still expire after 90 days.
+verify:
+  static_only: bash script that needs scp, zstd, flock and a remote ingest host

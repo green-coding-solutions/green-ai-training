@@ -1,0 +1,128 @@
+id: gen-2-00135-refactor
+category: refactor
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    I maintain a small Metropolis sampler in our group's simulation package. It samples a particle in a double-well potential. A parameter sweep starts hundreds of chains on the cluster, each about 20 million steps. The profiler shows almost all the time is spent in `run()`.
+
+    Can you clean it up and make it faster? Requirements:
+    - Standard library only. This module ships inside a plugin host where we can't add numpy or numba.
+    - Chains must stay bit-identical for a given seed. Our regression tests compare against stored trajectories.
+    - Keep the public API (`DoubleWellSampler(...)`, `run(n_steps, x0, thin)` and its return value).
+    - It should stay readable for the grad students who extend it.
+
+    ```python
+    import math
+    import random
+
+
+    class DoubleWellSampler:
+        """Metropolis sampler for a particle in V(x) = a*x**4 - b*x**2."""
+
+        def __init__(self, a=1.0, b=2.0, temperature=0.5, step=0.4, seed=1234):
+            self.a = a
+            self.b = b
+            self.beta = 1.0 / temperature
+            self.step = step
+            self.rng = random.Random(seed)
+
+        def potential(self, x):
+            x2 = x * x
+            return self.a * x2 * x2 - self.b * x2
+
+        def run(self, n_steps, x0=0.0, thin=10):
+            x = x0
+            e = self.potential(x)
+            samples = []
+            accepted = 0
+            for i in range(n_steps):
+                x_new = x + self.rng.gauss(0.0, self.step)
+                e_new = self.potential(x_new)
+                d_e = e_new - e
+                if d_e <= 0.0 or self.rng.random() < math.exp(-self.beta * d_e):
+                    x, e = x_new, e_new
+                    accepted += 1
+                if i % thin == 0:
+                    samples.append(x)
+            return samples, accepted / n_steps
+    ```
+- role: assistant
+  content: |
+    ```python
+    import math
+    import random
+
+
+    class DoubleWellSampler:
+        """Metropolis sampler for a particle in V(x) = a*x**4 - b*x**2."""
+
+        def __init__(self, a=1.0, b=2.0, temperature=0.5, step=0.4, seed=1234):
+            self.a = a
+            self.b = b
+            self.beta = 1.0 / temperature
+            self.step = step
+            self.rng = random.Random(seed)
+
+        def potential(self, x):
+            x2 = x * x
+            return self.a * x2 * x2 - self.b * x2
+
+        def run(self, n_steps, x0=0.0, thin=10):
+            # Look these up once per run instead of once per step.
+            potential = self.potential
+            gauss = self.rng.gauss
+            uniform = self.rng.random
+            exp = math.exp
+            beta = self.beta
+            step = self.step
+
+            x = x0
+            e = potential(x)
+            samples = []
+            append = samples.append
+            accepted = 0
+            for i in range(n_steps):
+                x_new = x + gauss(0.0, step)
+                e_new = potential(x_new)
+                d_e = e_new - e
+                if d_e <= 0.0 or uniform() < exp(-beta * d_e):
+                    x, e = x_new, e_new
+                    accepted += 1
+                if i % thin == 0:
+                    append(x)
+            return samples, accepted / n_steps
+    ```
+
+    **Green Notes**
+    - **Hoist loop-invariant attribute lookups** (reduces E): `self.rng.gauss`, `self.rng.random`, `math.exp`, `self.potential`, `self.beta`, `self.step` and `samples.append` used to be resolved on every step. Now they are local names, resolved once per `run()`. Expect a small gain. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local variable before a 10,000,000-iteration loop saved about 4-5%. It is worth it here because the loop is your hot path and runs across many chains.
+    - **Bit-identical chains:** the arithmetic is unchanged. The RNG calls happen in the same order, and the short-circuit `or` still skips `uniform()` when `d_e <= 0`. The same seed gives the same trajectory and acceptance rate.
+    - **One behavior detail:** `beta` and `step` are now read at the start of `run()`. Changing them on the instance during a run would no longer take effect. Nothing in the loop does that, so the result is the same.
+    - Larger speedups would require leaving the pure Python loop. Your constraints rule that out, so the structure is kept as it is for the students.
+verify:
+  test: |
+    s1 = DoubleWellSampler(seed=7)
+    s2 = DoubleWellSampler(seed=7)
+    a = s1.run(5000, x0=0.3, thin=5)
+    b = s2.run(5000, x0=0.3, thin=5)
+    assert a == b
+    samples, rate = a
+    assert len(samples) == 1000
+    assert 0.0 < rate < 1.0
+    s3 = DoubleWellSampler(a=0.5, b=1.5, temperature=1.0, step=0.8, seed=99)
+    samples3, rate3 = s3.run(1001, thin=10)
+    assert len(samples3) == 101
+  equivalence:
+    driver: |-
+      s = DoubleWellSampler(seed=42)
+      samples, rate = s.run(20000, x0=0.5, thin=7)
+      print(len(samples), repr(rate))
+      print(repr(sum(samples)))
+      print(repr(samples[:5]), repr(samples[-3:]))
+      t = DoubleWellSampler(a=0.5, b=1.5, temperature=1.0, step=0.8, seed=3)
+      samples2, rate2 = t.run(3000)
+      print(len(samples2), repr(rate2), repr(samples2[-1]))

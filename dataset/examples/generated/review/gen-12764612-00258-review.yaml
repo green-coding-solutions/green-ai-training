@@ -1,0 +1,96 @@
+id: gen-12764612-00258-review
+category: review
+language: python
+patterns:
+- string-join
+- regex-precompile
+facts:
+- F-STRCAT
+- F-REGEX
+messages:
+- role: user
+  content: |
+    hi, i am new to python and i wrote this to make a summary of our app logs. it works on my small test file but on the real logs (millions of lines some days) it feels slow. can you look at it and tell me what is wrong? i dont know what to fix
+
+    ```python
+    import re
+
+    def summarize_log(path):
+        f = open(path)
+        report = ""
+        count = 0
+        for line in f:
+            m = re.match(r"(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}) (ERROR|WARN) (\w+): (.*)", line)
+            if m:
+                count += 1
+                report += m.group(1) + " " + m.group(2) + " [" + m.group(3) + "] " + m.group(4) + " -> " + m.group(5) + "\n"
+        report += "Total: " + str(count) + "\n"
+        return report
+
+    if __name__ == "__main__":
+        print(summarize_log("app.log"))
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (log processing, large input)
+
+    #### [Bug] File is never closed
+    - **Where:** `f = open(path)`
+    - **Issue:** nothing closes the file. If an error happens in the loop, the handle stays open until the program ends.
+    - **Fix:** use `with open(path) as f:`.
+
+    #### [High] String built with `+=` in a loop
+    - **Where:** `report += ...`
+    - **Issue:** each matching line makes the string longer by `+=`. With millions of lines, this is the main cost of your function.
+    - **Fix:** collect the pieces in a list and call `"".join(...)` once at the end.
+    - **Impact:** reduces E and M. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces used roughly 260× less CPU energy with `"".join()` than with `+=`. Your real saving depends on how many lines match.
+
+    #### [Low] Regex pattern is written inside the loop
+    - **Where:** `re.match(r"...", line)`
+    - **Issue:** the pattern never changes, but it is looked up again for every line. Python caches compiled patterns, so the loss is small. In Green Metrics Tool micro-benchmarks, a precompiled pattern used about 18% less CPU energy over 1,000,000 matches. Compiling once is still cleaner and does not depend on the cache.
+    - **Fix:** `re.compile(...)` once at module level.
+
+    ```python
+    import re
+
+    LINE_RE = re.compile(r"(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}) (ERROR|WARN) (\w+): (.*)")
+
+    def summarize_log(path):
+        parts = []
+        with open(path) as f:
+            for line in f:
+                m = LINE_RE.match(line)
+                if m:
+                    date, clock, level, source, message = m.groups()
+                    parts.append(f"{date} {clock} [{level}] {source} -> {message}\n")
+        parts.append(f"Total: {len(parts)}\n")
+        return "".join(parts)
+
+    if __name__ == "__main__":
+        print(summarize_log("app.log"))
+    ```
+
+    The output is identical. `len(parts)` is the number of matched lines, because the total is added after the loop and before it joins.
+
+    **Already good:** the file is read line by line, so the whole log is never loaded at once.
+verify:
+  module: true
+  equivalence:
+    driver: |-
+      import os
+      import tempfile
+      lines = [
+          "2026-10-01 12:00:01 ERROR db: connection lost",
+          "2026-10-01 12:00:02 INFO web: request ok",
+          "2026-10-01 12:00:03 WARN cache: slow response (120ms)",
+          "garbage line without format",
+          "2026-10-02 08:15:59 ERROR api: timeout -> retry",
+          "2026-10-02 08:16:00 WARN disk: 91% full",
+      ]
+      for i in range(200):
+          lines.append(f"2026-10-03 10:{i % 60:02d}:00 {'ERROR' if i % 3 else 'WARN'} job{i % 7}: item {i} failed")
+      d = tempfile.mkdtemp()
+      p = os.path.join(d, "app.log")
+      with open(p, "w") as fh:
+          fh.write("\n".join(lines))
+      print(summarize_log(p))

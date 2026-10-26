@@ -1,0 +1,56 @@
+id: gen-2-00389-no-change
+category: no-change
+language: dockerfile
+patterns:
+- small-container-images
+- context-tradeoff
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    I maintain `logship`, a small Python service that tails JSON logs from our app nodes, batches them, compresses the rotated archives with the `zstd` CLI and uploads them to S3. GitHub Actions builds the image on every PR and on every merge to main. A colleague wants to move it to Alpine or distroless to "make it even leaner and cut CI energy".
+
+    Requirements:
+    - the `zstd` binary must stay in the image (the rotate step shells out to it)
+    - must run as non-root
+    - Debian-based is preferred because our ops team debugs with the usual Debian tools when needed
+    - deps: boto3, orjson, pyyaml (pinned in requirements.txt)
+
+    Is there anything worth changing here, or is it fine as is?
+
+    ```dockerfile
+    FROM python:3.12-slim
+
+    ENV PYTHONDONTWRITEBYTECODE=1 \
+        PYTHONUNBUFFERED=1
+
+    RUN apt-get update \
+        && apt-get install -y --no-install-recommends zstd \
+        && rm -rf /var/lib/apt/lists/*
+
+    RUN useradd --system --uid 10001 --home /app logship
+    WORKDIR /app
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY logship/ ./logship/
+
+    USER logship
+    ENTRYPOINT ["python", "-m", "logship"]
+    CMD ["--config", "/etc/logship/config.yaml"]
+    ```
+- role: assistant
+  content: |
+    It's fine as is. This Dockerfile already does the things that matter for an image CI builds on every PR, so I would not change it.
+
+    - **Slim base, runtime packages only:** `python:3.12-slim` with only `zstd`, installed with `--no-install-recommends`, and the apt lists removed. There are no compilers, editors or dev tools in the image.
+    - **Dependency layer before the source:** `requirements.txt` is copied and installed before `logship/`. A PR that only touches code reuses the cached pip layer when the CI cache is warm.
+    - **`pip --no-cache-dir`:** the image doesn't store a wheel cache.
+
+    In Green Metrics Tool measurements of a small Flask app built without a build cache, exactly this combination (slim base, runtime deps only, dependency layer first, `--no-cache-dir`) used ~124 J per build. The full `python:3.12` base with build tools and dev packages used ~885 J, about 7× more. Serving 2,000 requests afterwards cost the same with both images (~17 J), so the saving is in builds, pulls and stored copies. You already have that saving.
+
+    *Not applied:* switching to Alpine or distroless. Slim vs. full image was measured. Slim vs. Alpine or distroless was not, so I can't promise a further saving. Both options also conflict with your requirements. Distroless has no package manager for `zstd` and none of the Debian tools your ops team uses. On Alpine, some wheels may have to be built from source, and that brings compilers back into the build. If your colleague still wants to try it, build both variants in a Green Metrics Tool usage scenario on the same runner and compare the results. Don't decide based on image size alone.
+verify:
+  static_only: dockerfile, needs a Docker build

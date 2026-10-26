@@ -1,0 +1,80 @@
+id: gen-1-00158-review
+category: review
+language: python
+patterns:
+- deque-or-append
+- hoist-invariants
+facts:
+- F-LISTINS
+- F-ATTR
+messages:
+- role: user
+  content: |
+    review?
+
+    ```python
+    def score_stream(samples, cfg, size=16000):
+        """Rolling anomaly score for the audio model input, one score per hop."""
+        window = []
+        total = 0.0
+        scores = []
+        for i, x in enumerate(samples):
+            v = x * cfg.gain
+            window.insert(0, v)          # newest first
+            total += v
+            if len(window) > size:
+                total -= window.pop()
+            if i % cfg.hop == 0 and len(window) == size:
+                mean = total / size
+                scores.append(round(abs(window[0] - mean) / cfg.scale, 4))
+        return scores
+    ```
+- role: assistant
+  content: |
+    **Workload:** AI/ML (inference pre-processing, per sample)
+
+    #### [High] Front insert into a large window
+    - **Where:** `window.insert(0, v)`
+    - **Issue:** every insert shifts the whole list. Once the window is full, that is about 16000 element moves per sample, so the work grows with window size times stream length. You only read the newest value and drop the oldest, so a list is the wrong structure.
+    - **Fix:** use a `deque`. `appendleft` and `pop` are O(1), and `window[0]` is still the newest value.
+    - **Impact:** reduces E on the server for every sample. In Green Metrics Tool micro-benchmarks, 1,000,000 `list.insert(0, x)` calls used over 1000× the CPU energy of 1,000,000 `append` calls, because of the shifting. Your window is much smaller than a list of 1,000,000, so the gap will be smaller, but it still scales with `size`.
+
+    #### [Low] Attribute lookups in the loop
+    - **Where:** `cfg.gain`, `cfg.hop`, `cfg.scale`, `window.insert`
+    - **Issue:** each is looked up again on every sample. In Green Metrics Tool micro-benchmarks, caching one lookup in a local variable before a 10,000,000-iteration loop saved only about 4-5%. This matters only because the loop runs once per audio sample.
+    - **Fix:** read them into locals once before the loop.
+
+    ```python
+    from collections import deque
+
+
+    def score_stream(samples, cfg, size=16000):
+        """Rolling anomaly score for the audio model input, one score per hop."""
+        window = deque()
+        total = 0.0
+        scores = []
+        gain, hop, scale = cfg.gain, cfg.hop, cfg.scale
+        appendleft, pop = window.appendleft, window.pop
+        for i, x in enumerate(samples):
+            v = x * gain
+            appendleft(v)                # newest first
+            total += v
+            if len(window) > size:
+                total -= pop()
+            if i % hop == 0 and len(window) == size:
+                mean = total / size
+                scores.append(round(abs(window[0] - mean) / scale, 4))
+        return scores
+    ```
+
+    Output is identical. The order of the window is unchanged, and the running total is updated in the same way. Only use `window[0]` and `window[-1]` on a `deque`. Indexing into the middle is O(n), unlike a list.
+
+    **Already good:** the running `total` avoids re-summing the window on every hop.
+verify:
+  equivalence:
+    driver: |-
+      from types import SimpleNamespace
+      cfg = SimpleNamespace(gain=0.5, hop=50, scale=3.0)
+      samples = [((i * 37) % 101) / 10 for i in range(5000)]
+      out = score_stream(samples, cfg, size=200)
+      print(len(out), out[:5], out[-5:], round(sum(out), 6))

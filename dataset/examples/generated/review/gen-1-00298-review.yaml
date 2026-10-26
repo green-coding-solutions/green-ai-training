@@ -1,0 +1,140 @@
+id: gen-1-00298-review
+category: review
+language: python
+patterns:
+- vectorize-or-jit
+- simple-conditions
+facts:
+- F-NUMBA
+- F-COND
+messages:
+- role: user
+  content: |
+    review? runs nightly over our CI step history, around 20M rows
+
+    ```python
+    import json
+    import sys
+
+
+    def summarize(codes, durations_ms):
+        passed = failed = timeouts = killed = other = 0
+        slowest = 0
+        total_ms = 0
+        for i in range(len(codes)):
+            code = codes[i]
+            ms = durations_ms[i]
+            total_ms += ms
+            if ms > slowest:
+                slowest = ms
+            if 0 <= code < 1:
+                passed += 1
+            elif 1 <= code <= 2:
+                failed += 1
+            elif 124 <= code < 125:
+                timeouts += 1
+            elif 128 < code < 140 and code % 128 in (2, 9):
+                killed += 1
+            else:
+                other += 1
+        total = passed + failed + timeouts + killed + other
+        return {
+            "passed": passed,
+            "failed": failed,
+            "timeouts": timeouts,
+            "killed": killed,
+            "other": other,
+            "slowest_ms": slowest,
+            "avg_ms": total_ms / total,
+            "fail_rate": (failed + timeouts + killed) / total,
+        }
+
+
+    if __name__ == "__main__":
+        with open(sys.argv[1]) as f:
+            data = json.load(f)
+        print(summarize(data["codes"], data["durations_ms"]))
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly batch)
+
+    #### [Bug] Crash on empty input
+    - **Where:** `total_ms / total` and `(failed + ...) / total`
+    - **Issue:** if a night has no rows, `total` is 0 and the job dies with `ZeroDivisionError`.
+    - **Fix:** return zero rates when there are no rows (done in the code below).
+
+    #### [High] Pure Python loop over 20M rows
+    - **Where:** `for i in range(len(codes))`
+    - **Issue:** this is a CPU-bound numeric loop. Every row costs interpreter overhead for indexing, comparisons and additions.
+    - **Fix:** move the loop into a Numba `@njit` function and pass NumPy arrays.
+    - **Impact:** reduces E on every nightly run. In Green Metrics Tool micro-benchmarks, a pure Python numeric loop over 10,000,000 samples used about 4× more CPU energy than the same loop with Numba `@njit`. Your result will depend on the data, so measure a real run with `perf stat` or a Green Metrics Tool scenario.
+
+    #### [Low] Range and modulo guards for exact exit codes
+    - **Where:** the `if/elif` chain
+    - **Issue:** `0 <= code < 1`, `124 <= code < 125` and `code % 128 in (2, 9)` only match the codes 0, 1-2, 124, and 130/137. Plain equality says the same thing and is easier to read.
+    - **Impact:** in pure Python, simple equality branches used about 16% less CPU energy than complex range/modulo guards in Green Metrics Tool micro-benchmarks. Under Numba the gap will be smaller, so treat this mainly as a cleanup.
+
+    ```python
+    import json
+    import sys
+
+    import numpy as np
+    from numba import njit
+
+
+    @njit(cache=True)
+    def _count(codes, durations_ms):
+        passed = failed = timeouts = killed = other = 0
+        slowest = 0
+        total_ms = 0
+        for i in range(codes.shape[0]):
+            code = codes[i]
+            ms = durations_ms[i]
+            total_ms += ms
+            if ms > slowest:
+                slowest = ms
+            if code == 0:
+                passed += 1
+            elif code == 1 or code == 2:
+                failed += 1
+            elif code == 124:
+                timeouts += 1
+            elif code == 130 or code == 137:
+                killed += 1
+            else:
+                other += 1
+        return passed, failed, timeouts, killed, other, slowest, total_ms
+
+
+    def summarize(codes, durations_ms):
+        codes = np.asarray(codes, dtype=np.int64)
+        durations_ms = np.asarray(durations_ms, dtype=np.int64)
+        if codes.shape[0] != durations_ms.shape[0]:
+            raise ValueError("codes and durations_ms must have the same length")
+
+        passed, failed, timeouts, killed, other, slowest, total_ms = _count(codes, durations_ms)
+        total = codes.shape[0]
+        return {
+            "passed": passed,
+            "failed": failed,
+            "timeouts": timeouts,
+            "killed": killed,
+            "other": other,
+            "slowest_ms": slowest,
+            "avg_ms": total_ms / total if total else 0.0,
+            "fail_rate": (failed + timeouts + killed) / total if total else 0.0,
+        }
+
+
+    if __name__ == "__main__":
+        with open(sys.argv[1]) as f:
+            data = json.load(f)
+        print(summarize(data["codes"], data["durations_ms"]))
+    ```
+
+    Notes on behavior: durations are assumed to be integer milliseconds. Numba does not check array bounds, so the explicit length check replaces the `IndexError` the old loop would raise. The first run compiles the function. `cache=True` stores the result, so later nightly runs skip that cost.
+
+    **Already good:** a single pass over the data, with no per-row allocations.
+verify:
+  static_only: needs numba and numpy, which are beyond stdlib

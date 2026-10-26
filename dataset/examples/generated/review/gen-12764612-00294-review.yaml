@@ -1,0 +1,74 @@
+id: gen-12764612-00294-review
+category: review
+language: bash
+patterns:
+- bash-quoting
+facts:
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    pls review my script, is for ETL. it take the csv from sensors gateway every night and make jsonl for the data lake. files have around 3 million lines. i am not so expert in bash so maybe i did something wrong
+
+    ```bash
+    #!/bin/bash
+    # nightly etl: sensor csv -> jsonl
+    IN=$1
+    OUT=/data/etl/out/$(basename $IN .csv).jsonl
+
+    : > $OUT
+    while IFS=, read -r device ts temp hum batt; do
+      if [ "$device" = "device_id" ]; then
+        continue
+      fi
+      NOTE="Raw sensor reading from edge gateway, not calibrated, may contain gaps after reconnect; see wiki ETL-units for conversions and null handling rules"
+      echo "{\"device\":\"$device\",\"ts\":\"$ts\",\"temp_c\":$temp,\"humidity\":$hum,\"battery_mv\":$batt,\"note\":\"$NOTE\"}" >> $OUT
+    done < $IN
+
+    echo "done: $(wc -l < $OUT) records"
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline
+
+    #### [Bug] Unquoted variables in paths
+    - **Where:** `basename $IN .csv`, `: > $OUT`, `>> $OUT`, `done < $IN`, `wc -l < $OUT`
+    - **Issue:** if the file name has a space or a `*`, the shell splits or expands it. The script then reads or writes the wrong file, or fails with "ambiguous redirect".
+    - **Fix:** quote every variable that holds a path: `"$IN"`, `"$OUT"`.
+
+    #### [Medium] Double-quoted constant literal assigned for every row
+    - **Where:** `NOTE="Raw sensor reading ..."` inside the `while` loop
+    - **Issue:** the text has no `$`, backtick or backslash, but bash still scans a double-quoted string for them. It does this on each of the 3 million rows. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal in a loop used about 24% less CPU energy with single quotes at 1,000,000 iterations, and about 14% less at 10,000 iterations. Your literal is much shorter, so expect a smaller gain. The text never changes, so it can also be assigned once before the loop.
+    - **Fix:**
+      ```bash
+      NOTE='Raw sensor reading from edge gateway, not calibrated, may contain gaps after reconnect; see wiki ETL-units for conversions and null handling rules'
+      ```
+    - **Impact:** E, in proportion to the literal length and the row count.
+
+    #### [Low] Escaped double quotes in the output line
+    - **Where:** the `echo "{\"device\":..."` line
+    - **Issue:** double quotes are needed here because the variables must expand, so all the JSON quotes need a backslash. A single-quoted `printf` format has no expansion to scan and is easier to read. Fields that contain `\` or a leading `-` can also change what `echo` prints. `printf '%s'` prints them as they are.
+    - **Fix:** a complete version with all changes:
+      ```bash
+      #!/bin/bash
+      # nightly etl: sensor csv -> jsonl
+      IN=$1
+      OUT=/data/etl/out/$(basename "$IN" .csv).jsonl
+      NOTE='Raw sensor reading from edge gateway, not calibrated, may contain gaps after reconnect; see wiki ETL-units for conversions and null handling rules'
+
+      : > "$OUT"
+      while IFS=, read -r device ts temp hum batt; do
+        if [ "$device" = "device_id" ]; then
+          continue
+        fi
+        printf '{"device":"%s","ts":"%s","temp_c":%s,"humidity":%s,"battery_mv":%s,"note":"%s"}\n' \
+          "$device" "$ts" "$temp" "$hum" "$batt" "$NOTE" >> "$OUT"
+      done < "$IN"
+
+      echo "done: $(wc -l < "$OUT") records"
+      ```
+    - **Impact:** mostly readability and safety. The output is the same for normal data.
+
+    **Already good:** `read -r` with `IFS=,` splits the fields without starting a process per line, and `"$device"` is already quoted. Keep double quotes around variables.
+verify:
+  static_only: bash script that writes to /data/etl/out and needs an input CSV file

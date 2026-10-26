@@ -1,0 +1,114 @@
+id: gen-12764612-00127-multi-turn
+category: multi-turn
+language: python
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    nightly access log loader, ~500k lines per file. diff only pls
+
+    ```python
+    import re
+    from datetime import datetime
+
+    import psycopg
+
+    LINE = re.compile(r'^(\S+) \S+ \S+ \[([^\]]+)\] "(\S+) (\S+) [^"]*" (\d{3}) (\d+|-)')
+
+
+    def parse_ts(raw):
+        return datetime.strptime(raw, "%d/%b/%Y:%H:%M:%S %z")
+
+
+    def load_log(path, dsn):
+        loaded = 0
+        with psycopg.connect(dsn) as conn:
+            with open(path) as f:
+                for line in f:
+                    m = LINE.match(line)
+                    if not m:
+                        continue
+                    ip, raw_ts, method, url, status, size = m.groups()
+                    conn.execute(
+                        "INSERT INTO access_log (ip, ts, method, path, status, bytes) "
+                        "VALUES (%s, %s, %s, %s, %s, %s)",
+                        (ip, parse_ts(raw_ts), method, url, int(status),
+                         0 if size == "-" else int(size)),
+                    )
+                    conn.commit()
+                    loaded += 1
+        return loaded
+    ```
+- role: assistant
+  content: |
+    ```python
+    BATCH = 5000
+    COLUMNS = "ip, ts, method, path, status, bytes"
+
+
+    def flush(conn, rows):
+        if not rows:
+            return
+        with conn.cursor() as cur:
+            with cur.copy(f"COPY access_log ({COLUMNS}) FROM STDIN") as copy:
+                for row in rows:
+                    copy.write_row(row)
+        conn.commit()
+
+
+    def load_log(path, dsn):
+        loaded = 0
+        rows = []
+        with psycopg.connect(dsn) as conn:
+            with open(path) as f:
+                for line in f:
+                    m = LINE.match(line)
+                    if not m:
+                        continue
+                    ip, raw_ts, method, url, status, size = m.groups()
+                    rows.append((ip, parse_ts(raw_ts), method, url, int(status),
+                                 0 if size == "-" else int(size)))
+                    if len(rows) >= BATCH:
+                        flush(conn, rows)
+                        loaded += len(rows)
+                        rows = []
+            flush(conn, rows)
+            loaded += len(rows)
+        return loaded
+    ```
+
+    **Green Notes**
+    - **Batch database writes** (reduces E): one statement and one commit per row becomes one `COPY` and one commit per 5,000 rows. In Green Metrics Tool micro-benchmarks with 5,000-row batches, `COPY` used about 22× less CPU energy than one `execute()` per row, and about 8× less than `executemany()`.
+    - **Behavior change:** a failure now rolls back only the current batch. Earlier batches stay committed, as the old per-row commits did, but a failed run leaves up to 5,000 fewer rows than before.
+- role: user
+  content: |
+    ops reruns the job after failures, so the same file gets loaded twice. we have a unique index on (ip, ts, path), need to skip dupes. COPY can't do that, right? just make it work
+- role: assistant
+  content: |
+    Right, `COPY` has no `ON CONFLICT`. The simple fix is `executemany` with `DO NOTHING`:
+
+    ```python
+    INSERT_SQL = (
+        f"INSERT INTO access_log ({COLUMNS}) VALUES (%s, %s, %s, %s, %s, %s) "
+        "ON CONFLICT (ip, ts, path) DO NOTHING"
+    )
+
+
+    def flush(conn, rows):
+        if not rows:
+            return
+        with conn.cursor() as cur:
+            cur.executemany(INSERT_SQL, rows)
+        conn.commit()
+    ```
+
+    The rest of `load_log` stays as it was. Note that `loaded` now counts parsed rows, not inserted rows. Use `cur.rowcount` after `executemany` if you need the real insert count.
+
+    **Green Notes**
+    - **Batch database writes** (reduces E): you still send 5,000 rows per round trip and commit once per batch, so you keep most of the win over the per-row loop. In Green Metrics Tool micro-benchmarks with 5,000-row batches, `executemany()` used about 2.8× less CPU energy than one `execute()` per row. `COPY` was about 8× lower again, but that run had no conflict handling.
+    - If the load is large enough that this matters, the usual route is `COPY` into a temp table, then one `INSERT ... SELECT ... ON CONFLICT DO NOTHING`. I have no measurement for that variant, so I would only switch after timing it on your data.
+verify:
+  static_only: needs a running PostgreSQL server and psycopg

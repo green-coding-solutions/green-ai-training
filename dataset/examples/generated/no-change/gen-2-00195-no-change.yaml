@@ -1,0 +1,88 @@
+id: gen-2-00195-no-change
+category: no-change
+language: python
+patterns:
+- hoist-invariants
+- context-tradeoff
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    We have a small script that suggests job timeouts for our GitLab CI. A scheduled pipeline runs it once a night. An earlier step exports the jobs from the last 14 days to `jobs.json` through the API. That is about 6,000 jobs across roughly 40 job names. The script prints one suggested timeout per job name, and we copy the values into `.gitlab-ci.yml` by hand.
+
+    In the PR review, a colleague asked me to bind `math.ceil` and the `.append` method to local variables before the loops. He says that's the classic Python speed trick for hot loops. Our requirements:
+    - ops people who don't write much Python have to be able to read and change it
+    - output has to stay exactly the same
+    - if the change really matters, I'll make it
+
+    Should I do it? If anything else in here is actually wasteful, tell me that too.
+
+    ```python
+    import json
+    import math
+    import sys
+    from collections import defaultdict
+
+    SAFETY_FACTOR = 1.5
+    MIN_TIMEOUT_MIN = 5
+
+
+    def percentile(sorted_values, q):
+        """Nearest-rank percentile on an already sorted list."""
+        if not sorted_values:
+            raise ValueError("no values")
+        rank = math.ceil(q / 100 * len(sorted_values))
+        return sorted_values[max(rank, 1) - 1]
+
+
+    def load_durations(path):
+        with open(path, encoding="utf-8") as f:
+            jobs = json.load(f)
+        durations = defaultdict(list)
+        for job in jobs:
+            if job.get("status") != "success" or job.get("duration") is None:
+                continue
+            durations[job["name"]].append(job["duration"])
+        return durations
+
+
+    def suggest_timeouts(durations):
+        suggestions = {}
+        for name, values in durations.items():
+            values.sort()
+            p95 = percentile(values, 95)
+            minutes = math.ceil(p95 * SAFETY_FACTOR / 60)
+            suggestions[name] = max(minutes, MIN_TIMEOUT_MIN)
+        return suggestions
+
+
+    def main(path):
+        durations = load_durations(path)
+        suggestions = suggest_timeouts(durations)
+        for name in sorted(suggestions):
+            n = len(durations[name])
+            print(f"{name:<40} n={n:<5} timeout={suggestions[name]}m")
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1])
+    ```
+- role: assistant
+  content: |
+    No, keep the code as it is. Binding attribute lookups to local variables saves very little, even where it helps most. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local variable before a loop of 10,000,000 iterations saved about 4-5%. Your script is nowhere near that:
+
+    - The grouping loop in `load_durations` runs once per job, so about 6,000 times a night.
+    - `math.ceil` runs twice per job name, so about 80 calls in total.
+    - Starting the Python process and parsing `jobs.json` cost far more than these lookups. A few percent of the loop work is not measurable in a job that runs once a night.
+
+    The trick also adds lines like `ceil = math.ceil` that your ops colleagues would have to understand. That goes against your first requirement, and you would gain nothing in return.
+
+    Nothing else in here is wasteful:
+    - One pass over the jobs, grouped with `defaultdict(list)`.
+    - Each job name's durations are sorted once, in place, and the percentile is read straight from the sorted list.
+    - The file is read once, and the output is built in a single pass.
+
+    The trick only matters in very tight loops with millions of iterations, such as numeric inner loops. Even there it is a small gain, and it should come after any real algorithmic fix.
+verify:
+  static_only: no-change answer without code; the user's script stays unchanged

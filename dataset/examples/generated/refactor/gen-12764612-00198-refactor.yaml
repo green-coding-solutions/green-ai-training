@@ -1,0 +1,73 @@
+id: gen-12764612-00198-refactor
+category: refactor
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    Can you refactor this nightly script? It runs from cron at 02:00 on the same box that serves our orders REST API. The audit exports are about 6 GB of JSON lines per day. We keep them 90 days for the compliance team and almost never read them. Requirements: same file names per day, the compliance team must still be able to open a file with one command, and the script must not slow the API down more than it does now. It feels heavy, so please make it cheaper to run.
+
+    ```bash
+    #!/bin/bash
+    # nightly: archive api audit exports
+    SRC="/var/lib/orderapi/audit"
+    DEST="/mnt/archive/orderapi-audit"
+    KEEP_DAYS=90
+    DAY=$(date -d yesterday +%F)
+
+    mkdir -p "$DEST"
+    cd "$SRC" || exit 1
+
+    for f in audit-$DAY-*.jsonl; do
+      [ -e "$f" ] || continue
+      xz -9e -T0 -c "$f" > "$DEST/$f.xz"
+      rm "$f"
+    done
+
+    find "$DEST" -name "audit-*.jsonl.xz" -mtime +$KEEP_DAYS -delete
+    echo "archived $DAY" >> /var/log/orderapi/archive.log
+    ```
+- role: assistant
+  content: |
+    ```bash
+    #!/bin/bash
+    # nightly: archive api audit exports
+    SRC=/var/lib/orderapi/audit
+    DEST=/mnt/archive/orderapi-audit
+    KEEP_DAYS=90
+    DAY=$(date -d yesterday +%F)
+
+    mkdir -p "$DEST"
+    cd "$SRC" || exit 1
+
+    for f in audit-"$DAY"-*.jsonl; do
+      [ -e "$f" ] || continue
+      # write to a temp name first, so a half-written archive is never kept
+      if zstd -q -f -o "$DEST/$f.zst.tmp" "$f" && mv "$DEST/$f.zst.tmp" "$DEST/$f.zst"; then
+        rm "$f"
+      else
+        echo "compress failed: $f" >&2
+        rm -f "$DEST/$f.zst.tmp"
+      fi
+    done
+
+    # also removes the old .xz files while they age out
+    find "$DEST" \( -name 'audit-*.jsonl.xz' -o -name 'audit-*.jsonl.zst' \) -mtime +"$KEEP_DAYS" -delete
+    echo "archived $DAY" >> /var/log/orderapi/archive.log
+    ```
+
+    **Green Notes**
+    - **Fast codec for data compressed every night** (reduces E): `xz -9e` is one of the most expensive codecs. In Green Metrics Tool micro-benchmarks on English text, compressing 100 MB used about 458 J with `xz` at its default level and about 16 J with `zstd` at its default level, about 29× less. Your `-9e` is even slower than that default. The script now uses `zstd` at its default level.
+    - **Single thread** (reduces CPU contention): I dropped `-T0`. The job no longer takes all cores of the API box, and the default `zstd` run is already cheap.
+    - **Retention matches the data** (reduces storage): 90 days is far above the break-even. The estimate from the same measurements is about 0.15 days for `zstd` and about 7 days for `xz`, so compressing is right here. Do not skip it.
+    - **Reading is cheaper too:** decompressing 100 MB took about 5.3 J with `zstd` and about 11.7 J with `xz`.
+
+    Compliance now opens a file with `zstdcat audit-2026-10-25-01.jsonl.zst | less` instead of `xzcat`. Old `.xz` files stay readable and are deleted by the same retention rule. The measurements compare energy, not file size. `xz` usually makes smaller files, so expect the archive volume to grow somewhat. Check free space after a week.
+
+    Bug fixed: the old script ran `rm "$f"` even when `xz` failed, for example on a full archive disk, and lost that day's export. The source file is now deleted only after the archive was written and moved into place. I also quoted `$DAY` and `$KEEP_DAYS`.
+verify:
+  static_only: needs zstd, cron environment and archive volume paths

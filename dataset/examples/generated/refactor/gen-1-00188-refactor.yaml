@@ -1,0 +1,91 @@
+id: gen-1-00188-refactor
+category: refactor
+language: bash
+patterns:
+- compress-transmitted
+- bash-quoting
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    This script pushes our price and stock feed to the marketplace partners. Cron runs it every 10 minutes on the shop worker. Please clean it up and make it cheaper to run.
+
+    Requirements:
+    - bash 5, runs under cron, keep `set -euo pipefail`
+    - keep the same HTTP headers and the same `failed.log` behavior (one partner failing must not stop the others)
+    - all 12 partner endpoints accept zstd, gzip and xz bodies in `Content-Encoding` (we tested), so the codec is our choice
+    - the feed is useless after the run, partners fetch nothing from us later
+    - I do not care about the exact size on the wire, as long as it is much smaller than the raw CSV
+
+    ```bash
+    #!/usr/bin/env bash
+    # push price + stock feed to marketplace partners
+    set -euo pipefail
+
+    OUT_DIR="/var/spool/shop/price-feeds"
+    PARTNERS="/etc/shop/partners.tsv"   # name<TAB>url
+    STAMP="$(date +%Y%m%d%H%M)"
+    FEED="$OUT_DIR/prices-$STAMP.csv"
+
+    mkdir -p "$OUT_DIR"
+
+    psql "$SHOP_DB_URL" -At -F ',' -c "SELECT sku, price_cents, currency, stock FROM catalog.price_feed ORDER BY sku" > "$FEED"
+
+    while IFS=$'\t' read -r name url; do
+      echo "$(date -Is) pushing to $name"
+      xz -9e -k -c "$FEED" > "$FEED.xz"
+      curl --fail --silent --show-error \
+        -H "Content-Type: text/csv" \
+        -H "Content-Encoding: xz" \
+        -H "X-Feed-Version: 2" \
+        --data-binary "@$FEED.xz" \
+        "$url" || echo "FAILED: $name" >> "$OUT_DIR/failed.log"
+    done < "$PARTNERS"
+
+    echo "all partners done"
+    rm -f "$FEED" "$FEED.xz"
+    ```
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # push price + stock feed to marketplace partners
+    set -euo pipefail
+
+    OUT_DIR='/var/spool/shop/price-feeds'
+    PARTNERS='/etc/shop/partners.tsv'   # name<TAB>url
+    STAMP="$(date +%Y%m%d%H%M)"
+    FEED="$OUT_DIR/prices-$STAMP.csv"
+
+    mkdir -p "$OUT_DIR"
+
+    psql "$SHOP_DB_URL" -At -F ',' -c 'SELECT sku, price_cents, currency, stock FROM catalog.price_feed ORDER BY sku' > "$FEED"
+
+    # compress once, send the same body to every partner
+    zstd -q -f -c "$FEED" > "$FEED.zst"
+
+    while IFS=$'\t' read -r name url; do
+      echo "$(date -Is) pushing to $name"
+      curl --fail --silent --show-error \
+        -H 'Content-Type: text/csv' \
+        -H 'Content-Encoding: zstd' \
+        -H 'X-Feed-Version: 2' \
+        --data-binary "@$FEED.zst" \
+        "$url" || echo "FAILED: $name" >> "$OUT_DIR/failed.log"
+    done < "$PARTNERS"
+
+    echo 'all partners done'
+    rm -f "$FEED" "$FEED.zst"
+    ```
+
+    **Green Notes**
+    - **Fast codec for data that is compressed often** (reduces E): `xz -9e` was the most expensive choice for a feed that is rebuilt every 10 minutes and thrown away after the run. In Green Metrics Tool micro-benchmarks on 100 MB of text, zstd at its default level used about 4× less compression energy than gzip, and xz used about 29× more than zstd. The wire size will be somewhat larger than with xz. That matches your requirement, and the feed is still far smaller than the raw CSV. Decompression is cheap for both codecs, so the partners' side does not get worse.
+    - **Compress once, outside the loop** (reduces E): the old loop ran the compressor 12 times on the same file, once per partner. Now it runs once, and each partner gets the same bytes. Compression cost is the largest part of this script, so this matters more than the codec swap alone.
+    - **Single quotes for literals without expansion** (reduces E, small here): paths, header values, the SQL text and the echo messages are now single-quoted. Variables stay in double quotes. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal with single quotes used about 24% less CPU energy than with double quotes. Your literals are short and the script runs every 10 minutes, so the gain here is tiny. It is free, though.
+
+    Behavior is the same, except the header now says `Content-Encoding: zstd`. The `failed.log` handling and the exit behavior are unchanged. If one partner turns out to reject zstd in production, gzip at its default level is the next cheap choice. Avoid going back to xz or brotli for a payload like this.
+verify:
+  static_only: needs psql, curl, zstd and a database plus partner endpoints

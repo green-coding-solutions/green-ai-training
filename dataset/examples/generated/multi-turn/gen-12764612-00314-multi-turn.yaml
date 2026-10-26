@@ -1,0 +1,136 @@
+id: gen-12764612-00314-multi-turn
+category: multi-turn
+language: python
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    ```python
+    import csv
+    import logging
+    import psycopg
+
+    log = logging.getLogger("import")
+
+
+    def import_order_lines(path, dsn):
+        conn = psycopg.connect(dsn)
+        cur = conn.cursor()
+        n = 0
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                cur.execute(
+                    "INSERT INTO order_lines (order_id, sku, qty, unit_price_cents) "
+                    "VALUES (%s, %s, %s, %s)",
+                    (
+                        int(row["order_id"]),
+                        row["sku"].strip(),
+                        int(row["qty"]),
+                        int(row["unit_price_cents"]),
+                    ),
+                )
+                conn.commit()
+                n += 1
+                if n % 1000 == 0:
+                    log.info("imported %d lines", n)
+        conn.close()
+        return n
+    ```
+
+    ?
+- role: assistant
+  content: |
+    Your loop sends one INSERT and one commit per row. For a large export that is a round trip and a transaction per line. Load the file with `COPY` in one transaction instead:
+
+    ```python
+    import csv
+    import logging
+    import psycopg
+
+    log = logging.getLogger("import")
+
+
+    def import_order_lines(path, dsn):
+        n = 0
+        with psycopg.connect(dsn) as conn, conn.cursor() as cur, open(path, newline="") as f:
+            with cur.copy(
+                "COPY order_lines (order_id, sku, qty, unit_price_cents) FROM STDIN"
+            ) as copy:
+                for row in csv.DictReader(f):
+                    copy.write_row((
+                        int(row["order_id"]),
+                        row["sku"].strip(),
+                        int(row["qty"]),
+                        int(row["unit_price_cents"]),
+                    ))
+                    n += 1
+        log.info("imported %d lines", n)
+        return n
+    ```
+
+    **Green Notes**
+    - **Batch database writes** (reduces E, time): one `COPY` stream replaces one INSERT and one commit per row. In Green Metrics Tool micro-benchmarks with Postgres 16 and 500,000 rows in batches of 5,000, `COPY` used about 22× less CPU energy than one `execute()` per row. With batches of only 100 rows the gap was small, so this pays off for big files, not for a few rows.
+
+    Behavior change: the load is now all or nothing. A bad row rolls back the whole file. Before, the rows committed up to that point stayed in the table. The per-1000 progress log is gone. Log the total at the end instead.
+- role: user
+  content: |
+    the file gets re-sent sometimes so we have duplicates, unique key is (order_id, sku). need to skip those. and keep it simple pls, no temp tables
+
+    ```sql
+    ALTER TABLE order_lines ADD CONSTRAINT order_lines_uq UNIQUE (order_id, sku);
+    ```
+- role: assistant
+  content: |
+    `COPY` cannot skip conflicts, so use batched `executemany` with `ON CONFLICT DO NOTHING`. It needs no temp table:
+
+    ```python
+    import csv
+    import logging
+    import psycopg
+
+    log = logging.getLogger("import")
+
+    BATCH = 5000
+    INSERT_SQL = (
+        "INSERT INTO order_lines (order_id, sku, qty, unit_price_cents) "
+        "VALUES (%s, %s, %s, %s) "
+        "ON CONFLICT (order_id, sku) DO NOTHING"
+    )
+
+
+    def import_order_lines(path, dsn):
+        n = 0
+        batch = []
+        with psycopg.connect(dsn) as conn, conn.cursor() as cur, open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                batch.append((
+                    int(row["order_id"]),
+                    row["sku"].strip(),
+                    int(row["qty"]),
+                    int(row["unit_price_cents"]),
+                ))
+                if len(batch) >= BATCH:
+                    cur.executemany(INSERT_SQL, batch)
+                    conn.commit()
+                    n += len(batch)
+                    batch.clear()
+            if batch:
+                cur.executemany(INSERT_SQL, batch)
+                conn.commit()
+                n += len(batch)
+        log.info("processed %d lines", n)
+        return n
+    ```
+
+    **Green Notes**
+    - **Batch database writes** (reduces E, time): 5,000 rows per statement batch and one commit per batch, instead of one commit per row. In Green Metrics Tool micro-benchmarks with 5,000-row batches, `executemany` used about 2.8× less CPU energy than one `execute()` per row. `COPY` was about 8× less than `executemany`, which is the price of the duplicate handling here.
+
+    Notes:
+    - `n` counts processed lines, not inserted ones, because skipped duplicates are not reported.
+    - Progress is committed per batch again, so a failure keeps the earlier batches. Re-running the file is safe now, because the duplicates are skipped.
+    - If the files grow very large, you can get `COPY` speed back by copying into a temp table and running one `INSERT ... SELECT ... ON CONFLICT DO NOTHING`. At your current size this version is fine.
+verify:
+  static_only: needs a running PostgreSQL server and psycopg

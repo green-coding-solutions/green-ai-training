@@ -1,0 +1,95 @@
+id: gen-2-00293-generation
+category: generation
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    Hi, i need help for our ETL. Every night we import the product feed from our suppliers, it is a JSON lines file with around 5 millions records. Each record have a field `category_path` like `"Home & Garden > Kitchen > Knives"`. I need to make three new fields `cat_l1`, `cat_l2`, `cat_l3` from it as slugs: lowercase, no accents (we have french and german suppliers), `&` should become "and", only a-z, 0-9 and `-`. Maximum 3 level, if the path is deeper we cut it. If category_path is missing or empty then null. Script should read from stdin and write JSON lines to stdout, all other fields stay same. The categorys are not so many, maybe 300 diferent ones in the whole feed.
+- role: assistant
+  content: |
+    ```python
+    import json
+    import re
+    import sys
+    import unicodedata
+    from functools import lru_cache
+
+    MAX_LEVELS = 3
+    _NON_ALNUM = re.compile(r"[^a-z0-9]+")
+
+
+    def slugify(text: str) -> str:
+        text = unicodedata.normalize("NFKD", text)
+        text = text.encode("ascii", "ignore").decode("ascii").lower()
+        text = text.replace("&", " and ")
+        return _NON_ALNUM.sub("-", text).strip("-")
+
+
+    @lru_cache(maxsize=4096)
+    def category_slugs(path: str) -> tuple:
+        """'Home & Garden > Kitchen' -> ('home-and-garden', 'kitchen', None)"""
+        parts = [s for s in (slugify(p) for p in path.split(">")) if s]
+        return tuple((parts + [None] * MAX_LEVELS)[:MAX_LEVELS])
+
+
+    def main() -> None:
+        out = sys.stdout
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            l1, l2, l3 = category_slugs(rec.get("category_path") or "")
+            rec["cat_l1"], rec["cat_l2"], rec["cat_l3"] = l1, l2, l3
+            out.write(json.dumps(rec, ensure_ascii=False))
+            out.write("\n")
+        print(category_slugs.cache_info(), file=sys.stderr)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    Usage: `python category_slugs.py < feed.jsonl > feed_out.jsonl`
+
+    **Green Notes**
+    - **Memoize the category mapping** (reduces E): the feed repeats a small set of category paths across millions of records. With `@lru_cache` the Unicode normalization and regex work runs once per distinct path, and every other record is a dict lookup. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations with inputs from only 200 distinct values used ~43 J uncached and ~4.7 J with `lru_cache`, about 9× less.
+    - **Bounded cache, immutable result:** `maxsize` caps memory if a supplier sends unexpected junk paths. The function returns a tuple, so no caller can change a cached value by accident. The `cache_info()` line on stderr shows the hit rate after each run. If hits are low, the inputs are mostly unique, and the cache only adds overhead.
+verify:
+  module: true
+  test: |-
+    import io, json, sys
+
+    assert category_slugs("Home & Garden > Kitchen > Knives") == ("home-and-garden", "kitchen", "knives")
+    assert category_slugs("Électronique > Téléphones") == ("electronique", "telephones", None)
+    assert category_slugs("Garten & Außenbereich > Grills") == ("garten-and-auenbereich", "grills", None)
+    assert category_slugs("A > B > C > D") == ("a", "b", "c")
+    assert category_slugs("") == (None, None, None)
+    assert category_slugs(" > Sports >  ") == ("sports", None, None)
+
+    category_slugs.cache_clear()
+    category_slugs("Sports > Bikes")
+    category_slugs("Sports > Bikes")
+    assert category_slugs.cache_info().hits == 1
+
+    sys.stdin = io.StringIO(
+        '{"sku": "1", "category_path": "Sports > Bikes"}\n'
+        '\n'
+        '{"sku": "2"}\n'
+        '{"sku": "3", "category_path": "Sports > Bikes", "price": 9.5}\n'
+    )
+    buf = io.StringIO()
+    old_stdout = sys.stdout
+    sys.stdout = buf
+    try:
+        main()
+    finally:
+        sys.stdout = old_stdout
+    rows = [json.loads(l) for l in buf.getvalue().splitlines()]
+    assert len(rows) == 3
+    assert rows[0] == {"sku": "1", "category_path": "Sports > Bikes", "cat_l1": "sports", "cat_l2": "bikes", "cat_l3": None}
+    assert rows[1] == {"sku": "2", "cat_l1": None, "cat_l2": None, "cat_l3": None}
+    assert rows[2]["price"] == 9.5 and rows[2]["cat_l2"] == "bikes"

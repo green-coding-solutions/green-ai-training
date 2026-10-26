@@ -1,0 +1,47 @@
+id: gen-12764612-00188-generation
+category: generation
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    Need `trip_distances_km(points)` for our telematics ETL. `points` is an iterable of `(lat1, lon1, lat2, lon2)` tuples in degrees, tens of millions per nightly run. Return great-circle distance in km as a list, same order. Haversine, R = 6371.0088. Stdlib only. Just the code, I'll read it.
+- role: assistant
+  content: |
+    ```python
+    import math
+
+    EARTH_RADIUS_KM = 6371.0088
+
+
+    def trip_distances_km(points):
+        sin, cos, asin, sqrt, radians = (
+            math.sin, math.cos, math.asin, math.sqrt, math.radians
+        )
+        diameter = 2.0 * EARTH_RADIUS_KM
+        out = []
+        append = out.append
+        for lat1, lon1, lat2, lon2 in points:
+            p1 = radians(lat1)
+            p2 = radians(lat2)
+            s_lat = sin((p2 - p1) / 2.0)
+            s_lon = sin(radians(lon2 - lon1) / 2.0)
+            a = s_lat * s_lat + cos(p1) * cos(p2) * s_lon * s_lon
+            append(diameter * asin(sqrt(min(1.0, a))))
+        return out
+    ```
+
+    **Green Notes**
+    - **Hoist loop-invariant lookups** (reduces E): `math.*`, `out.append` and the `2 * R` constant are bound once before the loop, so each row skips five attribute lookups and one multiplication. This is a small win. In Green Metrics Tool micro-benchmarks, binding `math.sqrt` to a local before a 10,000,000-iteration loop saved about 4-5%. It is worth it here only because the loop runs per row at tens of millions of rows.
+    - `min(1.0, a)` guards against rounding pushing `a` slightly above 1 for near-antipodal points, which would raise `ValueError` in `sqrt`/`asin`.
+verify:
+  test: |-
+    d = trip_distances_km([(48.8566, 2.3522, 51.5074, -0.1278), (10.0, 20.0, 10.0, 20.0), (0.0, 0.0, 0.0, 180.0)])
+    assert len(d) == 3
+    assert abs(d[0] - 343.5) < 1.5, d[0]
+    assert d[1] == 0.0
+    assert abs(d[2] - 3.141592653589793 * 6371.0088) < 1e-6, d[2]
+    assert trip_distances_km([]) == []

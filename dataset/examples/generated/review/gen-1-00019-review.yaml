@@ -1,0 +1,133 @@
+id: gen-1-00019-review
+category: review
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    review pls, runs nightly on big nginx logs
+
+    ```python
+    import re
+    import sys
+    from collections import Counter
+
+    IGNORE = [r'^/healthz', r'^/static/', r'\.(png|jpg|css|js)$']
+
+
+    def parse(line):
+        m = re.match(r'(\S+) \S+ \S+ \[([^\]]+)\] "(\w+) (\S+) [^"]*" (\d{3}) (\d+|-)', line)
+        if not m:
+            return None
+        return m.group(1), m.group(3), m.group(4), int(m.group(5)), m.group(6)
+
+
+    def main(path):
+        errors = Counter()
+        total_bytes = 0
+        for line in open(path):
+            rec = parse(line)
+            if rec is None:
+                continue
+            ip, method, url, status, size = rec
+            if any(re.search(p, url) for p in IGNORE):
+                continue
+            total_bytes += int(size)
+            if status >= 500:
+                errors[url.split('?')[0]] += 1
+        for url, n in errors.most_common(10):
+            print(n, url)
+        print('bytes', total_bytes)
+
+
+    if __name__ == '__main__':
+        main(sys.argv[1])
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline
+
+    #### [Bug] Crash on responses without a body size
+    - **Where:** `int(size)` in `main`
+    - **Issue:** the line regex allows `-` as the size (nginx writes it for 304 and some aborted requests). `int('-')` raises `ValueError` and the whole nightly run dies.
+    - **Fix:** convert in `parse` and treat `-` as 0.
+
+    #### [Low] Regexes are passed as strings on every line
+    - **Where:** `re.match(...)` in `parse`, `re.search(p, url)` for each pattern in `IGNORE`
+    - **Issue:** every call looks the pattern up in `re`'s internal cache before it can match. Here there are only four distinct patterns, so the cache never thrashes and the cost is small. It still repeats once per line, and more than once for `IGNORE`.
+    - **Fix:** compile once at module level and call `.match` / `.search` on the compiled objects.
+    - **Impact:** reduces E per line, but only a little. In Green Metrics Tool micro-benchmarks, a precompiled pattern used about 18% less CPU energy for 1,000,000 matches than the inline call. The cost would be much higher if you built patterns dynamically per line, as `re` only caches a limited number of them.
+
+    ```python
+    import re
+    import sys
+    from collections import Counter
+
+    LINE_RE = re.compile(r'(\S+) \S+ \S+ \[([^\]]+)\] "(\w+) (\S+) [^"]*" (\d{3}) (\d+|-)')
+    IGNORE = [re.compile(p) for p in (r'^/healthz', r'^/static/', r'\.(png|jpg|css|js)$')]
+
+
+    def parse(line):
+        m = LINE_RE.match(line)
+        if not m:
+            return None
+        size = 0 if m.group(6) == '-' else int(m.group(6))
+        return m.group(1), m.group(3), m.group(4), int(m.group(5)), size
+
+
+    def main(path):
+        errors = Counter()
+        total_bytes = 0
+        with open(path) as fh:
+            for line in fh:
+                rec = parse(line)
+                if rec is None:
+                    continue
+                ip, method, url, status, size = rec
+                if any(p.search(url) for p in IGNORE):
+                    continue
+                total_bytes += size
+                if status >= 500:
+                    errors[url.split('?')[0]] += 1
+        for url, n in errors.most_common(10):
+            print(n, url)
+        print('bytes', total_bytes)
+
+
+    if __name__ == '__main__':
+        main(sys.argv[1])
+    ```
+
+    **Already good:** the file is read as a stream, one pass, and `Counter` keeps only the error paths in memory.
+verify:
+  module: true
+  test: |
+    rec = parse('1.2.3.4 - - [10/Oct/2026:10:00:00 +0000] "GET /a HTTP/1.1" 304 -')
+    assert rec is not None and rec[4] == 0 and rec[3] == 304
+    rec = parse('1.2.3.4 - - [10/Oct/2026:10:00:00 +0000] "GET /a HTTP/1.1" 200 512')
+    assert rec[4] == 512
+    assert parse('garbage') is None
+  equivalence:
+    driver: |-
+      import os
+      import tempfile
+      log = "\n".join([
+          '1.1.1.1 - - [10/Oct/2026:10:00:00 +0000] "GET /api/orders?id=1 HTTP/1.1" 500 120',
+          '1.1.1.2 - - [10/Oct/2026:10:00:01 +0000] "GET /api/orders?id=2 HTTP/1.1" 502 80',
+          '1.1.1.3 - - [10/Oct/2026:10:00:02 +0000] "POST /api/pay HTTP/1.1" 503 45',
+          '1.1.1.4 - - [10/Oct/2026:10:00:03 +0000] "GET /healthz HTTP/1.1" 500 10',
+          '1.1.1.5 - - [10/Oct/2026:10:00:04 +0000] "GET /static/app.js HTTP/1.1" 200 3000',
+          '1.1.1.6 - - [10/Oct/2026:10:00:05 +0000] "GET /logo.png HTTP/1.1" 200 900',
+          '1.1.1.7 - - [10/Oct/2026:10:00:06 +0000] "GET /index HTTP/1.1" 200 1500',
+          'not a log line',
+          '1.1.1.8 - - [10/Oct/2026:10:00:07 +0000] "GET /api/pay HTTP/1.1" 500 60',
+      ]) + "\n"
+      with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
+          f.write(log)
+      try:
+          main(f.name)
+      finally:
+          os.unlink(f.name)

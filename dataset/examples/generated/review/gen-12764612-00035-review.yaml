@@ -1,0 +1,68 @@
+id: gen-12764612-00035-review
+category: review
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    hi, i made a small python tool called pdfstamp. it puts a "DRAFT" or "APPROVED" stamp on pdf files from the command line. i made a Dockerfile so my colleagues can use it without installing python stuff. it works but the build is slow and the image feels big. i dont know what is wrong, can you look?
+
+    ```dockerfile
+    FROM python:3.12
+
+    RUN apt-get update && apt-get install -y build-essential git curl vim
+
+    WORKDIR /app
+    COPY . .
+
+    RUN pip install -r requirements.txt
+    RUN pip install pytest black mypy ipython
+
+    ENTRYPOINT ["python", "-m", "pdfstamp"]
+    ```
+
+    requirements.txt has pypdf, reportlab and click.
+- role: assistant
+  content: |
+    **Workload:** script (CLI tool, image rebuilt whenever the code changes)
+
+    #### [High] Full base image plus tools the tool never uses
+    - **Where:** `FROM python:3.12` and the `apt-get install` line
+    - **Issue:** `python:3.12` is the large image. On top of it you install a compiler, git, curl and vim. pypdf, reportlab and click are installed from prebuilt wheels, so none of these are needed to run `pdfstamp`. Every build, pull and stored copy carries them.
+    - **Fix:** use `python:3.12-slim` and drop the `apt-get` line. If a package ever fails to install because it needs a compiler, build it in a separate build stage and copy only the result.
+    - **Impact:** E on every build, pull and stored copy of the image. In Green Metrics Tool micro-benchmarks, building a small Flask app image with a slim base and runtime dependencies only used about 7× less energy than with the full base plus dev tools. Running the app afterwards cost the same, so the saving is in the build and the image size, not in the run.
+
+    #### [Medium] Test and dev tools are installed in the runtime image
+    - **Where:** `RUN pip install pytest black mypy ipython`
+    - **Issue:** your colleagues only run the stamp command. These tools add download and install work and extra layers. They are also an extra install step that runs again on each build.
+    - **Fix:** remove the line. Keep dev tools in a `requirements-dev.txt` that you install on your own machine or in a test job.
+
+    #### [Medium] Code is copied before the dependencies are installed
+    - **Where:** `COPY . .` before `pip install`
+    - **Issue:** any change to any file invalidates the layer cache, so pip reinstalls all packages on every build, even if `requirements.txt` did not change.
+    - **Fix:** copy `requirements.txt` first, install, then copy the source. Add a `.dockerignore` with `.git` and `__pycache__`, so they do not end up in the image.
+
+    #### [Low] pip keeps its download cache
+    - **Where:** `RUN pip install -r requirements.txt`
+    - **Issue:** pip stores downloaded files inside the layer. They are never used again in the image.
+    - **Fix:** add `--no-cache-dir`.
+
+    ```dockerfile
+    FROM python:3.12-slim
+
+    WORKDIR /app
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY pdfstamp/ pdfstamp/
+
+    ENTRYPOINT ["python", "-m", "pdfstamp"]
+    ```
+
+    **Already good:** `ENTRYPOINT` in exec form, so arguments like `pdfstamp in.pdf --text DRAFT` pass straight to your tool. A fixed `WORKDIR` is also fine.
+verify:
+  static_only: Dockerfile review, needs docker and network access to build

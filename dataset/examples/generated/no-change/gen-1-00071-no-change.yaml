@@ -1,0 +1,61 @@
+id: gen-1-00071-no-change
+category: no-change
+language: python
+patterns:
+- async-concurrent-io
+- context-tradeoff
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import os
+
+    import requests
+    from flask import Flask, jsonify, request
+
+    app = Flask(__name__)
+
+    CRM_URL = "https://api.crm.example.com/v2/contacts"
+    CRM_TOKEN = os.environ["CRM_TOKEN"]
+
+
+    @app.post("/api/signup")
+    def signup():
+        data = request.get_json(silent=True) or {}
+        email = (data.get("email") or "").strip().lower()
+        if "@" not in email or len(email) > 254:
+            return jsonify(error="invalid email"), 400
+
+        try:
+            resp = requests.post(
+                CRM_URL,
+                json={"email": email, "source": "landing"},
+                headers={"Authorization": f"Bearer {CRM_TOKEN}"},
+                timeout=5,
+            )
+            resp.raise_for_status()
+        except requests.RequestException:
+            app.logger.exception("crm signup failed")
+            return jsonify(error="try again later"), 502
+
+        return jsonify(ok=True), 201
+    ```
+- role: assistant
+  content: |-
+    This is the signup endpoint for your landing page. It is already efficient, so I would not change it.
+
+    It makes one outgoing request per signup. Async only helps when several requests can overlap. With one request there is nothing to overlap. Moving to `httpx.AsyncClient` would mean an async framework and more code, with no gain.
+
+    For scale: in Green Metrics Tool micro-benchmarks, 10 sequential `urllib` requests versus async `httpx` used about 7% less CPU energy and about 17% less wall time. The gain was mostly wall time, and it came from overlapping requests. A single call has none of that.
+
+    What is already good:
+    - The input is validated before any network call, so bad requests cost almost nothing.
+    - The call has a `timeout=5`, so a slow CRM cannot hold a worker for long.
+    - `raise_for_status()` plus a logged error gives a clean 502 and does no retries.
+    - The handler does nothing else per request.
+
+    If the endpoint later calls several services per signup (CRM, mailing list, analytics), run those calls concurrently then. For one call, keep it as it is.

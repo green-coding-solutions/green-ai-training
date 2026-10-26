@@ -1,0 +1,101 @@
+id: gen-2-00448-estimate
+category: estimate
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    We run a solar-powered LoRa-to-MQTT gateway at remote pump stations. Every polling cycle it reads raw 12-bit ADC counts from the NTC thermistors on the attached sensor nodes and converts them to °C before publishing. Requirements: it has to stay pure Python (no numpy on the gateway image), and the output must not change. We are on a tight power budget, so I want to know before touching anything: if I hoist the `self.cfg.*` and `math.log` lookups out of the loop below, how much energy does that save? Please give me a number if you can.
+
+    ```python
+    import math
+
+
+    class ThermistorBatch:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+        def convert(self, counts):
+            out = []
+            for c in counts:
+                if c <= 0 or c >= self.cfg.adc_max:
+                    out.append(None)  # open or shorted sensor
+                    continue
+                r = self.cfg.r_fixed * c / (self.cfg.adc_max - c)
+                ln_r = math.log(r)
+                inv_t = (self.cfg.sh_a
+                         + self.cfg.sh_b * ln_r
+                         + self.cfg.sh_c * ln_r ** 3)
+                out.append(1.0 / inv_t - 273.15)
+            return out
+    ```
+- role: assistant
+  content: |
+    I can't give you a reliable number, and I won't make one up. The direction is clear, though: the saving is small.
+
+    **Measured reference:** in Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local variable before a 10,000,000-iteration loop saved about 4-5% of CPU energy. That is the upper end of what this kind of change gives. Your loop does more work per iteration (a `log`, a power, divisions), so the lookups are an even smaller share of the cost. Your case has more attribute lookups per iteration (`self.cfg.x` is two lookups), but I did not measure that, so I can't carry the 4-5% over to your gateway.
+
+    This is the same loop with the invariants hoisted. The output is identical:
+
+    ```python
+    import math
+
+
+    class ThermistorBatch:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+        def convert(self, counts):
+            cfg = self.cfg
+            adc_max = cfg.adc_max
+            r_fixed = cfg.r_fixed
+            sh_a, sh_b, sh_c = cfg.sh_a, cfg.sh_b, cfg.sh_c
+            log = math.log
+
+            out = []
+            append = out.append
+            for c in counts:
+                if c <= 0 or c >= adc_max:
+                    append(None)  # open or shorted sensor
+                    continue
+                r = r_fixed * c / (adc_max - c)
+                ln_r = log(r)
+                inv_t = sh_a + sh_b * ln_r + sh_c * ln_r ** 3
+                append(1.0 / inv_t - 273.15)
+            return out
+    ```
+
+    **Green Notes**
+    - **Hoist loop invariants** (reduces E): the config values and `math.log` are looked up once per batch, not once per sample. The gain only shows with long batches. For a few dozen samples per cycle it is far below what you can measure.
+    - *Not applied:* anything beyond this. The radio and the sleep schedule almost certainly cost far more than this conversion. If you have a power budget problem, measure where the time goes first.
+
+    **How to measure your own saving:**
+    1. Run both versions on a recorded batch of real counts, repeated many times, and compare CPU time: `perf stat -e task-clock python bench.py`, or `time` if `perf` is not on the device.
+    2. For energy, use RAPL on a comparable x86 box, or a USB power meter on the gateway itself. Check that the difference is larger than the run-to-run noise before you trust it.
+    3. Multiply the per-batch difference by your polling rate only after you have measured it.
+
+    ```bash
+    perf stat -r 20 -e task-clock python bench_old.py
+    perf stat -r 20 -e task-clock python bench_new.py
+    ```
+
+    Behavior note: the config is now read once per batch. If another thread changes `cfg` while a batch runs, the whole batch uses the values from the start, which is usually what you want.
+verify:
+  module: false
+  green_block: 0
+  test: |
+    from types import SimpleNamespace
+    cfg = SimpleNamespace(adc_max=4095, r_fixed=10000.0, sh_a=1.009249522e-3, sh_b=2.378405444e-4, sh_c=2.019202697e-7)
+    res = ThermistorBatch(cfg).convert([0, 2048, 4095])
+    assert res[0] is None and res[2] is None
+    assert abs(res[1] - 25.0) < 1.0
+  equivalence:
+    driver: |-
+      from types import SimpleNamespace
+      cfg = SimpleNamespace(adc_max=4095, r_fixed=10000.0, sh_a=1.009249522e-3, sh_b=2.378405444e-4, sh_c=2.019202697e-7)
+      b = ThermistorBatch(cfg)
+      counts = [0, 1, 100, 1000, 2048, 3000, 4094, 4095, 5000, -3]
+      print([None if v is None else round(v, 6) for v in b.convert(counts)])

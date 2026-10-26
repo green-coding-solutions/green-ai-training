@@ -1,0 +1,104 @@
+id: gen-12764612-00077-generation
+category: generation
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    I need a Python script for our GitLab pipeline. It runs as a gate before we promote a new version of our ticket-routing model to production.
+
+    Requirements:
+    - Input: a TorchScript model file, a `.npy` float feature matrix (N x 64) and a `.npy` label array (N,) of class ids.
+    - Run the model on CPU over the whole validation set in batches (batch size configurable, default 256).
+    - Compute accuracy. Exit with code 1 if it is below a threshold given by `--min-accuracy` (default 0.92), otherwise 0.
+    - Write a small JSON report (accuracy, sample count, threshold, passed) to a path from `--report`.
+    - Print one summary line to stdout so it shows up in the job log.
+    - The runner has only torch and numpy, no GPU.
+- role: assistant
+  content: |
+    ```python
+    #!/usr/bin/env python3
+    """Accuracy gate for a TorchScript classifier. Exit code 1 if below threshold."""
+    import argparse
+    import json
+    import sys
+
+    import numpy as np
+    import torch
+
+
+    def evaluate(model, features, labels, batch_size):
+        correct = 0
+        with torch.no_grad():
+            for start in range(0, len(features), batch_size):
+                end = start + batch_size
+                batch = torch.from_numpy(features[start:end])
+                preds = model(batch).argmax(dim=1).numpy()
+                correct += int((preds == labels[start:end]).sum())
+        return correct / len(features)
+
+
+    def main():
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("--model", required=True)
+        parser.add_argument("--features", required=True)
+        parser.add_argument("--labels", required=True)
+        parser.add_argument("--report", required=True)
+        parser.add_argument("--min-accuracy", type=float, default=0.92)
+        parser.add_argument("--batch-size", type=int, default=256)
+        args = parser.parse_args()
+
+        features = np.load(args.features).astype(np.float32, copy=False)
+        labels = np.load(args.labels)
+        if features.ndim != 2 or features.shape[1] != 64:
+            sys.exit(f"expected features of shape (N, 64), got {features.shape}")
+        if len(features) != len(labels):
+            sys.exit("features and labels have different lengths")
+        if len(features) == 0:
+            sys.exit("validation set is empty")
+
+        model = torch.jit.load(args.model, map_location="cpu")
+        model.eval()
+
+        accuracy = evaluate(model, features, labels, args.batch_size)
+        passed = accuracy >= args.min_accuracy
+
+        with open(args.report, "w") as fh:
+            json.dump(
+                {
+                    "accuracy": round(accuracy, 4),
+                    "samples": int(len(features)),
+                    "threshold": args.min_accuracy,
+                    "passed": passed,
+                },
+                fh,
+                indent=2,
+            )
+
+        print(f"accuracy={accuracy:.4f} threshold={args.min_accuracy} samples={len(features)} passed={passed}")
+        return 0 if passed else 1
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+
+    Example job step:
+
+    ```yaml
+    model-gate:
+      stage: test
+      script:
+        - python scripts/model_gate.py --model build/router.pt --features data/val_x.npy --labels data/val_y.npy --report gate.json
+      artifacts:
+        paths: [gate.json]
+    ```
+
+    **Green Notes**
+    - **`torch.no_grad()` around the forward pass** (reduces E): the gate only reads predictions, so PyTorch does not need to build the autograd graph. In Green Metrics Tool micro-benchmarks of 100,000 CPU inferences, running without `no_grad` used about 14% more energy (~157 J vs ~135 J). This job runs on every candidate model, so the saving repeats.
+    - `model.eval()` is there for correctness, not energy: it switches off dropout and batch-norm updates, so the accuracy you gate on is the one production will see.
+verify:
+  static_only: needs torch and a TorchScript model file, which are not in the stdlib test environment

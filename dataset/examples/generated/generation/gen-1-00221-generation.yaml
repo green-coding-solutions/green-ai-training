@@ -1,0 +1,57 @@
+id: gen-1-00221-generation
+category: generation
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    I need a small writer for our CFD post-processing. After each run we have the mesh nodes as a list of `(x, y, z)` tuples and one temperature value per node, in the same order. People open the result in ParaView, so it should be a legacy VTK file, ASCII, `DATASET POLYDATA`, with the nodes as points and vertices, and the temperatures as point data (`SCALARS`).
+
+    Requirements:
+    - `vtk_text(points, scalars, name="temperature") -> str` that builds the file content
+    - `write_vtk(path, points, scalars, name="temperature")` that writes it to disk
+    - a `ValueError` if the lengths don't match, or if `name` contains whitespace (ParaView breaks on that)
+    - 6 significant digits are enough for the numbers
+    - typical meshes have 200k to 3M nodes
+    - standard library only, no numpy in this tool
+- role: assistant
+  content: |-
+    ```python
+    def vtk_text(points, scalars, name="temperature"):
+        n = len(points)
+        if len(scalars) != n:
+            raise ValueError(f"{n} points but {len(scalars)} scalar values")
+        if not name or any(c.isspace() for c in name):
+            raise ValueError("name must not be empty or contain whitespace")
+
+        lines = [
+            "# vtk DataFile Version 3.0",
+            "simulation snapshot",
+            "ASCII",
+            "DATASET POLYDATA",
+            f"POINTS {n} float",
+        ]
+        lines.extend(f"{x:.6g} {y:.6g} {z:.6g}" for x, y, z in points)
+        lines.append(f"VERTICES {n} {2 * n}")
+        lines.extend(f"1 {i}" for i in range(n))
+        lines.append(f"POINT_DATA {n}")
+        lines.append(f"SCALARS {name} float 1")
+        lines.append("LOOKUP_TABLE default")
+        lines.extend(f"{v:.6g}" for v in scalars)
+        return "\n".join(lines) + "\n"
+
+
+    def write_vtk(path, points, scalars, name="temperature"):
+        text = vtk_text(points, scalars, name)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+    ```
+
+    The validation runs before any output is built, so a bad call never leaves a half-written file.
+
+    **Green Notes**
+    - **Collect lines in a list, join once** (reduces E): with up to 3M nodes the file has several million lines. Repeated `+=` (or an f-string append in a loop) on a growing string does a lot of extra work as the text gets longer. `"\n".join(lines)` builds the result in one pass. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces with `join` used roughly 260× less CPU energy than `+=`.
+    - **One `write` call**: the file is written in a single call instead of one small write per line.

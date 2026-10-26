@@ -1,0 +1,52 @@
+id: gen-1-00204-refactor
+category: refactor
+language: bash
+patterns:
+- bash-quoting
+facts:
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    Warehouse pick-list builder, runs on every order batch (~200k lines in orders.tsv on a busy day). Clean it up, diff only please.
+
+    ```bash
+    #!/usr/bin/env bash
+    # build pick list for the warehouse from orders.tsv
+    set -euo pipefail
+
+    IN="${1:-orders.tsv}"
+    OUT="${2:-picklist.txt}"
+    : > "$OUT"
+
+    while IFS=$'\t' read -r order_id sku qty bin; do
+      [[ "$order_id" == "order_id" ]] && continue
+      case "$qty" in
+        ''|*[!0-9]*)
+          echo "skipping $order_id: bad qty '$qty'" >&2
+          continue
+          ;;
+      esac
+      printf "%s\t%s\t%s\t%s\n" "$order_id" "$sku" "$qty" "$bin" >> "$OUT"
+      if [[ "$bin" == "HAZ" ]]; then
+        printf "%s\n" "  ** HAZMAT: wear gloves, use the separate tote, follow procedure 7.2 before closing the order **" >> "$OUT"
+      fi
+    done < "$IN"
+    ```
+- role: assistant
+  content: |-
+    ```text
+    -  [[ "$order_id" == "order_id" ]] && continue
+    +  [[ "$order_id" == 'order_id' ]] && continue
+    -  printf "%s\t%s\t%s\t%s\n" "$order_id" "$sku" "$qty" "$bin" >> "$OUT"
+    +  printf '%s\t%s\t%s\t%s\n' "$order_id" "$sku" "$qty" "$bin" >> "$OUT"
+    -  if [[ "$bin" == "HAZ" ]]; then
+    +  if [[ "$bin" == 'HAZ' ]]; then
+    -    printf "%s\n" "  ** HAZMAT: wear gloves, use the separate tote, follow procedure 7.2 before closing the order **" >> "$OUT"
+    +    printf '%s\n' '  ** HAZMAT: wear gloves, use the separate tote, follow procedure 7.2 before closing the order **' >> "$OUT"
+    ```
+
+    **Green Notes**
+    - **Single quotes for literals without expansion** (reduces E): the loop body runs once per order line, and none of these strings need `$`, backticks or backslash handling by bash. Single-quoted text is taken as is, double-quoted text is scanned first. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal in a loop used about 24% less CPU energy with single quotes (100,000 and 1,000,000 iterations), and about 14% less at 10,000 iterations. Your literals are much shorter, so expect a small absolute saving. It still repeats on every line.
+    - Output is identical: `printf` still receives `\t` and `\n` as two characters and expands them itself.
+    - **Left unchanged:** `"$order_id"`, `"$sku"`, `"$qty"`, `"$bin"`, `"$OUT"` and the `echo` that expands `$order_id` and `$qty` stay double-quoted. They need expansion, and removing those quotes would break on spaces.

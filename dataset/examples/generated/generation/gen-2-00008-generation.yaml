@@ -1,0 +1,104 @@
+id: gen-2-00008-generation
+category: generation
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS
+messages:
+- role: user
+  content: |
+    I need a shipping script for our batch inference nodes. Setup:
+
+    - 6 GPU nodes run batch inference jobs. Each job writes its predictions to `/data/out/<job_id>/` as JSONL shards (`part-0000.jsonl`, `part-0001.jsonl`, ...). A job is about 1.5 GB of JSONL. Each node finishes a few jobs per hour.
+    - When a job is done, the runner writes an empty `_SUCCESS` file into the job dir.
+    - Some jobs also write a `plots/` folder with PNG calibration plots.
+    - All of it has to go to our aggregation box `agg-01` in the other datacenter, into `/srv/predictions/<node>/<job_id>/`. The link between the DCs is ~200 Mbit and other teams use it too, so right now uploads clog it.
+    - The Python loader on agg-01 can read `.gz` or `.zst` shards (python-zstandard is installed there).
+
+    Requirements:
+    - bash, will run from cron every 5 minutes, must not run twice at the same time
+    - only ship jobs that have `_SUCCESS` and were not shipped before
+    - the loader must never see a half-uploaded job
+    - check integrity on the remote side, and delete the local shards only after the check passes
+    - if something fails, log it and retry on the next run
+    - log to stderr, `set -euo pipefail`
+    - we have ssh keys, rsync and zstd on all machines
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # ship-predictions.sh: send finished batch-inference jobs to the aggregation host.
+    # Cron: */5 * * * * /opt/infer/ship-predictions.sh 2>>/var/log/ship-predictions.log
+    set -Eeuo pipefail
+    shopt -s nullglob
+
+    OUT_ROOT=${OUT_ROOT:-/data/out}
+    REMOTE=${REMOTE:-ship@agg-01}
+    REMOTE_ROOT=${REMOTE_ROOT:-/srv/predictions}
+    LOCK_FILE=${LOCK_FILE:-/tmp/ship-predictions.lock}
+    NODE=${HOSTNAME%%.*}
+
+    log() { printf '%(%F %T)T %s\n' -1 "$*" >&2; }
+    trap 'log "error in line $LINENO, will retry on next run"' ERR
+
+    exec 9>"$LOCK_FILE"
+    flock -n 9 || { log 'previous run still active, skipping'; exit 0; }
+
+    ship_job() {
+      local dir=$1
+      local job=${dir##*/}
+
+      # Job ids end up in remote shell commands: allow only safe characters.
+      if [[ ! $job =~ ^[A-Za-z0-9._-]+$ ]]; then
+        log "$job: unexpected characters in job id, skipping"
+        return 0
+      fi
+
+      local part="$REMOTE_ROOT/$NODE/$job.partial"
+      local final="$REMOTE_ROOT/$NODE/$job"
+      local shards=("$dir"/*.jsonl)
+      if (( ${#shards[@]} == 0 )); then
+        log "$job: no shards, skipping"
+        return 0
+      fi
+
+      # Text shards: zstd at its default level, all cores.
+      # -f overwrites .zst leftovers from an aborted run. Originals are kept.
+      zstd -q -T0 -f -- "${shards[@]}"
+      ( cd "$dir" && sha256sum -- *.jsonl.zst plots/*.png > SHA256SUMS )
+
+      local files=("${shards[@]/%/.zst}" "$dir/SHA256SUMS")
+      # PNG is already compressed: send the plots as they are.
+      if [[ -d $dir/plots ]]; then
+        files+=("$dir/plots")
+      fi
+
+      ssh "$REMOTE" "mkdir -p '$part'"
+      # No rsync -z or ssh -C: the data is already compressed.
+      rsync -a --partial -- "${files[@]}" "$REMOTE:$part/"
+
+      # Verify, then publish with one rename so the loader never sees a partial job.
+      ssh "$REMOTE" "cd '$part' && sha256sum -c --quiet SHA256SUMS && rm -rf '$final' && mv '$part' '$final'"
+
+      rm -f -- "${shards[@]}" "${shards[@]/%/.zst}"
+      touch -- "$dir/.shipped"
+      log "$job: shipped ${#shards[@]} shards to $REMOTE:$final"
+    }
+
+    for dir in "$OUT_ROOT"/*/; do
+      dir=${dir%/}
+      [[ -f $dir/_SUCCESS && ! -e $dir/.shipped ]] || continue
+      ship_job "$dir"
+    done
+    ```
+
+    If a step fails, the script stops and logs the line. The local shards and the `.partial` dir stay where they are, and the next cron run ships the job again. `.shipped` and `SHA256SUMS` stay in the job dir as a record. On agg-01 the loader can read a shard with `zstandard.open(path, 'rt')`.
+
+    **Green Notes**
+    - **Compress transmitted data with a fast codec** (reduces network and E): every job gets compressed once, and that happens many times per hour across all nodes, so the codec's CPU cost adds up. In Green Metrics Tool measurements on 100 MB of English text, zstd at its default level used ~16 J, gzip ~67 J (about 4× more), xz ~458 J and brotli at its CLI default quality 11 ~3019 J. Those figures compare energy only, not compression ratio. Raise the zstd level only if the link stays the bottleneck, and measure the extra CPU before you keep it.
+    - **No double compression** (reduces E): `rsync -z` or `ssh -C` would try to compress the `.zst` files again and burn CPU for nothing. The PNG plots are sent as they are for the same reason.
+    - **Cheap on the receiving side:** decompressing is cheap with zstd. In the same measurements, decompressing 100 MB took ~5.3 J with zstd and ~9.1 J with gzip, so the loader on agg-01 does not pay extra for the switch.
+verify:
+  static_only: bash script that needs ssh, rsync, zstd and a remote host

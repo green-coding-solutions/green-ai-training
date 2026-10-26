@@ -1,0 +1,39 @@
+id: gen-12764612-00237-generation
+category: generation
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    diff only please. need `drop_flagged(observations, flagged_ids)` for our photometry pipeline. observations is a list of dicts with source_id, mag, flux (a few million per night). flagged_ids is ~200k source IDs from the quality catalog. keep input order. just the code
+- role: assistant
+  content: |
+    ```python
+    def drop_flagged(observations, flagged_ids):
+        """Return observations whose source_id is not flagged. Input order is kept."""
+        flagged = frozenset(flagged_ids)
+        return [obs for obs in observations if obs["source_id"] not in flagged]
+    ```
+
+    If you call this once per small batch, build the `frozenset` once at startup and pass it in. Then each call does not rebuild it. `frozenset(...)` of a `frozenset` returns the same object, so the function above works for both cases.
+
+    **Green Notes**
+    - **Set for repeated membership tests** (reduces E): the flagged IDs are hashed once, then each observation costs one O(1) lookup. A list would scan up to ~200k IDs per observation, so millions of observations would mean billions of comparisons. Output order and duplicates in `observations` are unchanged.
+    - *Not applied:* a set for a single lookup. In Green Metrics Tool micro-benchmarks, one membership test on a 10,000,000-element list (~6.9 J) was cheaper than converting it to a set first (~10.5 J). The set only pays off here because you check millions of observations against the same IDs.
+verify:
+  test: |-
+    obs = [
+        {"source_id": 5, "mag": 1.0, "flux": 2.0},
+        {"source_id": 7, "mag": 1.5, "flux": 3.0},
+        {"source_id": 5, "mag": 2.0, "flux": 4.0},
+        {"source_id": 9, "mag": 2.5, "flux": 5.0},
+    ]
+    out = drop_flagged(obs, [5, 11])
+    assert [o["source_id"] for o in out] == [7, 9]
+    assert drop_flagged(obs, frozenset()) == obs
+    fs = frozenset([7])
+    assert [o["mag"] for o in drop_flagged(obs, fs)] == [1.0, 2.0, 2.5]
+    assert drop_flagged([], [1]) == []

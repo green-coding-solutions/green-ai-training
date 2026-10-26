@@ -1,0 +1,99 @@
+id: gen-2-00031-multi-turn
+category: multi-turn
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    runs as the last step of every job in our wake sweep (~60 jobs/day). the archive step eats a lot of core-hours on our allocation. diff only pls
+
+    ```bash
+    #!/bin/bash
+    # called at the end of every sbatch job: archive_run.sh <run dir>
+    set -euo pipefail
+
+    RUN_DIR="$1"
+    RUN_ID=$(basename "$RUN_DIR")
+    ARCHIVE_DIR="/project/cfd-wake/archive"
+    STAGING="/scratch/$USER/staging"
+    QUEUE="/scratch/$USER/restart_queue"
+
+    mkdir -p "$STAGING" "$QUEUE"
+
+    # restart fields for the next job in the chain (picked up within a few minutes, then deleted)
+    for f in "$RUN_DIR"/restart/*.bin; do
+        gzip -9 "$f"
+        mv "$f.gz" "$QUEUE/"
+    done
+
+    # probes + logs + postProcessing (all ascii)
+    tar -cf "$STAGING/$RUN_ID.tar" -C "$RUN_DIR" probes logs postProcessing
+    xz -9 "$STAGING/$RUN_ID.tar"
+    rsync -a "$STAGING/$RUN_ID.tar.xz" "$ARCHIVE_DIR/"
+    rm -f "$STAGING/$RUN_ID.tar.xz"
+
+    # run metadata for the sweep db
+    printf '%s,%s,%s\n' "$RUN_ID" "$(date -Is)" "$SLURM_JOB_ID" >> /project/cfd-wake/runs.csv
+
+    echo "archived $RUN_ID"
+    ```
+- role: assistant
+  content: |
+    ```text
+    --- a/archive_run.sh
+    +++ b/archive_run.sh
+    @@
+     # restart fields for the next job in the chain (picked up within a few minutes, then deleted)
+    -for f in "$RUN_DIR"/restart/*.bin; do
+    -    gzip -9 "$f"
+    -    mv "$f.gz" "$QUEUE/"
+    -done
+    +shopt -s nullglob
+    +restarts=("$RUN_DIR"/restart/*.bin)
+    +if (( ${#restarts[@]} )); then
+    +    mv -- "${restarts[@]}" "$QUEUE/"
+    +fi
+    @@
+     tar -cf "$STAGING/$RUN_ID.tar" -C "$RUN_DIR" probes logs postProcessing
+    -xz -9 "$STAGING/$RUN_ID.tar"
+    -rsync -a "$STAGING/$RUN_ID.tar.xz" "$ARCHIVE_DIR/"
+    -rm -f "$STAGING/$RUN_ID.tar.xz"
+    +zstd -q --rm "$STAGING/$RUN_ID.tar"
+    +rsync -a "$STAGING/$RUN_ID.tar.zst" "$ARCHIVE_DIR/"
+    +rm -f "$STAGING/$RUN_ID.tar.zst"
+    ```
+
+    **Green Notes**
+    - **No compression for short-lived restart files** (reduces E): they are read within minutes and then deleted. Compression only pays off when the data stays on disk for a while, so `gzip -9` here costs CPU and saves nothing. The next job in the chain now has to read `.bin` instead of `.bin.gz`, so drop the `gunzip` there.
+    - **zstd instead of `xz -9` for the per-job archive** (reduces E): this step runs after every job. In Green Metrics Tool benchmarks on 100 MB of English text at default levels, xz used about 29× the CPU energy of zstd. That comparison is energy only. xz files will be smaller, so if the `/project` quota is tight, keep xz. Unlike xz, zstd keeps its input unless you pass `--rm`. Readers unpack with `tar -I zstd -xf`.
+    - **Bug fix:** when a job leaves no restart files, the old loop ran `gzip` on the literal `*.bin`. That failed under `set -e`, so the run was never archived. `nullglob` plus the count check fixes it.
+- role: user
+  content: |
+    quota on /project is the actual bottleneck and the archives stay there for years. xz stays. restart part is fine, I'll patch the reader.
+- role: assistant
+  content: |
+    Makes sense. For archives you keep for years on a tight quota, xz's smaller files are worth the extra CPU per job. Here is the diff with only the restart hunk:
+
+    ```text
+    --- a/archive_run.sh
+    +++ b/archive_run.sh
+    @@
+     # restart fields for the next job in the chain (picked up within a few minutes, then deleted)
+    -for f in "$RUN_DIR"/restart/*.bin; do
+    -    gzip -9 "$f"
+    -    mv "$f.gz" "$QUEUE/"
+    -done
+    +shopt -s nullglob
+    +restarts=("$RUN_DIR"/restart/*.bin)
+    +if (( ${#restarts[@]} )); then
+    +    mv -- "${restarts[@]}" "$QUEUE/"
+    +fi
+    ```
+
+    This still removes the compression work that never paid off, and it fixes the case with no restart files.
+verify:
+  static_only: needs Slurm job environment, /project and /scratch paths, and zstd/xz on the cluster

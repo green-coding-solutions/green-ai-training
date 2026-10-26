@@ -1,0 +1,158 @@
+id: gen-2-00036-refactor
+category: refactor
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    hi, we have this job in our gitlab ci that check every file in the monorepo has a owner team. it run in every pipeline, the repo has around 70k files and most of the folders dont have a own entry in owners.json, only the service folders on top level. can you make it more fast and clean? output must stay same, other jobs parse it.
+
+    ```python
+    #!/usr/bin/env python3
+    """Ownership check: every tracked file must have a team in owners.json."""
+    import json
+    import subprocess
+    import sys
+
+
+    def load_owners(path="ci/owners.json"):
+        # {"services/payments": "team-payments", "libs/auth": "team-identity", "infra": "team-platform"}
+        with open(path) as f:
+            return json.load(f)
+
+
+    def tracked_files():
+        out = subprocess.run(["git", "ls-files"], capture_output=True, text=True, check=True)
+        return out.stdout.splitlines()
+
+
+    def owner_for(path, owners):
+        parts = path.split("/")
+        # longest prefix first: services/payments/api/x.py, services/payments/api, services/payments, services
+        for i in range(len(parts), 0, -1):
+            prefix = "/".join(parts[:i])
+            try:
+                return owners[prefix]
+            except KeyError:
+                pass
+        try:
+            return owners["*"]
+        except KeyError:
+            return None
+
+
+    def summarize(files, owners):
+        per_team = {}
+        unowned = []
+        for f in files:
+            team = owner_for(f, owners)
+            if team is None:
+                unowned.append(f)
+                continue
+            try:
+                per_team[team] += 1
+            except KeyError:
+                per_team[team] = 1
+        return per_team, unowned
+
+
+    if __name__ == "__main__":
+        owners = load_owners()
+        per_team, unowned = summarize(tracked_files(), owners)
+        for team, n in sorted(per_team.items()):
+            print(f"{team:25} {n:6d} files")
+        if unowned:
+            print(f"\n{len(unowned)} files without owner:")
+            for f in unowned[:50]:
+                print("  " + f)
+            sys.exit(1)
+    ```
+- role: assistant
+  content: |
+    ```python
+    #!/usr/bin/env python3
+    """Ownership check: every tracked file must have a team in owners.json."""
+    import json
+    import subprocess
+    import sys
+
+
+    def load_owners(path="ci/owners.json"):
+        # {"services/payments": "team-payments", "libs/auth": "team-identity", "infra": "team-platform"}
+        with open(path) as f:
+            return json.load(f)
+
+
+    def tracked_files():
+        out = subprocess.run(["git", "ls-files"], capture_output=True, text=True, check=True)
+        return out.stdout.splitlines()
+
+
+    def owner_for(path, owners):
+        parts = path.split("/")
+        # longest prefix first: services/payments/api/x.py, services/payments/api, services/payments, services
+        for i in range(len(parts), 0, -1):
+            prefix = "/".join(parts[:i])
+            if prefix in owners:
+                return owners[prefix]
+        return owners.get("*")
+
+
+    def summarize(files, owners):
+        per_team = {}
+        unowned = []
+        for f in files:
+            team = owner_for(f, owners)
+            if team is None:
+                unowned.append(f)
+                continue
+            try:
+                per_team[team] += 1
+            except KeyError:
+                per_team[team] = 1
+        return per_team, unowned
+
+
+    if __name__ == "__main__":
+        owners = load_owners()
+        per_team, unowned = summarize(tracked_files(), owners)
+        for team, n in sorted(per_team.items()):
+            print(f"{team:25} {n:6d} files")
+        if unowned:
+            print(f"\n{len(unowned)} files without owner:")
+            for f in unowned[:50]:
+                print("  " + f)
+            sys.exit(1)
+    ```
+
+    **Green Notes**
+    - **`in` check instead of `try/except KeyError` in `owner_for`** (reduces E): the loop walks up each path, and most prefixes are not in owners.json. So the old code raised and caught an exception at almost every level, for every one of the 70k files, on every pipeline. An `in` test costs no exception. In Green Metrics Tool micro-benchmarks with 10,000,000 dict lookups and about half of the keys missing, `try/except KeyError` used ~76 J and `dict.get` ~67 J, about 12% less. An `if key in d` check performed like `dict.get`. In your job, misses are the normal case.
+    - **Same behavior:** I used `in` and not `owners.get(prefix)` on purpose. If an entry in owners.json is `null`, the file still counts as unowned, the same as before. A `get()` with an `is None` check would skip to the parent folder instead. The `"*"` fallback uses `get()`, which returns `None` like the old `except` branch did. The output is unchanged.
+    - **Counter in `summarize` left as it is:** that `try/except` misses only once per team and then always hits. When misses are rare, `try/except` is cheap, because the cost is in raising the exception.
+verify:
+  module: true
+  equivalence:
+    driver: |-
+      owners = {
+          "services/payments": "team-payments",
+          "services/payments/legacy": None,
+          "libs/auth": "team-identity",
+          "infra": "team-platform",
+          "docs/README.md": "team-docs",
+      }
+      files = []
+      for top in ["services/payments/api", "services/payments/legacy/v1", "services/search",
+                  "libs/auth/jwt", "libs/utils", "infra/terraform/modules", "docs", "tools"]:
+          for i in range(30):
+              files.append(f"{top}/file_{i}.py")
+      files += ["docs/README.md", "Makefile", "services/payments"]
+      per_team, unowned = summarize(files, owners)
+      print(sorted(per_team.items()))
+      print(len(unowned), unowned[:5], unowned[-3:])
+      owners["*"] = "team-platform"
+      per_team, unowned = summarize(files, owners)
+      print(sorted(per_team.items()), len(unowned), unowned[:3])
+      print(owner_for("services/payments/legacy/v1/x.py", owners), owner_for("a/b/c", owners))

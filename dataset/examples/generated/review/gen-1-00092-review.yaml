@@ -1,0 +1,114 @@
+id: gen-1-00092-review
+category: review
+language: javascript
+patterns:
+- dom-size
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    Hello, can you make review of my code pls? Is the admin page for discount coupons in our webshop. Marketing make many coupons by campaign and now we have about 7000 of them. When I open the page, the browser is slow and the fan of my laptop go crazy. Thanks!
+
+    ```javascript
+    async function loadCoupons() {
+      const res = await fetch('/api/admin/coupons');
+      const coupons = await res.json();
+      const list = document.getElementById('coupon-list');
+      list.innerHTML = '';
+
+      coupons.forEach(c => {
+        const row = document.createElement('div');
+        row.className = 'coupon-row';
+        row.innerHTML = `
+          <div class="cell"><span class="code">${c.code}</span></div>
+          <div class="cell"><span class="discount">${c.discount}%</span></div>
+          <div class="cell"><span class="usage">${c.used} / ${c.limit}</span></div>
+          <div class="cell"><span class="expires">${c.expires}</span></div>
+          <div class="cell"><span class="note">${c.note}</span></div>
+        `;
+        list.appendChild(row);
+      });
+
+      document.getElementById('coupon-count').textContent = coupons.length + ' coupons';
+    }
+
+    loadCoupons();
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (internal admin page)
+
+    #### [Security] Unescaped text goes into `innerHTML`
+    - **Where:** the template string in `row.innerHTML = ...`
+    - **Issue:** `c.note` and `c.code` are typed by staff and put into the page as HTML. A note like `<img src=x onerror=...>` runs script in the admin's session.
+    - **Fix:** set the values with `textContent` (see the code below).
+
+    #### [Bug] Failed requests are not handled
+    - **Where:** `fetch` and `res.json()`
+    - **Issue:** on a 401 or 500, `res.json()` throws or returns an error object. `forEach` then fails and the page stays empty without a message.
+    - **Fix:** check `res.ok` and show a message.
+
+    #### [High] 7,000 rows in the DOM at once
+    - **Where:** `coupons.forEach(...)` with `list.appendChild(row)`
+    - **Issue:** every coupon builds 11 elements (a row, 5 cells and 5 spans). That is about 77,000 nodes in the live DOM, added one by one. The browser has to build, style and lay out all of them, although nobody reads 7,000 rows at once. In Green Metrics Tool micro-benchmarks, a table of 10,000 rows with 14 elements per row, appended to the live DOM one by one, used about 56% more CPU energy over 30 page loads than the same data paginated to 100 rows per page as a plain table built in a `DocumentFragment`. That is the same shape as your page.
+    - **Fix:** keep the data in memory, render one page of 100 rows, and use a plain `<table>` with one `<td>` per value, without wrapper elements.
+    - **Impact:** E on the client, on every page open. This is the main reason for the slow tab.
+
+    ```html
+    <table>
+      <thead><tr><th>Code</th><th>Discount</th><th>Used</th><th>Expires</th><th>Note</th></tr></thead>
+      <tbody id="coupon-body"></tbody>
+    </table>
+    <button id="prev">Previous</button>
+    <span id="coupon-count"></span>
+    <button id="next">Next</button>
+    ```
+
+    ```javascript
+    const PAGE_SIZE = 100;
+    let coupons = [];
+    let page = 0;
+
+    async function loadCoupons() {
+      const res = await fetch('/api/admin/coupons');
+      if (!res.ok) {
+        document.getElementById('coupon-count').textContent = 'Could not load coupons (' + res.status + ')';
+        return;
+      }
+      coupons = await res.json();
+      renderPage(0);
+    }
+
+    function renderPage(n) {
+      const pages = Math.max(1, Math.ceil(coupons.length / PAGE_SIZE));
+      page = Math.min(Math.max(n, 0), pages - 1);
+
+      const frag = document.createDocumentFragment();
+      for (const c of coupons.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)) {
+        const tr = document.createElement('tr');
+        const values = [c.code, c.discount + '%', c.used + ' / ' + c.limit, c.expires, c.note];
+        for (const v of values) {
+          const td = document.createElement('td');
+          td.textContent = v ?? '';
+          tr.appendChild(td);
+        }
+        frag.appendChild(tr);
+      }
+      document.getElementById('coupon-body').replaceChildren(frag);
+
+      document.getElementById('coupon-count').textContent =
+        coupons.length + ' coupons, page ' + (page + 1) + ' of ' + pages;
+    }
+
+    document.getElementById('prev').addEventListener('click', () => renderPage(page - 1));
+    document.getElementById('next').addEventListener('click', () => renderPage(page + 1));
+
+    loadCoupons();
+    ```
+
+    Only 100 rows are in the page now, so browser search (Ctrl+F) finds only the current page. If marketing needs to find a coupon by code, add a search box that filters the `coupons` array before slicing, or let the API filter.
+
+    **Already good:** one `fetch` for all data, and the count is shown to the user.
+verify:
+  static_only: needs a browser DOM and a fetch endpoint

@@ -1,0 +1,53 @@
+id: gen-2-00340-generation
+category: generation
+language: python
+patterns:
+- simple-conditions
+facts:
+- F-COND
+messages:
+- role: user
+  content: |
+    py func: webhook delivery response status -> "ok" / "retry" / "drop". 2xx ok, 408, 429 and 5xx retry, everything else drop. runs on every delivery attempt in our dispatcher
+- role: assistant
+  content: |
+    ```python
+    from typing import Literal
+
+    Decision = Literal["ok", "retry", "drop"]
+
+    _RETRYABLE_4XX = (408, 429)
+
+
+    def retry_decision(status: int) -> Decision:
+        """Decide what the webhook dispatcher does with a delivery response."""
+        cls = status // 100
+        if cls == 2:
+            return "ok"
+        if cls == 5 or status in _RETRYABLE_4XX:
+            return "retry"
+        return "drop"
+    ```
+
+    **Green Notes**
+    - **Simple equality conditions** (reduces E): the function does one integer division, then only plain `==` checks. It avoids a chain of range guards like `200 <= status < 300`. In Green Metrics Tool micro-benchmarks with 10,000,000 classifications, simple equality branches used about 16% less CPU energy than complex range/modulo conditions.
+    - **Common case first:** most deliveries succeed, so most calls return after the first comparison.
+    - *Not applied:* `match`/`case`. In the same benchmarks it differed from `if/elif` by about 1%, which is noise. Use it only if you find it easier to read.
+
+    1xx, 3xx and other 4xx codes return `"drop"`, as you specified. A status outside 100-599 also returns `"drop"`.
+verify:
+  test: |-
+    assert retry_decision(200) == "ok"
+    assert retry_decision(204) == "ok"
+    assert retry_decision(299) == "ok"
+    assert retry_decision(408) == "retry"
+    assert retry_decision(429) == "retry"
+    assert retry_decision(500) == "retry"
+    assert retry_decision(503) == "retry"
+    assert retry_decision(599) == "retry"
+    assert retry_decision(400) == "drop"
+    assert retry_decision(404) == "drop"
+    assert retry_decision(410) == "drop"
+    assert retry_decision(301) == "drop"
+    assert retry_decision(101) == "drop"
+    assert retry_decision(600) == "drop"

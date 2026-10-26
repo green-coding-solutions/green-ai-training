@@ -1,0 +1,87 @@
+id: gen-1-00225-generation
+category: generation
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    hi, i am new to python. i wrote a function that pads the token lists for my model batch. the model wants padding on the left. it gives the right result but with long inputs (4000 tokens) it is very slow and i dont know why. can you write it the right way?
+
+    ```python
+    def left_pad_batch(batch, pad_id=0, max_len=None):
+        if max_len is None:
+            max_len = max((len(s) for s in batch), default=0)
+        ids = []
+        masks = []
+        for seq in batch:
+            seq = list(seq)[-max_len:]   # keep the last max_len tokens
+            mask = [1] * len(seq)
+            while len(seq) < max_len:
+                seq.insert(0, pad_id)
+                mask.insert(0, 0)
+            ids.append(seq)
+            masks.append(mask)
+        return {"input_ids": ids, "attention_mask": masks}
+
+
+    if __name__ == "__main__":
+        out = left_pad_batch([[5, 6, 7], [1], [9, 8, 7, 6, 5]], pad_id=0)
+        print(out["input_ids"])
+        print(out["attention_mask"])
+    ```
+- role: assistant
+  content: |
+    The slow part is `insert(0, ...)` inside the `while` loop. Every front insert moves all items in the list one step to the right. So padding a short sequence up to 4000 tokens does thousands of full shifts, for both lists. Count the padding once and build each list in one step:
+
+    ```python
+    def left_pad_batch(batch, pad_id=0, max_len=None):
+        if max_len is None:
+            max_len = max((len(s) for s in batch), default=0)
+        ids = []
+        masks = []
+        for seq in batch:
+            seq = list(seq)[-max_len:]   # keep the last max_len tokens
+            n_pad = max_len - len(seq)
+            ids.append([pad_id] * n_pad + seq)
+            masks.append([0] * n_pad + [1] * len(seq))
+        return {"input_ids": ids, "attention_mask": masks}
+
+
+    if __name__ == "__main__":
+        out = left_pad_batch([[5, 6, 7], [1], [9, 8, 7, 6, 5]], pad_id=0)
+        print(out["input_ids"])
+        print(out["attention_mask"])
+    ```
+
+    The output is the same as before: padding on the left, mask 0 for padding and 1 for real tokens, and long inputs still keep their last `max_len` tokens.
+
+    **Green Notes**
+    - **Avoid front insertion** (reduces E): the loop was O(n²) per sequence because each `insert(0, x)` shifts the whole list. Now each list is built once, so the work is O(n). In Green Metrics Tool micro-benchmarks, 1,000,000 `list.insert(0, x)` calls used ~1515 J and 1,000,000 `list.append(x)` calls used ~1.2 J. The front insert is slow because of the shifting. Your lists are shorter than that test, but the cause is the same and it grows with sequence length.
+    - *Not applied:* `collections.deque`. You know the pad count up front, so one list build is simpler and a deque adds nothing here.
+verify:
+  equivalence:
+    driver: |
+      batches = [
+          [[5, 6, 7], [1], [9, 8, 7, 6, 5]],
+          [[], [3, 4]],
+          [[1, 2, 3, 4, 5, 6], [7]],
+          [[2, 2]],
+      ]
+      for b in batches:
+          out = left_pad_batch(b, pad_id=0)
+          print(out["input_ids"])
+          print(out["attention_mask"])
+      out = left_pad_batch([[1, 2, 3, 4, 5], [6]], pad_id=99, max_len=3)
+      print(out["input_ids"])
+      print(out["attention_mask"])
+      out = left_pad_batch([[1, 2], [3]], pad_id=7, max_len=6)
+      print(out["input_ids"])
+      print(out["attention_mask"])
+      print(left_pad_batch([]))
+  test: |-
+    r = left_pad_batch([[5, 6, 7], [1]], pad_id=0)
+    assert r["input_ids"] == [[5, 6, 7], [0, 0, 1]]
+    assert r["attention_mask"] == [[1, 1, 1], [0, 0, 1]]

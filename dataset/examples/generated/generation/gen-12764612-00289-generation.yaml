@@ -1,0 +1,64 @@
+id: gen-12764612-00289-generation
+category: generation
+language: python
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    hello, i need a python script for command line. it read a big csv file (about 800 000 lines) with electricity meter readings and put it to our postgres. columns in csv are meter_id,read_at,kwh and there is a header line. table is meter_readings with same 3 columns. we use psycopg 3. script should get the file path and the database url like arguments. thank you!
+- role: assistant
+  content: |
+    ```python
+    #!/usr/bin/env python3
+    import argparse
+    import csv
+
+    import psycopg
+
+
+    def load(path, dsn):
+        count = 0
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                with open(path, newline="") as f:
+                    reader = csv.reader(f)
+                    next(reader)  # skip header
+                    with cur.copy(
+                        "COPY meter_readings (meter_id, read_at, kwh) FROM STDIN"
+                    ) as copy:
+                        for row in reader:
+                            copy.write_row(row)
+                            count += 1
+        return count
+
+
+    def main():
+        parser = argparse.ArgumentParser(description="Load meter readings from CSV into Postgres")
+        parser.add_argument("csv_path")
+        parser.add_argument("database_url")
+        args = parser.parse_args()
+
+        rows = load(args.csv_path, args.database_url)
+        print(f"Loaded {rows} rows")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    Run it like this:
+
+    ```bash
+    python load_readings.py readings.csv postgresql://user:pass@localhost/energy
+    ```
+
+    The whole file is loaded in one transaction. If one line is bad (for example an empty `kwh`), nothing is written and you can fix the file and run again. The file is read line by line, so memory stays small.
+
+    **Green Notes**
+    - **Batch database writes with COPY** (reduces E): 800 000 rows with one `INSERT` per row would mean 800 000 round trips. `COPY` streams all rows in one statement. In Green Metrics Tool micro-benchmarks with 500,000 rows in batches of 5,000, `COPY` used about 22× less CPU energy than one `execute()` per row and about 8× less than `executemany()`.
+    - *Not applied:* chunked commits. One transaction is simpler and gives all-or-nothing loading. If the table is huge and you want to resume after a crash, commit every few hundred thousand rows.
+verify:
+  static_only: needs PostgreSQL and psycopg

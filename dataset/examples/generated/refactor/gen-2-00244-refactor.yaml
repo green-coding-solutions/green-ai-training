@@ -1,0 +1,90 @@
+id: gen-2-00244-refactor
+category: refactor
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    defect classifier image is 4gb and every code push re-downloads the model. fix this
+
+    ```dockerfile
+    FROM python:3.11
+
+    RUN apt-get update && apt-get install -y build-essential git curl wget vim htop
+
+    WORKDIR /srv/classifier
+    COPY . .
+
+    RUN pip install --upgrade pip && \
+        pip install -r requirements.txt && \
+        pip install pytest black ruff ipython jupyterlab
+
+    RUN mkdir -p models && \
+        curl -L -o models/defect-resnet50-int8.onnx \
+        https://artifacts.internal.example/models/defect-resnet50/v7/model.onnx
+
+    ENV MODEL_PATH=/srv/classifier/models/defect-resnet50-int8.onnx \
+        OMP_NUM_THREADS=4 \
+        PORT=8080
+
+    EXPOSE 8080
+    CMD ["sh", "-c", "uvicorn classifier.api:app --host 0.0.0.0 --port $PORT --workers 2"]
+    ```
+- role: assistant
+  content: |
+    ```dockerfile
+    FROM python:3.11-slim
+
+    ENV PYTHONDONTWRITEBYTECODE=1 \
+        PYTHONUNBUFFERED=1 \
+        PIP_NO_CACHE_DIR=1 \
+        PIP_DISABLE_PIP_VERSION_CHECK=1
+
+    WORKDIR /srv/classifier
+
+    # 1. Dependencies: rebuilt only when requirements.txt changes
+    COPY requirements.txt .
+    RUN pip install -r requirements.txt
+
+    # 2. Model: rebuilt only when MODEL_VERSION changes
+    ARG MODEL_VERSION=v7
+    RUN mkdir -p models && \
+        python -c "import urllib.request; urllib.request.urlretrieve('https://artifacts.internal.example/models/defect-resnet50/${MODEL_VERSION}/model.onnx', 'models/defect-resnet50-int8.onnx')"
+
+    # 3. Source last: a code push only rebuilds this layer
+    COPY . .
+
+    ENV MODEL_PATH=/srv/classifier/models/defect-resnet50-int8.onnx \
+        OMP_NUM_THREADS=4 \
+        PORT=8080
+
+    EXPOSE 8080
+    CMD ["sh", "-c", "uvicorn classifier.api:app --host 0.0.0.0 --port $PORT --workers 2"]
+    ```
+
+    Add a `.dockerignore` next to it:
+
+    ```text
+    .git
+    .venv
+    models/
+    notebooks/
+    tests/
+    **/__pycache__
+    ```
+
+    **Green Notes**
+    - **Slim base, runtime dependencies only** (reduces E, network): `python:3.11-slim` instead of the full image, and no `build-essential`, `git`, `curl`, `wget`, `vim`, `htop`, `pytest`, `black`, `ruff`, `ipython` or `jupyterlab`. None of them are needed to serve the model. In Green Metrics Tool measurements of a small Flask app image built without cache, the full `python:3.12` base with build and dev tools used ~885 J and 157 s, the slim image with runtime dependencies only and the dependency layer first ~124 J and 25 s, about 7× less. Serving requests afterwards cost the same with both images (~17 J), so the saving is in every build, pull and stored copy.
+    - **Dependency and model layers before the source** (reduces E, network): before, `COPY . .` came first, so every code change invalidated the pip install and the model download. Now a code push reuses both cached layers and only copies the source.
+    - **`PIP_NO_CACHE_DIR=1`**: pip's download cache no longer ends up in the image.
+
+    Behavior changes to check:
+    - The `.dockerignore` must exclude `models/`. Otherwise a local `models/` folder from the repo would overwrite the downloaded model in step 3.
+    - The model layer is cached by its command, so a new model needs a new version: `docker build --build-arg MODEL_VERSION=v8 .`. Don't replace the file behind an existing version URL.
+    - The dev tools are gone from the image. If CI runs `pytest` or `ruff` inside this image, install them in a separate test stage or CI step.
+    - If a package in `requirements.txt` has no prebuilt wheel and needs a compiler, add a builder stage with `build-essential` and copy only the installed packages into the slim stage.
+verify:
+  static_only: Dockerfile build needs Docker, network access and the internal artifact store

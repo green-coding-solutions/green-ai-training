@@ -1,0 +1,68 @@
+id: gen-2-00377-no-change
+category: no-change
+language: python
+patterns:
+- vectorize-or-jit
+- none
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    add numba to this pls, its part of the nightly meter ETL
+
+    ```python
+    import numpy as np
+
+    ROLLOVER = 100_000.0  # meter counter wraps after 99999.9 kWh
+
+
+    def interval_consumption(readings, timestamps, max_kw=50.0):
+        """Cumulative counter readings -> kWh per interval.
+
+        Handles counter rollover and flags intervals with impossible power.
+        timestamps: unix seconds, sorted ascending.
+        """
+        readings = np.asarray(readings, dtype=np.float64)
+        ts = np.asarray(timestamps, dtype=np.int64)
+
+        delta = np.diff(readings)
+        delta = np.where(delta < 0, delta + ROLLOVER, delta)
+
+        hours = np.diff(ts) / 3600.0
+        power = np.divide(delta, hours, out=np.full_like(delta, np.nan), where=hours > 0)
+        bad = ~(power <= max_kw)  # also catches NaN (duplicate timestamps)
+        delta[bad] = np.nan
+        return delta, bad
+
+
+    def process_day(meters):
+        out = {}
+        for meter_id, (ts, readings) in meters.items():
+            kwh, bad = interval_consumption(readings, ts)
+            out[meter_id] = {
+                "total_kwh": float(np.nansum(kwh)),
+                "bad_intervals": int(bad.sum()),
+                "peak_kwh": float(np.nanmax(kwh)) if (~bad).any() else 0.0,
+            }
+        return out
+    ```
+- role: assistant
+  content: |
+    I'd leave this as it is. Numba would not make it meaningfully faster.
+
+    - **No per-sample Python loop.** `np.diff`, `np.where`, `np.divide` and the boolean mask each process the whole array in numpy's compiled code. That is already what `@njit` would give you.
+    - **The only Python loop is per meter.** It runs once per meter, not once per reading. It also iterates a dict of tuples, which `@njit` can't compile without a rewrite into typed containers.
+    - **Cost without gain.** Numba adds a heavy dependency and JIT compilation every time the nightly job starts a fresh process.
+
+    Numba pays off in the opposite case: a pure Python `for` loop over every sample. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples in such a loop used ~40 J, and ~9.5 J with `@njit` (about 4× less). Your code has already removed that loop with numpy.
+
+    If the nightly job feels slow, profile it before adding anything:
+
+    ```bash
+    python -m cProfile -s cumtime etl.py | head -n 30
+    ```
+
+    Then fix whatever actually shows up at the top.
+verify:
+  static_only: no-change answer; the user's code stays unchanged and the only code block is a bash profiling command

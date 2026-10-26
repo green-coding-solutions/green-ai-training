@@ -1,0 +1,39 @@
+id: gen-12764612-00240-generation
+category: generation
+language: sql
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    hello, i need a sql query for our model serving service (Postgres). When a prediction request come in, we must load the feature row of one customer from table `customer_features` and give it to the model. The table have 60 columns, most are big json and text fields for the old training pipeline (raw_events_json, notes_text, embedding_debug_json and more). The model only need these: customer_id, age_bucket, country, tenure_days, avg_basket, last_order_days, churn_score_prev. The endpoint is called very much, maybe 100 times each second. Please write the query, thank you
+- role: assistant
+  content: |
+    ```sql
+    SELECT customer_id,
+           age_bucket,
+           country,
+           tenure_days,
+           avg_basket,
+           last_order_days,
+           churn_score_prev
+    FROM customer_features
+    WHERE customer_id = $1;
+    ```
+
+    Make sure `customer_id` has an index (a primary key is enough), so the lookup reads one row.
+
+    **Green Notes**
+    - **Select only the needed columns** (reduces E, network): the query names the 7 columns the model uses and skips the large JSON and text fields. These are read, sent and parsed on every request if you use `SELECT *`. In Green Metrics Tool micro-benchmarks on a 52-column table with large text columns, naming 10 columns used about 5.5× to 7× less CPU energy than `SELECT *`. In the same benchmarks, cost grew with the data each column carries: 8 columns used about 58 J and all 52 columns about 465 J, for 2,500 rows read 1,000 times.
+    - The saving depends on how big the skipped columns are. Your table has large JSON and text fields, so it should apply here. Measure on your own data to see the real gain.
+verify:
+  sql:
+    setup: CREATE TABLE customer_features (customer_id INTEGER PRIMARY KEY, age_bucket TEXT, country TEXT, tenure_days INTEGER,
+      avg_basket REAL, last_order_days INTEGER, churn_score_prev REAL, raw_events_json TEXT, notes_text TEXT, embedding_debug_json
+      TEXT); INSERT INTO customer_features VALUES (1, '30-39', 'DE', 400, 42.5, 12, 0.31, '{}', 'note', '{}'), (2, '20-29',
+      'FR', 90, 18.0, 40, 0.72, '{}', 'note2', '{}');
+    compare: false

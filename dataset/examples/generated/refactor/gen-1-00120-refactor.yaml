@@ -1,0 +1,125 @@
+id: gen-1-00120-refactor
+category: refactor
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import math
+
+
+    class Calibrator:
+        """Temperature scaling + softmax for classifier logits."""
+
+        def __init__(self, temperature, bias, clip, labels):
+            self.temperature = temperature
+            self.bias = bias
+            self.clip = clip
+            self.labels = labels
+
+        def calibrate_batch(self, logits_batch):
+            out = []
+            for logits in logits_batch:
+                scaled = []
+                for z in logits:
+                    z = z / self.temperature + self.bias
+                    if z > self.clip:
+                        z = self.clip
+                    elif z < -self.clip:
+                        z = -self.clip
+                    scaled.append(z)
+                m = max(scaled)
+                exps = [math.exp(z - m) for z in scaled]
+                total = math.fsum(exps)
+                out.append([e / total for e in exps])
+            return out
+
+        def top_label(self, probs):
+            best = max(range(len(probs)), key=probs.__getitem__)
+            return self.labels[best], probs[best]
+
+
+    if __name__ == "__main__":
+        cal = Calibrator(1.5, 0.1, 8.0, ["cat", "dog", "bird"])
+        batch = [[2.0, 0.5, -1.0], [12.0, 3.0, 0.0], [-20.0, -19.0, -30.0]]
+        for probs in cal.calibrate_batch(batch):
+            label, p = cal.top_label(probs)
+            print(label, round(p, 6), [round(x, 6) for x in probs])
+    ```
+- role: assistant
+  content: |
+    ```python
+    import math
+
+
+    class Calibrator:
+        """Temperature scaling + softmax for classifier logits."""
+
+        def __init__(self, temperature, bias, clip, labels):
+            self.temperature = temperature
+            self.bias = bias
+            self.clip = clip
+            self.labels = labels
+
+        def calibrate_batch(self, logits_batch):
+            # read attributes and module functions once, not once per logit
+            temperature = self.temperature
+            bias = self.bias
+            clip = self.clip
+            neg_clip = -clip
+            exp = math.exp
+            fsum = math.fsum
+
+            out = []
+            append_out = out.append
+            for logits in logits_batch:
+                scaled = []
+                append = scaled.append
+                for z in logits:
+                    z = z / temperature + bias
+                    if z > clip:
+                        z = clip
+                    elif z < neg_clip:
+                        z = neg_clip
+                    append(z)
+                m = max(scaled)
+                exps = [exp(z - m) for z in scaled]
+                total = fsum(exps)
+                append_out([e / total for e in exps])
+            return out
+
+        def top_label(self, probs):
+            best = max(range(len(probs)), key=probs.__getitem__)
+            return self.labels[best], probs[best]
+
+
+    if __name__ == "__main__":
+        cal = Calibrator(1.5, 0.1, 8.0, ["cat", "dog", "bird"])
+        batch = [[2.0, 0.5, -1.0], [12.0, 3.0, 0.0], [-20.0, -19.0, -30.0]]
+        for probs in cal.calibrate_batch(batch):
+            label, p = cal.top_label(probs)
+            print(label, round(p, 6), [round(x, 6) for x in probs])
+    ```
+
+    The output is identical. The math is unchanged and runs in the same order.
+
+    **Green Notes**
+    - **Hoisted loop invariants** (reduces E): `self.temperature`, `self.bias`, `self.clip`, `math.exp` and `math.fsum` are now looked up once per batch. Before, the inner loop repeated these lookups for every logit. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local variable before a 10-million-iteration loop saved about 4-5%. Expect a gain of that size, not more.
+    - **Worth it only because this is a hot loop:** it runs per logit, per sample, per request. In code that runs less often, I would leave the lookups as they were.
+    - `top_label` runs once per sample and has no loop-invariant work, so it is unchanged.
+    - If batches are large, the bigger saving is to run this step as one NumPy array operation. I did not do that here, because it would change your dependencies and float rounding.
+verify:
+  module: true
+  equivalence:
+    driver: |-
+      cal = Calibrator(1.5, 0.1, 8.0, ["cat", "dog", "bird"])
+      batch = [[2.0, 0.5, -1.0], [12.0, 3.0, 0.0], [-20.0, -19.0, -30.0], [0.0, 0.0, 0.0]]
+      for probs in cal.calibrate_batch(batch):
+          label, p = cal.top_label(probs)
+          print(label, round(p, 9), [round(x, 9) for x in probs])

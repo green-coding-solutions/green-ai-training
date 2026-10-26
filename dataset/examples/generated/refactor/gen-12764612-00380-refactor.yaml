@@ -1,0 +1,122 @@
+id: gen-12764612-00380-refactor
+category: refactor
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    Our nightly log job parses the API gateway logs and then flags latency spikes. Millions of requests per night, and the spike detector is now most of the runtime in the profiler. Can you optimize it?
+
+    Requirements:
+    - Same result as now: a list of flagged indices, in order.
+    - The EWMA and variance update has to stay exactly as it is. Our alert thresholds were tuned on it.
+    - We run it from cron in a fresh process each night. Adding numba to requirements.txt is fine.
+    - Don't touch the log parsing.
+
+    ```python
+    import re
+    import sys
+    import numpy as np
+
+    LINE_RE = re.compile(r'^(\S+) \S+ \S+ \[[^\]]+\] "(\w+) (\S+)[^"]*" (\d{3}) \d+ (\d+(?:\.\d+)?)ms$')
+
+
+    def load_latencies(path):
+        values = []
+        with open(path) as fh:
+            for line in fh:
+                m = LINE_RE.match(line.strip())
+                if m and m.group(4) != "499":
+                    values.append(float(m.group(5)))
+        return np.array(values, dtype=np.float64)
+
+
+    def flag_latency_anomalies(latencies_ms, alpha=0.05, k=4.0, warmup=200):
+        flagged = []
+        if len(latencies_ms) == 0:
+            return flagged
+        mean = latencies_ms[0]
+        var = 0.0
+        for i in range(1, len(latencies_ms)):
+            x = latencies_ms[i]
+            diff = x - mean
+            std = var ** 0.5
+            if i >= warmup and std > 0 and diff > k * std:
+                flagged.append(i)
+                continue
+            mean += alpha * diff
+            var = (1 - alpha) * (var + alpha * diff * diff)
+        return flagged
+
+
+    if __name__ == "__main__":
+        lat = load_latencies(sys.argv[1])
+        for idx in flag_latency_anomalies(lat):
+            print(idx, lat[idx])
+    ```
+- role: assistant
+  content: |
+    The detector is a numeric loop where each step depends on the previous mean and variance. You can't vectorize it with NumPy without changing the maths, so JIT-compile it with Numba. The parsing stays as it is.
+
+    ```python
+    import re
+    import sys
+    import numpy as np
+    from numba import njit
+
+    LINE_RE = re.compile(r'^(\S+) \S+ \S+ \[[^\]]+\] "(\w+) (\S+)[^"]*" (\d{3}) \d+ (\d+(?:\.\d+)?)ms$')
+
+
+    def load_latencies(path):
+        values = []
+        with open(path) as fh:
+            for line in fh:
+                m = LINE_RE.match(line.strip())
+                if m and m.group(4) != "499":
+                    values.append(float(m.group(5)))
+        return np.array(values, dtype=np.float64)
+
+
+    @njit(cache=True)
+    def _anomaly_mask(lat, alpha, k, warmup):
+        n = len(lat)
+        mask = np.zeros(n, dtype=np.bool_)
+        if n == 0:
+            return mask
+        mean = lat[0]
+        var = 0.0
+        for i in range(1, n):
+            x = lat[i]
+            diff = x - mean
+            std = var ** 0.5
+            if i >= warmup and std > 0 and diff > k * std:
+                mask[i] = True
+                continue
+            mean += alpha * diff
+            var = (1 - alpha) * (var + alpha * diff * diff)
+        return mask
+
+
+    def flag_latency_anomalies(latencies_ms, alpha=0.05, k=4.0, warmup=200):
+        lat = np.ascontiguousarray(latencies_ms, dtype=np.float64)
+        return np.flatnonzero(_anomaly_mask(lat, alpha, k, warmup)).tolist()
+
+
+    if __name__ == "__main__":
+        lat = load_latencies(sys.argv[1])
+        for idx in flag_latency_anomalies(lat):
+            print(idx, lat[idx])
+    ```
+
+    **Green Notes**
+    - **Numba `@njit` on the detector loop** (reduces E): the loop runs once per request, with float maths only, which is the case Numba is good at. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples in a pure Python loop used ~40 J, and the same loop with `@njit` used ~9.5 J (about 4× less). Your loop is a different workload, so measure it with `perf stat` or `time` on a real night's data.
+    - **`cache=True`** (reduces E): the job starts a fresh process each night. The compiled code is stored on disk, so only the first run pays the compile cost. Make sure the cache directory is writable for the cron user.
+    - **Same behavior:** the update formulas, the order of operations and the `continue` for spikes are unchanged, and the function still returns a plain list of indices in order. The kernel writes to a boolean mask instead of appending to a list, because Numba is happiest with arrays.
+    - *Not applied:* the log parsing. It is regex and string work per line, so Numba would not help there, and you asked me to leave it.
+
+    If you ever run this on small inputs, such as a few thousand values, the compile time can cost more than it saves. At your size it pays off.
+verify:
+  static_only: needs numba, which is not in stdlib + numpy

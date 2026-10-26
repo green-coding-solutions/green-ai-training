@@ -1,0 +1,85 @@
+id: gen-12764612-00334-estimate
+category: estimate
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    We have a CI helper that turns our test results into a JUnit XML file. It runs as the last step of every pipeline, and some of our suites have a very large number of test cases. Our sustainability lead wants a number for how much energy we save if we stop using `+=` here.
+
+    Requirements: same XML output byte for byte, no new dependencies, and I need something I can put in a report without it being made up.
+
+    ```python
+    def render_junit(results):
+        out = '<?xml version="1.0" encoding="UTF-8"?>\n'
+        failures = sum(1 for r in results if r["status"] == "fail")
+        out += f'<testsuite name="ci" tests="{len(results)}" failures="{failures}">\n'
+        for r in results:
+            out += f'  <testcase classname="{r["cls"]}" name="{r["name"]}" time="{r["time"]:.3f}"'
+            if r["status"] == "fail":
+                out += ">\n"
+                out += f'    <failure message="{r["msg"]}"/>\n'
+                out += "  </testcase>\n"
+            else:
+                out += "/>\n"
+        out += "</testsuite>\n"
+        return out
+    ```
+- role: assistant
+  content: |
+    I can't give you a number for your pipelines without measuring them. I can give you a measured figure for the pattern and the conditions it holds under.
+
+    In Green Metrics Tool micro-benchmarks, building one string from 1,000,000 pieces used ~469 J of CPU energy with `+=` and ~1.8 J with `"".join()`. That is roughly 260× less for `join`. An f-string appended in a loop behaved like `+=` (~455 J), so your `out += f'...'` lines count as `+=`.
+
+    The output is identical. Collect the pieces in a list and join once:
+
+    ```python
+    def render_junit(results):
+        failures = sum(1 for r in results if r["status"] == "fail")
+        parts = [
+            '<?xml version="1.0" encoding="UTF-8"?>\n',
+            f'<testsuite name="ci" tests="{len(results)}" failures="{failures}">\n',
+        ]
+        for r in results:
+            parts.append(
+                f'  <testcase classname="{r["cls"]}" name="{r["name"]}" time="{r["time"]:.3f}"'
+            )
+            if r["status"] == "fail":
+                parts.append(">\n")
+                parts.append(f'    <failure message="{r["msg"]}"/>\n')
+                parts.append("  </testcase>\n")
+            else:
+                parts.append("/>\n")
+        parts.append("</testsuite>\n")
+        return "".join(parts)
+    ```
+
+    **What to write in the report**
+    - The saving comes from the number of pieces. It grows with suite size and with how often the step runs.
+    - The benchmark used a very large piece count. For small suites with a few hundred test cases, the absolute saving is tiny, and the step is probably not worth much attention.
+    - Don't multiply the benchmark figure by your pipeline runs. It is one benchmark on one machine, and your cost per run is different.
+
+    **How to get your own number:** run `render_junit` on a real large result set, once with each version. Use a Green Metrics Tool usage scenario if you can. Otherwise compare CPU time with `perf stat` or `time` on the same input, repeated several times. That gives you a figure you can defend.
+verify:
+  equivalence:
+    driver: |
+      results = []
+      for i in range(300):
+          st = "fail" if i % 7 == 0 else "pass"
+          results.append({
+              "cls": f"suite.mod{i % 5}",
+              "name": f"test_case_{i}",
+              "time": i * 0.0137,
+              "status": st,
+              "msg": f"assert {i} == {i + 1}",
+          })
+      print(render_junit(results))
+      print(render_junit([]))
+  test: |-
+    out = render_junit([{"cls": "a.B", "name": "t1", "time": 0.5, "status": "pass", "msg": ""}])
+    assert out.startswith('<?xml version="1.0" encoding="UTF-8"?>\n')
+    assert out.endswith("</testsuite>\n")
+    assert 'failures="0"' in out

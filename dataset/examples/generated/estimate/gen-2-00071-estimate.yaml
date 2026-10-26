@@ -1,0 +1,74 @@
+id: gen-2-00071-estimate
+category: estimate
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    Flame graph on our cart service shows `validate_cart` near the top. ~12k blocked SKUs, carts are 20-40 lines, ~300 req/s at peak. If I swap the list for a set, what does that buy us energy-wise? Just the diff and a number please.
+
+    ```python
+    import json
+    from pathlib import Path
+
+    from flask import Flask, jsonify, request
+
+    app = Flask(__name__)
+
+    def _load_blocked(path: Path) -> list[str]:
+        with path.open() as fh:
+            return [row["sku"] for row in json.load(fh)["blocked"]]
+
+    BLOCKED_SKUS = _load_blocked(Path("/etc/cart/blocked_skus.json"))
+
+
+    @app.post("/api/cart/validate")
+    def validate_cart():
+        payload = request.get_json(force=True)
+        items = payload.get("items", [])
+        rejected = [it["sku"] for it in items if it["sku"] in BLOCKED_SKUS]
+        if rejected:
+            return jsonify({"ok": False, "rejected": rejected}), 422
+        return jsonify({"ok": True, "count": len(items)})
+    ```
+- role: assistant
+  content: |
+    Diff:
+
+    ```python
+    def _load_blocked(path: Path) -> frozenset[str]:
+        with path.open() as fh:
+            return frozenset(row["sku"] for row in json.load(fh)["blocked"])
+    ```
+
+    Nothing else changes. `in` gives the same result, and `rejected` keeps the cart order because it is still built from `items`. If other code indexes into `BLOCKED_SKUS` or depends on its order, keep the list for that and add a separate set.
+
+    **What it buys you (direction, not a number):**
+    - Today every cart line scans the list, up to 12k string comparisons for a SKU that isn't blocked, which is the common case. With a set, each line is one hash lookup, whatever the list size. Per request that's 20-40 full scans → 20-40 hash lookups, at 300 req/s.
+    - You build the set once, at import. That is what makes it pay off. In Green Metrics Tool micro-benchmarks, a *single* membership test on a 10,000,000-element list used ~6.9 J, while converting that list to a set first and testing once used ~10.5 J, about 50% more. So converting only pays off with repeated lookups. You have millions of them per hour against the same data, so you're on the good side of that trade. Just don't move the `frozenset(...)` call into the handler.
+
+    I don't have a measured figure for your sizes, and scaling the benchmark above to your traffic would be made up. To get your number:
+
+    ```python
+    import timeit
+
+    skus = [f"SKU-{i:06d}" for i in range(12_000)]
+    blocked_list = skus
+    blocked_set = frozenset(skus)
+    # 30-line cart, mostly SKUs that are not blocked (worst case for the list)
+    cart = [f"SKU-{i:06d}" for i in range(11_995, 12_025)]
+
+    t_list = timeit.timeit(lambda: [s for s in cart if s in blocked_list], number=200)
+    t_set = timeit.timeit(lambda: [s for s in cart if s in blocked_set], number=200)
+    print(f"list: {t_list:.4f}s  set: {t_set:.4f}s  per 200 carts")
+    ```
+
+    For CPU energy instead of CPU time, replay a peak-traffic load against both builds as a Green Metrics Tool usage scenario, or at least compare `perf stat -e power/energy-pkg/` over the same load. Your flame graph will also show `validate_cart` dropping out of the top frames.
+verify:
+  green_block: 1
+  test: |-
+    assert [s for s in cart if s in blocked_list] == [s for s in cart if s in blocked_set]
+    assert [s for s in cart if s in blocked_set] == [f"SKU-{i:06d}" for i in range(11_995, 12_000)]

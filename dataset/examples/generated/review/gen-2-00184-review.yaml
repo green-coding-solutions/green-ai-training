@@ -1,0 +1,132 @@
+id: gen-2-00184-review
+category: review
+language: python
+patterns:
+- simple-conditions
+- keep-star-imports
+facts:
+- F-COND
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    from datetime import *
+    import hashlib
+
+    LAUNCH_AT = datetime(2026, 11, 3, 9, 0, tzinfo=timezone.utc)
+
+    HEROES = {
+        "A": {"headline": "Ship faster with Lumen", "cta": "Start free trial"},
+        "B": {"headline": "Your team, finally in sync", "cta": "Book a demo"},
+        "C": {"headline": "Plans that grow with you", "cta": "See pricing"},
+        "D": {"headline": "Loved by product teams", "cta": "Read case studies"},
+    }
+
+
+    def visitor_hash(visitor_id: str) -> int:
+        return int(hashlib.sha1(visitor_id.encode()).hexdigest()[:8], 16)
+
+
+    def pick_hero(visitor_id: str) -> str:
+        n = visitor_hash(visitor_id)
+        if n % 100 >= 0 and n % 100 < 25:
+            return "A"
+        elif n % 100 >= 25 and n % 100 < 50:
+            return "B"
+        elif n % 100 >= 50 and n % 100 < 75:
+            return "C"
+        elif n % 100 >= 75 and n % 100 < 100:
+            return "D"
+        return "A"
+
+
+    def landing_context(visitor_id: str) -> dict:
+        variant = pick_hero(visitor_id)
+        countdown = None
+        if datetime.now() < LAUNCH_AT:
+            countdown = int((LAUNCH_AT - datetime.now()).total_seconds())
+        return {
+            "variant": variant,
+            "hero": HEROES[variant],
+            "countdown_seconds": countdown,
+            "year": date.today().year,
+        }
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (landing page backend, runs on every page view)
+
+    #### [Bug] Comparing a naive and an aware datetime crashes every request
+    - **Where:** `landing_context`, `datetime.now() < LAUNCH_AT`
+    - **Issue:** `LAUNCH_AT` has `tzinfo=timezone.utc`, but `datetime.now()` has no timezone. Python raises `TypeError: can't compare offset-naive and offset-aware datetimes`, so the page never renders. The second `datetime.now()` call also reads the clock again, so the countdown is not based on the same instant as the check.
+    - **Fix:** read the time once with `now = datetime.now(timezone.utc)` and use `now` for both the check and the countdown.
+
+    #### [Low] Range and modulo guard chain for the A/B bucket
+    - **Where:** `pick_hero`
+    - **Issue:** every branch computes `n % 100` again and checks two range bounds. The four ranges are just four equal slices of 0-99. Also, `n % 100` is always in 0-99, so the last `return "A"` can never run.
+    - **Fix:** work out the bucket once with `n % 100 // 25`, then use plain equality checks. Every visitor gets the same variant as before, so running experiments are not affected.
+    - **Impact:** reduces E slightly per page view. In Green Metrics Tool micro-benchmarks over 10 million classifications, simple equality branches used about 16% less CPU energy than complex range/modulo conditions. Next to rendering a page this cost is tiny, so the main win here is readability.
+
+    ```python
+    from datetime import *
+    import hashlib
+
+    LAUNCH_AT = datetime(2026, 11, 3, 9, 0, tzinfo=timezone.utc)
+
+    HEROES = {
+        "A": {"headline": "Ship faster with Lumen", "cta": "Start free trial"},
+        "B": {"headline": "Your team, finally in sync", "cta": "Book a demo"},
+        "C": {"headline": "Plans that grow with you", "cta": "See pricing"},
+        "D": {"headline": "Loved by product teams", "cta": "Read case studies"},
+    }
+
+
+    def visitor_hash(visitor_id: str) -> int:
+        return int(hashlib.sha1(visitor_id.encode()).hexdigest()[:8], 16)
+
+
+    def pick_hero(visitor_id: str) -> str:
+        bucket = visitor_hash(visitor_id) % 100 // 25
+        if bucket == 0:
+            return "A"
+        elif bucket == 1:
+            return "B"
+        elif bucket == 2:
+            return "C"
+        return "D"
+
+
+    def landing_context(visitor_id: str) -> dict:
+        variant = pick_hero(visitor_id)
+        now = datetime.now(timezone.utc)
+        countdown = None
+        if now < LAUNCH_AT:
+            countdown = int((LAUNCH_AT - now).total_seconds())
+        return {
+            "variant": variant,
+            "hero": HEROES[variant],
+            "countdown_seconds": countdown,
+            "year": date.today().year,
+        }
+    ```
+
+    I did not change `from datetime import *`. In Green Metrics Tool micro-benchmarks, star imports and `import module` showed no measurable energy difference.
+
+    **Already good:** the bucket comes from a hash of the visitor ID, so each visitor always sees the same variant without any stored state.
+verify:
+  green_block: 0
+  equivalence:
+    driver: |
+      from collections import Counter
+      ids = [f"visitor-{i}" for i in range(2000)]
+      print(sorted(Counter(pick_hero(v) for v in ids).items()))
+      print([pick_hero(v) for v in ids[:60]])
+  test: |
+    ctx = landing_context("visitor-42")
+    assert ctx["variant"] in HEROES
+    assert ctx["hero"] is HEROES[ctx["variant"]]
+    assert ctx["countdown_seconds"] is None or ctx["countdown_seconds"] >= 0
+    assert all(pick_hero(f"v{i}") in "ABCD" for i in range(500))

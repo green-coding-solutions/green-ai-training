@@ -1,0 +1,79 @@
+id: gen-12764612-00123-refactor
+category: refactor
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    Hello, we have small gateway box in the field, it collect sensor readings from the devices and write json files every few minutes. This script run from cron after midnight and pack the old files. The box is not strong and the fan is going loud every night when it run. Can you make it better please? Maybe I have also some mistake in it, I am not so good in bash.
+
+    ```bash
+    #!/bin/bash
+    # archive sensor data from gateway
+    DATA_DIR=/var/lib/gw/readings
+    ARCHIVE_DIR=/var/lib/gw/archive
+    DAY=$(date -d yesterday +%Y-%m-%d)
+
+    mkdir -p "$ARCHIVE_DIR"
+    cd "$DATA_DIR" || exit 1
+
+    files=$(ls | grep "^readings-$DAY")
+    if [ -z "$files" ]; then
+      echo "no files for $DAY"
+      exit 0
+    fi
+
+    tar -cf - $files | xz -9e > "$ARCHIVE_DIR/readings-$DAY.tar.xz"
+    if [ $? -eq 0 ]; then
+      rm -f $files
+    fi
+
+    # keep archives for 90 days
+    find "$ARCHIVE_DIR" -name "readings-*.tar.xz" -mtime +90 -delete
+    ```
+- role: assistant
+  content: |
+    ```bash
+    #!/bin/bash
+    # archive sensor data from gateway
+    set -o pipefail
+
+    DATA_DIR=/var/lib/gw/readings
+    ARCHIVE_DIR=/var/lib/gw/archive
+    DAY=$(date -d yesterday +%Y-%m-%d)
+
+    mkdir -p "$ARCHIVE_DIR"
+    cd "$DATA_DIR" || exit 1
+
+    shopt -s nullglob
+    files=(readings-"$DAY"*)
+    if [ "${#files[@]}" -eq 0 ]; then
+      echo "no files for $DAY"
+      exit 0
+    fi
+
+    out="$ARCHIVE_DIR/readings-$DAY.tar.zst"
+    if tar -cf - -- "${files[@]}" | zstd -q -f -o "$out"; then
+      rm -f -- "${files[@]}"
+    else
+      rm -f "$out"
+      echo "archive failed for $DAY, source files kept" >&2
+      exit 1
+    fi
+
+    # keep archives for 90 days (old .xz and new .zst)
+    find "$ARCHIVE_DIR" \( -name 'readings-*.tar.xz' -o -name 'readings-*.tar.zst' \) -mtime +90 -delete
+    ```
+
+    **Green Notes**
+    - **Fast codec for data you compress every night** (reduces E): `xz -9e` is one of the most expensive codecs. In Green Metrics Tool micro-benchmarks, compressing 100 MB of English text with xz used about 29× the energy of zstd at its default level. That CPU work is your loud fan. The archives are stored for months, so compressing them is still worth it. An estimate (not a measurement) says zstd pays back its cost after the data is stored for a fraction of a day.
+    - **Trade-off:** these benchmarks compare energy, not file size. `xz` usually makes smaller files. If the disk of the gateway is almost full, keep `xz` with a lower level, or test the sizes on your real data first.
+    - **Bug fixed:** `$?` only showed the exit code of `xz`. If `tar` failed, the script still deleted your source files. With `set -o pipefail` and the `if` around the pipeline, files are removed only when both tools worked. A broken archive is removed, so the next run can try again.
+    - **Safer file list:** `ls | grep` and the unquoted `$files` break on odd file names. A glob into an array is correct and starts no extra processes.
+    - Old `.tar.xz` archives stay readable and are still deleted by age. New ones are `.tar.zst`, so `zstd` must be installed on the box and wherever you unpack them.
+verify:
+  static_only: bash script needs zstd, xz, GNU date and a gateway data directory; cannot run in the sandbox

@@ -1,0 +1,54 @@
+id: gen-2-00426-generation
+category: generation
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    py: keep the last 500 predictions (label, confidence, latency) of our inference api in memory, newest first, for a /debug/recent endpoint
+- role: assistant
+  content: |
+    ```python
+    from collections import deque
+    from itertools import islice
+    from threading import Lock
+
+
+    class RecentPredictions:
+        def __init__(self, size: int = 500):
+            self._items = deque(maxlen=size)
+            self._lock = Lock()
+
+        def add(self, label: str, confidence: float, latency_ms: float) -> None:
+            record = {
+                "label": label,
+                "confidence": confidence,
+                "latency_ms": latency_ms,
+            }
+            with self._lock:
+                self._items.appendleft(record)
+
+        def latest(self, n: int | None = None) -> list[dict]:
+            with self._lock:
+                return list(islice(self._items, n))
+    ```
+
+    Call `add()` after each prediction. Return `latest()` from the endpoint.
+
+    **Green Notes**
+    - **`deque.appendleft` instead of `list.insert(0, x)`** (reduces E): `add()` runs on every request. A list shifts all items on each front insert, a deque does not. In Green Metrics Tool micro-benchmarks, 1,000,000 `list.insert(0, x)` calls used about 1515 J, while 1,000,000 `list.append(x)` calls used about 1.2 J. With only 500 items the gap is smaller, but the deque costs nothing extra to write.
+    - **`maxlen=size`** drops the oldest record on its own. No manual `pop()` or slicing, and memory stays bounded.
+    - **`islice` in `latest()`** copies only the `n` records the endpoint needs, not all of them.
+verify:
+  test: |-
+    r = RecentPredictions(size=3)
+    for i in range(5):
+        r.add(f"c{i}", i / 10, float(i))
+    out = r.latest()
+    assert [x["label"] for x in out] == ["c4", "c3", "c2"]
+    assert [x["label"] for x in r.latest(2)] == ["c4", "c3"]
+    assert out[0] == {"label": "c4", "confidence": 0.4, "latency_ms": 4.0}
+    assert RecentPredictions().latest() == []

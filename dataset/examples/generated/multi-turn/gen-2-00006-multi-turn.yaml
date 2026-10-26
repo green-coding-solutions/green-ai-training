@@ -1,0 +1,107 @@
+id: gen-2-00006-multi-turn
+category: multi-turn
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    hi, i need a function for our inference API (sentiment model behind FastAPI). before the tokenizer we must clean the text: remove URLs, replace emails with [EMAIL], phone numbers with [PHONE], and many whitespaces to one space. it is called for every request, before `tokenizer(...)`.
+- role: assistant
+  content: |
+    ```python
+    import re
+
+    _URL_RE = re.compile(r"https?://\S+|www\.\S+")
+    _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+    _PHONE_RE = re.compile(r"\+?\d[\d\s/().-]{6,}\d")
+    _SPACE_RE = re.compile(r"\s+")
+
+
+    def clean_text(text: str) -> str:
+        text = _URL_RE.sub(" ", text)          # URLs first: they can contain @ and digits
+        text = _EMAIL_RE.sub("[EMAIL]", text)  # emails before phones: they can contain digits
+        text = _PHONE_RE.sub("[PHONE]", text)
+        return _SPACE_RE.sub(" ", text).strip()
+    ```
+
+    The phone pattern is loose on purpose (8+ characters of digits and separators). It also catches dates like `2024-01-15`. Tighten it if that matters for your model.
+
+    **Green Notes**
+    - **Compile regex once, outside the function** (reduces E): the four patterns are compiled once at import, so a request does no pattern lookup. The win is small, because Python's `re` caches compiled patterns anyway. In Green Metrics Tool micro-benchmarks over 1,000,000 matches, a precompiled pattern used about 18% less CPU energy than calling `re.match(pattern, s)` inline.
+- role: user
+  content: |
+    ok thanks. but now product want that every customer can add own mask rules (regex + replacement), we load them from db for the customer of the request. we have ~3000 customers, each 2-10 rules. is it fine if i just do `re.sub(rule.pattern, rule.repl, text)` in a loop? my colleage say python cache the regex anyway so re.compile is useless.
+- role: assistant
+  content: |
+    Your colleague is right for a handful of fixed patterns, but not here. `re` keeps only about 512 compiled patterns in its cache. 3000 customers with 2-10 rules each means thousands of distinct patterns, so most calls miss the cache and compile the pattern again. That is the expensive case: in Green Metrics Tool micro-benchmarks, recompiling on every call cost about 200× more per match than a cached pattern.
+
+    Compile each customer's rule set once and reuse it:
+
+    ```python
+    import re
+    from functools import lru_cache
+
+    Rules = tuple[tuple[str, str], ...]  # ((pattern, replacement), ...)
+
+
+    @lru_cache(maxsize=4096)
+    def compile_rules(rules: Rules) -> tuple[tuple[re.Pattern, str], ...]:
+        return tuple((re.compile(p), repl) for p, repl in rules)
+
+
+    def validate_rules(rules: Rules) -> None:
+        """Call when a customer saves rules. Reject the save on re.error."""
+        for p, _ in rules:
+            re.compile(p)
+
+
+    def clean_text(text: str, customer_rules: Rules = ()) -> str:
+        text = _URL_RE.sub(" ", text)
+        text = _EMAIL_RE.sub("[EMAIL]", text)
+        text = _PHONE_RE.sub("[PHONE]", text)
+        for pattern, repl in compile_rules(customer_rules):
+            text = pattern.sub(repl, text)
+        return _SPACE_RE.sub(" ", text).strip()
+    ```
+
+    - The cache key is the rule tuple itself. When a customer edits their rules, the tuple changes, so the new set gets compiled and the old entry ages out. You don't need any invalidation. Pass the DB rows as a tuple of `(pattern, replacement)` tuples.
+    - **Bug risk:** one invalid customer regex raises `re.error` and fails the request. `validate_rules` catches that when the rule is saved, not at inference time.
+    - **Security:** customers write these patterns, so one of them can backtrack catastrophically (e.g. `(a+)+$`) and block a worker. Limit pattern length and test rules on save. If you need a hard limit, the third-party `regex` module supports a `timeout` argument.
+- role: user
+  content: |
+    hmm this is too much for now, deadline is friday. in the beta we have only 40 customers with own rules. can i ship the simple loop and change later?
+- role: assistant
+  content: |
+    Yes, for the beta the simple loop is fine. 40 customers with up to 10 rules each is at most 400 patterns. That fits in `re`'s cache of 512, so after the first request each pattern comes from the cache. Other libraries in the process share that cache, but there is still room.
+
+    ```python
+    import re
+
+    _URL_RE = re.compile(r"https?://\S+|www\.\S+")
+    _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+    _PHONE_RE = re.compile(r"\+?\d[\d\s/().-]{6,}\d")
+    _SPACE_RE = re.compile(r"\s+")
+
+
+    def clean_text(text: str, customer_rules=()) -> str:
+        text = _URL_RE.sub(" ", text)
+        text = _EMAIL_RE.sub("[EMAIL]", text)
+        text = _PHONE_RE.sub("[PHONE]", text)
+        for pattern, repl in customer_rules:
+            text = re.sub(pattern, repl, text)
+        return _SPACE_RE.sub(" ", text).strip()
+    ```
+
+    I'd still ship the `re.error` check when rules are saved. It's three lines, and it stops one broken rule from failing requests. When you open the feature to all customers, swap the loop for `compile_rules(customer_rules)` from before. The function signature stays the same.
+verify:
+  test: |-
+    out = clean_text("Call me at +49 170 1234567 or mail a.b@x.de, see https://x.io/a?b=1  ok")
+    assert out == "Call me at [PHONE] or mail [EMAIL], see ok", out
+    assert clean_text("  hello \n\t world ") == "hello world"
+    rules = ((r"ORD-\d+", "[ORDER]"), (r"(?i)acme", "[BRAND]"))
+    out = clean_text("Order ORD-12345 from ACME was late", rules)
+    assert out == "Order [ORDER] from [BRAND] was late", out
+    assert clean_text("no rules here", ()) == "no rules here"

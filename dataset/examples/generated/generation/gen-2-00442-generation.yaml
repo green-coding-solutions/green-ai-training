@@ -1,0 +1,69 @@
+id: gen-2-00442-generation
+category: generation
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # support-bundle.sh - technician runs this over ssh when a gateway misbehaves
+    # collect:
+    #   /var/log/gw/*.log*   (~40 MB, plain text, current + rotated .log.1 .. .log.4, not gzipped)
+    #   /etc/gw/*.conf       (NOT /etc/gw/token)
+    #   journalctl -u gw-sensord --since '-6h'
+    # send to https://support.example-iot.com/upload/$GW_ID
+    #   PUT, server accepts .tar.zst, bearer token is in /etc/gw/token
+    # gateway: small ARM box, LTE, we pay per MB
+    # TODO
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    GW_ID=${GW_ID:-$(</etc/gw/id)}
+    TOKEN=$(</etc/gw/token)
+    URL="https://support.example-iot.com/upload/${GW_ID}"
+
+    command -v zstd >/dev/null || { echo 'zstd is not installed' >&2; exit 1; }
+
+    WORK=$(mktemp -d)
+    trap 'rm -rf "$WORK"' EXIT
+    BUNDLE="${WORK}/bundle.tar.zst"
+
+    journalctl -u gw-sensord --since '-6h' --no-pager > "${WORK}/gw-sensord.journal"
+
+    # null-separated file list, relative to /
+    list_files() {
+      cd /
+      find var/log/gw -type f -name '*.log*' -print0
+      find etc/gw -type f -name '*.conf' -print0
+    }
+
+    # stream tar straight into zstd, no uncompressed tarball on disk
+    tar -cf - -C / --null -T <(list_files) -C "$WORK" gw-sensord.journal \
+      | zstd -q -o "$BUNDLE"
+
+    curl --fail --silent --show-error \
+         --retry 3 --retry-delay 5 --max-time 900 \
+         -H "Authorization: Bearer ${TOKEN}" \
+         -H 'Content-Type: application/zstd' \
+         --upload-file "$BUNDLE" \
+         "$URL"
+    ```
+
+    **Green Notes**
+    - **Compress before sending** (reduces network): the bundle is plain text, which shrinks a lot, and you pay per MB on LTE. The file is compressed once and uploaded as one file, so `--retry` can resend a small file after a dropped connection.
+    - **zstd at its default level, not xz** (reduces E): in Green Metrics Tool micro-benchmarks compressing 100 MB of text, zstd used about 16 J, gzip about 67 J and xz about 458 J (about 29× zstd). Those figures compare energy, not file size. xz would give a smaller file, but on a small ARM box that is a poor trade for a bundle you send once.
+    - **Only text goes in:** logs and configs compress well. If rotated logs were already `.gz`, leave them out of the compression step, since they gain nothing.
+
+    The script never touches `/etc/gw/token`: the `find` only picks `*.conf`, so the bearer token is not in the bundle.
+verify:
+  static_only: needs journalctl, zstd, /etc/gw files and a remote HTTPS endpoint

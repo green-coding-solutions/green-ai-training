@@ -1,0 +1,150 @@
+id: gen-2-00381-review
+category: review
+language: python
+patterns:
+- keep-star-imports
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    review before I push to the lab repo
+
+    ```python
+    """Half-life estimate from gamma counter runs.
+
+    Each run is a list of (t_seconds, counts) bins of equal width.
+    """
+    from math import *  # TODO: switch to `import math`? probably faster
+
+    BIN_WIDTH_S = 60.0
+
+
+    def net_rates(bins, background_cps):
+        """Count rate per bin minus the measured background (counts/s)."""
+        return [(t, c / BIN_WIDTH_S - background_cps) for t, c in bins]
+
+
+    def fit_decay(bins, background_cps=0.0):
+        """Least-squares fit of ln(rate) = ln(A0) - lambda * t.
+
+        Returns (A0 in counts/s, lambda in 1/s).
+        """
+        pts = net_rates(bins, background_cps)
+        xs = [t for t, _ in pts]
+        ys = [log(r) for _, r in pts]
+        n = len(xs)
+        mx = fsum(xs) / n
+        my = fsum(ys) / n
+        sxx = fsum((x - mx) ** 2 for x in xs)
+        sxy = fsum((x - mx) * (y - my) for x, y in zip(xs, ys))
+        slope = sxy / sxx
+        return exp(my - slope * mx), -slope
+
+
+    def half_life(bins, background_cps=0.0):
+        _, lam = fit_decay(bins, background_cps)
+        return log(2) / lam
+
+
+    def summarize(runs, background_cps):
+        out = {}
+        for name, bins in runs.items():
+            t_half = half_life(bins, background_cps)
+            out[name] = {"t_half_s": t_half, "t_half_min": t_half / 60}
+        return out
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (lab analysis)
+
+    #### [Bug] `log` crashes on tail bins at or below background
+    - **Where:** `fit_decay`, `ys = [log(r) for _, r in pts]`
+    - **Issue:** after you subtract the background, late bins often have a net rate of zero or less. `log` then raises `ValueError: math domain error` and the whole run fails.
+    - **Fix:** fit only bins with a positive net rate. Better still, choose a fit window where the tail stays clearly above background. Bins just above zero are noisy and pull the slope.
+
+    #### [Bug] No guard for input that can't be fitted
+    - **Where:** `sxy / sxx` in `fit_decay`, `log(2) / lam` in `half_life`
+    - **Issue:** with fewer than 2 usable bins you get a `ZeroDivisionError`. A flat or rising run (long-lived source, background set too high) gives `lam <= 0`, so the half-life comes out negative, or the code divides by zero.
+    - **Fix:** raise a `ValueError` with a clear message in both places.
+
+    **On the TODO:** keep `from math import *`. Switching to `import math` would not make it faster in any measurable way. In Green Metrics Tool micro-benchmarks with 1,000 Python process starts, `from sympy import *` and `import sympy` used ~3103 J vs ~3093 J. `from posix import *` and `import posix` both used ~121 J. The energy goes into loading the module, and the import style doesn't change that. I removed the TODO.
+
+    ```python
+    """Half-life estimate from gamma counter runs.
+
+    Each run is a list of (t_seconds, counts) bins of equal width.
+    """
+    from math import *
+
+    BIN_WIDTH_S = 60.0
+
+
+    def net_rates(bins, background_cps):
+        """Count rate per bin minus the measured background (counts/s)."""
+        return [(t, c / BIN_WIDTH_S - background_cps) for t, c in bins]
+
+
+    def fit_decay(bins, background_cps=0.0):
+        """Least-squares fit of ln(rate) = ln(A0) - lambda * t.
+
+        Only bins with a positive net rate are used.
+        Returns (A0 in counts/s, lambda in 1/s).
+        """
+        pts = [(t, r) for t, r in net_rates(bins, background_cps) if r > 0]
+        if len(pts) < 2:
+            raise ValueError("need at least 2 bins above background to fit")
+        xs = [t for t, _ in pts]
+        ys = [log(r) for _, r in pts]
+        n = len(xs)
+        mx = fsum(xs) / n
+        my = fsum(ys) / n
+        sxx = fsum((x - mx) ** 2 for x in xs)
+        if sxx == 0:
+            raise ValueError("all usable bins have the same time stamp")
+        sxy = fsum((x - mx) * (y - my) for x, y in zip(xs, ys))
+        slope = sxy / sxx
+        return exp(my - slope * mx), -slope
+
+
+    def half_life(bins, background_cps=0.0):
+        _, lam = fit_decay(bins, background_cps)
+        if lam <= 0:
+            raise ValueError(f"no decay in fit (lambda = {lam:.3g} 1/s), check the background")
+        return log(2) / lam
+
+
+    def summarize(runs, background_cps):
+        out = {}
+        for name, bins in runs.items():
+            t_half = half_life(bins, background_cps)
+            out[name] = {"t_half_s": t_half, "t_half_min": t_half / 60}
+        return out
+    ```
+
+    **Already good:** `fsum` keeps the sums accurate, and each run takes one pass over a small list. Apart from the bugs, no efficiency issues worth changing.
+verify:
+  green_block: 0
+  test: |
+    clean = [(i * 60.0, round(60.0 * (50.0 * exp(-i * 60.0 / 900.0) + 0.5))) for i in range(20)]
+    tail = clean + [(20 * 60.0, 0), (21 * 60.0, 0)]
+    t_true = 900.0 * log(2)
+    assert abs(half_life(tail, 0.5) - t_true) / t_true < 0.02
+    try:
+        half_life([(0.0, 10)], 0.5)
+        raise AssertionError("expected ValueError for a single bin")
+    except ValueError:
+        pass
+    flat = [(i * 60.0, 60) for i in range(10)]
+    try:
+        half_life(flat, 0.0)
+        raise AssertionError("expected ValueError for a flat run")
+    except ValueError:
+        pass
+  equivalence:
+    driver: |-
+      bins_a = [(i * 60.0, round(60.0 * (50.0 * exp(-i * 60.0 / 900.0) + 0.5))) for i in range(20)]
+      bins_b = [(i * 60.0, round(60.0 * (120.0 * exp(-i * 60.0 / 400.0) + 0.5))) for i in range(15)]
+      res = summarize({"run_a": bins_a, "run_b": bins_b}, 0.5)
+      for name in sorted(res):
+          print(name, round(res[name]["t_half_s"], 6), round(res[name]["t_half_min"], 6))

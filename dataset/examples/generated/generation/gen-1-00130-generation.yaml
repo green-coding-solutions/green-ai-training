@@ -1,0 +1,73 @@
+id: gen-1-00130-generation
+category: generation
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    hi, im new to python and not sure how to do this right. in our gitlab CI we keep the build logs of every job in a folder, around 300 files, each one maybe 50k lines. i want a script that goes over all the *.log files and counts how often each kind of warning appears. the lines look like
+
+    `2025-03-02 14:11:09 WARNING: DeprecationWarning old api used in foo.py`
+
+    so the kind is the word right after WARNING: . it will run in the pipeline after the tests. can you write it? i dont know if my idea with a loop over lines is even ok
+- role: assistant
+  content: |
+    Reading line by line is fine. This script takes the log folder as its argument and prints the warning kinds, most frequent first:
+
+    ```python
+    import re
+    import sys
+    from collections import Counter
+    from pathlib import Path
+
+    WARNING_RE = re.compile(r"\bWARNING:\s+(?P<kind>[\w.-]+)")
+
+
+    def count_warnings(log_dir):
+        counts = Counter()
+        for path in sorted(Path(log_dir).glob("*.log")):
+            with path.open(encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    match = WARNING_RE.search(line)
+                    if match:
+                        counts[match.group("kind")] += 1
+        return counts
+
+
+    def main():
+        if len(sys.argv) != 2:
+            sys.exit("usage: count_warnings.py LOG_DIR")
+        for kind, n in count_warnings(sys.argv[1]).most_common():
+            print(f"{n:6d}  {kind}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    Run it with `python count_warnings.py path/to/logs`. `errors="replace"` keeps one bad byte in a log from crashing the whole job.
+
+    **Green Notes**
+    - **Compile the regex once** (reduces E): the pattern is built a single time at module level and reused for every line, so the loop of millions of matches does no pattern setup. Python's `re` module caches patterns internally, so the win is small. In Green Metrics Tool micro-benchmarks of 1,000,000 matches, an inline `re.match(pattern, s)` used ~21 J and a precompiled pattern ~18 J, about 18% less. It also keeps the pattern in one named place.
+verify:
+  module: true
+  test: |-
+    import tempfile, pathlib
+    with tempfile.TemporaryDirectory() as d:
+        p = pathlib.Path(d)
+        (p / "a.log").write_text(
+            "ok line\n"
+            "2025-03-02 14:11:09 WARNING: DeprecationWarning old api used in foo.py\n"
+            "2025-03-02 14:11:10 WARNING: Slow step took long\n"
+        )
+        (p / "b.log").write_text(
+            "2025-03-02 14:12:00 WARNING: DeprecationWarning again\n"
+            "INFO nothing here\n"
+        )
+        (p / "notes.txt").write_text("WARNING: Ignored file\n")
+        c = count_warnings(d)
+        assert c == {"DeprecationWarning": 2, "Slow": 1}, c
+        assert c.most_common()[0] == ("DeprecationWarning", 2)

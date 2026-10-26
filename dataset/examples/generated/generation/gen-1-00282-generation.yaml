@@ -1,0 +1,81 @@
+id: gen-1-00282-generation
+category: generation
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    hi, im new to python. i need a function that reads a csv we export from our old CRM and adds a column with the country code (DE, FR, US...). the country column is just free text that people typed, so a lot of rows are empty or have things i dont have in my list. i dont know how to handle the ones that are not found, my first try crashed with KeyError. what is the right way? file has about 2 million rows
+- role: assistant
+  content: |
+    Use `dict.get()` with a default. A missing country then gives an empty code and never raises.
+
+    ```python
+    import csv
+    from collections import Counter
+
+    COUNTRY_CODES = {
+        "germany": "DE",
+        "deutschland": "DE",
+        "france": "FR",
+        "united states": "US",
+        "usa": "US",
+        "united kingdom": "GB",
+        "uk": "GB",
+        "netherlands": "NL",
+        "spain": "ES",
+        "italy": "IT",
+    }
+
+
+    def add_country_codes(src_path, dst_path):
+        """Copy the CSV and add a country_code column.
+
+        Returns a Counter of non-empty country texts that were not in the table.
+        """
+        unknown = Counter()
+        with open(src_path, newline="", encoding="utf-8") as src, \
+                open(dst_path, "w", newline="", encoding="utf-8") as dst:
+            reader = csv.DictReader(src)
+            writer = csv.DictWriter(dst, fieldnames=[*reader.fieldnames, "country_code"])
+            writer.writeheader()
+            for row in reader:
+                name = (row.get("country") or "").strip().casefold()
+                code = COUNTRY_CODES.get(name, "")
+                if not code and name:
+                    unknown[name] += 1
+                row["country_code"] = code
+                writer.writerow(row)
+        return unknown
+    ```
+
+    Example use:
+
+    ```python
+    unknown = add_country_codes("customers.csv", "customers_with_codes.csv")
+    print(unknown.most_common(20))
+    ```
+
+    The returned counter shows which typed values are missing from your table. Add the common ones to `COUNTRY_CODES` and run again. Empty cells are not counted as unknown.
+
+    **Green Notes**
+    - **No exceptions for expected control flow** (reduces E): in your data a missing country is normal, not an error, so `dict.get(key, default)` is the right tool. In Green Metrics Tool micro-benchmarks with 10,000,000 dict lookups where about half of the keys were missing, `dict.get` used ~67 J and `try/except KeyError` ~76 J, about 12% less. The cost is in raising the exception. If misses were rare, `try/except` would be just as cheap.
+verify:
+  module: false
+  green_block: 0
+  test: |-
+    import os, tempfile, csv
+    d = tempfile.mkdtemp()
+    src = os.path.join(d, "in.csv")
+    dst = os.path.join(d, "out.csv")
+    with open(src, "w", newline="", encoding="utf-8") as f:
+        f.write("id,name,country\n1,A,Germany\n2,B,\n3,C,Narnia\n4,D, USA \n5,E,narnia\n")
+    unknown = add_country_codes(src, dst)
+    assert unknown == {"narnia": 2}, unknown
+    with open(dst, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    assert [r["country_code"] for r in rows] == ["DE", "", "", "US", ""]
+    assert list(rows[0].keys()) == ["id", "name", "country", "country_code"]

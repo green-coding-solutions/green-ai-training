@@ -1,0 +1,66 @@
+id: gen-12764612-00083-generation
+category: generation
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    python func: add remote-area surcharge to orders when postcode is in our surcharge list (csv, ~8k postcodes). ~200k orders per day
+- role: assistant
+  content: |
+    ```python
+    import csv
+    from decimal import Decimal
+
+
+    def normalize_postcode(value):
+        return value.strip().upper().replace(" ", "")
+
+
+    def load_surcharge_postcodes(path):
+        """Read the postcode list once and return it as a set."""
+        with open(path, newline="") as f:
+            return {normalize_postcode(row[0]) for row in csv.reader(f) if row}
+
+
+    def apply_remote_surcharge(orders, postcodes, fee=Decimal("4.90")):
+        """Add `fee` to order["shipping"] for orders going to a surcharge postcode."""
+        for order in orders:
+            if normalize_postcode(order["postcode"]) in postcodes:
+                order["shipping"] += fee
+        return orders
+    ```
+
+    Load the set once per run and pass it in:
+
+    ```python
+    postcodes = load_surcharge_postcodes("surcharge_postcodes.csv")
+    apply_remote_surcharge(todays_orders, postcodes)
+    ```
+
+    **Green Notes**
+    - **Set for repeated membership tests** (reduces E): the list is checked once per order, about 200k times. A set makes each check O(1) instead of a scan over ~8k entries. It is built once, when the file is loaded.
+    - **Postcodes are normalized on both sides**, so `"sw1a 1aa"` and `"SW1A1AA"` match.
+    - *Not applied:* a set for a single order or a one-off check. In Green Metrics Tool micro-benchmarks, converting a 10,000,000-element list to a set for one lookup cost about 50% more than one linear scan. The set only pays off because you look up many times.
+verify:
+  test: |-
+    from decimal import Decimal
+    pc = {normalize_postcode(x) for x in ["IV27 4AA", "ZE1 0AA"]}
+    orders = [
+        {"postcode": " iv27 4aa ", "shipping": Decimal("5.00")},
+        {"postcode": "SW1A 1AA", "shipping": Decimal("5.00")},
+        {"postcode": "ze10aa", "shipping": Decimal("0.00")},
+    ]
+    out = apply_remote_surcharge(orders, pc)
+    assert out[0]["shipping"] == Decimal("9.90")
+    assert out[1]["shipping"] == Decimal("5.00")
+    assert out[2]["shipping"] == Decimal("4.90")
+    import os, tempfile
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "pc.csv")
+        with open(p, "w") as f:
+            f.write("IV27 4AA\n\nZE1 0AA\n")
+        assert load_surcharge_postcodes(p) == {"IV274AA", "ZE10AA"}

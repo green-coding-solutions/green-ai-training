@@ -1,0 +1,60 @@
+id: gen-1-00165-generation
+category: generation
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    need python func, takes list of PDB ids, returns {id: resolution} from the RCSB api. about 400 ids per run
+- role: assistant
+  content: |
+    The requests are independent, so this sends them concurrently with a cap on how many are in flight.
+
+    ```python
+    import asyncio
+
+    import httpx
+
+    RCSB_ENTRY_URL = "https://data.rcsb.org/rest/v1/core/entry/{pdb_id}"
+
+
+    async def _fetch_resolution(client, sem, pdb_id):
+        async with sem:
+            resp = await client.get(RCSB_ENTRY_URL.format(pdb_id=pdb_id))
+        if resp.status_code == 404:
+            return pdb_id, None
+        resp.raise_for_status()
+        info = resp.json().get("rcsb_entry_info") or {}
+        resolution = info.get("resolution_combined")
+        # NMR and some other entries have no resolution
+        return pdb_id, (resolution[0] if resolution else None)
+
+
+    async def fetch_resolutions(pdb_ids, max_concurrent=10):
+        sem = asyncio.Semaphore(max_concurrent)
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            results = await asyncio.gather(
+                *(_fetch_resolution(client, sem, pdb_id) for pdb_id in pdb_ids)
+            )
+        return dict(results)
+
+
+    def get_resolutions(pdb_ids, max_concurrent=10):
+        return asyncio.run(fetch_resolutions(pdb_ids, max_concurrent))
+
+
+    if __name__ == "__main__":
+        print(get_resolutions(["4HHB", "1UBQ", "XXXX"]))
+    ```
+
+    Unknown ids map to `None`. Other HTTP errors raise.
+
+    **Green Notes**
+    - **Async concurrent I/O** (reduces E, wall time): 400 sequential requests spend almost all their time waiting on the network, and concurrency overlaps that wait. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. For small request counts the gain is mostly wall time, so expect the main win in run time, not in joules.
+    - **Bounded concurrency**: the semaphore keeps at most 10 requests in flight, so the API is not flooded and memory stays flat. One shared client is used for all requests.
+    - *Not applied:* async for a handful of ids. For 5 or 10 ids a plain loop is simpler and the difference is small.
+verify:
+  static_only: needs network access and the httpx package

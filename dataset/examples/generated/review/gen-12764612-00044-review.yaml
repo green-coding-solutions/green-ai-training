@@ -1,0 +1,78 @@
+id: gen-12764612-00044-review
+category: review
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    review pls
+
+    ```python
+    import sys
+    import torch
+    from torch import nn
+    from logfeat import hash_tokens
+
+    LABELS = ["ok", "warn", "page"]
+
+    model = nn.Sequential(
+        nn.Linear(512, 128),
+        nn.ReLU(),
+        nn.Dropout(0.2),
+        nn.Linear(128, 3),
+    )
+    model.load_state_dict(torch.load("models/sev.pt"))
+
+
+    def classify(line):
+        x = torch.tensor(hash_tokens(line, 512), dtype=torch.float32).unsqueeze(0)
+        logits = model(x)
+        return LABELS[int(logits.argmax(dim=1))]
+
+
+    def main():
+        for line in sys.stdin:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            label = classify(line)
+            if label != "ok":
+                print(f"{label}\t{line}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (log processing, one forward pass per line)
+
+    #### [Bug] Model is never put in eval mode
+    - **Where:** model setup, before `classify`
+    - **Issue:** a freshly built `nn.Sequential` is in training mode. `Dropout(0.2)` stays active, so the same log line can get different labels on different runs. Some real `page` lines will be dropped and some `ok` lines will be flagged.
+    - **Fix:** call `model.eval()` after loading the weights.
+
+    #### [High] Autograd graph is built for every line
+    - **Where:** `classify`, the `model(x)` call
+    - **Issue:** the forward pass runs with gradient tracking on. Each call records an autograd graph that is never used, and it is thrown away right after. This is pure overhead on a per-line path.
+    - **Fix:** run inference under `torch.no_grad()`.
+    - **Impact:** reduces E per line. In Green Metrics Tool micro-benchmarks, 100,000 CPU inferences used about 14% less CPU energy with `torch.no_grad()` than without it. The saving is bounded, because the matrix math itself is unchanged.
+
+    ```python
+    model.load_state_dict(torch.load("models/sev.pt"))
+    model.eval()
+
+
+    def classify(line):
+        x = torch.tensor(hash_tokens(line, 512), dtype=torch.float32).unsqueeze(0)
+        with torch.no_grad():
+            logits = model(x)
+        return LABELS[int(logits.argmax(dim=1))]
+    ```
+
+    **Already good:** lines are streamed from stdin, so memory stays flat on large logs. Empty lines are skipped before any model work.
+verify:
+  static_only: needs torch and a project-specific logfeat module

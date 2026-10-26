@@ -1,0 +1,55 @@
+id: gen-12764612-00002-refactor
+category: refactor
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    slim this down, the deploy-hook receiver gets rebuilt on every merge
+
+    ```dockerfile
+    FROM python:3.12
+
+    RUN apt-get update && apt-get install -y build-essential git curl vim htop
+
+    WORKDIR /app
+    COPY . .
+
+    RUN pip install -r requirements.txt
+    RUN pip install pytest black mypy ipython
+
+    ENV FLASK_ENV=production
+    ENV HOOK_PORT=8080
+    EXPOSE 8080
+
+    CMD ["python", "hooks.py"]
+    ```
+- role: assistant
+  content: |
+    ```dockerfile
+    FROM python:3.12-slim
+
+    WORKDIR /app
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY . .
+
+    ENV FLASK_ENV=production
+    ENV HOOK_PORT=8080
+    EXPOSE 8080
+
+    CMD ["python", "hooks.py"]
+    ```
+
+    **Green Notes**
+    - **Slim base image** (reduces E on every build and pull): `python:3.12-slim` replaces the full `python:3.12`. The full image ships compilers and many tools this service never uses.
+    - **Runtime dependencies only** (reduces E and M): `build-essential`, `git`, `curl`, `vim`, `htop` and the dev tools (`pytest`, `black`, `mypy`, `ipython`) are gone. Run tests and linting in a separate CI step or a dev image. In Green Metrics Tool micro-benchmarks, building a small Flask image this way used about 7× less energy than the full-image version. Serving requests afterwards cost the same with both, so the saving is in every build, pull and stored copy. That adds up when CI builds on every merge.
+    - **Dependency layer before the source** (reduces E): `requirements.txt` is copied and installed first. A code-only change now reuses the cached dependency layer instead of reinstalling everything. `--no-cache-dir` keeps pip's download cache out of the image.
+    - **Behavior difference:** you can no longer `docker exec` into the container and use `vim`, `git` or `curl`. If one of your packages has no prebuilt wheel and needs a compiler, the pip step will fail. Add the build tools in a separate build stage rather than going back to the full image.
+verify:
+  static_only: Dockerfile refactor; needs a Docker daemon and network to build, nothing to execute with stdlib Python

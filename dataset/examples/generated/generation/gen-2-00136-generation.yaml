@@ -1,0 +1,71 @@
+id: gen-2-00136-generation
+category: generation
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: "```bash\n#!/usr/bin/env bash\n# summarize_preds.sh - run after each nightly batch inference job\n# usage: ./summarize_preds.sh\
+    \ preds.tsv [min_conf]\n#\n# preds.tsv is written by the inference worker, ~500k lines, one header line:\n#   request_id<TAB>label<TAB>confidence<TAB>latency_ms\n\
+    #   e.g. 8f3a91c2\tcat\t0.9731\t41.2\n#\n# should print:\n#   count per label\n#   how many predictions have confidence\
+    \ < min_conf (default 0.6)\n#   avg and max latency_ms\n#\n# TODO\n```\n\n?\n"
+- role: assistant
+  content: |
+    This script does the whole summary in one `awk` pass over the file:
+
+    ```bash
+    #!/usr/bin/env bash
+    # summarize_preds.sh - summary of one batch inference run
+    # usage: ./summarize_preds.sh preds.tsv [min_conf]
+    set -euo pipefail
+
+    if [[ $# -lt 1 || $# -gt 2 ]]; then
+        echo 'usage: summarize_preds.sh preds.tsv [min_conf]' >&2
+        exit 2
+    fi
+
+    preds=$1
+    min_conf=${2:-0.6}
+
+    if [[ ! $min_conf =~ ^[0-9]*\.?[0-9]+$ ]]; then
+        echo "min_conf must be a number, got: $min_conf" >&2
+        exit 2
+    fi
+    if [[ ! -r $preds ]]; then
+        echo "cannot read $preds" >&2
+        exit 1
+    fi
+
+    awk -F '\t' -v min_conf="$min_conf" -v sort_cmd='sort' -v err='/dev/stderr' '
+        NR == 1 { next }                    # header line
+        NF < 4  { bad++; next }
+        {
+            count[$2]++
+            if ($3 + 0 < min_conf + 0) low++
+            lat = $4 + 0
+            sum += lat
+            if (n == 0 || lat > max) max = lat
+            n++
+        }
+        END {
+            printf "per label:\n"
+            fflush()
+            for (label in count) printf "  %s\t%d\n", label, count[label] | sort_cmd
+            close(sort_cmd)
+            printf "low confidence (< %s): %d\n", min_conf, low + 0
+            if (n > 0) printf "latency ms: avg %.1f, max %.1f\n", sum / n, max
+            else       printf "latency ms: no rows\n"
+            if (bad) printf "skipped malformed lines: %d\n", bad > err
+        }
+    ' "$preds"
+    ```
+
+    Labels are printed in alphabetical order. The script skips the header line. If any lines have fewer than 4 fields, it reports how many on stderr.
+
+    **Green Notes**
+    - **One `awk` pass instead of a `while read` loop** (reduces E): the file has about 500k lines every night. Bash can't compare a float like `0.57 < 0.6` by itself, so a shell loop would start `bc`, `cut` or `expr` processes on every line. In Green Metrics Tool micro-benchmarks that summarized a 20,000-line access log, one `awk` pass used over 1000× less CPU energy than a loop that ran `$(echo | cut)` and `$(expr)` for each field. It also used about 4× less than a loop that used only bash builtins.
+    - **Bash builtins for the argument checks** (reduces E): `[[ =~ ]]` and `${2:-0.6}` validate the input without starting any extra processes. This code runs only once per run, so it costs very little either way.
+verify:
+  static_only: bash script, needs a predictions TSV file as input

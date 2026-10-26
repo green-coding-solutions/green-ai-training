@@ -1,0 +1,176 @@
+id: gen-2-00128-refactor
+category: refactor
+language: python
+patterns:
+- memoize
+- hoist-invariants
+facts:
+- F-LRU
+- F-ATTR
+messages:
+- role: user
+  content: |
+    takes ages on a day of gateway access logs. fix this
+
+    ```python
+    import ipaddress
+    import math
+    from collections import Counter
+
+    INTERNAL_NETS = [
+        ipaddress.ip_network("10.0.0.0/8"),
+        ipaddress.ip_network("172.16.0.0/12"),
+        ipaddress.ip_network("192.168.0.0/16"),
+        ipaddress.ip_network("100.64.0.0/10"),
+    ]
+
+    OFFICE_NETS = {
+        "berlin": ipaddress.ip_network("10.20.0.0/16"),
+        "hamburg": ipaddress.ip_network("10.30.0.0/16"),
+    }
+
+
+    def classify_ip(ip):
+        addr = ipaddress.ip_address(ip)
+        for name, net in OFFICE_NETS.items():
+            if addr in net:
+                return "office:" + name
+        for net in INTERNAL_NETS:
+            if addr in net:
+                return "internal"
+        if addr.is_loopback:
+            return "loopback"
+        return "external"
+
+
+    def summarize(path):
+        by_class = Counter()
+        bytes_by_class = Counter()
+        errors_by_class = Counter()
+        size_hist = Counter()
+        bad_lines = 0
+        with open(path) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 10:
+                    bad_lines += 1
+                    continue
+                ip, status, size = parts[0], parts[8], parts[9]
+                cls = classify_ip(ip)
+                by_class[cls] += 1
+                if status.startswith("5"):
+                    errors_by_class[cls] += 1
+                if size != "-":
+                    n = int(size)
+                    bytes_by_class[cls] += n
+                    if n > 0:
+                        size_hist[int(math.log10(n))] += 1
+        return by_class, bytes_by_class, errors_by_class, size_hist, bad_lines
+    ```
+- role: assistant
+  content: |
+    ```python
+    import ipaddress
+    import math
+    from collections import Counter
+    from functools import lru_cache
+
+    INTERNAL_NETS = [
+        ipaddress.ip_network("10.0.0.0/8"),
+        ipaddress.ip_network("172.16.0.0/12"),
+        ipaddress.ip_network("192.168.0.0/16"),
+        ipaddress.ip_network("100.64.0.0/10"),
+    ]
+
+    OFFICE_NETS = {
+        "berlin": ipaddress.ip_network("10.20.0.0/16"),
+        "hamburg": ipaddress.ip_network("10.30.0.0/16"),
+    }
+
+
+    @lru_cache(maxsize=65536)
+    def classify_ip(ip):
+        addr = ipaddress.ip_address(ip)
+        for name, net in OFFICE_NETS.items():
+            if addr in net:
+                return "office:" + name
+        for net in INTERNAL_NETS:
+            if addr in net:
+                return "internal"
+        if addr.is_loopback:
+            return "loopback"
+        return "external"
+
+
+    def summarize(path):
+        by_class = Counter()
+        bytes_by_class = Counter()
+        errors_by_class = Counter()
+        size_hist = Counter()
+        bad_lines = 0
+        log10 = math.log10
+        with open(path) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 10:
+                    bad_lines += 1
+                    continue
+                ip, status, size = parts[0], parts[8], parts[9]
+                cls = classify_ip(ip)
+                by_class[cls] += 1
+                if status.startswith("5"):
+                    errors_by_class[cls] += 1
+                if size != "-":
+                    n = int(size)
+                    bytes_by_class[cls] += n
+                    if n > 0:
+                        size_hist[int(log10(n))] += 1
+        return by_class, bytes_by_class, errors_by_class, size_hist, bad_lines
+    ```
+
+    **Green Notes**
+    - **Memoize `classify_ip`** (reduces E): this was the hot spot. Every line parsed the IP again and checked it against up to six networks. Gateway logs repeat the same client IPs many times, so now each distinct IP is classified once and later lines are a dict lookup. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations drawn from only 200 distinct inputs used ~4.7 J with `lru_cache` instead of ~43 J, about 9× less. The saving depends on repeats. If your logs are mostly unique public IPs, the cache only adds overhead. Check with `classify_ip.cache_info()` after a run: you want hits to be much higher than misses.
+    - **Bounded cache** (reduces M): `maxsize=65536` keeps memory flat on days with many distinct clients. The function returns plain strings, so sharing cached results is safe.
+    - **`log10` hoisted into a local** (reduces E, slightly): this saves one module attribute lookup per line. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local before a 10,000,000-iteration loop saved about 4-5%. It is a minor gain, but it costs nothing here.
+
+    The output is the same. A malformed IP still raises `ValueError` just like before, because `lru_cache` doesn't cache exceptions.
+verify:
+  equivalence:
+    driver: |-
+      import os
+      import random
+      import tempfile
+
+      random.seed(7)
+      pool = (
+          ["10.20.%d.%d" % (random.randint(0, 255), random.randint(1, 254)) for _ in range(15)]
+          + ["10.30.%d.%d" % (random.randint(0, 255), random.randint(1, 254)) for _ in range(10)]
+          + ["172.20.1.%d" % random.randint(1, 254) for _ in range(5)]
+          + ["100.64.3.%d" % random.randint(1, 254) for _ in range(5)]
+          + ["192.168.0.%d" % random.randint(1, 254) for _ in range(5)]
+          + ["127.0.0.1", "8.8.8.8", "203.0.113.9", "198.51.100.23"]
+      )
+      lines = []
+      for i in range(5000):
+          if i % 97 == 0:
+              lines.append("garbage line\n")
+              continue
+          ip = random.choice(pool)
+          status = random.choice(["200", "200", "304", "404", "500", "503"])
+          size = random.choice(["-", "0", str(random.randint(1, 5_000_000))])
+          lines.append(
+              '%s - - [23/Oct/2026:10:00:%02d +0000] "GET /api/v1/items HTTP/1.1" %s %s "-" "curl/8.5"\n'
+              % (ip, i % 60, status, size)
+          )
+      fd, path = tempfile.mkstemp(suffix=".log")
+      with os.fdopen(fd, "w") as f:
+          f.writelines(lines)
+      try:
+          by_class, bytes_by_class, errors_by_class, size_hist, bad = summarize(path)
+      finally:
+          os.remove(path)
+      print(sorted(by_class.items()))
+      print(sorted(bytes_by_class.items()))
+      print(sorted(errors_by_class.items()))
+      print(sorted(size_hist.items()))
+      print(bad)

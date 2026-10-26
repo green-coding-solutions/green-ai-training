@@ -1,0 +1,61 @@
+id: gen-2-00296-generation
+category: generation
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    Need a generator for our log anomaly scorer. `logfeat.featurize(line) -> list[float]` (len 256) already exists. Model is TorchScript at `models/loganom.pt`, CPU only, one logit per line. Read a log file, score in batches of 512, yield `(lineno, line, prob)` for lines with sigmoid prob >= threshold (default 0.9). Runs over every rotated file on ~40 hosts. Code only.
+- role: assistant
+  content: |
+    ```python
+    from collections.abc import Iterator
+
+    import torch
+
+    from logfeat import featurize
+
+
+    def load_model(path: str = "models/loganom.pt") -> torch.jit.ScriptModule:
+        model = torch.jit.load(path, map_location="cpu")
+        model.eval()
+        return model
+
+
+    def _score(model, batch: list[tuple[int, str]]) -> list[float]:
+        x = torch.tensor([featurize(line) for _, line in batch], dtype=torch.float32)
+        with torch.no_grad():
+            return torch.sigmoid(model(x)).reshape(-1).tolist()
+
+
+    def flag_anomalies(
+        model,
+        path: str,
+        threshold: float = 0.9,
+        batch_size: int = 512,
+    ) -> Iterator[tuple[int, str, float]]:
+        batch: list[tuple[int, str]] = []
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for lineno, raw in enumerate(f, start=1):
+                batch.append((lineno, raw.rstrip("\n")))
+                if len(batch) == batch_size:
+                    yield from _emit(model, batch, threshold)
+                    batch = []
+        if batch:
+            yield from _emit(model, batch, threshold)
+
+
+    def _emit(model, batch, threshold):
+        for (lineno, line), prob in zip(batch, _score(model, batch)):
+            if prob >= threshold:
+                yield lineno, line, prob
+    ```
+
+    **Green Notes**
+    - **`torch.no_grad()` around the forward pass** (reduces E): autograd does not record a graph or keep activations for a backward pass that never runs. That work would repeat for every batch of every file on every host. In Green Metrics Tool micro-benchmarks, 100,000 PyTorch CPU inferences used ~157 J without `no_grad()` and ~135 J with it, about 14% less.
+    - `model.eval()` is there for correctness, not speed. It puts dropout and batch-norm layers into inference behavior.
+verify:
+  static_only: needs torch, the internal logfeat module and the TorchScript model file

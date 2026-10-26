@@ -1,0 +1,70 @@
+id: gen-12764612-00135-generation
+category: generation
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # push-exports.sh <YYYY-MM-DD>
+    # copies one day of sensor exports (CSV + NDJSON) to the analysis box
+    set -euo pipefail
+
+    day=$1
+    src_root=/data/exports
+    dest_host=analysis-02
+    dest_dir=/srv/incoming
+
+    if [[ ! -d "$src_root/$day" ]]; then
+      echo "no export for $day" >&2
+      exit 1
+    fi
+
+    echo "pushing $day to $dest_host"
+
+    # TODO: send $src_root/$day to $dest_host:$dest_dir (vpn link, slow)
+
+    echo "done $day"
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # push-exports.sh <YYYY-MM-DD>
+    # copies one day of sensor exports (CSV + NDJSON) to the analysis box
+    set -euo pipefail
+
+    day=${1:?'usage: push-exports.sh YYYY-MM-DD'}
+    src_root=/data/exports
+    dest_host=analysis-02
+    dest_dir=/srv/incoming
+
+    if [[ ! -d "$src_root/$day" ]]; then
+      echo 'no export for '"$day" >&2
+      exit 1
+    fi
+
+    echo "pushing $day to $dest_host"
+
+    tar -C "$src_root" -cf - -- "$day" \
+      | zstd -q -T0 \
+      | ssh "$dest_host" "mkdir -p -- '$dest_dir' && zstd -dc | tar -C '$dest_dir' -xf -"
+
+    echo "done $day"
+    ```
+
+    With `pipefail` set, a failure in `tar`, `zstd` or the remote side stops the script with a non-zero exit code. The analysis box needs `zstd` installed. The files end up in `/srv/incoming/<day>/`, the same as a plain copy would.
+
+    **Green Notes**
+    - **Compress transmitted data with zstd** (reduces network and E): CSV and NDJSON are text and shrink a lot, so the slow VPN link carries far fewer bytes. zstd is a fast codec, so the compression work stays small. In Green Metrics Tool measurements with default settings on 100 MB of text, zstd used ~16 J to compress and gzip ~67 J, while xz used ~458 J.
+    - *Not applied:* `xz` or other high-ratio codecs. They compress a bit better, but the energy cost is far higher, and this data is sent once and then used. They only make sense when the ratio matters more than the cost, for example for long-term storage. The measurements compare energy, not file size.
+
+    If the export folder later contains already-compressed files (`.gz`, `.parquet`, JPEG), the extra `zstd` step gains almost nothing for those files.
+verify:
+  static_only: needs ssh, a remote host and zstd

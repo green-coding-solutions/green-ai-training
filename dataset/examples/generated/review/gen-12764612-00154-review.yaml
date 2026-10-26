@@ -1,0 +1,93 @@
+id: gen-12764612-00154-review
+category: review
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    hello, can you look on this script? it run at the end of every pipeline in our CI (we have around 150 pipelines every day). It pack the test reports and logs and put it to artifact storage, we keep 30 days. Sometimes the runner is busy when many pipelines finish same time and I dont know why. Please review, I am not sure if all is ok.
+
+    ```bash
+    #!/bin/bash
+    # archive_results.sh <pipeline_id> <branch>
+    PIPELINE_ID=$1
+    BRANCH=$2
+    WORK=/var/ci/workspace/$PIPELINE_ID
+    STORE=/mnt/artifacts/$BRANCH
+
+    mkdir -p $STORE
+    cd $WORK
+
+    tar -cf - reports logs coverage | xz -9e -T0 > $STORE/results-$PIPELINE_ID.tar.xz
+
+    if [ $? -eq 0 ]; then
+      rm -rf $WORK
+    fi
+
+    find /mnt/artifacts -name 'results-*.tar.xz' -mtime +30 -exec rm -f {} \;
+    echo "archived $PIPELINE_ID to $STORE"
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (CI job, runs after every pipeline)
+
+    #### [Bug] `rm -rf $WORK` can wipe the whole workspace
+    - **Where:** `WORK=/var/ci/workspace/$PIPELINE_ID` and `rm -rf $WORK`
+    - **Issue:** if the script is called without a pipeline id, `WORK` becomes `/var/ci/workspace/` and `rm -rf` deletes the workspaces of all running pipelines. The variables are also unquoted, so spaces in a value split the path.
+    - **Fix:** fail on a missing argument, check that the id is a number, and quote every variable.
+
+    #### [Bug] A failed `tar` is not detected
+    - **Where:** `tar ... | xz ... > file` and `if [ $? -eq 0 ]`
+    - **Issue:** without `pipefail`, `$?` is only the exit code of the last command. If `tar` fails (a missing folder, disk full), the archive is incomplete, but the check passes and `rm -rf` deletes the only copy of the results.
+    - **Fix:** use `set -euo pipefail`, write to a `.part` file and `mv` it only when the pipeline succeeded.
+
+    #### [Security] Branch name is used as a path
+    - **Where:** `STORE=/mnt/artifacts/$BRANCH`
+    - **Issue:** a branch name like `../../etc/x` or one with spaces writes outside the artifact folder. Branch names come from users.
+    - **Fix:** replace every character that is not a letter, digit, `_` or `-` before using it in a path.
+
+    #### [High] `xz -9e` on every pipeline
+    - **Where:** `xz -9e -T0`
+    - **Issue:** `-9e` is the slowest xz setting, and `-T0` uses all cores. About 150 times a day, this burns CPU for text that only lives 30 days. It also explains the busy runner when many pipelines end together.
+    - **Fix:** use zstd at its default level. Reports and logs are text, so it still compresses them well.
+    - **Impact:** reduces E on the runner. In Green Metrics Tool micro-benchmarks on 100 MB of text, xz at its default level used about 29× more CPU energy than zstd at its default level. `-9e` is slower than that default. Those measurements compare energy only, not file size. xz makes smaller files, which matters for long-term storage but not much for 30 days.
+
+    Compression itself is still worth it for data kept 30 days. A rough estimate (not a direct measurement) puts the break-even at about 0.15 days for zstd and about 7 days for xz. So xz also needs to store data much longer before it pays back.
+
+    ```bash
+    #!/bin/bash
+    # archive_results.sh <pipeline_id> <branch>
+    set -euo pipefail
+
+    PIPELINE_ID=${1:?pipeline id missing}
+    BRANCH=${2:?branch missing}
+
+    [[ $PIPELINE_ID =~ ^[0-9]+$ ]] || { echo 'pipeline id must be a number' >&2; exit 1; }
+    BRANCH_DIR=${BRANCH//[^A-Za-z0-9_-]/_}
+
+    WORK=/var/ci/workspace/$PIPELINE_ID
+    STORE=/mnt/artifacts/$BRANCH_DIR
+    OUT=$STORE/results-$PIPELINE_ID.tar.zst
+
+    mkdir -p "$STORE"
+
+    tar -C "$WORK" -cf - reports logs coverage | zstd -q -T0 -o "$OUT.part"
+    mv "$OUT.part" "$OUT"
+    rm -rf "$WORK"
+
+    find /mnt/artifacts -name 'results-*.tar.*' -mtime +30 -delete
+    echo "archived $PIPELINE_ID to $STORE"
+    ```
+
+    Things that change:
+    - New archives are `.tar.zst`. Read them with `tar --zstd -xf` (zstd must be installed where people download them).
+    - The cleanup pattern now matches both `.tar.xz` and `.tar.zst`, so the old files still expire after 30 days.
+    - Branch folders have new names, for example `feature/login` becomes `feature_login`.
+
+    **Already good:** the cleanup runs by age with a fixed retention, and `-T0` is fine for zstd on a busy runner only if you cap it with `-T2` or so when many pipelines end together.
+verify:
+  static_only: needs zstd/xz tools and a CI filesystem layout (/var/ci, /mnt/artifacts)

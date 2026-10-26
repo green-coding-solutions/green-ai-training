@@ -1,0 +1,119 @@
+id: gen-2-00045-review
+category: review
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    `render_landing()` is called by our Flask view on every hit to `/`. `page` is the CMS doc, cached in-process, edited maybe twice a week, around 25 markdown blocks. Review it, diffs only, no essays.
+
+    ```python
+    import html
+
+    FAQ_LIMIT = 8
+
+
+    def md_to_html(text):
+        """CMS blocks: paragraphs, "- " bullet lists, **bold**."""
+        out = []
+        for block in text.strip().split("\n\n"):
+            block = html.escape(block.strip())
+            bold = False
+            while "**" in block:
+                block = block.replace("**", "</strong>" if bold else "<strong>", 1)
+                bold = not bold
+            lines = block.split("\n")
+            if all(line.startswith("- ") for line in lines):
+                items = "".join("<li>" + line[2:] + "</li>" for line in lines)
+                out.append("<ul>" + items + "</ul>")
+            else:
+                out.append("<p>" + "<br>".join(lines) + "</p>")
+        return "".join(out)
+
+
+    def render_landing(page, query):
+        ref = query.get("ref", "")
+        hero = md_to_html(page["hero"]["body"])
+        features = "".join(
+            '<li class="feature"><h3>%s</h3>%s</li>'
+            % (html.escape(f["title"]), md_to_html(f["body"]))
+            for f in page["features"]
+        )
+        faq_items = []
+        for item in page["faq"][:FAQ_LIMIT]:
+            faq_items.append(
+                "<details><summary>%s</summary>%s</details>"
+                % (html.escape(item["q"]), md_to_html(item["a"]))
+            )
+        return (
+            '<section class="hero"><h1>%s</h1>%s'
+            '<form action="/signup"><input type="hidden" name="ref" value="%s">'
+            '<button>Start free trial</button></form></section>'
+            '<ul class="features">%s</ul><section class="faq">%s</section>'
+        ) % (html.escape(page["hero"]["title"]), hero, ref, features, "".join(faq_items))
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (server-side render, every request)
+
+    #### [Security] Reflected XSS through `ref`
+    - **Where:** `render_landing`, the hidden `ref` input
+    - **Issue:** `ref` comes straight from the query string and goes into the attribute unescaped. A `"` in `?ref=` closes the attribute and lets anyone inject markup into your landing page.
+    - **Fix:** in the final `%` tuple, pass `html.escape(ref)` instead of `ref`. It escapes quotes by default.
+
+    #### [Bug] Odd number of `**` leaves `<strong>` open
+    - **Where:** `md_to_html`, bold loop
+    - **Issue:** one stray `**` in a CMS block opens `<strong>` and never closes it. Everything after it on the page renders bold.
+    - **Fix:** after the `while` loop, add `if bold: block += "</strong>"` (included in the snippet below).
+
+    #### [High] Same markdown converted on every request
+    - **Where:** `md_to_html`, called for the hero, every feature and every FAQ item
+    - **Issue:** the inputs are the same couple dozen CMS strings until someone edits the page, but each request converts all of them again. That is the case memoization is made for. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations drawn from only 200 distinct inputs used ~43 J uncached and ~4.7 J with `@functools.lru_cache`, about 9× less. The gain depends on inputs repeating, which they do here.
+    - **Fix:** `md_to_html` with the cache and the bold fix:
+
+    ```python
+    import html
+    from functools import lru_cache
+
+
+    @lru_cache(maxsize=256)
+    def md_to_html(text):
+        """CMS blocks: paragraphs, "- " bullet lists, **bold**."""
+        out = []
+        for block in text.strip().split("\n\n"):
+            block = html.escape(block.strip())
+            bold = False
+            while "**" in block:
+                block = block.replace("**", "</strong>" if bold else "<strong>", 1)
+                bold = not bold
+            if bold:
+                block += "</strong>"
+            lines = block.split("\n")
+            if all(line.startswith("- ") for line in lines):
+                items = "".join("<li>" + line[2:] + "</li>" for line in lines)
+                out.append("<ul>" + items + "</ul>")
+            else:
+                out.append("<p>" + "<br>".join(lines) + "</p>")
+        return "".join(out)
+    ```
+
+    This is safe: the key is a `str` and the result is an immutable `str`. `maxsize` keeps memory bounded, and old versions of edited blocks get evicted. Each worker process has its own cache. Don't cache `render_landing` itself, because `page` is an unhashable dict and `ref` changes per request.
+
+    - **Impact:** E. After the first hit per block, each conversion is one dict lookup, and that saving repeats on every request. M stays small, bounded by the number of distinct blocks.
+
+    **Already good:** titles and FAQ questions are escaped, and the output is built with `join`.
+verify:
+  green_block: 0
+  test: |-
+    assert md_to_html("Hi **there**") == "<p>Hi <strong>there</strong></p>"
+    assert md_to_html("Save **today") == "<p>Save <strong>today</strong></p>"
+    assert md_to_html("- a\n- **b**") == "<ul><li>a</li><li><strong>b</strong></li></ul>"
+    assert md_to_html("a & b\nc\n\nd") == "<p>a &amp; b<br>c</p><p>d</p>"
+    md_to_html.cache_clear()
+    for _ in range(100):
+        md_to_html("Same CMS block")
+    info = md_to_html.cache_info()
+    assert info.misses == 1 and info.hits == 99

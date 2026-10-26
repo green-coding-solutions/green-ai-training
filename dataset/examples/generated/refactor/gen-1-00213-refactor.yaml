@@ -1,0 +1,106 @@
+id: gen-1-00213-refactor
+category: refactor
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    hi, i'm new to python and i wrote this to pull the first error line for every request out of our app log. it gives the right result but when the log is big (a few million lines) it gets slower and slower the longer it runs. i don't know what is wrong, can you clean it up?
+
+    ```python
+    import re
+    import sys
+
+    ERROR_RE = re.compile(r"ERROR \[(\w[\w-]*)\] request=(\w+)")
+
+
+    def first_errors(lines):
+        seen = []
+        result = []
+        for line in lines:
+            m = ERROR_RE.search(line)
+            if not m:
+                continue
+            request_id = m.group(2)
+            if request_id not in seen:
+                seen.append(request_id)
+                result.append(line.strip())
+        return result
+
+
+    def main():
+        path = sys.argv[1] if len(sys.argv) > 1 else "app.log"
+        with open(path) as f:
+            for line in first_errors(f):
+                print(line)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    The slowdown comes from `request_id not in seen`. `seen` is a list that grows with every new request id, so each check scans the whole list. The total work grows with the square of the number of ids. A set checks in constant time.
+
+    ```python
+    import re
+    import sys
+
+    ERROR_RE = re.compile(r"ERROR \[(\w[\w-]*)\] request=(\w+)")
+
+
+    def first_errors(lines):
+        seen = set()
+        result = []
+        for line in lines:
+            m = ERROR_RE.search(line)
+            if not m:
+                continue
+            request_id = m.group(2)
+            if request_id not in seen:
+                seen.add(request_id)
+                result.append(line.strip())
+        return result
+
+
+    def main():
+        path = sys.argv[1] if len(sys.argv) > 1 else "app.log"
+        with open(path) as f:
+            for line in first_errors(f):
+                print(line)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **Set for repeated membership tests** (reduces E): `seen` is checked once per error line, and it keeps growing. A list makes every check O(n), a set makes it O(1). The output is the same and still in log order, because `result` is the list that keeps the order and `seen` is only used for the lookup.
+    - A set is not always the better choice. In Green Metrics Tool micro-benchmarks, one lookup in a 10,000,000-element list used ~6.9 J, while converting it to a set first and looking up once used ~10.5 J. Here you look up millions of times in a growing collection, so the set wins. For a single check, keep the list.
+    - The regex is already compiled once outside the loop and the file is read line by line, so there is nothing to change there.
+verify:
+  module: true
+  test: |
+    sample = [
+        "2024-05-01 10:00:01 ERROR [worker-1] request=a1 db timeout\n",
+        "2024-05-01 10:00:02 INFO [worker-1] request=a1 ok\n",
+        "2024-05-01 10:00:03 ERROR [worker-2] request=b2 bad input\n",
+        "2024-05-01 10:00:04 ERROR [worker-1] request=a1 retry failed\n",
+    ]
+    assert first_errors(sample) == [
+        "2024-05-01 10:00:01 ERROR [worker-1] request=a1 db timeout",
+        "2024-05-01 10:00:03 ERROR [worker-2] request=b2 bad input",
+    ]
+    assert first_errors([]) == []
+  equivalence:
+    driver: |-
+      lines = []
+      for i in range(3000):
+          rid = "r%d" % (i * 7 % 400)
+          level = "ERROR" if i % 3 else "INFO"
+          lines.append("2024-05-01 10:%02d:%02d %s [worker-%d] request=%s msg %d\n" % (i // 60 % 60, i % 60, level, i % 4, rid, i))
+      for out in first_errors(lines):
+          print(out)

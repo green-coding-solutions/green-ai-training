@@ -1,0 +1,115 @@
+id: gen-2-00166-generation
+category: generation
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    ```nginx
+    # plugins.tern.internal - registry behind `tern plugin install` / `tern plugin search`
+    server {
+        listen 443 ssl;
+        server_name plugins.tern.internal;
+
+        ssl_certificate     /etc/nginx/tls/plugins.crt;
+        ssl_certificate_key /etc/nginx/tls/plugins.key;
+
+        root /srv/tern-registry/public;
+        access_log /var/log/nginx/tern-registry.access.log;
+
+        # full plugin index (~3 MB json), rebuilt by cron every night,
+        # every `tern plugin ...` call downloads it if older than 1h
+        location = /index.json {
+            # TODO compression
+        }
+
+        # schemas/*.json - config schemas, only change on release
+        location /schemas/ {
+        }
+
+        # dl/<plugin>/<version>.tar.gz
+        location /dl/ {
+            # TODO
+        }
+
+        # tern plugin search -> small go service
+        location /api/ {
+            proxy_pass http://127.0.0.1:8081;
+            proxy_set_header Host $host;
+            # TODO compression?
+        }
+    }
+    ```
+
+    ?
+- role: assistant
+  content: |
+    Here are the TODOs filled in. Static JSON is compressed ahead of time, search responses are compressed on the fly, and tarballs are left alone.
+
+    ```nginx
+    # plugins.tern.internal - registry behind `tern plugin install` / `tern plugin search`
+    server {
+        listen 443 ssl;
+        server_name plugins.tern.internal;
+
+        ssl_certificate     /etc/nginx/tls/plugins.crt;
+        ssl_certificate_key /etc/nginx/tls/plugins.key;
+
+        root /srv/tern-registry/public;
+        access_log /var/log/nginx/tern-registry.access.log;
+
+        gzip_vary on;    # Vary: Accept-Encoding, so caches keep both variants apart
+
+        # full plugin index, rebuilt by cron every night.
+        # Serves index.json.gz as is when the client accepts gzip,
+        # otherwise the plain index.json.
+        location = /index.json {
+            gzip_static on;
+        }
+
+        # config schemas, change only on release (precompressed in the release step)
+        location /schemas/ {
+            gzip_static on;
+        }
+
+        # plugin tarballs are already gzip-compressed: no compression here
+        location /dl/ {
+            gzip off;
+        }
+
+        # search results are generated per request: compress on the fly, moderate level
+        location /api/ {
+            proxy_pass http://127.0.0.1:8081;
+            proxy_set_header Host $host;
+
+            gzip on;
+            gzip_comp_level 4;
+            gzip_types application/json;
+            gzip_min_length 1024;    # tiny result lists are not worth compressing
+        }
+    }
+    ```
+
+    Add the compression to the jobs that write the files. `-k` keeps the plain file for clients without gzip support:
+
+    ```bash
+    # nightly cron, right after index.json is written
+    gzip -9 -k -f /srv/tern-registry/public/index.json
+
+    # release step
+    gzip -9 -k -f /srv/tern-registry/public/schemas/*.json
+    ```
+
+    The `.gz` must be rewritten every time the plain file changes. Otherwise gzip clients get the old index.
+
+    **Green Notes**
+    - **Precompressed static assets** (reduces E): the index and schemas are compressed once per rebuild and then served many times with no compression work in nginx. In Green Metrics Tool measurements of nginx serving text assets, compressing on every request cost about 4× the CPU energy of serving precompressed files.
+    - **Compression stays on** (reduces network): in the same benchmark, compression sent about 10× fewer bytes for text assets. That matters here, because every `tern plugin` call on laptops and CI runners can fetch the full index.
+    - **On-the-fly gzip only for dynamic responses** (reduces E): search results can't be precompressed. A moderate level, JSON only, and a minimum size keep the per-request CPU cost low.
+
+    *Not applied:* compression for `/dl/`. The tarballs are already gzip files, so compressing them again costs CPU and saves no bytes.
+verify:
+  static_only: nginx config plus shell lines for cron/release jobs, needs a running nginx with gzip_static module

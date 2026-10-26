@@ -1,0 +1,50 @@
+id: gen-2-00113-generation
+category: generation
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    Need a deploy step for GitLab CI. Tar up ./dist (JS, CSS, HTML, sourcemaps, ~180 MB), push it to every host in $DEPLOY_HOSTS (space separated) under /srv/app/releases/$CI_COMMIT_SHA, then atomically switch /srv/app/current to the new release. Runs on every merge to main, 8 hosts. SSH user is `deploy`. Just the script, skip the essay.
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    : "${DEPLOY_HOSTS:?space-separated host list required}"
+    : "${CI_COMMIT_SHA:?}"
+    build_dir=${BUILD_DIR:-dist}
+    release="/srv/app/releases/${CI_COMMIT_SHA}"
+    release_q=$(printf '%q' "$release")
+
+    remote_cmd='set -e
+    mkdir -p '"$release_q"'
+    zstd -dq | tar -C '"$release_q"' -xf -
+    ln -sfn '"$release_q"' /srv/app/current.tmp
+    mv -T /srv/app/current.tmp /srv/app/current'
+
+    archive=$(mktemp)
+    trap 'rm -f "$archive"' EXIT
+
+    # Compress once on the runner, ship the same archive to every host.
+    tar -C "$build_dir" -cf - . | zstd -q -T0 -c > "$archive"
+
+    read -ra hosts <<< "$DEPLOY_HOSTS"
+    for host in "${hosts[@]}"; do
+      echo "deploying ${CI_COMMIT_SHA} to ${host}"
+      ssh -o BatchMode=yes "deploy@${host}" "$remote_cmd" < "$archive"
+    done
+    ```
+
+    Needs `zstd` on the runner and on the hosts.
+
+    **Green Notes**
+    - **zstd for a transfer that runs on every merge** (reduces E, network): the build output is mostly text, so it compresses well and each host receives far fewer bytes. Green Metrics Tool measured default settings on 100 MB of English text. zstd used about 4× less energy than gzip to compress, and xz about 29× more than zstd. Decompression on the hosts is cheap with zstd too. These figures compare energy, not compression ratio. xz would produce a smaller archive, but it would cost a lot more CPU on every merge.
+    - **Compress once, send to every host** (reduces E): the runner compresses once per deploy, not once per host.
+    - **No `ssh -C` on top** (reduces E): the stream is already compressed. A second compression pass costs CPU and saves nothing.
+verify:
+  static_only: needs ssh access to remote hosts and zstd; deploy script cannot run in the sandbox

@@ -1,0 +1,102 @@
+id: gen-12764612-00248-generation
+category: generation
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    I need a Python function for our nightly product feed ETL. The supplier sends a JSONL file, about 2 million lines per run. Each line has `sku`, `title` and `description`.
+
+    Requirements:
+    - strip HTML tags from the title and collapse whitespace
+    - pull the pack size out of the cleaned title, like "500 ml", "1,5 l", "2 kg" (value as float with a dot, unit lowercase)
+    - find a 13-digit EAN in the description if there is one
+    - lines that are not valid JSON or miss sku/title must be skipped and counted, not crash the run
+    - it should work on any iterable of lines, so we can pass the open file
+
+    Yield one dict per good line: `sku`, `title`, `size_value`, `size_unit`, `ean`.
+- role: assistant
+  content: |
+    ```python
+    import json
+    import re
+    from collections.abc import Iterable, Iterator
+
+    TAG_RE = re.compile(r"<[^>]+>")
+    SPACE_RE = re.compile(r"\s+")
+    SIZE_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(ml|l|g|kg)\b", re.IGNORECASE)
+    EAN_RE = re.compile(r"\b\d{13}\b")
+
+
+    def clean_feed(lines: Iterable[str], stats: dict) -> Iterator[dict]:
+        stats.setdefault("skipped", 0)
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                raw = json.loads(line)
+                sku = raw["sku"]
+                title = raw["title"]
+            except (json.JSONDecodeError, KeyError, TypeError):
+                stats["skipped"] += 1
+                continue
+            if not isinstance(sku, str) or not isinstance(title, str):
+                stats["skipped"] += 1
+                continue
+
+            title = SPACE_RE.sub(" ", TAG_RE.sub(" ", title)).strip()
+
+            size = SIZE_RE.search(title)
+            size_value = float(size.group(1).replace(",", ".")) if size else None
+            size_unit = size.group(2).lower() if size else None
+
+            description = raw.get("description")
+            ean_match = EAN_RE.search(description) if isinstance(description, str) else None
+
+            yield {
+                "sku": sku,
+                "title": title,
+                "size_value": size_value,
+                "size_unit": size_unit,
+                "ean": ean_match.group(0) if ean_match else None,
+            }
+    ```
+
+    Use it like this:
+
+    ```python
+    stats = {}
+    with open("feed.jsonl", encoding="utf-8") as f:
+        for record in clean_feed(f, stats):
+            ...  # write to your target
+    print("skipped:", stats["skipped"])
+    ```
+
+    **Green Notes**
+    - **Compile regexes once** (reduces E): the four patterns are compiled at module level, so the per-line work is only matching. Python's `re` module caches patterns, so the win is small. In Green Metrics Tool micro-benchmarks, 1,000,000 matches with a precompiled pattern used about 18% less CPU energy than inline `re.match(pattern, s)`. Over 2 million lines with four patterns each, it is still free to do.
+    - The patterns are fixed strings, so the cache would not thrash here. Precompiling matters more when a pattern is built dynamically per call or when you have more than 512 distinct patterns.
+    - The file is read line by line through a generator, so memory stays flat for any feed size.
+verify:
+  module: true
+  test: |-
+    sample = [
+        '{"sku": "A1", "title": "<b>Shampoo</b>  Fresh 1,5 L", "description": "EAN 4006381333931 made in DE"}',
+        'not json',
+        '',
+        '{"sku": "B2", "title": "Rice 500 g"}',
+        '{"title": "no sku"}',
+        '[1, 2]',
+        '{"sku": "C3", "title": "<p>Tea</p>", "description": "no code 12345"}',
+    ]
+    stats = {}
+    out = list(clean_feed(sample, stats))
+    assert stats["skipped"] == 3, stats
+    assert len(out) == 3
+    assert out[0] == {"sku": "A1", "title": "Shampoo Fresh 1,5 L", "size_value": 1.5,
+                      "size_unit": "l", "ean": "4006381333931"}, out[0]
+    assert out[1]["size_value"] == 500.0 and out[1]["size_unit"] == "g" and out[1]["ean"] is None
+    assert out[2]["title"] == "Tea" and out[2]["size_value"] is None and out[2]["ean"] is None

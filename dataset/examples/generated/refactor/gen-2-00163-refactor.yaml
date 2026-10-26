@@ -1,0 +1,74 @@
+id: gen-2-00163-refactor
+category: refactor
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    image for our sentiment inference svc takes ages in CI, fix this
+
+    ```dockerfile
+    FROM python:3.11
+
+    RUN apt-get update && apt-get install -y \
+        build-essential \
+        git \
+        curl \
+        wget \
+        vim \
+        htop
+
+    WORKDIR /app
+
+    COPY . /app
+
+    RUN pip install --upgrade pip
+    RUN pip install -r requirements.txt
+    RUN pip install -r requirements-dev.txt
+    RUN pip install jupyter ipython
+
+    ENV MODEL_PATH=/app/models/sentiment.onnx
+    ENV OMP_NUM_THREADS=4
+
+    EXPOSE 8080
+
+    HEALTHCHECK --interval=30s --timeout=5s \
+        CMD curl -f http://localhost:8080/health || exit 1
+
+    CMD ["uvicorn", "serve.api:app", "--host", "0.0.0.0", "--port", "8080"]
+    ```
+- role: assistant
+  content: |
+    ```dockerfile
+    FROM python:3.11-slim
+
+    WORKDIR /app
+
+    # Dependency layer first: it stays cached while only the code or model changes
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY . .
+
+    ENV MODEL_PATH=/app/models/sentiment.onnx
+    ENV OMP_NUM_THREADS=4
+
+    EXPOSE 8080
+
+    HEALTHCHECK --interval=30s --timeout=5s \
+        CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=3)" || exit 1
+
+    CMD ["uvicorn", "serve.api:app", "--host", "0.0.0.0", "--port", "8080"]
+    ```
+
+    **Green Notes**
+    - **Slim base, runtime dependencies only** (reduces E, M, network): the final image no longer contains the compiler toolchain, git, wget, vim, htop, Jupyter, IPython or the dev requirements. Green Metrics Tool measured this on a small Flask app image built without a build cache. The full `python:3.12` image with build tools and dev packages used ~885 J and 157 s. `python:3.12-slim` with runtime dependencies only, the dependency layer first and `pip --no-cache-dir` used ~124 J and 25 s, about 7× less. Serving 2,000 requests afterwards cost the same with both images, so the saving comes back on every build, pull and stored copy.
+    - **Dependency layer before the source** (reduces E): a change to the code or the model no longer reinstalls every package, as long as your CI keeps the Docker layer cache.
+    - **`pip --no-cache-dir`** (reduces M): pip's download cache is no longer stored in the image. I also dropped `pip install --upgrade pip`, because the slim image's pip is enough here.
+
+    The health check behaves the same: `curl` is gone, so it now uses Python's `urllib`, which also fails on 4xx/5xx responses and on timeouts. Run tests and linters from `requirements-dev.txt` in a separate CI step or a separate build stage, not in the image you deploy. If a package in `requirements.txt` has no prebuilt wheel or comes from a git URL, install it in a builder stage and copy only the result into the final image. Don't put `build-essential` back into the final image.
+verify:
+  static_only: Dockerfile, needs docker build and the project's requirements.txt

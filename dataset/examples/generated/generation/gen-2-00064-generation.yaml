@@ -1,0 +1,106 @@
+id: gen-2-00064-generation
+category: generation
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    Hi, I am writing small gateway on a raspberry pi that receive MQTT messages from our sensor nodes (paho client, this part allready works). Now I need a router. In the config the user put a list of topic filters with the MQTT wildcards + and #, and a handler for each one. For every incoming message I must call all handlers wich match the topic. We have around 40 filters now but the customer can add more, and at peak we get maybe 200 msg per second. Can you write the matching part in pure python? No extra library please, only stdlib.
+- role: assistant
+  content: |
+    ```python
+    import re
+    from typing import Callable
+
+    Handler = Callable[[str, bytes], None]
+
+
+    def _filter_to_regex(topic_filter: str) -> str:
+        """Translate an MQTT topic filter into an equivalent regex string."""
+        if not topic_filter:
+            raise ValueError("empty topic filter")
+        levels = topic_filter.split("/")
+        multi = levels[-1] == "#"
+        if multi:
+            levels = levels[:-1]
+
+        parts = []
+        for level in levels:
+            if level == "+":
+                parts.append("[^/]*")            # exactly one level, may be empty
+            elif "+" in level or "#" in level:
+                raise ValueError(f"invalid wildcard in filter {topic_filter!r}")
+            else:
+                parts.append(re.escape(level))
+
+        if not multi:
+            return "/".join(parts)
+        if not parts:
+            return ".*"                          # filter is just "#"
+        return "/".join(parts) + "(?:/.*)?"      # "a/#" also matches "a"
+
+
+    class TopicRouter:
+        def __init__(self) -> None:
+            self._routes: list[tuple[re.Pattern[str], bool, Handler]] = []
+
+        def add(self, topic_filter: str, handler: Handler) -> None:
+            """Register a handler. The filter is translated and compiled once, here."""
+            pattern = re.compile(_filter_to_regex(topic_filter))
+            wildcard_first = topic_filter[0] in "+#"
+            self._routes.append((pattern, wildcard_first, handler))
+
+        def dispatch(self, topic: str, payload: bytes) -> int:
+            """Call every handler whose filter matches the topic. Returns the number called."""
+            system_topic = topic.startswith("$")
+            called = 0
+            for pattern, wildcard_first, handler in self._routes:
+                # MQTT spec: filters starting with a wildcard don't match $-topics
+                if system_topic and wildcard_first:
+                    continue
+                if pattern.fullmatch(topic):
+                    handler(topic, payload)
+                    called += 1
+            return called
+    ```
+
+    Load the config with one `router.add(filter, handler)` per entry at startup. In paho, call `router.dispatch(msg.topic, msg.payload)` from `on_message`. Bad filters like `a/#/b` or `te+mp` raise `ValueError` when you add them, so config errors show up at startup and not on the first message. As the MQTT spec requires, filters that start with `+` or `#` don't match `$SYS/...` topics.
+
+    **Green Notes**
+    - **Compile regex once, outside the hot path** (reduces E): each filter is translated and compiled once in `add()`. Per message, only `fullmatch` runs. If you rebuilt the pattern from the filter for every message, you would repeat the translation each time. And once the customer's filters outgrow the `re` module's internal pattern cache, every match would recompile. In Green Metrics Tool micro-benchmarks over 1,000,000 matches, forcing a recompile on every call cost about 200× more per match. A precompiled pattern was only about 18% cheaper than inline `re.match` with a warm cache. The big saving comes from not recompiling, not from calling `re.compile` in itself.
+verify:
+  green_block: 0
+  test: |-
+    calls = []
+    r = TopicRouter()
+    r.add("sensors/+/temp", lambda t, p: calls.append(("temp", t)))
+    r.add("sensors/#", lambda t, p: calls.append(("all", t)))
+    r.add("#", lambda t, p: calls.append(("any", t)))
+    r.add("gw/status", lambda t, p: calls.append(("status", t)))
+    assert r.dispatch("sensors/n07/temp", b"21.5") == 3
+    assert r.dispatch("sensors", b"") == 2
+    assert r.dispatch("sensors/n07/hum", b"") == 2
+    assert r.dispatch("sensors/n07/temp/raw", b"") == 2
+    assert r.dispatch("sensors//temp", b"") == 3
+    assert r.dispatch("$SYS/broker/load", b"") == 0
+    assert r.dispatch("gw/status", b"") == 2
+    assert r.dispatch("gw/status/x", b"") == 1
+    assert ("temp", "sensors/n07/temp") in calls
+
+    r2 = TopicRouter()
+    r2.add("dev.1/+", lambda t, p: None)
+    r2.add("$SYS/#", lambda t, p: None)
+    assert r2.dispatch("dev.1/x", b"") == 1
+    assert r2.dispatch("devX1/x", b"") == 0
+    assert r2.dispatch("$SYS/broker/load", b"") == 1
+
+    for bad in ["", "a/#/b", "sensors/te+mp", "a/b#"]:
+        try:
+            r2.add(bad, lambda t, p: None)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"accepted invalid filter {bad!r}")

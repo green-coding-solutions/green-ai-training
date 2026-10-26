@@ -1,0 +1,298 @@
+id: gen-2-00178-generation
+category: generation
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    We need a QA environment for our shop on our k8s cluster (1.29). Plain manifests please, no helm. Requirements:
+
+    - namespace `shop-qa`
+    - storefront: `registry.example.com/shop/storefront:qa`, port 3000
+    - checkout-api: `registry.example.com/shop/checkout-api:qa`, port 8080
+    - postgres 16 with a persistent volume. QA seeds a test catalog once and doesn't want to redo it
+    - redis for carts and sessions
+    - something that catches the order confirmation emails so nothing goes to real customers
+    - ingress (nginx) at qa.shop.example.com, `/api` goes to checkout-api, everything else to storefront
+    - DB password is in an existing secret `qa-db` (key `password`)
+
+    In prod we run 4 storefront replicas, 3 checkout-api, a recommendation worker and elasticsearch for search. QA only tests the checkout and order flow. The QA team is in Berlin and works Mon-Fri, roughly 8 to 18.
+- role: assistant
+  content: |
+    This is one file. Apply it with `kubectl apply -f shop-qa.yaml`. Change the env var names to the ones your apps read.
+
+    ```yaml
+    apiVersion: v1
+    kind: Namespace
+    metadata:
+      name: shop-qa
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: storefront
+      namespace: shop-qa
+      labels: {app: storefront, schedule: office-hours}
+    spec:
+      replicas: 1
+      selector:
+        matchLabels: {app: storefront}
+      template:
+        metadata:
+          labels: {app: storefront}
+        spec:
+          containers:
+            - name: storefront
+              image: registry.example.com/shop/storefront:qa
+              ports: [{containerPort: 3000}]
+              env:
+                - {name: API_URL, value: "http://checkout-api:8080"}
+              resources:
+                requests: {cpu: 100m, memory: 256Mi}
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: checkout-api
+      namespace: shop-qa
+      labels: {app: checkout-api, schedule: office-hours}
+    spec:
+      replicas: 1
+      selector:
+        matchLabels: {app: checkout-api}
+      template:
+        metadata:
+          labels: {app: checkout-api}
+        spec:
+          containers:
+            - name: checkout-api
+              image: registry.example.com/shop/checkout-api:qa
+              ports: [{containerPort: 8080}]
+              env:
+                - {name: DB_HOST, value: postgres}
+                - {name: DB_USER, value: shop}
+                - name: DB_PASSWORD
+                  valueFrom:
+                    secretKeyRef: {name: qa-db, key: password}
+                - {name: REDIS_URL, value: "redis://redis:6379/0"}
+                - {name: SMTP_HOST, value: mailpit}
+                - {name: SMTP_PORT, value: "1025"}
+              resources:
+                requests: {cpu: 100m, memory: 256Mi}
+    ---
+    apiVersion: apps/v1
+    kind: StatefulSet
+    metadata:
+      name: postgres
+      namespace: shop-qa
+      labels: {app: postgres, schedule: office-hours}
+    spec:
+      serviceName: postgres
+      replicas: 1
+      selector:
+        matchLabels: {app: postgres}
+      template:
+        metadata:
+          labels: {app: postgres}
+        spec:
+          containers:
+            - name: postgres
+              image: postgres:16
+              ports: [{containerPort: 5432}]
+              env:
+                - {name: POSTGRES_USER, value: shop}
+                - {name: POSTGRES_DB, value: shop}
+                - name: POSTGRES_PASSWORD
+                  valueFrom:
+                    secretKeyRef: {name: qa-db, key: password}
+                - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+              volumeMounts:
+                - {name: data, mountPath: /var/lib/postgresql/data}
+              resources:
+                requests: {cpu: 100m, memory: 256Mi}
+      volumeClaimTemplates:
+        - metadata:
+            name: data
+          spec:
+            accessModes: [ReadWriteOnce]
+            resources:
+              requests: {storage: 5Gi}
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: redis
+      namespace: shop-qa
+      labels: {app: redis, schedule: office-hours}
+    spec:
+      replicas: 1
+      selector:
+        matchLabels: {app: redis}
+      template:
+        metadata:
+          labels: {app: redis}
+        spec:
+          containers:
+            - name: redis
+              image: redis:7-alpine
+              ports: [{containerPort: 6379}]
+              resources:
+                requests: {cpu: 50m, memory: 64Mi}
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: mailpit
+      namespace: shop-qa
+      labels: {app: mailpit, schedule: office-hours}
+    spec:
+      replicas: 1
+      selector:
+        matchLabels: {app: mailpit}
+      template:
+        metadata:
+          labels: {app: mailpit}
+        spec:
+          containers:
+            - name: mailpit
+              image: axllent/mailpit:v1.20
+              ports: [{containerPort: 1025}, {containerPort: 8025}]
+              resources:
+                requests: {cpu: 10m, memory: 32Mi}
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: storefront, namespace: shop-qa}
+    spec:
+      selector: {app: storefront}
+      ports: [{port: 3000}]
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: checkout-api, namespace: shop-qa}
+    spec:
+      selector: {app: checkout-api}
+      ports: [{port: 8080}]
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: postgres, namespace: shop-qa}
+    spec:
+      clusterIP: None
+      selector: {app: postgres}
+      ports: [{port: 5432}]
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: redis, namespace: shop-qa}
+    spec:
+      selector: {app: redis}
+      ports: [{port: 6379}]
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: mailpit, namespace: shop-qa}
+    spec:
+      selector: {app: mailpit}
+      ports:
+        - {name: smtp, port: 1025}
+        - {name: ui, port: 8025}
+    ---
+    apiVersion: networking.k8s.io/v1
+    kind: Ingress
+    metadata: {name: shop-qa, namespace: shop-qa}
+    spec:
+      ingressClassName: nginx
+      rules:
+        - host: qa.shop.example.com
+          http:
+            paths:
+              - path: /api
+                pathType: Prefix
+                backend:
+                  service: {name: checkout-api, port: {number: 8080}}
+              - path: /
+                pathType: Prefix
+                backend:
+                  service: {name: storefront, port: {number: 3000}}
+    ---
+    # Office-hours schedule: everything labeled schedule=office-hours
+    apiVersion: v1
+    kind: ServiceAccount
+    metadata: {name: office-hours-scaler, namespace: shop-qa}
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: Role
+    metadata: {name: office-hours-scaler, namespace: shop-qa}
+    rules:
+      - apiGroups: [apps]
+        resources: [deployments, statefulsets]
+        verbs: [get, list]
+      - apiGroups: [apps]
+        resources: [deployments/scale, statefulsets/scale]
+        verbs: [get, patch, update]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata: {name: office-hours-scaler, namespace: shop-qa}
+    subjects:
+      - {kind: ServiceAccount, name: office-hours-scaler, namespace: shop-qa}
+    roleRef:
+      {apiGroup: rbac.authorization.k8s.io, kind: Role, name: office-hours-scaler}
+    ---
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata: {name: scale-down-evening, namespace: shop-qa}
+    spec:
+      schedule: "0 19 * * 1-5"
+      timeZone: Europe/Berlin
+      concurrencyPolicy: Forbid
+      jobTemplate:
+        spec:
+          backoffLimit: 2
+          template:
+            spec:
+              serviceAccountName: office-hours-scaler
+              restartPolicy: OnFailure
+              containers:
+                - name: kubectl
+                  image: registry.k8s.io/kubectl:v1.29.0
+                  args: [scale, -n, shop-qa, "deployment,statefulset",
+                         -l, schedule=office-hours, --replicas=0]
+    ---
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata: {name: scale-up-morning, namespace: shop-qa}
+    spec:
+      schedule: "0 7 * * 1-5"
+      timeZone: Europe/Berlin
+      concurrencyPolicy: Forbid
+      jobTemplate:
+        spec:
+          backoffLimit: 2
+          template:
+            spec:
+              serviceAccountName: office-hours-scaler
+              restartPolicy: OnFailure
+              containers:
+                - name: kubectl
+                  image: registry.k8s.io/kubectl:v1.29.0
+                  args: [scale, -n, shop-qa, "deployment,statefulset",
+                         -l, schedule=office-hours, --replicas=1]
+    ```
+
+    To read the caught emails: `kubectl -n shop-qa port-forward svc/mailpit 8025`, then open `http://localhost:8025`.
+
+    **Green Notes**
+    - **Scale to zero outside working hours** (reduces E, M): one CronJob scales everything down at 19:00 and another scales it up at 07:00, Mon-Fri, Berlin time. That leaves an hour of buffer on each side of your team's hours. Friday's scale-down lasts until Monday, so the environment is off every night and all weekend.
+    - **Only what QA tests** (reduces E, M): one replica per service, small resource requests, and no recommendation worker or Elasticsearch, because the checkout and order flow doesn't need them. In Green Metrics Tool measurements of an idle preview environment, going from 3 app replicas, Postgres, Redis and a worker down to 1 replica and Postgres used only about 3% less CPU energy per idle minute. Trimming mainly frees reserved cluster capacity. The off hours save more.
+
+    Behavior to know:
+    - Postgres keeps its volume, so the seeded catalog survives the nightly stop.
+    - Redis has no volume, so carts and sessions reset every morning.
+    - While everything is scaled down, the ingress returns 503. For late testing, scale up by hand: `kubectl -n shop-qa scale deployment,statefulset -l schedule=office-hours --replicas=1`.
+verify:
+  static_only: Kubernetes manifests, need a cluster to apply

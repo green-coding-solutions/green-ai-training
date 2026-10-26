@@ -1,0 +1,63 @@
+id: gen-12764612-00027-generation
+category: generation
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    py: parse price strings from scraped competitor listings, like "1.299,00 €", "$12.50", "EUR 7,99", into (cents, currency). runs over ~2M rows
+- role: assistant
+  content: |
+    ```python
+    import re
+    from decimal import Decimal
+
+    _AMOUNT_RE = re.compile(r"\d(?:[\d.,]*\d)?")
+    _CURRENCY_RE = re.compile(r"[€$£]|\b(?:EUR|USD|GBP)\b")
+    _GROUP_SEP_RE = re.compile(r"[.,]")
+
+    _SYMBOLS = {"€": "EUR", "$": "USD", "£": "GBP"}
+
+
+    def parse_price(text):
+        """Return (cents, currency) or None. currency is None if not found."""
+        m = _AMOUNT_RE.search(text)
+        if m is None:
+            return None
+        raw = m.group()
+
+        # Last separator is the decimal mark only if 1-2 digits follow it.
+        sep = max(raw.rfind("."), raw.rfind(","))
+        if sep != -1 and len(raw) - sep - 1 in (1, 2):
+            whole, frac = raw[:sep], raw[sep + 1:]
+        else:
+            whole, frac = raw, ""
+
+        whole = _GROUP_SEP_RE.sub("", whole)
+        value = Decimal(f"{whole}.{frac}") if frac else Decimal(whole)
+        cents = int((value * 100).to_integral_value())
+
+        c = _CURRENCY_RE.search(text)
+        currency = None
+        if c is not None:
+            currency = _SYMBOLS.get(c.group(), c.group())
+        return cents, currency
+    ```
+
+    Amounts use `Decimal`, so there are no float rounding errors in cents. A value like `1,299` is read as 1299, not 1.299, because three digits after the last separator mean a thousands group.
+
+    **Green Notes**
+    - **Compile regex once** (reduces E): the three patterns are compiled at module level, not inside `parse_price`. With 2M rows, that is no per-call pattern lookup. This is a small win, because Python's `re` caches compiled patterns itself. In Green Metrics Tool micro-benchmarks, 1,000,000 matches with a precompiled pattern used about 18% less CPU energy than inline `re.match(pattern, s)`.
+    - *Not applied:* anything beyond that. Parsing cost here is dominated by the regex search and `Decimal`, and the patterns are fixed, so there is nothing else to change.
+verify:
+  test: |-
+    assert parse_price("1.299,00 €") == (129900, "EUR")
+    assert parse_price("$12.50") == (1250, "USD")
+    assert parse_price("EUR 7,99") == (799, "EUR")
+    assert parse_price("£1,299") == (129900, "GBP")
+    assert parse_price("12") == (1200, None)
+    assert parse_price("1,299.99 USD") == (129999, "USD")
+    assert parse_price("sold out") is None

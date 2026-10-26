@@ -1,0 +1,120 @@
+id: gen-1-00217-review
+category: review
+language: python
+patterns:
+- regex-precompile
+- hoist-invariants
+facts:
+- F-REGEX
+- F-ATTR
+messages:
+- role: user
+  content: |
+    hi, i wrote this small script to clean subtitle files (.srt) before i put them on my media player. it works but a friend looked at it and said its "not so good". i dont know what is wrong, can you look at it? i run it on a folder with maybe 300 files
+
+    ```python
+    import os
+    import re
+    import sys
+
+
+    def clean_srt(path):
+        out_lines = []
+        f = open(path, encoding="utf-8")
+        for line in f:
+            line = line.rstrip("\n")
+            if re.match(r"^\d+$", line):
+                out_lines.append(line)
+            elif re.match(r"^\d\d:\d\d:\d\d,\d\d\d --> \d\d:\d\d:\d\d,\d\d\d$", line):
+                out_lines.append(line)
+            else:
+                line = re.sub(r"<[^>]+>", "", line)
+                line = re.sub(r"\s+", " ", line)
+                out_lines.append(line.strip())
+        out = open(path, "w", encoding="utf-8")
+        out.write("\n".join(out_lines) + "\n")
+        out.close()
+        return len(out_lines)
+
+
+    if __name__ == "__main__":
+        folder = sys.argv[1]
+        for name in os.listdir(folder):
+            if name.endswith(".srt"):
+                n = clean_srt(os.path.join(folder, name))
+                print(name, n)
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (batch over a folder)
+
+    #### [Bug] Files are never closed safely
+    - **Where:** `f = open(path, ...)` and `out = open(path, "w", ...)`
+    - **Issue:** `f` is never closed. If anything fails in the loop, the handle stays open. The output file is opened while `f` is still open, and `out.close()` is skipped if `write` fails. On Windows an open handle can also block later rename or delete steps.
+    - **Fix:** use `with` for both files. Read everything first, then write.
+
+    #### [Low] Regex calls repeat the pattern text on every line
+    - **Where:** the four `re.match` / `re.sub` calls inside the loop
+    - **Issue:** the patterns are fixed strings, so Python's `re` module caches them and this is not slow. Each call still does a cache lookup per line. In Green Metrics Tool micro-benchmarks, a precompiled pattern used about 18% less CPU energy than an inline `re.match` over 1,000,000 matches. The gain is small because of that cache. It is also easy to do: compile once at the top and give the patterns names. The names make the code easier to read.
+    - **Impact:** reduces E a little, per line of every file.
+
+    #### [Low] Method lookup on every line
+    - **Where:** `out_lines.append`
+    - **Issue:** the attribute is looked up again for every line. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local variable before a 10,000,000-iteration loop saved about 4-5%. Expect about that much at most, so this only matters because your loop runs over many lines of many files. If you prefer plain `out_lines.append`, that is fine too.
+
+    ```python
+    import os
+    import re
+    import sys
+
+    INDEX_RE = re.compile(r"^\d+$")
+    TIME_RE = re.compile(r"^\d\d:\d\d:\d\d,\d\d\d --> \d\d:\d\d:\d\d,\d\d\d$")
+    TAG_RE = re.compile(r"<[^>]+>")
+    SPACE_RE = re.compile(r"\s+")
+
+
+    def clean_srt(path):
+        out_lines = []
+        append = out_lines.append
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if INDEX_RE.match(line) or TIME_RE.match(line):
+                    append(line)
+                else:
+                    line = TAG_RE.sub("", line)
+                    append(SPACE_RE.sub(" ", line).strip())
+        with open(path, "w", encoding="utf-8") as out:
+            out.write("\n".join(out_lines) + "\n")
+        return len(out_lines)
+
+
+    if __name__ == "__main__":
+        folder = sys.argv[1]
+        for name in os.listdir(folder):
+            if name.endswith(".srt"):
+                n = clean_srt(os.path.join(folder, name))
+                print(name, n)
+    ```
+
+    The output is the same as before. The script still overwrites the original files, so keep a copy of your subtitles the first time you run it.
+
+    **Already good:** the logic is simple and clear, `encoding="utf-8"` is set on both files, and the `__main__` guard lets you import the function.
+verify:
+  module: true
+  test: |
+    import re
+    assert isinstance(TIME_RE, re.Pattern)
+    assert isinstance(TAG_RE, re.Pattern)
+  equivalence:
+    driver: |-
+      import os
+      import tempfile
+
+      d = tempfile.mkdtemp()
+      p = os.path.join(d, "a.srt")
+      with open(p, "w", encoding="utf-8") as fh:
+          fh.write("1\n00:00:01,000 --> 00:00:02,500\n<i>Hello   there</i>\n\n2\n00:00:03,000 --> 00:00:04,000\n<b>Bye</b>  now\n")
+      print(clean_srt(p))
+      with open(p, encoding="utf-8") as fh:
+          print(repr(fh.read()))

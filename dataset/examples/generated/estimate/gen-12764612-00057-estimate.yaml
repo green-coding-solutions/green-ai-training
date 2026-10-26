@@ -1,0 +1,104 @@
+id: gen-12764612-00057-estimate
+category: estimate
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    hi, i made a small script that count syllables in a text file, i run it on whole books (txt from gutenberg). it is slow-ish and i dont know why. a friend say "use lru_cache" but i dont understand if it really help. how much energy would it save?
+
+    ```python
+    import re
+    import sys
+
+
+    def count_syllables(word):
+        word = word.lower()
+        groups = re.findall(r"[aeiouy]+", word)
+        count = len(groups)
+        if word.endswith("e") and count > 1:
+            count -= 1
+        return max(count, 1)
+
+
+    def main(path):
+        total = 0
+        words = 0
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                for w in re.findall(r"[A-Za-z']+", line):
+                    total += count_syllables(w)
+                    words += 1
+        print(f"{words} words, {total} syllables")
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1])
+    ```
+- role: assistant
+  content: |
+    It can help here, because a book repeats the same words again and again ("the", "and", "of"). Your function is pure: the same word always gives the same result. That is the case where caching works.
+
+    In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over only 200 distinct inputs used ~43 J without `@functools.lru_cache` and ~4.7 J with it, about 9× less. I can't turn that into a number for your script. The saving depends on:
+
+    - **How often words repeat.** Books have a small set of very common words, so the hit rate should be high. If most inputs were unique, the cache would only add overhead.
+    - **How expensive the function is.** A cache lookup also costs something. `count_syllables` is short, so the gain per hit is smaller than for a heavy computation.
+    - **How long the script runs.** For a short text, startup and file reading dominate and the saving is tiny.
+
+    The change is one line. Keep the cache bounded, so memory stays small on very large inputs:
+
+    ```python
+    import re
+    import sys
+    from functools import lru_cache
+
+
+    @lru_cache(maxsize=50_000)
+    def count_syllables(word):
+        word = word.lower()
+        groups = re.findall(r"[aeiouy]+", word)
+        count = len(groups)
+        if word.endswith("e") and count > 1:
+            count -= 1
+        return max(count, 1)
+
+
+    def main(path):
+        total = 0
+        words = 0
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                for w in re.findall(r"[A-Za-z']+", line):
+                    total += count_syllables(w)
+                    words += 1
+        print(f"{words} words, {total} syllables")
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1])
+    ```
+
+    The output is the same. Words are passed as strings, which are hashable, so caching is safe.
+
+    To measure it on your own book, compare CPU time before and after:
+
+    ```bash
+    time python syllables_old.py book.txt
+    time python syllables_new.py book.txt
+    ```
+
+    You can check the hit rate by printing `count_syllables.cache_info()` at the end of `main`. A high number of hits compared to misses means the cache is doing its job. For real energy numbers, run both versions in a Green Metrics Tool usage scenario, or use `perf stat` as a CPU-time proxy.
+verify:
+  module: true
+  green_block: 0
+  test: |-
+    count_syllables.cache_clear()
+    assert count_syllables("banana") == 3
+    assert count_syllables("banana") == 3
+    assert count_syllables("table") == 1
+    assert count_syllables("rhythm") == 1
+    info = count_syllables.cache_info()
+    assert info.hits == 1 and info.misses == 3

@@ -1,0 +1,102 @@
+id: gen-1-00251-refactor
+category: refactor
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    diff only pls. review apps for our log pipeline, GitLab CI. they pile up and the cluster is always full
+
+    ```yaml
+    stages:
+      - build
+      - test
+      - review
+
+    build_image:
+      stage: build
+      image: docker:26
+      services: [docker:26-dind]
+      script:
+        - docker build -t $CI_REGISTRY_IMAGE/parser:$CI_COMMIT_SHORT_SHA ./parser
+        - docker push $CI_REGISTRY_IMAGE/parser:$CI_COMMIT_SHORT_SHA
+
+    unit_tests:
+      stage: test
+      image: python:3.12-slim
+      script:
+        - pip install -r parser/requirements.txt pytest
+        - pytest parser/tests
+
+    deploy_review:
+      stage: review
+      image: alpine/helm:3.14.0
+      script:
+        - >
+          helm upgrade --install logpipe-$CI_COMMIT_REF_SLUG ./deploy/chart
+          --namespace review-$CI_COMMIT_REF_SLUG --create-namespace
+          --set image.tag=$CI_COMMIT_SHORT_SHA
+          --set parser.replicaCount=3
+          --set postgres.enabled=true
+          --set redis.enabled=true
+          --set worker.enabled=true
+          --wait
+      environment:
+        name: review/$CI_COMMIT_REF_SLUG
+        url: https://$CI_COMMIT_REF_SLUG.review.logpipe.example.com
+      rules:
+        - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+    ```
+- role: assistant
+  content: |
+    Only the `deploy_review` job changes, plus a new `stop_review` job:
+
+    ```yaml
+    deploy_review:
+      stage: review
+      image: alpine/helm:3.14.0
+      script:
+        - >
+          helm upgrade --install logpipe-$CI_COMMIT_REF_SLUG ./deploy/chart
+          --namespace review-$CI_COMMIT_REF_SLUG --create-namespace
+          --set image.tag=$CI_COMMIT_SHORT_SHA
+          --set parser.replicaCount=1
+          --set postgres.enabled=true
+          --set redis.enabled=false
+          --set worker.enabled=false
+          --wait
+      environment:
+        name: review/$CI_COMMIT_REF_SLUG
+        url: https://$CI_COMMIT_REF_SLUG.review.logpipe.example.com
+        on_stop: stop_review
+        auto_stop_in: 2 days
+      rules:
+        - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+    stop_review:
+      stage: review
+      image: alpine/helm:3.14.0
+      variables:
+        GIT_STRATEGY: none
+      script:
+        - helm uninstall logpipe-$CI_COMMIT_REF_SLUG --namespace review-$CI_COMMIT_REF_SLUG
+        - kubectl delete namespace review-$CI_COMMIT_REF_SLUG --ignore-not-found
+      environment:
+        name: review/$CI_COMMIT_REF_SLUG
+        action: stop
+      rules:
+        - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+          when: manual
+    ```
+
+    **Green Notes**
+    - **Environments that stop** (reduces E, M): the old job had no `on_stop`, so every branch kept its stack until someone cleaned up by hand. Now GitLab runs `stop_review` when the MR is merged or closed, and `auto_stop_in` removes forgotten ones after 2 days. In Green Metrics Tool micro-benchmarks, an idle preview with 3 app replicas, Postgres, Redis and a polling worker used only about 3% more CPU energy per minute than one with 1 replica and Postgres. Machine energy differed by less than 1%. The saving is the hours the environments do not run, not the extra services.
+    - **Only MR pipelines deploy:** branches without an open MR no longer get an environment. This changes behavior: a push to a plain branch no longer deploys.
+    - **Smaller stack:** 1 parser replica, Redis and the worker off. This also frees memory and scheduling room. Turn them back on for the MRs that need them, for example by a CI variable, if reviewers test queue or worker behavior.
+
+    Your `kubectl` call needs an image that has it. `alpine/helm` does not, so use an image with both tools or a separate cleanup step.
+verify:
+  static_only: GitLab CI pipeline with Helm and kubectl needs a cluster and GitLab runner

@@ -1,0 +1,66 @@
+id: gen-12764612-00119-no-change
+category: no-change
+language: python
+patterns:
+- torch-no-grad
+- none
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    hi, im quite new to pytorch. I wrote this check that runs in our gitlab pipeline before we release the ticket tagging model. it loads the new weights and tests them on a small golden set, if accuracy is too low the pipeline fails. a colleague said "pytorch inference needs a special thing or it wastes CPU" but I dont know if I forgot something. can you look if something is wrong?
+
+    ```python
+    import json
+    import sys
+
+    import torch
+
+    from app.model import TicketClassifier
+
+    GOLDEN = "ci/golden_tickets.pt"
+    MIN_ACCURACY = 0.92
+
+
+    def load_model(path):
+        model = TicketClassifier()
+        model.load_state_dict(torch.load(path, map_location="cpu"))
+        model.eval()
+        return model
+
+
+    @torch.inference_mode()
+    def accuracy(model, features, labels, batch_size=256):
+        correct = 0
+        for start in range(0, len(features), batch_size):
+            batch = features[start:start + batch_size]
+            preds = model(batch).argmax(dim=1)
+            correct += (preds == labels[start:start + batch_size]).sum().item()
+        return correct / len(features)
+
+
+    def main():
+        model = load_model(sys.argv[1])
+        data = torch.load(GOLDEN)
+        acc = accuracy(model, data["features"], data["labels"])
+        print(json.dumps({"accuracy": round(acc, 4)}))
+        if acc < MIN_ACCURACY:
+            print("accuracy below gate", file=sys.stderr)
+            sys.exit(1)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    Nothing is wrong. You already did the thing your colleague means.
+
+    - **Gradient tracking is off.** `@torch.inference_mode()` on `accuracy` stops PyTorch from building the autograd graph during the forward pass. That is the same idea as `torch.no_grad()`. In Green Metrics Tool micro-benchmarks with 100,000 PyTorch CPU inferences, running without `torch.no_grad()` used ~157 J and with it ~135 J, about 14% less. Your code is already on the cheap side. Don't add `no_grad` on top, it would do nothing extra.
+    - **`model.eval()` is called.** This is correct for a check. It also makes the result stable, because dropout is off.
+    - **The golden set runs in batches.** That is a good way to feed a model on CPU.
+
+    This job runs once per pipeline on a small set, so even a bigger gain here would be tiny. If the job feels slow, look at the timestamps in the CI log first. Most of the time is usually installing packages and loading files, not the forward pass.
+verify:
+  static_only: needs torch and the project's app.model, not available in the stdlib + numpy sandbox

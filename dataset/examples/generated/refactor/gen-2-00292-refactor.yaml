@@ -1,0 +1,126 @@
+id: gen-2-00292-refactor
+category: refactor
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    make this less wasteful
+
+    ```yaml
+    apiVersion: argoproj.io/v1alpha1
+    kind: ApplicationSet
+    metadata:
+      name: storefront-previews
+      namespace: argocd
+    spec:
+      generators:
+        - scmProvider:
+            github:
+              organization: acme-shop
+              allBranches: true
+              tokenRef:
+                secretName: github-token
+                key: token
+            filters:
+              - repositoryMatch: ^storefront$
+      template:
+        metadata:
+          name: 'storefront-{{branch}}'
+        spec:
+          project: previews
+          source:
+            repoURL: '{{url}}'
+            targetRevision: '{{branch}}'
+            path: deploy/chart
+            helm:
+              values: |
+                replicaCount: 3
+                postgresql:
+                  enabled: true
+                redis:
+                  enabled: true
+                worker:
+                  enabled: true
+                  replicas: 2
+                ingress:
+                  host: {{branch}}.preview.acme-shop.dev
+          destination:
+            server: https://kubernetes.default.svc
+            namespace: 'storefront-{{branch}}'
+          syncPolicy:
+            automated:
+              prune: true
+              selfHeal: true
+            syncOptions:
+              - CreateNamespace=true
+    ```
+- role: assistant
+  content: |
+    ```yaml
+    apiVersion: argoproj.io/v1alpha1
+    kind: ApplicationSet
+    metadata:
+      name: storefront-previews
+      namespace: argocd
+    spec:
+      generators:
+        - pullRequest:
+            github:
+              owner: acme-shop
+              repo: storefront
+              tokenRef:
+                secretName: github-token
+                key: token
+              labels:
+                - preview
+            requeueAfterSeconds: 300
+      template:
+        metadata:
+          name: 'storefront-pr-{{number}}'
+          finalizers:
+            - resources-finalizer.argocd.argoproj.io
+        spec:
+          project: previews
+          source:
+            repoURL: https://github.com/acme-shop/storefront.git
+            targetRevision: '{{head_sha}}'
+            path: deploy/chart
+            helm:
+              values: |
+                replicaCount: 1
+                postgresql:
+                  enabled: true
+                  primary:
+                    persistence:
+                      enabled: false
+                redis:
+                  enabled: true
+                worker:
+                  enabled: true
+                  replicas: 1
+                ingress:
+                  host: pr-{{number}}.preview.acme-shop.dev
+          destination:
+            server: https://kubernetes.default.svc
+            namespace: 'storefront-pr-{{number}}'
+          syncPolicy:
+            automated:
+              prune: true
+              selfHeal: true
+            syncOptions:
+              - CreateNamespace=true
+    ```
+
+    **Green Notes**
+    - **Environments only exist while a PR is open** (reduces E, M): the old generator created a preview for every branch, including `main` and merged branches nobody deleted. Each one ran around the clock. The `pullRequest` generator drops a PR once it is merged or closed, and Argo CD then deletes the Application within about five minutes. The finalizer makes sure the Deployments, Services and Postgres actually get removed, not just the Application object.
+    - **Opt-in with the `preview` label:** only PRs that carry the label get an environment. This changes behavior. Remove the `labels` filter if every PR really needs a preview.
+    - **1 app replica, 1 worker, no persistent volume for Postgres** (reduces M): a preview doesn't need high availability, and its data is throwaway. Without persistence, no PVC is left behind when the StatefulSet is deleted. The replica cut is the small part of the win, though. In Green Metrics Tool measurements, an idle preview with 1 app replica and Postgres used only about 3% less CPU energy than one with 3 replicas, Postgres, Redis and a worker. Idle services cost little per minute. The real saving is the hours of environments that no longer exist, plus less reserved memory on the preview nodes.
+    - **Bug fixed:** `{{branch}}` went straight into the Application name, namespace and hostname. Branches like `feature/Checkout-v2` produce invalid names, so those previews never synced. PR numbers are always valid. `targetRevision` now pins the PR head commit and updates on every push.
+
+    Argo CD does not delete namespaces it created with `CreateNamespace`, so empty `storefront-pr-*` namespaces stay behind. They hold no workloads, but you can remove them from a cleanup job. If you run kube-downscaler or something similar, scaling previews to zero outside working hours removes most of the remaining hours too.
+verify:
+  static_only: Argo CD ApplicationSet manifest, needs a Kubernetes cluster with Argo CD

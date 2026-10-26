@@ -1,0 +1,224 @@
+id: gen-2-00046-review
+category: review
+language: python
+patterns:
+- regex-precompile
+- keep-star-imports
+facts:
+- F-REGEX
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    Can you review our extended XYZ trajectory parser before it goes into the nightly post-processing batch? Context:
+
+    - It runs over all MD runs on /scratch every night. That's a few hundred trajectories, each about 50k frames × 192 atoms.
+    - Python 3.11, stdlib + numpy only. It's the cluster image, so we can't add packages.
+    - The output (mean energy and radius of gyration per file) goes into our group's run database. Correct numbers matter more than anything else.
+    - The team has two open questions. (1) Should we `re.compile` the regexes, or is that pointless? (2) A colleague wants to replace `from math import *` with `import math` because star imports are "slow and load everything". Is that worth doing?
+
+    Please rank the findings by severity.
+
+    ```python
+    """Extract per-frame energies and positions from extended XYZ trajectories.
+
+    Used by the analysis notebooks and by the nightly batch that post-processes
+    all MD runs on /scratch.
+    """
+    import re
+    import sys
+    from math import *
+
+    import numpy as np
+
+    FRAME_KEYS = ("energy", "temperature")
+
+
+    def parse_comment(line):
+        info = {}
+        for key in FRAME_KEYS:
+            m = re.search(key + r"=(\S+)", line)
+            if m:
+                info[key] = float(m.group(1))
+        return info
+
+
+    def read_frames(path):
+        with open(path) as fh:
+            while True:
+                header = fh.readline()
+                if not header:
+                    break
+                n_atoms = int(header)
+                info = parse_comment(fh.readline())
+                symbols, coords = [], []
+                for _ in range(n_atoms):
+                    line = fh.readline()
+                    m = re.match(r"\s*([A-Z][a-z]?)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)", line)
+                    if not m:
+                        continue
+                    symbols.append(m.group(1))
+                    coords.append([float(m.group(2)), float(m.group(3)), float(m.group(4))])
+                yield info, symbols, np.array(coords)
+
+
+    def radius_of_gyration(coords):
+        center = coords.mean(axis=0)
+        return sqrt(((coords - center) ** 2).sum(axis=1).mean())
+
+
+    def summarize(path):
+        energies, rgs = [], []
+        for info, symbols, coords in read_frames(path):
+            energies.append(info.get("energy", nan))
+            rgs.append(radius_of_gyration(coords))
+        return np.array(energies), np.array(rgs)
+
+
+    if __name__ == "__main__":
+        for path in sys.argv[1:]:
+            e, rg = summarize(path)
+            print(f"{path}: {len(e)} frames, <E> = {np.nanmean(e):.4f} eV, <Rg> = {rg.mean():.3f} A")
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly batch, scientific computing)
+
+    #### [Bug] Atoms in exponent notation are dropped without warning
+    - **Where:** atom regex `([-\d.]+)` and the `continue` in `read_frames`
+    - **Issue:** `[-\d.]+` does not match values like `1.2e-05` or `-3.0E+00`, which many MD codes and ASE write for small coordinates. Those lines fail the match, and `continue` drops the atom. The frame then has fewer atoms, so Rg is wrong, and nothing reports it. A truncated last frame is also accepted without error.
+    - **Fix:** use a full float pattern, and raise on any line that doesn't parse. If the batch should go on after a bad file, catch the error per file.
+
+    #### [Bug] `energy=` also matches inside `free_energy=`
+    - **Where:** `re.search(key + r"=(\S+)", line)` in `parse_comment`
+    - **Issue:** the search also matches inside `free_energy=` or `potential_energy=`. If the writer puts one of those keys before `energy=`, the database gets the wrong energy.
+    - **Fix:** anchor the key to a whitespace boundary: `(?<!\S)energy=(\S+)`.
+
+    #### [Medium] Regexes rebuilt and looked up on every line
+    - **Where:** `re.match(...)` per atom line, `re.search(key + ...)` per frame
+    - **Issue:** your batch runs the atom regex on every atom line of every frame, so this is the hottest loop in the batch. Each call goes through `re`'s internal pattern cache. The comment patterns are also rebuilt by string concatenation for every frame. There are only two keys, so they still hit the cache and nothing gets recompiled.
+    - **Fix:** compile all patterns once at module level and call `.match` / `.search` on the compiled objects.
+    - **Impact:** E, small per call but repeated on every line. In Green Metrics Tool micro-benchmarks, 1,000,000 matches with a precompiled pattern used about 18% less CPU energy than inline `re.match`. The gain is modest because `re` caches compiled patterns. So the answer to question (1) is: compile them. It isn't pointless here, but don't expect a big win.
+
+    **Not a finding: `from math import *`.** Question (2): `import math` loads the same module. In Green Metrics Tool micro-benchmarks over 1,000 process starts, star imports and plain `import x` showed no measurable energy difference, both for a heavy package and for a built-in module. Changing it saves nothing, so leave it as it is.
+
+    **Already good:** frames are streamed with a generator, so memory stays flat even for 50k-frame files.
+
+    Revised module (same output on valid files; malformed or truncated frames now raise `ValueError`):
+
+    ```python
+    """Extract per-frame energies and positions from extended XYZ trajectories.
+
+    Used by the analysis notebooks and by the nightly batch that post-processes
+    all MD runs on /scratch.
+    """
+    import re
+    import sys
+    from math import *
+
+    import numpy as np
+
+    FRAME_KEYS = ("energy", "temperature")
+
+    FLOAT = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
+    ATOM_RE = re.compile(rf"\s*([A-Z][a-z]?)\s+({FLOAT})\s+({FLOAT})\s+({FLOAT})")
+    KEY_RES = {key: re.compile(rf"(?<!\S){key}=(\S+)") for key in FRAME_KEYS}
+
+
+    def parse_comment(line):
+        info = {}
+        for key, pattern in KEY_RES.items():
+            m = pattern.search(line)
+            if m:
+                info[key] = float(m.group(1))
+        return info
+
+
+    def read_frames(path):
+        with open(path) as fh:
+            while True:
+                header = fh.readline()
+                if not header:
+                    break
+                n_atoms = int(header)
+                info = parse_comment(fh.readline())
+                symbols, coords = [], []
+                for _ in range(n_atoms):
+                    line = fh.readline()
+                    m = ATOM_RE.match(line)
+                    if not m:
+                        raise ValueError(f"{path}: bad atom line {line!r}")
+                    symbols.append(m.group(1))
+                    coords.append([float(m.group(2)), float(m.group(3)), float(m.group(4))])
+                yield info, symbols, np.array(coords)
+
+
+    def radius_of_gyration(coords):
+        center = coords.mean(axis=0)
+        return sqrt(((coords - center) ** 2).sum(axis=1).mean())
+
+
+    def summarize(path):
+        energies, rgs = [], []
+        for info, symbols, coords in read_frames(path):
+            energies.append(info.get("energy", nan))
+            rgs.append(radius_of_gyration(coords))
+        return np.array(energies), np.array(rgs)
+
+
+    if __name__ == "__main__":
+        for path in sys.argv[1:]:
+            e, rg = summarize(path)
+            print(f"{path}: {len(e)} frames, <E> = {np.nanmean(e):.4f} eV, <Rg> = {rg.mean():.3f} A")
+    ```
+verify:
+  module: true
+  test: |
+    import os, tempfile
+    text = (
+        "2\n"
+        "Properties=species:S:1:pos:R:3 free_energy=-5.0 energy=-12.5 temperature=310.0\n"
+        "C 1.0e-03 -2.5E+00 0\n"
+        "O 1.5 .5 -3\n"
+    )
+    fd, path = tempfile.mkstemp(suffix=".xyz")
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
+    frames = list(read_frames(path))
+    assert len(frames) == 1
+    info, symbols, coords = frames[0]
+    assert info == {"energy": -12.5, "temperature": 310.0}, info
+    assert symbols == ["C", "O"]
+    assert coords.shape == (2, 3)
+    assert abs(coords[0, 0] - 1.0e-3) < 1e-12
+    assert coords[0, 1] == -2.5 and coords[1, 1] == 0.5 and coords[1, 2] == -3.0
+    bad = path + ".bad"
+    with open(bad, "w") as fh:
+        fh.write("1\nenergy=1.0\nX? 1 2 3\n")
+    try:
+        list(read_frames(bad))
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+    os.remove(path)
+    os.remove(bad)
+  equivalence:
+    driver: |-
+      import os, tempfile
+      lines = []
+      for i in range(3):
+          lines.append("4")
+          lines.append(
+              f'Lattice="10 0 0 0 10 0 0 0 10" Properties=species:S:1:pos:R:3 '
+              f'energy={-100.5 + i * 0.25:.4f} temperature={300 + i}.0 free_energy=-99.0 pbc="T T T"'
+          )
+          for j, sym in enumerate(["O", "H", "H", "Na"]):
+              lines.append(f"{sym} {0.1 * i + j:.5f} {-1.25 + j:.5f} {2.0 * j:.5f}")
+      fd, path = tempfile.mkstemp(suffix=".xyz")
+      with os.fdopen(fd, "w") as fh:
+          fh.write("\n".join(lines) + "\n")
+      for info, symbols, coords in read_frames(path):
+          print(sorted(info.items()), symbols, coords.round(6).tolist())
+      e, rg = summarize(path)
+      print(e.round(6).tolist(), rg.round(6).tolist())
+      os.remove(path)

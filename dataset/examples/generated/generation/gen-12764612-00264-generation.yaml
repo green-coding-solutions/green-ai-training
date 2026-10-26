@@ -1,0 +1,50 @@
+id: gen-12764612-00264-generation
+category: generation
+language: sql
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    I need a query for the observation browser in our transit survey web app (Postgres 16, psycopg 3). Table is `observations`, about 45 columns. It has the usual metadata, plus a few big ones: `fits_header` (text, several KB), `calibration_log` (text), `light_curve_json` (jsonb) and `operator_notes`.
+
+    Requirements:
+    - The user picks a target and a date range. Show the observations of that target in the range.
+    - Only observations with `quality_flag = 'good'`.
+    - Newest first, with a page size parameter.
+    - The table in the UI shows: observation id, target name, observation time, exposure in seconds, airmass, seeing (arcsec), SNR and the instrument name.
+    - Clicking a row opens a detail page. That is a separate endpoint, so you don't need to cover it.
+
+    Please use named parameters.
+- role: assistant
+  content: |
+    ```sql
+    SELECT
+        obs_id,
+        target_name,
+        observed_at,
+        exposure_s,
+        airmass,
+        seeing_arcsec,
+        snr,
+        instrument_name
+    FROM observations
+    WHERE target_name = %(target)s
+      AND observed_at >= %(start)s
+      AND observed_at <  %(end)s
+      AND quality_flag = 'good'
+    ORDER BY observed_at DESC
+    LIMIT %(page_size)s;
+    ```
+
+    The range is half-open (`>= start`, `< end`). Pass the day after the last day to include a full end date, and adjacent ranges won't overlap.
+
+    **Green Notes**
+    - **Select only the needed columns** (reduces E and M): the query names the 8 columns the table shows. It skips `fits_header`, `calibration_log`, `light_curve_json` and `operator_notes`, so the database does not read, send or parse those large values for every row. In Green Metrics Tool micro-benchmarks on a 52-column table with large text columns, `SELECT *` used ~470 J and naming 10 columns used ~64 J (about 7× less) for 2,500 rows read 1,000 times. The saving grows with the size of the skipped columns.
+    - The detail endpoint can fetch the heavy columns for one `obs_id` when a row is opened.
+verify:
+  static_only: Postgres-specific psycopg named parameters and a table schema not available here

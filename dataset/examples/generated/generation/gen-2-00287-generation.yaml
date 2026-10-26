@@ -1,0 +1,90 @@
+id: gen-2-00287-generation
+category: generation
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    nginx vhost for our shop pls. vite spa build in /srv/shop/dist (hashed files under /assets), cart/checkout api on 127.0.0.1:9000 under /api, product images in /srv/shop/media, google shopping feed + sitemap xml in /srv/shop/feeds (cron rebuilds them hourly)
+- role: assistant
+  content: |
+    TLS is left out. Add your `listen 443 ssl` and certificate lines as usual.
+
+    ```nginx
+    server {
+        listen 80;
+        server_name shop.example.com;
+
+        root /srv/shop/dist;
+
+        gzip_vary on;
+
+        # Hashed Vite assets: precompressed at build time, cached forever
+        location /assets/ {
+            gzip_static on;
+            add_header Cache-Control "public, max-age=31536000, immutable";
+            try_files $uri =404;
+        }
+
+        # SPA entry point and client-side routes
+        location / {
+            gzip_static on;
+            add_header Cache-Control "no-cache";
+            try_files $uri $uri/ /index.html;
+        }
+
+        # Feed and sitemap: precompressed by the hourly cron job
+        location /feeds/ {
+            alias /srv/shop/feeds/;
+            gzip_static on;
+            add_header Cache-Control "public, max-age=300";
+        }
+
+        # Product images: already compressed formats, no gzip
+        location /media/ {
+            alias /srv/shop/media/;
+            add_header Cache-Control "public, max-age=86400";
+        }
+
+        # Cart / checkout API: dynamic JSON, compressed on the fly
+        location /api/ {
+            proxy_pass http://127.0.0.1:9000;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            gzip on;
+            gzip_comp_level 4;
+            gzip_min_length 1024;
+            gzip_types application/json;
+        }
+    }
+    ```
+
+    Create the `.gz` files once. Do it after `vite build` in CI:
+
+    ```bash
+    find dist -type f \( -name '*.js' -o -name '*.css' -o -name '*.html' -o -name '*.svg' -o -name '*.json' \) \
+      -exec gzip -k -f -9 {} +
+    ```
+
+    Then add this at the end of the hourly feed job:
+
+    ```bash
+    cd /srv/shop/feeds || exit 1
+    for f in products.xml sitemap.xml; do
+      gzip -c -6 "$f" > "$f.gz.tmp" && mv "$f.gz.tmp" "$f.gz"
+    done
+    ```
+
+    `gzip_static` does not check whether the `.gz` file is older than the original. If the feed job updates the XML but skips this step, clients that accept gzip get the old feed. Writing to a temp file and then using `mv` swaps the file atomically.
+
+    **Green Notes**
+    - **Precompressed static assets** (reduces E, network): the build, the feed and the sitemap are gzipped once, and nginx sends the `.gz` file as is. In Green Metrics Tool measurements with nginx serving text assets, compression sent about 10× fewer bytes. Compressing on every request cost about 4× the CPU energy of serving precompressed files.
+    - **On-the-fly gzip only for the API** (reduces network): cart and checkout JSON is different on every request, so it cannot be precompressed. A moderate level and a minimum size keep the CPU cost per response low.
+    - **No compression for `/media`** (reduces E): JPEG, PNG and WebP are already compressed, so gzip would cost CPU and save nothing. gzip is off there by default.
+verify:
+  static_only: nginx configuration and shell build steps

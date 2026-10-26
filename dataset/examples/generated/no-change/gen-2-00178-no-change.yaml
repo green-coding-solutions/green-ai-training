@@ -1,0 +1,52 @@
+id: gen-2-00178-no-change
+category: no-change
+language: bash
+patterns:
+- compress-stored
+- context-tradeoff
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    release archives on the backup box keep growing. should I compress them?
+
+    ```bash
+    #!/usr/bin/env bash
+    # CI: archive release artifacts (runs on tag pipelines only)
+    set -euo pipefail
+
+    TAG="${CI_COMMIT_TAG:?not a tag pipeline}"
+    DEST=/srv/releases
+    STAGE="$(mktemp -d)"
+    trap 'rm -rf "$STAGE"' EXIT
+
+    mkdir -p "$STAGE/$TAG"
+    cp dist/*.whl dist/*.tar.gz "$STAGE/$TAG/"
+    cp docs/screenshots/*.png "$STAGE/$TAG/"
+    cp build/app-image.tar.zst "$STAGE/$TAG/"
+
+    tar -C "$STAGE" -cf "$DEST/$TAG.tar" "$TAG"
+    sha256sum "$DEST/$TAG.tar" > "$DEST/$TAG.tar.sha256"
+
+    find "$DEST" -name 'v*.tar*' -mtime +365 -delete
+    echo "archived $TAG ($(du -h "$DEST/$TAG.tar" | cut -f1))"
+    ```
+- role: assistant
+  content: |
+    No. Leave the plain `tar -cf` as it is. Everything in that archive is already compressed:
+
+    - `*.whl` files are ZIP archives, and the `*.tar.gz` sdists are gzip.
+    - The PNG screenshots are compressed images.
+    - `app-image.tar.zst` is already zstd. It is probably the largest member.
+
+    Compressed data has almost no redundancy left. If you add `gzip`, `xz` or `zstd` on top, every tag pipeline reads and recompresses every byte, and the archive stays about the same size. Text is different. In Green Metrics Tool benchmarks that compressed 100 MB of text, xz used about 29× the energy of zstd. Text does shrink, though. Your inputs would cost CPU without the size gain.
+
+    The growth comes from how much you keep, not from how you pack it:
+
+    - Find the biggest members: `tar -tvf /srv/releases/<tag>.tar | sort -k3 -n | tail`
+    - Your retention lever is the `find ... -mtime +365 -delete` line. You could shorten it. If your registry already keeps old images, you could also drop `app-image.tar.zst` from older releases. Either frees more space than any codec would.
+
+    The rest of the script is fine. It makes one tar pass, starts no processes per file, and the trap cleans up the temp dir.
+verify:
+  static_only: bash CI script that needs build artifacts, CI variables and /srv/releases

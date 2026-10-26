@@ -1,0 +1,80 @@
+id: gen-2-00280-generation
+category: generation
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    py script: sum cpu requests per team label from `kubectl get pods -A -o json`. lots of our pods have no team label yet, put those under "unowned"
+- role: assistant
+  content: |
+    Pipe the kubectl output into it: `kubectl get pods -A -o json | python cpu_by_team.py`
+
+    ```python
+    import json
+    import sys
+    from collections import defaultdict
+
+
+    def parse_cpu(value):
+        """Convert a Kubernetes CPU quantity ('250m', '1', '0.5') to millicores."""
+        if value.endswith("m"):
+            return int(value[:-1])
+        return int(round(float(value) * 1000))
+
+
+    def cpu_requests_by_team(pods_json, label="team"):
+        totals = defaultdict(int)
+        for pod in pods_json.get("items", []):
+            labels = pod["metadata"].get("labels") or {}
+            team = labels.get(label, "unowned")
+            for container in pod["spec"].get("containers", []):
+                requests = (container.get("resources") or {}).get("requests") or {}
+                cpu = requests.get("cpu")
+                if cpu is not None:
+                    totals[team] += parse_cpu(cpu)
+        return dict(totals)
+
+
+    def main():
+        totals = cpu_requests_by_team(json.load(sys.stdin))
+        for team, millicores in sorted(totals.items(), key=lambda kv: kv[1], reverse=True):
+            print(f"{team:<24} {millicores:>8}m")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    Containers without a CPU request add nothing to the total. Init containers are not counted.
+
+    **Green Notes**
+    - **No exceptions for expected control flow** (reduces E): a missing `team` label or missing `resources.requests` is normal here, not an error. So the lookups use `dict.get` with a default, not `try/except KeyError`. Raising the exception is the expensive part. In Green Metrics Tool micro-benchmarks with 10,000,000 dict lookups and about half the keys missing, `dict.get` used ~67 J and `try/except KeyError` ~76 J, about 12% less with `get`.
+
+    For a single snapshot of a few hundred pods the difference is tiny. Here `get` is mainly the clearer idiom.
+verify:
+  module: true
+  test: |-
+    sample = {
+        "items": [
+            {"metadata": {"labels": {"team": "payments"}},
+             "spec": {"containers": [
+                 {"resources": {"requests": {"cpu": "250m"}}},
+                 {"resources": {}},
+             ]}},
+            {"metadata": {},
+             "spec": {"containers": [{"resources": {"requests": {"cpu": "0.5"}}}]}},
+            {"metadata": {"labels": {"app": "x"}},
+             "spec": {"containers": [{"resources": {"requests": {"cpu": "1"}}}]}},
+            {"metadata": {"labels": {"team": "payments"}},
+             "spec": {"containers": [{"resources": {"requests": {"memory": "1Gi"}}}, {}]}},
+        ]
+    }
+    assert cpu_requests_by_team(sample) == {"payments": 250, "unowned": 1500}
+    assert cpu_requests_by_team({}) == {}
+    assert parse_cpu("0.57") == 570
+    assert parse_cpu("2") == 2000
+    assert parse_cpu("100m") == 100

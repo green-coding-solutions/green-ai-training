@@ -1,0 +1,54 @@
+id: gen-2-00373-no-change
+category: no-change
+language: sql
+patterns:
+- select-columns
+- none
+facts:
+- F-PG-SELECT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    ?
+
+    ```sql
+    -- monthly station means for the climatology plots
+    -- $1 = period start, $2 = period end (exclusive)
+    SELECT s.station_code,
+           s.lat,
+           s.lon,
+           date_trunc('month', o.observed_at) AS month,
+           avg(o.temp_c)  AS mean_temp_c,
+           min(o.temp_c)  AS min_temp_c,
+           max(o.temp_c)  AS max_temp_c,
+           count(*)       AS n_obs
+    FROM observations o
+    JOIN stations s ON s.id = o.station_id
+    WHERE o.observed_at >= $1
+      AND o.observed_at <  $2
+      AND o.qc_flag = 0
+      AND NOT EXISTS (
+            SELECT *
+            FROM calibration_issues ci
+            WHERE ci.station_id = o.station_id
+              AND o.observed_at >= ci.valid_from
+              AND (ci.valid_to IS NULL OR o.observed_at < ci.valid_to)
+          )
+    GROUP BY s.station_code, s.lat, s.lon, date_trunc('month', o.observed_at)
+    HAVING count(*) >= 20
+    ORDER BY s.station_code, month;
+    ```
+- role: assistant
+  content: |
+    This query is already efficient. I wouldn't change it. Neither of the two `*` here means "fetch every column":
+
+    - **`count(*)`** counts rows. It does not read the columns of `observations`.
+    - **`SELECT *` inside `NOT EXISTS`** only checks whether a matching row exists. PostgreSQL reads no column values for it, so `SELECT 1` gives the same plan. Changing it is a matter of style only.
+    - **The output columns are already named.** The query returns 8 columns, and the aggregation runs in the database. The client gets one row per station and month instead of the raw observations.
+
+    Selecting only the columns you need saves energy when the query sends wide rows to the client. In Green Metrics Tool micro-benchmarks on a 52-column table with large text columns, naming the 10 needed columns used about 5.5× to 7× less CPU energy than `SELECT *`. Nothing like that happens in this query.
+
+    The logic also looks correct. Open-ended calibration issues (`valid_to IS NULL`) are excluded, and the period end is exclusive.
+verify:
+  static_only: no-change answer without rewritten code; query uses Postgres placeholders and date_trunc

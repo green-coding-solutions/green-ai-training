@@ -1,0 +1,73 @@
+id: gen-1-00249-estimate
+category: estimate
+language: bash
+patterns:
+- bash-quoting
+facts:
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    how much energy do we save if I switch the quotes in this to single? it builds our landing page variants, runs in CI on every push
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    OUT="dist/variants"
+    mkdir -p "$OUT"
+
+    while IFS='|' read -r slug headline; do
+      page="$OUT/$slug.html"
+      echo "<!DOCTYPE html>" > "$page"
+      echo "<html lang=\"en\"><head><meta charset=\"utf-8\">" >> "$page"
+      echo "<link rel=\"stylesheet\" href=\"/css/landing.css\">" >> "$page"
+      echo "<title>$headline</title></head><body>" >> "$page"
+      echo "<main class=\"hero\"><h1>$headline</h1>" >> "$page"
+      echo "<a class=\"cta\" href=\"/signup?src=$slug\">Start free</a></main>" >> "$page"
+      echo "</body></html>" >> "$page"
+    done < campaigns.txt
+    ```
+- role: assistant
+  content: |
+    Very little, and I can't give you a reliable number for your pipeline.
+
+    **Measured reference:** in Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal in a loop used about 24% less CPU energy with single quotes than with double quotes (1,000,000 iterations: ~314 J vs ~237 J). With 10,000 iterations the saving was about 14%. That is the cost of bash scanning double-quoted text for `$`, backticks and backslashes.
+
+    Your case is far from that setup:
+    - Your literals are about 30-60 characters, not thousands.
+    - Several of your strings need expansion (`$headline`, `$slug`, `$page`). Those must stay in double quotes.
+    - The loop does 7 file appends per line, and each `echo >> "$page"` opens and closes the file. That work is likely larger than the quote scanning. I have no measurement for it, so I won't guess.
+
+    So expect a small percentage on the quoting work, and a tiny absolute saving. It grows with literal length and loop count.
+
+    The static lines can use single quotes, which also removes the `\"` escapes:
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    OUT='dist/variants'
+    mkdir -p "$OUT"
+
+    while IFS='|' read -r slug headline; do
+      page="$OUT/$slug.html"
+      {
+        echo '<!DOCTYPE html>'
+        echo '<html lang="en"><head><meta charset="utf-8">'
+        echo '<link rel="stylesheet" href="/css/landing.css">'
+        echo "<title>$headline</title></head><body>"
+        echo "<main class=\"hero\"><h1>$headline</h1>"
+        echo "<a class=\"cta\" href=\"/signup?src=$slug\">Start free</a></main>"
+        echo '</body></html>'
+      } > "$page"
+    done < campaigns.txt
+    ```
+
+    **Green Notes**
+    - **Bash quoting** (reduces E): single quotes for literals without expansion. Variables stay in double quotes.
+    - The `{ ... } > "$page"` group opens each file once instead of seven times. The output is identical.
+
+    **How to measure:** run the old and new script on your real `campaigns.txt` as a Green Metrics Tool usage scenario, with several repeats. At least use `perf stat` or `time` for CPU time as a proxy. If the difference is within run-to-run noise, the quote change alone is not worth a ticket. Keep it for the lint rule and readability.
+verify:
+  static_only: bash script reads campaigns.txt and writes files; not run in the python verifier

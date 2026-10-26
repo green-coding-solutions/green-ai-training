@@ -1,0 +1,90 @@
+id: gen-1-00015-refactor
+category: refactor
+language: bash
+patterns:
+- compress-stored
+- bash-quoting
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # load_partner_batches.sh - runs every 30 min from cron
+    set -euo pipefail
+
+    INBOX="/srv/etl/inbox"
+    ARCHIVE="/srv/etl/archive"
+    LOCK="/var/run/etl_load.lock"
+    KEEP_DAYS=180
+    DB="postgresql://etl@db01/warehouse"
+
+    exec 9>"$LOCK"
+    flock -n 9 || { echo "already running"; exit 0; }
+
+    mkdir -p "$ARCHIVE"
+
+    for f in "$INBOX"/*.csv; do
+        [ -e "$f" ] || continue
+        name=$(basename "$f")
+        echo "loading $name"
+        psql "$DB" -v ON_ERROR_STOP=1 -c "\copy staging.partner_events from '$f' with (format csv, header true)"
+        day=$(date +%F)
+        mkdir -p "$ARCHIVE/$day"
+        7z a -mx=9 -bd -bso0 "$ARCHIVE/$day/$name.7z" "$f"
+        rm "$f"
+    done
+
+    find "$ARCHIVE" -name '*.7z' -mtime +"$KEEP_DAYS" -delete
+    echo "done"
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # load_partner_batches.sh - runs every 30 min from cron
+    set -euo pipefail
+
+    INBOX='/srv/etl/inbox'
+    ARCHIVE='/srv/etl/archive'
+    LOCK='/var/run/etl_load.lock'
+    KEEP_DAYS=180
+    DB='postgresql://etl@db01/warehouse'
+
+    exec 9>"$LOCK"
+    flock -n 9 || { echo 'already running'; exit 0; }
+
+    mkdir -p "$ARCHIVE"
+
+    for f in "$INBOX"/*.csv; do
+        [ -e "$f" ] || continue
+        name=$(basename "$f")
+        echo "loading $name"
+        psql "$DB" -v ON_ERROR_STOP=1 -c "\copy staging.partner_events from '$f' with (format csv, header true)"
+        day=$(date +%F)
+        mkdir -p "$ARCHIVE/$day"
+        zstd -q -f -o "$ARCHIVE/$day/$name.zst" "$f"
+        rm "$f"
+    done
+
+    find "$ARCHIVE" \( -name '*.7z' -o -name '*.zst' \) -mtime +"$KEEP_DAYS" -delete
+    echo 'done'
+    ```
+
+    **Green Notes**
+    - **Fast codec for data compressed often** (reduces E): this job compresses every batch file, every 30 minutes, all year. In Green Metrics Tool micro-benchmarks on 100 MB of English text, 7-Zip with its default settings used ~724 J and zstd at its default level ~16 J. `-mx=9` is above the 7-Zip default, so it does not get cheaper. Those benchmarks compared energy only, not file size. 7-Zip usually makes smaller files.
+    - **Compression is still worth it here:** the archive is kept 180 days. A Green Coding Solutions estimate (not a direct measurement) puts the storage break-even for zstd at about 0.15 days. So zstd pays back long before the files expire.
+    - **Single quotes for fixed text** (reduces E): paths, the DB URL and the log messages need no expansion, so they are now single-quoted. In Green Metrics Tool micro-benchmarks single quotes used about 24% less CPU energy for that work. For this script the absolute saving is tiny. Strings with `$name` or `$f` and all variable references stay double-quoted.
+
+    **Behavior changes**
+    - New archives are `.zst`. Read them with `zstd -d` or `zstdcat`. Check any restore or reprocessing script that expects `.7z`.
+    - The cleanup now deletes both `.7z` and `.zst`, so the old archives still expire after 180 days.
+    - `-f` lets a rerun overwrite a same-day file instead of failing under `set -e`.
+    - If smaller files matter more than energy (tight disk, slow link), a higher zstd level gives a better ratio at more CPU cost. I have no measured figure for that.
+verify:
+  static_only: needs psql, flock, 7z and zstd binaries and a database; not runnable in the sandbox

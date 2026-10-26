@@ -1,0 +1,80 @@
+id: gen-2-00382-generation
+category: generation
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    hi, we have a log collector vm. fluent-bit write the logs from all our servers into `/var/log/collected/<hostname>/<YYYY-MM-DD-HH>.log`, one file per hour. The files are big, 100-400 MB plain text. Developers download them with the browser or `curl` when they debug something, maybe 50-100 downloads a day. When there is an incident the same file get downloaded many times. Downloads are very slow over the VPN, so i want compression.
+
+    Can you write me the nginx config? I need directory listing, access only from our internal network 10.20.0.0/16, port 80 is ok. nginx 1.24 on debian.
+- role: assistant
+  content: |
+    Only the current hour's file still changes. Every closed hour can be compressed once and served as a `.gz` from then on.
+
+    ```nginx
+    server {
+        listen 80;
+        server_name logs.internal;
+
+        root /var/log/collected;
+
+        allow 10.20.0.0/16;
+        deny  all;
+
+        location / {
+            autoindex on;
+            autoindex_exact_size off;
+            autoindex_localtime on;
+
+            # nginx's mime.types does not know .log, so serve it as text
+            types {
+                text/plain log;
+            }
+            default_type application/octet-stream;
+            charset utf-8;
+
+            # closed hours: send the .gz written once by the cron job below
+            gzip_static on;
+
+            # the hour that is still being written: compress on the fly, cheapest level
+            gzip on;
+            gzip_comp_level 1;
+            gzip_types text/plain;
+            gzip_vary on;
+        }
+    }
+    ```
+
+    Cron job that precompresses each hour after it closes:
+
+    ```bash
+    #!/usr/bin/env bash
+    # /usr/local/bin/compress-closed-hours.sh
+    # crontab: 5 * * * * /usr/local/bin/compress-closed-hours.sh
+    set -euo pipefail
+    shopt -s nullglob
+
+    # use date -u if fluent-bit names the files in UTC
+    current="$(date +%Y-%m-%d-%H).log"
+
+    for f in /var/log/collected/*/*.log; do
+        [[ ${f##*/} == "$current" ]] && continue
+        [[ -e $f.gz ]] && continue
+        # write to a temp file first, so nginx never serves a half-written .gz
+        gzip -c -- "$f" > "$f.gz.tmp"
+        mv -- "$f.gz.tmp" "$f.gz"
+    done
+    ```
+
+    `gzip_static` only sends the `.gz` when the client sends `Accept-Encoding: gzip`. Browsers do this automatically. With curl, use `curl --compressed -O http://logs.internal/web-01/2026-10-24-13.log`. Without `--compressed`, curl gets the uncompressed file. The `.log` files stay next to the `.gz` files, so those clients still work.
+
+    **Green Notes**
+    - **Precompress closed hours** (reduces E): each file is compressed once by cron. After that, every download, including the repeated ones during an incident, gets the ready `.gz`. In Green Metrics Tool measurements of nginx serving text assets, gzip on every request cost about 4× the CPU energy of serving precompressed files.
+    - **Keep compression on** (reduces network): in the same measurement, compression sent about 10× fewer bytes for text. Over your VPN, the transfer is the slow part, and log text compresses well.
+    - **On-the-fly gzip only for the current hour, at level 1** (reduces E): this file is still growing, so it cannot be precompressed. Level 1 keeps the per-request CPU cost low and still shrinks plain text a lot.
+verify:
+  static_only: nginx config plus cron script, needs a running nginx and the collector's directory layout

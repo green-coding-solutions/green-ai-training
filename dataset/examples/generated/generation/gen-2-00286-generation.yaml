@@ -1,0 +1,72 @@
+id: gen-2-00286-generation
+category: generation
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    hi, i need a Dockerfile for our modbus bridge. it run on our field gateways (raspberry pi 4, arm64). it read modbus RTU from /dev/ttyUSB0 and publish the values to mqtt broker.
+
+    - python 3.12, code is in `bridge/` package, start with `python -m bridge`
+    - it read config from /etc/bridge/config.yaml, we mount this file from the host
+    - deps in requirements.txt: pymodbus, pyserial, paho-mqtt, pyyaml
+    - we have also requirements-dev.txt with pytest, ruff and mypy, only for developing
+    - CI build the image on every tag, and around 300 gateways pull it over LTE
+
+    should not run as root if possible. thx!
+- role: assistant
+  content: |
+    ```dockerfile
+    FROM python:3.12-slim
+
+    ENV PYTHONDONTWRITEBYTECODE=1 \
+        PYTHONUNBUFFERED=1
+
+    WORKDIR /app
+
+    # Non-root user that may open the serial port
+    RUN useradd --system --no-create-home --groups dialout bridge
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY bridge ./bridge
+
+    USER bridge
+    CMD ["python", "-m", "bridge"]
+    ```
+
+    `.dockerignore`, so dev files never reach the build:
+
+    ```text
+    .git
+    .venv
+    __pycache__
+    tests
+    requirements-dev.txt
+    ```
+
+    Build for the Pi and run it on a gateway:
+
+    ```bash
+    docker buildx build --platform linux/arm64 -t registry.example.com/modbus-bridge:1.4.0 --push .
+
+    docker run -d --restart unless-stopped \
+      --device /dev/ttyUSB0 \
+      -v /etc/bridge/config.yaml:/etc/bridge/config.yaml:ro \
+      registry.example.com/modbus-bridge:1.4.0
+    ```
+
+    `dialout` is group 20 on Debian and Raspberry Pi OS, so the `bridge` user can open the serial device. If your host uses another group ID for `/dev/ttyUSB0`, add `--group-add <gid>` to `docker run`.
+
+    **Green Notes**
+    - **Small container image** (reduces E, storage, network): slim base, runtime dependencies only, no pip cache. In Green Metrics Tool measurements of a small Flask app, an image built this way used about 7× less energy to build than one on the full `python:3.12` base with build tools and dev packages. Serving requests cost the same. Here, every one of your 300 gateways also downloads fewer bytes over LTE on each release.
+    - **Dependency layer first** (reduces E): `requirements.txt` is installed before the code is copied, so a code-only change rebuilds just the last layer. Gateways then only pull that small layer, not the dependencies again.
+    - **Dev tools stay out**: pytest, ruff and mypy belong in CI or a separate dev image, not in the image on the gateways.
+
+    All four runtime packages ship arm64 wheels, so no compiler is needed. If a future dependency starts compiling during `pip install`, build it in a separate build stage. Don't add `build-essential` to this image.
+verify:
+  static_only: Dockerfile

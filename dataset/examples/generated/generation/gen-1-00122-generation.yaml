@@ -1,0 +1,81 @@
+id: gen-1-00122-generation
+category: generation
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    ```python
+    class LinkQualityLog:
+        """Keeps the last 300 RSSI samples of the LTE modem, newest first.
+        Used by the status page of the gateway."""
+
+        def __init__(self, size=300):
+            self.size = size
+            # TODO
+
+        def add(self, ts, rssi):
+            # TODO: newest goes to index 0, drop the oldest when full
+            pass
+
+        def latest(self, n=10):
+            # TODO: the n newest samples as a list of (ts, rssi)
+            pass
+
+        def average(self):
+            # TODO: mean rssi over all stored samples, None if empty
+            pass
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```python
+    from collections import deque
+    from itertools import islice
+
+
+    class LinkQualityLog:
+        """Keeps the last 300 RSSI samples of the LTE modem, newest first.
+        Used by the status page of the gateway."""
+
+        def __init__(self, size=300):
+            self.size = size
+            self._samples = deque(maxlen=size)
+
+        def add(self, ts, rssi):
+            # appendleft is O(1); when full, the oldest sample falls off the right end
+            self._samples.appendleft((ts, rssi))
+
+        def latest(self, n=10):
+            # deques do not support slicing, islice reads only the first n items
+            return list(islice(self._samples, n))
+
+        def average(self):
+            if not self._samples:
+                return None
+            return sum(rssi for _, rssi in self._samples) / len(self._samples)
+    ```
+
+    **Green Notes**
+    - **Avoid front insertion** (reduces E): `list.insert(0, x)` shifts every stored item on each sample, `deque.appendleft` does not. In Green Metrics Tool micro-benchmarks, 1,000,000 front inserts into a list used about 1515 J, and 1,000,000 appends used about 1.2 J. With only 300 items the shift is short, but the deque needs no extra code and stays flat if you raise `size` later.
+    - **Bounded buffer** (reduces M): `maxlen` drops the oldest sample by itself, so there is no `pop()` and memory never grows past `size`.
+
+    `latest()` returns a new list, so the status page can read it safely while new samples arrive.
+verify:
+  test: |-
+    log = LinkQualityLog(size=3)
+    assert log.latest() == []
+    assert log.average() is None
+    log.add(1, -70)
+    log.add(2, -80)
+    log.add(3, -90)
+    assert log.latest(2) == [(3, -90), (2, -80)]
+    assert log.average() == -80.0
+    log.add(4, -60)
+    assert log.latest() == [(4, -60), (3, -90), (2, -80)]
+    assert len(log._samples) == 3
+    assert log.average() == (-60 - 90 - 80) / 3

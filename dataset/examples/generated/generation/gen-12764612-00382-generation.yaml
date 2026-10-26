@@ -1,0 +1,72 @@
+id: gen-12764612-00382-generation
+category: generation
+language: sql
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    I'm building a REST endpoint `PUT /suppliers/{id}/prices` for our shop backend (PostgreSQL 16). Suppliers send a price file with up to about 50,000 rows per request: sku, price_cents, currency.
+
+    Target table:
+
+    ```sql
+    CREATE TABLE product_prices (
+        sku         text PRIMARY KEY,
+        price_cents integer NOT NULL CHECK (price_cents >= 0),
+        currency    char(3) NOT NULL,
+        updated_at  timestamptz NOT NULL DEFAULT now()
+    );
+    ```
+
+    Requirements:
+    - Existing SKUs are updated, new SKUs are inserted.
+    - Only touch rows where price or currency really changed, so `updated_at` stays meaningful.
+    - If the same SKU appears twice in one file, the last line wins.
+    - All or nothing: one bad row and the table stays unchanged.
+
+    Can you write the SQL for the database part? The app is Python with psycopg 3.
+- role: assistant
+  content: |
+    Load the file into a temporary staging table with one `COPY`, then upsert from it in one statement:
+
+    ```sql
+    BEGIN;
+
+    CREATE TEMP TABLE price_stage (
+        line_no     bigint GENERATED ALWAYS AS IDENTITY,
+        sku         text NOT NULL,
+        price_cents integer NOT NULL CHECK (price_cents >= 0),
+        currency    char(3) NOT NULL
+    ) ON COMMIT DROP;
+
+    -- the app streams the rows here (psycopg: cur.copy(...) and copy.write_row(...))
+    COPY price_stage (sku, price_cents, currency) FROM STDIN (FORMAT csv);
+
+    INSERT INTO product_prices (sku, price_cents, currency, updated_at)
+    SELECT DISTINCT ON (sku) sku, price_cents, currency, now()
+    FROM price_stage
+    ORDER BY sku, line_no DESC
+    ON CONFLICT (sku) DO UPDATE
+    SET price_cents = EXCLUDED.price_cents,
+        currency    = EXCLUDED.currency,
+        updated_at  = EXCLUDED.updated_at
+    WHERE (product_prices.price_cents, product_prices.currency)
+          IS DISTINCT FROM (EXCLUDED.price_cents, EXCLUDED.currency);
+
+    COMMIT;
+    ```
+
+    In the app, wrap this in one transaction. If `COPY` or the upsert raises, roll back and return a 4xx. Nothing is half written.
+
+    **Green Notes**
+    - **Bulk load with `COPY` instead of one `INSERT` per row** (reduces E): 50,000 rows go to the server as one stream, not 50,000 statements and round trips. In Green Metrics Tool micro-benchmarks with PostgreSQL and psycopg 3 (500,000 rows in batches of 5,000), `COPY` used about 22× less CPU energy than one `execute()` per row, and about 8× less than `executemany()`.
+    - **One set-based upsert from the staging table:** the conflict handling and the "changed rows only" check run inside the database, not row by row in the app.
+    - **`DISTINCT ON ... ORDER BY line_no DESC`:** it keeps the last line per SKU. Without it, Postgres raises "cannot affect row a second time" when a file contains a SKU twice.
+
+    *Not applied:* `COPY` for small requests. If a supplier sends only a few dozen rows, the gain is small. In the same benchmarks, with batches of about 100 rows the three methods were close, because the fixed cost per batch dominates. The staging pattern still works fine for small files, so you don't need a second code path.
+verify:
+  static_only: needs PostgreSQL (COPY FROM STDIN, temp tables, DISTINCT ON, ON CONFLICT)

@@ -1,0 +1,149 @@
+id: gen-12764612-00142-review
+category: review
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import math
+
+
+    class LatencyHistogram:
+        """Power-of-two latency buckets from access log lines: ip method ms"""
+
+        def __init__(self, max_bucket=20):
+            self.max_bucket = max_bucket
+            self.counts = [0] * (max_bucket + 1)
+            self.total_ms = 0.0
+            self.skipped = 0
+
+        def feed(self, path):
+            f = open(path)
+            for line in f:
+                parts = line.split()
+                if len(parts) < 3:
+                    self.skipped += 1
+                    continue
+                try:
+                    ms = float(parts[2])
+                except:
+                    self.skipped += 1
+                    continue
+                if ms < 1:
+                    bucket = 0
+                else:
+                    bucket = int(math.log2(ms))
+                if bucket > self.max_bucket:
+                    bucket = self.max_bucket
+                self.counts[bucket] += 1
+                self.total_ms += ms
+
+        def mean(self):
+            n = sum(self.counts)
+            return self.total_ms / n if n else 0.0
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (one pass over large log files)
+
+    #### [Bug] `nan` and `inf` latencies crash the run
+    - **Where:** `float(parts[2])` followed by `int(math.log2(ms))`
+    - **Issue:** `float("nan")` and `float("inf")` parse fine. Then `int(math.log2(ms))` raises `ValueError` or `OverflowError`, which the `try` does not cover. One bad line stops the whole file, and the counts so far are only partly filled.
+    - **Fix:** skip values that are not finite, as shown in the code below.
+
+    #### [Bug] File is never closed, bare `except`
+    - **Where:** `f = open(path)`, `except:`
+    - **Issue:** the handle stays open if the loop raises. A bare `except:` also swallows `KeyboardInterrupt`, so Ctrl-C on a long run is counted as a skipped line.
+    - **Fix:** use `with open(...)` and `except ValueError`.
+
+    #### [Low] Repeated attribute lookups in the per-line loop
+    - **Where:** `self.counts`, `self.max_bucket`, `self.total_ms`, `self.skipped`, `math.log2`
+    - **Issue:** each line looks up these names again. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local variable before a 10,000,000-iteration loop saved about 4-5%. So the gain is small. It is only worth it here because the loop runs once per log line on big files.
+    - **Fix:** bind them to locals before the loop and write the totals back once at the end.
+    - **Impact:** E, a few percent at most.
+
+    ```python
+    import math
+
+
+    class LatencyHistogram:
+        """Power-of-two latency buckets from access log lines: ip method ms"""
+
+        def __init__(self, max_bucket=20):
+            self.max_bucket = max_bucket
+            self.counts = [0] * (max_bucket + 1)
+            self.total_ms = 0.0
+            self.skipped = 0
+
+        def feed(self, path):
+            counts = self.counts
+            max_bucket = self.max_bucket
+            log2 = math.log2
+            isfinite = math.isfinite
+            total_ms = self.total_ms
+            skipped = self.skipped
+
+            with open(path) as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 3:
+                        skipped += 1
+                        continue
+                    try:
+                        ms = float(parts[2])
+                    except ValueError:
+                        skipped += 1
+                        continue
+                    if not isfinite(ms):
+                        skipped += 1
+                        continue
+                    if ms < 1:
+                        bucket = 0
+                    else:
+                        bucket = int(log2(ms))
+                        if bucket > max_bucket:
+                            bucket = max_bucket
+                    counts[bucket] += 1
+                    total_ms += ms
+
+            self.total_ms = total_ms
+            self.skipped = skipped
+
+        def mean(self):
+            n = sum(self.counts)
+            return self.total_ms / n if n else 0.0
+    ```
+
+    `counts` is the same list object, so it is updated in place. `total_ms` and `skipped` are written back after the loop. If reading the file fails halfway, those two are not updated. Lines with `nan` or `inf` now count as skipped instead of crashing.
+
+    **Already good:** one streaming pass over the file, no list of all lines in memory, and the bucket math is O(1) per line.
+verify:
+  module: false
+  test: |
+    import os, tempfile
+    fd, p = tempfile.mkstemp()
+    os.close(fd)
+    with open(p, "w") as fh:
+        fh.write("a b nan\na b inf\na b 4\n")
+    h = LatencyHistogram()
+    h.feed(p)
+    os.unlink(p)
+    assert h.skipped == 2 and sum(h.counts) == 1
+  equivalence:
+    driver: |-
+      import os, tempfile
+      lines = ["1.1.1.1 GET 0.5", "a GET 3.2", "b GET 130.0", "c GET abc", "short", "d GET 99999999", "e GET 7"] * 50
+      fd, p = tempfile.mkstemp()
+      os.close(fd)
+      with open(p, "w") as fh:
+          fh.write("\n".join(lines) + "\n")
+      h = LatencyHistogram()
+      h.feed(p)
+      os.unlink(p)
+      print(h.counts, h.skipped, round(h.total_ms, 3), round(h.mean(), 3))

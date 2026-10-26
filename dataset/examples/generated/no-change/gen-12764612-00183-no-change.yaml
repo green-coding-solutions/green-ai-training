@@ -1,0 +1,43 @@
+id: gen-12764612-00183-no-change
+category: no-change
+language: python
+patterns:
+- async-concurrent-io
+- context-tradeoff
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    Diff only please. Would switching the fetch in this to httpx.AsyncClient save anything? It's the detector correction step in our beamline pipeline, runs once per acquisition.
+
+    ```python
+    import json
+    import urllib.request
+
+    import numpy as np
+
+    CAL_URL = "https://calib.example-lab.org/api/detectors/{det}/gain"
+
+
+    def load_gain(det_id):
+        with urllib.request.urlopen(CAL_URL.format(det=det_id), timeout=10) as resp:
+            return np.asarray(json.load(resp)["gain"], dtype=np.float64)
+
+
+    def correct_frames(frames, det_id):
+        gain = load_gain(det_id)
+        out = np.empty(frames.shape, dtype=np.float64)
+        for i in range(frames.shape[0]):
+            out[i] = (frames[i] - frames[i].mean()) / gain
+        return out
+    ```
+- role: assistant
+  content: |-
+    No diff. Leave it as is.
+
+    - **One request per run.** Async saves time by overlapping waits between several requests. With a single call there is nothing to overlap, so the event loop would only add code. `correct_frames` would also have to become `async` or call `asyncio.run`.
+    - **The work is CPU-bound.** After the fetch, the time goes into the frame loop. Async does not make that part cheaper.
+    - **Even with many requests the gain is modest.** In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used about 7% less CPU energy than sync `urllib`, and about 17% less wall time. The saving was mostly wall time.
+
+    Async would make sense if one run fetched many calibration files, for example one per detector module. Then `asyncio.gather` over the requests would cut the waiting.

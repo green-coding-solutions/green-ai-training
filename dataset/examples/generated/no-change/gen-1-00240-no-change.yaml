@@ -1,0 +1,58 @@
+id: gen-1-00240-no-change
+category: no-change
+language: python
+patterns:
+- batch-db-writes
+- context-tradeoff
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    Hi, I'm new to this and I wrote a nightly job that checks our 4 image classifiers on a validation set and saves the scores in Postgres. A friend looked at it and said "you insert in a loop, thats bad". I don't really know what is wrong with it. Can you tell me what to fix?
+
+    ```python
+    import os
+    import psycopg
+
+    from registry import load_model, load_validation_set
+
+    MODEL_NAMES = ["resnet_a", "resnet_b", "mobilenet_small", "effnet_lite"]
+
+
+    def evaluate(model, images, labels):
+        correct = 0
+        for img, label in zip(images, labels):
+            if model.predict(img) == label:
+                correct += 1
+        return correct / len(labels)
+
+
+    def main():
+        images, labels = load_validation_set()
+        with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+            with conn.cursor() as cur:
+                for name in MODEL_NAMES:
+                    model = load_model(name)
+                    acc = evaluate(model, images, labels)
+                    cur.execute(
+                        "INSERT INTO model_scores (model_name, accuracy, n_samples, run_date) "
+                        "VALUES (%s, %s, %s, CURRENT_DATE)",
+                        (name, acc, len(labels)),
+                    )
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    Nothing is wrong here. I would leave the insert as it is.
+
+    - **Only 4 rows per run.** One `INSERT` per row only becomes a problem with many rows per batch. In Green Metrics Tool micro-benchmarks with PostgreSQL, inserting 500,000 rows in batches of 5,000, `COPY` used about 22× less energy than one `execute()` per row. With batches of only 100 rows the difference was small (loop ~13 J, `executemany` ~15 J, `COPY` ~9.5 J), because the fixed cost per batch dominates. Your batch is 4 rows, so there is nothing to win.
+    - **The insert is not where the work is.** `evaluate()` runs every image through every model. That is the real cost of the job. Four small inserts are not.
+    - **The code is already clean.** It uses one connection, parameterized queries, and the `with psycopg.connect(...)` block commits once at the end.
+
+    A batched write would matter if you saved one row per prediction (thousands of rows per run). Then use `cur.executemany(...)`, or `COPY` for very large loads. For 4 summary rows, keep the loop. It is the simplest and clearest version.
+verify:
+  static_only: needs a PostgreSQL server, the psycopg package and project modules (registry)

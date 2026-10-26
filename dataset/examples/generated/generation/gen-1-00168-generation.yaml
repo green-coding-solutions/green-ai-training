@@ -1,0 +1,80 @@
+id: gen-1-00168-generation
+category: generation
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    hello, i need python function for our deploy checker in CI. it read all the kubernetes yaml of our services (around 300 files) and for every container it must compare cpu and memory requests with the limits. values are strings like "250m", "1", "512Mi", "2Gi", "1.5G". i need function what give me a number from this string. in our manifests it is always the same few values again and again (like 100m, 500m, 256Mi, 1Gi). please also raise error when string is not valid, so the pipeline fail
+- role: assistant
+  content: |
+    ```python
+    import re
+    from functools import lru_cache
+
+    _QUANTITY = re.compile(r"([0-9]+(?:\.[0-9]+)?)(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?")
+
+    _FACTORS = {
+        "": 1,
+        "m": 0.001,
+        "k": 1000,
+        "M": 1000**2,
+        "G": 1000**3,
+        "T": 1000**4,
+        "P": 1000**5,
+        "E": 1000**6,
+        "Ki": 1024,
+        "Mi": 1024**2,
+        "Gi": 1024**3,
+        "Ti": 1024**4,
+        "Pi": 1024**5,
+        "Ei": 1024**6,
+    }
+
+
+    @lru_cache(maxsize=512)
+    def parse_quantity(value: str) -> float:
+        """Convert a Kubernetes quantity like '250m' or '512Mi' to a float.
+
+        CPU is returned in cores, memory in bytes.
+        Raises ValueError for invalid strings.
+        """
+        match = _QUANTITY.fullmatch(value.strip())
+        if match is None:
+            raise ValueError(f"invalid quantity: {value!r}")
+        number, suffix = match.groups()
+        return float(number) * _FACTORS[suffix or ""]
+
+
+    def exceeds_limit(request: str, limit: str) -> bool:
+        return parse_quantity(request) > parse_quantity(limit)
+    ```
+
+    **Green Notes**
+    - **Memoize with `lru_cache`** (reduces E): `parse_quantity` is pure and your manifests repeat the same few strings, so each distinct string is parsed once and every later call is a cache hit. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over 200 distinct inputs used about 9× less CPU energy with `lru_cache`.
+    - **Bounded cache and safe results:** `maxsize=512` keeps memory fixed, and the function returns a plain float, so callers cannot change a cached value. Invalid strings raise `ValueError` and are not cached.
+
+    *Not applied:* no cache outside this function. The cache only helps because the inputs repeat. If most strings were unique, it would only add overhead.
+verify:
+  test: |-
+    import math
+    assert math.isclose(parse_quantity("250m"), 0.25)
+    assert parse_quantity("1") == 1
+    assert parse_quantity("512Mi") == 512 * 1024**2
+    assert parse_quantity("2Gi") == 2 * 1024**3
+    assert math.isclose(parse_quantity("1.5G"), 1.5e9)
+    assert parse_quantity("100m") == parse_quantity("100m")
+    assert exceeds_limit("2", "500m") is True
+    assert exceeds_limit("256Mi", "1Gi") is False
+    for bad in ["", "abc", "12 Mi", "5mi", "-1", "1Gb"]:
+        try:
+            parse_quantity(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(bad)
+    parse_quantity("250m")
+    assert parse_quantity.cache_info().hits >= 1

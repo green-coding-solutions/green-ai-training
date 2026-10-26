@@ -1,0 +1,47 @@
+id: gen-1-00132-generation
+category: generation
+language: sql
+sql_dialect: postgres
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    gateway resends overlapping events.csv after reconnect (device_id,event_ts,code,payload), need postgres sql to load it without dupes
+- role: assistant
+  content: |
+    Load the file into a temp staging table with `COPY`, then insert from it and skip rows that already exist.
+
+    ```sql
+    CREATE TABLE IF NOT EXISTS gateway_events (
+        device_id text        NOT NULL,
+        event_ts  timestamptz NOT NULL,
+        code      integer     NOT NULL,
+        payload   text,
+        PRIMARY KEY (device_id, event_ts, code)
+    );
+
+    BEGIN;
+
+    CREATE TEMP TABLE staging_events (LIKE gateway_events INCLUDING DEFAULTS)
+        ON COMMIT DROP;
+
+    \copy staging_events (device_id, event_ts, code, payload) FROM 'events.csv' WITH (FORMAT csv, HEADER true)
+
+    INSERT INTO gateway_events (device_id, event_ts, code, payload)
+    SELECT device_id, event_ts, code, payload
+    FROM staging_events
+    ON CONFLICT (device_id, event_ts, code) DO NOTHING;
+
+    COMMIT;
+    ```
+
+    Run it with `psql -d yourdb -f load_events.sql`. The staging table has no primary key, so duplicates inside the file are loaded there and `DO NOTHING` drops them. The whole file is one transaction, so a failed load leaves no partial data. The key `(device_id, event_ts, code)` is my guess for "same event". Change it if your gateway can send two different events with the same device, time and code.
+
+    **Green Notes**
+    - **Batch database writes** (reduces E): `COPY` streams the whole file in one go, and one `INSERT ... SELECT` replaces a statement per row. In Green Metrics Tool micro-benchmarks with 500,000 rows in batches of 5,000 on PostgreSQL 16, `COPY` used ~17 J and one `execute()` per row ~384 J, about 22× less. With batches of only ~100 rows the gap was small, so this pays off for large files like yours, not for a handful of rows.
+    - **One transaction per file** (reduces E): one commit instead of one per row, and the dedupe runs inside the database, so no round trip per event.
+verify:
+  static_only: needs PostgreSQL with psql meta-commands (\copy, ON CONFLICT, temp tables)

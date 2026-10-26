@@ -1,0 +1,104 @@
+id: gen-1-00109-generation
+category: generation
+language: python
+patterns:
+- keep-star-imports
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    ```python
+    # gateway/window.py
+    from collections import *
+    from time import *
+
+    WINDOW_S = 60
+
+
+    class SensorWindow:
+        """Keeps the readings of the last WINDOW_S seconds per sensor
+        and gives count / mean / min / max for one sensor."""
+
+        def __init__(self, window_s=WINDOW_S, clock=monotonic):
+            ...
+
+        def add(self, sensor_id, value, ts=None):
+            ...
+
+        def stats(self, sensor_id):
+            # None if no reading in the window
+            ...
+    ```
+
+    ?
+- role: assistant
+  content: |
+    Here is the class filled in. I left your imports as they are.
+
+    ```python
+    # gateway/window.py
+    from collections import *
+    from time import *
+
+    WINDOW_S = 60
+
+
+    class SensorWindow:
+        """Keeps the readings of the last WINDOW_S seconds per sensor
+        and gives count / mean / min / max for one sensor."""
+
+        def __init__(self, window_s=WINDOW_S, clock=monotonic):
+            self.window_s = window_s
+            self._clock = clock
+            self._readings = defaultdict(deque)
+
+        def add(self, sensor_id, value, ts=None):
+            if ts is None:
+                ts = self._clock()
+            q = self._readings[sensor_id]
+            q.append((ts, value))
+            self._expire(q, ts)
+
+        def _expire(self, q, now):
+            limit = now - self.window_s
+            while q and q[0][0] <= limit:
+                q.popleft()
+
+        def stats(self, sensor_id):
+            q = self._readings.get(sensor_id)
+            if not q:
+                return None
+            self._expire(q, self._clock())
+            if not q:
+                return None
+            values = [v for _, v in q]
+            return {
+                "count": len(values),
+                "mean": sum(values) / len(values),
+                "min": min(values),
+                "max": max(values),
+            }
+    ```
+
+    Readings must arrive in time order for each sensor. Old readings are dropped on every `add()` and `stats()`, so memory stays bounded.
+
+    **Green Notes**
+    - **Star imports left as they are** (no effect on E): in Green Metrics Tool micro-benchmarks, `from x import *` and `import x` showed no measurable energy difference over 1,000 process starts. Changing them would only be style. In new files, explicit imports are the normal choice for readability.
+verify:
+  test: |-
+    t = [0.0]
+    w = SensorWindow(window_s=60, clock=lambda: t[0])
+    assert w.stats(1) is None
+    w.add(1, 10.0)
+    t[0] = 30.0
+    w.add(1, 20.0)
+    assert w.stats(1) == {"count": 2, "mean": 15.0, "min": 10.0, "max": 20.0}
+    t[0] = 70.0
+    assert w.stats(1) == {"count": 1, "mean": 20.0, "min": 20.0, "max": 20.0}
+    t[0] = 200.0
+    assert w.stats(1) is None
+    assert w.stats(99) is None
+    w2 = SensorWindow()
+    w2.add("a", 1.5)
+    assert w2.stats("a")["count"] == 1

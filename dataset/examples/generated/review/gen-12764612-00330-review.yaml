@@ -1,0 +1,135 @@
+id: gen-12764612-00330-review
+category: review
+language: html
+patterns:
+- dom-size
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    review pls, tab freezes when I open a big mass-spec run
+
+    ```html
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <meta charset="utf-8">
+    <title>Peak list viewer</title>
+    <style>
+      .row { display: flex; border-bottom: 1px solid #ddd; }
+      .cell { width: 140px; padding: 4px; text-align: right; }
+      .cell span { display: block; }
+    </style>
+    </head>
+    <body>
+    <h3 id="title"></h3>
+    <div id="peaks"></div>
+    <script>
+    fetch('/api/runs/latest/peaks.json')
+      .then(r => r.json())
+      .then(data => {
+        document.getElementById('title').innerHTML =
+          'Run: ' + data.run_name + ' (' + data.peaks.length + ' peaks)';
+        const box = document.getElementById('peaks');
+        data.peaks.forEach(p => {
+          const row = document.createElement('div');
+          row.className = 'row';
+          row.innerHTML =
+            '<div class="cell"><span>' + p.mz.toFixed(4) + '</span></div>' +
+            '<div class="cell"><span>' + p.intensity.toExponential(2) + '</span></div>' +
+            '<div class="cell"><span>' + p.charge + '</span></div>' +
+            '<div class="cell"><span>' + p.rt.toFixed(2) + '</span></div>' +
+            '<div class="cell"><span>' + p.snr.toFixed(1) + '</span></div>';
+          box.appendChild(row);
+        });
+      });
+    </script>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (internal viewer, client-side rendering)
+
+    #### [Security] Run name is inserted as HTML
+    - **Where:** `document.getElementById('title').innerHTML = ...`
+    - **Issue:** `data.run_name` comes from the run file. If it contains markup, the page runs it. Run files can be uploaded by other people.
+    - **Fix:** use `textContent`.
+
+    #### [High] Every peak is rendered at once, with two wrapper elements per cell
+    - **Where:** the `data.peaks.forEach(...)` loop
+    - **Issue:** a run with about 12k peaks creates about 130k DOM nodes (a row, plus a `div` and a `span` for each of 5 cells). Each row is also parsed from an HTML string and appended to the live DOM one at a time. The browser has to build, style and lay out all of it, even though only a few dozen rows are visible.
+    - **Fix:** keep the data in an array and show one page of 100 rows. Use a plain `<table>` with one `td` per value, and build each page in a `DocumentFragment`.
+    - **Impact:** reduces client E and M for every page load. In Green Metrics Tool micro-benchmarks, 30 page loads of a 10,000-row table built from 14 elements per row used about 56% less CPU energy when paginated to 100 rows per page as a plain table in a `DocumentFragment`.
+
+    ```html
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <meta charset="utf-8">
+    <title>Peak list viewer</title>
+    <style>
+      td { padding: 4px 12px; border-bottom: 1px solid #ddd; text-align: right; }
+    </style>
+    </head>
+    <body>
+    <h3 id="title"></h3>
+    <p>
+      <button id="prev">Prev</button>
+      <span id="page"></span>
+      <button id="next">Next</button>
+    </p>
+    <table><tbody id="peaks"></tbody></table>
+    <script>
+    const PAGE_SIZE = 100;
+    let peaks = [];
+    let page = 0;
+
+    function render() {
+      const pages = Math.max(1, Math.ceil(peaks.length / PAGE_SIZE));
+      const start = page * PAGE_SIZE;
+      const frag = document.createDocumentFragment();
+      for (const p of peaks.slice(start, start + PAGE_SIZE)) {
+        const tr = document.createElement('tr');
+        const values = [
+          p.mz.toFixed(4),
+          p.intensity.toExponential(2),
+          p.charge,
+          p.rt.toFixed(2),
+          p.snr.toFixed(1),
+        ];
+        for (const v of values) {
+          const td = document.createElement('td');
+          td.textContent = v;
+          tr.appendChild(td);
+        }
+        frag.appendChild(tr);
+      }
+      document.getElementById('peaks').replaceChildren(frag);
+      document.getElementById('page').textContent = (page + 1) + ' / ' + pages;
+      document.getElementById('prev').disabled = page === 0;
+      document.getElementById('next').disabled = page >= pages - 1;
+    }
+
+    document.getElementById('prev').onclick = () => { page--; render(); };
+    document.getElementById('next').onclick = () => { page++; render(); };
+
+    fetch('/api/runs/latest/peaks.json')
+      .then(r => r.json())
+      .then(data => {
+        document.getElementById('title').textContent =
+          'Run: ' + data.run_name + ' (' + data.peaks.length + ' peaks)';
+        peaks = data.peaks;
+        render();
+      });
+    </script>
+    </body>
+    </html>
+    ```
+
+    Behavior change: browser find (Ctrl+F) now only searches the current page. If people need to look up a specific m/z, add a small filter box that filters `peaks` before paging.
+
+    **Already good:** the data is fetched once as JSON, and the numbers are formatted in one place.
+verify:
+  static_only: browser DOM and fetch code in an HTML page, no runtime available in the test harness

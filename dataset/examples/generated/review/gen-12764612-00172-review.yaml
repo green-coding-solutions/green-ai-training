@@ -1,0 +1,142 @@
+id: gen-12764612-00172-review
+category: review
+language: html
+patterns:
+- css-animations
+- lazy-load-images
+facts:
+- F-ANIM
+- F-LAZY-IMG
+messages:
+- role: user
+  content: |
+    Hello, I make this page for our lab, it show the result of sequencing run, so the collegues can open the link and see the plots. Can you give me feedback please? I am biologist not web developper so maybe something is wrong, my english is not so good sorry.
+
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <title>Run report</title>
+      <style>
+        body { font-family: sans-serif; max-width: 900px; margin: 0 auto; padding: 0 12px; }
+        figure { margin: 24px 0; }
+        img { max-width: 100%; height: auto; }
+        .spinner {
+          display: inline-block; width: 18px; height: 18px;
+          border: 3px solid #ccc; border-top-color: #2a7; border-radius: 50%;
+        }
+      </style>
+    </head>
+    <body>
+      <h1>Run <span id="run-name"></span> <span class="spinner" id="spin"></span></h1>
+      <p id="status">QC is running...</p>
+
+      <figure>
+        <img src="plots/overview_quality.png" alt="Overview of read quality">
+        <figcaption>Overview, all lanes</figcaption>
+      </figure>
+      <figure>
+        <img src="plots/lane1_coverage.png" alt="Coverage lane 1">
+        <figcaption>Coverage, lane 1</figcaption>
+      </figure>
+      <figure>
+        <img src="plots/lane2_coverage.png" alt="Coverage lane 2">
+        <figcaption>Coverage, lane 2</figcaption>
+      </figure>
+      <figure>
+        <img src="plots/lane3_coverage.png" alt="Coverage lane 3">
+        <figcaption>Coverage, lane 3</figcaption>
+      </figure>
+      <figure>
+        <img src="plots/lane4_coverage.png" alt="Coverage lane 4">
+        <figcaption>Coverage, lane 4</figcaption>
+      </figure>
+      <figure>
+        <img src="plots/gc_content.png" alt="GC content">
+        <figcaption>GC content per sample</figcaption>
+      </figure>
+      <figure>
+        <img src="plots/duplication.png" alt="Duplication rate">
+        <figcaption>Duplication rate</figcaption>
+      </figure>
+
+      <script>
+        const spin = document.getElementById('spin');
+        const statusEl = document.getElementById('status');
+        let angle = 0;
+        let done = false;
+
+        // run name comes from the link, like report.html#run=R2291
+        const params = new URLSearchParams(location.hash.slice(1));
+        document.getElementById('run-name').innerHTML = params.get('run') || '';
+
+        function spinLoop() {
+          if (done) return;
+          angle = (angle + 6) % 360;
+          spin.style.transform = 'rotate(' + angle + 'deg)';
+          requestAnimationFrame(spinLoop);
+        }
+        requestAnimationFrame(spinLoop);
+
+        setInterval(async () => {
+          const r = await fetch('status.json');
+          const s = await r.json();
+          if (s.qc === 'finished') {
+            done = true;
+            spin.style.display = 'none';
+            statusEl.textContent = 'QC finished';
+          }
+        }, 10000);
+      </script>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (static report page)
+
+    #### [Security] Run name written with `innerHTML`
+    - **Where:** `document.getElementById('run-name').innerHTML = params.get('run')`
+    - **Issue:** the value comes from the link. Someone can send a colleague a link with HTML or a script in `run=`, and it will run on your page.
+    - **Fix:** use `textContent`, which treats the value as plain text:
+      ```javascript
+      document.getElementById('run-name').textContent = params.get('run') || '';
+      ```
+
+    #### [Medium] Spinner is moved by JavaScript on every frame
+    - **Where:** `spinLoop()` with `requestAnimationFrame`
+    - **Issue:** JavaScript wakes up on every frame and writes a new `transform`, for as long as QC runs. A CSS animation does the same movement without that script work. In Green Metrics Tool browser benchmarks, a 20-second animation used ~161 J of CPU energy with `requestAnimationFrame` style updates and ~145 J with CSS `@keyframes`, about 10% less. The saving is small for one spinner, but people may leave this tab open while QC runs.
+    - **Fix:** let CSS rotate it, and JavaScript only hides it at the end:
+      ```html
+      <style>
+        .spinner { animation: spin 1s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+      </style>
+      ```
+      ```javascript
+      // remove spinLoop, angle and the requestAnimationFrame call
+      // the setInterval code stays, it only needs:
+      if (s.qc === 'finished') {
+        spin.hidden = true;
+        statusEl.textContent = 'QC finished';
+      }
+      ```
+      Add `.spinner[hidden] { display: none; }` to the CSS, because your `.spinner` rule sets `display`, and that would override `hidden`.
+    - **Impact:** E on the client, small but constant while the tab is open.
+
+    #### [Medium] All 7 plots load at once
+    - **Where:** the `<img>` tags of the lane, GC and duplication plots
+    - **Issue:** the browser downloads every plot when the page opens, also the ones nobody scrolls to. In Green Metrics Tool micro-benchmarks, an article with 15 photos (about 2 MB) used ~368 J over 20 loads without scrolling. With `loading="lazy"` below the fold it used ~325 J, about 12% less. When visitors scrolled to the end, there was no difference. So it helps only if people often stop reading before the last plots.
+    - **Fix:** add `loading="lazy"` to the plots below the first screen. Keep the first image eager, because it is the first thing people see:
+      ```html
+      <img src="plots/overview_quality.png" alt="Overview of read quality">
+      <img src="plots/lane1_coverage.png" alt="Coverage lane 1" loading="lazy">
+      <img src="plots/lane2_coverage.png" alt="Coverage lane 2" loading="lazy">
+      <!-- same for lane3, lane4, gc_content, duplication -->
+      ```
+    - **Impact:** network and client E, for visitors who do not scroll to the end. It costs nothing if they do.
+
+    **Already good:** `alt` text on every image, `max-width: 100%` on images, and a `lang` attribute.
+verify:
+  static_only: browser page with fetch and DOM code

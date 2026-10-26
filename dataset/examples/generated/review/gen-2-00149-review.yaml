@@ -1,0 +1,78 @@
+id: gen-2-00149-review
+category: review
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    hi, I am junior dev at an online shop (we sell outdoor gear). I wrote this backup script, cron runs it every night at 2:30. It works, but it takes almost 2 hours. My colleague says one CPU core is at 100% the whole time and checkout is slow while it runs (we have customers in other timezones). I don't really know what is wrong with it. Can you take a look?
+
+    ```bash
+    #!/bin/bash
+    # nightly shop backup, cron: 30 2 * * *
+
+    DATE=$(date +%F)
+    MEDIA_DIR=/var/www/shop/media/products
+    LOG_DIR=/var/log/shop
+    BACKUP_DIR=/mnt/backup/shop
+    DEST=$BACKUP_DIR/$DATE
+
+    mkdir -p $DEST
+
+    echo "$(date) start backup" >> /var/log/shop-backup.log
+
+    # product photos uploaded in the admin (jpg, png, webp), around 40 GB
+    tar -cjf $DEST/product-images.tar.bz2 $MEDIA_DIR
+
+    # yesterday's logs: checkout, payment webhooks, nginx access
+    cd $LOG_DIR
+    for f in *.log.1; do
+        bzip2 -9 -c $f > $DEST/$f.bz2
+    done
+    rm -f *.log.1
+
+    # keep 14 days
+    find $BACKUP_DIR -mindepth 1 -maxdepth 1 -type d -mtime +14 -exec rm -rf {} \;
+
+    echo "$(date) backup done" >> /var/log/shop-backup.log
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (nightly cron on the shop server)
+
+    #### [Bug] Logs are deleted even when the backup of them failed
+    - **Where:** `cd $LOG_DIR` and `rm -f *.log.1` after the loop
+    - **Issue:** `rm` runs no matter what `bzip2` did. If the backup disk is full or not mounted, the write fails, and yesterday's checkout and payment logs are still deleted. If `cd` fails, the script keeps running in the wrong directory.
+    - **Fix:** stop if `cd` fails, and delete each log only after its compressed copy was written successfully (see the snippet below).
+
+    #### [High] Product photos are compressed with bzip2 every night
+    - **Where:** `tar -cjf ... product-images.tar.bz2`
+    - **Issue:** JPEG, PNG and WebP are already compressed. bzip2 gains almost nothing on them, but it still pushes all 40 GB through a slow, single-threaded compressor. This is most likely your 2 hours and the busy CPU core during checkout.
+    - **Fix:** write a plain tar without compression:
+      ```bash
+      tar -cf "$DEST/product-images.tar" "$MEDIA_DIR"
+      ```
+    - **Impact:** removes almost all CPU work of the backup, every night. The archive stays about the same size, because the photos don't shrink anyway.
+
+    #### [Medium] Logs use bzip2, an expensive codec, for data compressed every day
+    - **Where:** `bzip2 -9 -c $f` in the log loop
+    - **Issue:** logs are compressed every night, so the codec cost repeats. bzip2 is also slow to decompress, which you pay whenever someone opens an old log to debug an order.
+    - **Fix:** use zstd at its default level (`apt install zstd` if it is missing). Read the logs later with `zstdcat`.
+      ```bash
+      cd "$LOG_DIR" || exit 1
+      for f in *.log.1; do
+          [ -e "$f" ] || continue
+          zstd -q -c "$f" > "$DEST/$f.zst" && rm -f "$f"
+      done
+      ```
+    - **Impact:** reduces E every night. In Green Metrics Tool benchmarks compressing 100 MB of text with default settings, bzip2 used ~106 J and zstd ~16 J. Decompressing used ~52 J with bzip2 and ~5.3 J with zstd. These figures compare energy, not file size. bzip2 may produce somewhat smaller files. If backup space is tight, compare the sizes after one night with `ls -lh`.
+
+    **Already good:**
+    - Logs are kept for 14 days. That is long enough for compression to pay off. Data kept only for minutes would not be worth compressing.
+    - Old backups are cleaned up automatically, so the backup disk doesn't grow without limit.
+verify:
+  static_only: needs real paths under /var/www and /mnt/backup and the zstd binary

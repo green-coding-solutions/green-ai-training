@@ -1,0 +1,49 @@
+id: gen-1-00222-generation
+category: generation
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    hi, im new to python and i write small helper scripts for our CI. i need a function that gets the list of changed files from a merge request (can be thousands) and a dict that maps file path -> team name (from our owners file). it should give back the files grouped by team, so the pipeline can ping each team. a lot of files have no owner in the dict, maybe half. those should go in a group called "unowned". i dont really know how to handle the missing ones, can you write it?
+- role: assistant
+  content: |
+    ```python
+    from collections import defaultdict
+
+    def group_by_owner(changed_files, owners):
+        """Group changed file paths by owning team.
+
+        Files without an entry in `owners` go into the "unowned" group.
+        Order inside each group follows the input order.
+        """
+        groups = defaultdict(list)
+        for path in changed_files:
+            team = owners.get(path, "unowned")
+            groups[team].append(path)
+        return dict(groups)
+    ```
+
+    Example:
+
+    ```python
+    owners = {"api/app.py": "backend", "web/index.html": "frontend"}
+    files = ["api/app.py", "docs/readme.md", "web/index.html", "ci/build.sh"]
+    print(group_by_owner(files, owners))
+    # {'backend': ['api/app.py'], 'unowned': ['docs/readme.md', 'ci/build.sh'], 'frontend': ['web/index.html']}
+    ```
+
+    **Green Notes**
+    - **`dict.get` with a default instead of `try/except KeyError`** (reduces E): a missing key is an expected case here, and with half the files unowned, raising and catching an exception would happen on every second file. In Green Metrics Tool micro-benchmarks with 10,000,000 dict lookups where about half of the keys were missing, `dict.get` used about 12% less CPU energy than `try/except KeyError`. An `if path in owners` check performs about the same as `get`.
+    - *Not applied:* `try/except` stays a good choice when a miss is rare. The cost is in raising the exception, so it is cheap if it almost never happens.
+verify:
+  test: |-
+    owners = {"a.py": "backend", "b.html": "frontend"}
+    res = group_by_owner(["a.py", "x.md", "b.html", "y.sh", "a.py"], owners)
+    assert res == {"backend": ["a.py", "a.py"], "unowned": ["x.md", "y.sh"], "frontend": ["b.html"]}
+    assert isinstance(res, dict)
+    assert group_by_owner([], owners) == {}
+    assert group_by_owner(["q"], {}) == {"unowned": ["q"]}

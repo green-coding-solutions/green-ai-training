@@ -1,0 +1,81 @@
+id: gen-2-00367-refactor
+category: refactor
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```bash
+    #!/bin/bash
+    # nightly price snapshot for the shop: export, diff against yesterday, archive
+    set -euo pipefail
+
+    ARCHIVE=/srv/shop/price-history
+    TMP=/var/tmp/price-snap
+    DAY=$(date +%Y%m%d)
+    mkdir -p "$ARCHIVE" "$TMP"
+
+    # export all active product prices (~4 GB JSON lines)
+    psql -d shop -At -c "COPY (SELECT row_to_json(p) FROM (SELECT sku, price, currency, updated_at FROM prices WHERE active) p) TO STDOUT" \
+      | gzip -9 > "$TMP/prices.json.gz"
+
+    # changed prices vs yesterday, for the repricing report
+    zcat "$TMP/prices.json.gz" | sort > "$TMP/today.sorted"
+    bzcat "$ARCHIVE/prices-$(date -d yesterday +%F).json.bz2" 2>/dev/null | sort > "$TMP/yesterday.sorted" || true
+    comm -13 "$TMP/yesterday.sorted" "$TMP/today.sorted" > "$TMP/changed.json"
+    /opt/shop/bin/send-reprice-report "$TMP/changed.json"
+
+    # keep 2 years of history
+    zcat "$TMP/prices.json.gz" | bzip2 -9 > "$ARCHIVE/prices-$DAY.json.bz2"
+    find "$ARCHIVE" -name 'prices-*.json.bz2' -mtime +730 -delete
+    rm -rf "$TMP"
+    ```
+- role: assistant
+  content: |
+    ```bash
+    #!/bin/bash
+    # nightly price snapshot for the shop: export, diff against yesterday, archive
+    set -euo pipefail
+
+    ARCHIVE=/srv/shop/price-history
+    TMP=/var/tmp/price-snap
+    DAY=$(date +%Y%m%d)
+    PREV=$ARCHIVE/prices-$(date -d yesterday +%Y%m%d).json
+    mkdir -p "$ARCHIVE" "$TMP"
+
+    # export all active product prices (~4 GB JSON lines), uncompressed: the file only lives for this run
+    psql -d shop -At -c 'COPY (SELECT row_to_json(p) FROM (SELECT sku, price, currency, updated_at FROM prices WHERE active) p) TO STDOUT' \
+      > "$TMP/prices.json"
+
+    # changed prices vs yesterday, for the repricing report
+    sort "$TMP/prices.json" > "$TMP/today.sorted"
+    if [[ -f $PREV.zst ]]; then
+      zstd -dcq -- "$PREV.zst" | sort > "$TMP/yesterday.sorted"
+    elif [[ -f $PREV.bz2 ]]; then   # snapshots from before the switch to zstd
+      bzcat -- "$PREV.bz2" | sort > "$TMP/yesterday.sorted"
+    else
+      echo "no snapshot for $(date -d yesterday +%F), every price counts as changed" >&2
+      : > "$TMP/yesterday.sorted"
+    fi
+    comm -13 "$TMP/yesterday.sorted" "$TMP/today.sorted" > "$TMP/changed.json"
+    /opt/shop/bin/send-reprice-report "$TMP/changed.json"
+
+    # keep 2 years of history
+    zstd -q -f -o "$ARCHIVE/prices-$DAY.json.zst" "$TMP/prices.json"
+    find "$ARCHIVE" \( -name 'prices-*.json.zst' -o -name 'prices-*.json.bz2' \) -mtime +730 -delete
+    rm -rf "$TMP"
+    ```
+
+    **Green Notes**
+    - **Bug fixed: yesterday's snapshot was never found.** The archive is written as `prices-20261024`, but the lookup used `%F` (`prices-2026-10-24`). The `2>/dev/null || true` hid the error, so the repricing report listed every price as changed every night. The lookup now uses the same format. If a snapshot is missing, the script now logs it instead of failing silently.
+    - **No compression for the temp export** (reduces E): the file is deleted a few minutes later. The old script compressed it with `gzip -9` and then decompressed it twice. Data kept only for minutes should not be compressed. Green Coding Solutions estimates that even zstd needs the data to be stored for about 0.15 days before compression pays off. The plain file needs about 4 GB free in `/var/tmp` while the job runs.
+    - **zstd instead of `bzip2 -9` for the archive** (reduces E): each snapshot is compressed once and decompressed again the next night for the diff. In Green Metrics Tool benchmarks on 100 MB of text, compressing took ~16 J with zstd and ~106 J with bzip2, and decompressing took ~5.3 J with zstd and ~52 J with bzip2. These figures compare energy, not file size. `bzip2 -9` may produce somewhat smaller files. If storage volume over 2 years matters more to you, test a higher zstd level on one real snapshot and compare size and run time.
+    - **Transition:** the archive contents and line order are unchanged. Only the extension changes to `.zst`, so update anything else that reads the `.bz2` files. You can remove the `bzcat` branch after the first night. `find` cleans up both extensions until the old `.bz2` files age out. Install `zstd` on the box if it is missing.
+verify:
+  static_only: needs a PostgreSQL database, psql, zstd and the shop's report binary

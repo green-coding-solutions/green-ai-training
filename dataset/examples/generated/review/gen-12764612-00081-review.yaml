@@ -1,0 +1,71 @@
+id: gen-12764612-00081-review
+category: review
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    hi, i made this nginx config for our jenkins build artifacts so devs can download test reports and builds. it works but my colleague says something is wrong with it, he did not say what. can you look?
+
+    ```nginx
+    server {
+        listen 80;
+        server_name artifacts.ci.internal;
+
+        sendfile on;
+        tcp_nopush on;
+
+        gzip on;
+        gzip_comp_level 9;
+        gzip_types *;
+
+        location /artifacts {
+            alias /srv/ci/artifacts/;
+            autoindex on;
+        }
+
+        location /health {
+            return 200 'ok';
+        }
+    }
+    ```
+
+    the folder has html test reports, junit xml, console logs, and also the built .tar.gz and .zip packages and some png screenshots from the ui tests
+- role: assistant
+  content: |
+    **Workload:** CI/CD infrastructure (static file server, read by many devs and tools)
+
+    #### [Security] `alias` without a trailing slash on the location
+    - **Where:** `location /artifacts`
+    - **Issue:** the location has no trailing slash, but the alias does. A request like `/artifacts../something` is mapped to `/srv/ci/artifacts/../something`. That lets clients read files outside the artifacts folder.
+    - **Fix:** match the slash on both sides: `location /artifacts/ { alias /srv/ci/artifacts/; ... }`.
+
+    #### [High] gzip at level 9 on every file type, on every request
+    - **Where:** `gzip_comp_level 9;` and `gzip_types *;`
+    - **Issue:** `gzip_types *` compresses everything, including `.tar.gz`, `.zip` and `.png`. These are already compressed, so nginx spends CPU and gains almost no size. The high level makes it worse for the text files too, because every download is compressed again from scratch. In Green Metrics Tool micro-benchmarks (nginx, 2,000 requests for text assets), gzip level 5 on every request used about 4× the CPU energy of serving precompressed files. Both cut the bytes sent by about 10×.
+    - **Fix:** compress only text types, and serve precompressed files for reports that are written once and read many times:
+      ```nginx
+      gzip on;
+      gzip_comp_level 5;
+      gzip_vary on;
+      gzip_types text/plain text/css text/xml application/xml application/json application/javascript;
+
+      location /artifacts/ {
+          alias /srv/ci/artifacts/;
+          gzip_static on;
+      }
+      ```
+      Then add one step at the end of the Jenkins job, for example `gzip -k -9 report.html junit.xml console.log`. Level 9 is fine there because it runs once per build, not once per download. `gzip_static` serves the `.gz` file next to the original if it exists. Files without a `.gz` fall back to the normal `gzip` rules.
+    - **Impact:** reduces E on the server for every download. Packages and screenshots are served as they are. Text keeps the byte saving.
+
+    #### [Medium] `autoindex on` lists everything
+    - **Where:** `location /artifacts`
+    - **Issue:** anyone who can reach the host can browse all build folders, including old and internal ones. For an internal tool this may be intended, so confirm that it is.
+    - **Fix:** keep it if devs need the listing. Otherwise remove it and link to the builds directly, or restrict the host to the CI network with `allow` and `deny`.
+
+    **Already good:** `sendfile on` and `tcp_nopush on` are right for serving static files.
+verify:
+  static_only: nginx configuration, no runnable code

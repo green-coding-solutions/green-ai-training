@@ -1,0 +1,168 @@
+id: gen-2-00165-review
+category: review
+language: python
+patterns:
+- memoize
+- hoist-invariants
+facts:
+- F-LRU
+- F-ATTR
+messages:
+- role: user
+  content: |
+    Review pls, diffs only, skip the essay. Nightly artifact cleanup in our CI. The bucket manifest has ~2M objects, spread over a few thousand branches.
+
+    ```python
+    import fnmatch
+    import math
+    from datetime import datetime, timezone
+
+    GIB = 1024 ** 3
+
+    # (pattern, keep_days); first match wins. 0 = keep forever
+    RETENTION_POLICIES = [
+        ("main", 0),
+        ("release/*", 0),
+        ("hotfix/*", 90),
+        ("renovate/*", 3),
+        ("dependabot/*", 3),
+        ("feature/*", 14),
+        ("*", 7),
+    ]
+
+
+    def retention_days(branch):
+        name = branch.strip().lower()
+        if name.startswith("refs/heads/"):
+            name = name[len("refs/heads/"):]
+        for pattern, days in RETENTION_POLICIES:
+            if fnmatch.fnmatchcase(name, pattern):
+                return days
+        return 7
+
+
+    def plan_cleanup(artifacts, now=None):
+        """artifacts: dicts from the bucket manifest."""
+        now = now or datetime.now(timezone.utc)
+        to_delete = []
+        freed_gib = 0
+        for a in artifacts:
+            keep_days = retention_days(a["branch"])
+            created = datetime.fromisoformat(a["created_at"])
+            age_days = (now - created).days
+            if age_days > keep_days:
+                to_delete.append(a["key"])
+                freed_gib += math.ceil(a["size"] / GIB)
+        return to_delete, freed_gib
+    ```
+- role: assistant
+  content: |
+    **Workload:** CI/CD (nightly batch, per-artifact loop)
+
+    #### [Bug] "Keep forever" artifacts get deleted
+    - **Where:** `plan_cleanup`, `if age_days > keep_days`
+    - **Issue:** `0` means keep forever, but `age_days > 0` is true after one day. Every `main` and `release/*` artifact older than a day is scheduled for deletion.
+    - **Fix:** skip them before the age check: `if keep_days == 0: continue`.
+
+    #### [High] Retention rules re-evaluated for every artifact
+    - **Where:** `retention_days`, called once per manifest entry
+    - **Issue:** it is a pure function of the branch string. You have a few thousand branches but millions of calls, so the same strip/lower/prefix check plus up to 7 `fnmatchcase` calls repeat for the same input again and again.
+    - **Fix:** decorate it with `@lru_cache(maxsize=4096)` (`from functools import lru_cache`).
+    - **Impact:** E per row drops to a dict hit for repeated branches. In Green Metrics Tool micro-benchmarks, 1,000,000 computations over 200 distinct inputs used about 9× less CPU energy with `lru_cache`. This only holds because inputs repeat heavily. It also assumes `RETENTION_POLICIES` is not changed at runtime.
+
+    #### [Low] Module attribute lookups inside the loop
+    - **Where:** `datetime.fromisoformat`, `math.ceil` in `plan_cleanup`
+    - **Issue:** looked up again on every iteration.
+    - **Fix:** `parse_ts = datetime.fromisoformat` and `ceil = math.ceil` before the loop.
+    - **Impact:** small. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` locally before a 10,000,000-iteration loop saved about 4-5%. Optional.
+
+    Patched file:
+
+    ```python
+    import fnmatch
+    import math
+    from datetime import datetime, timezone
+    from functools import lru_cache
+
+    GIB = 1024 ** 3
+
+    # (pattern, keep_days); first match wins. 0 = keep forever
+    RETENTION_POLICIES = [
+        ("main", 0),
+        ("release/*", 0),
+        ("hotfix/*", 90),
+        ("renovate/*", 3),
+        ("dependabot/*", 3),
+        ("feature/*", 14),
+        ("*", 7),
+    ]
+
+
+    @lru_cache(maxsize=4096)
+    def retention_days(branch):
+        name = branch.strip().lower()
+        if name.startswith("refs/heads/"):
+            name = name[len("refs/heads/"):]
+        for pattern, days in RETENTION_POLICIES:
+            if fnmatch.fnmatchcase(name, pattern):
+                return days
+        return 7
+
+
+    def plan_cleanup(artifacts, now=None):
+        """artifacts: dicts from the bucket manifest."""
+        now = now or datetime.now(timezone.utc)
+        to_delete = []
+        freed_gib = 0
+        parse_ts = datetime.fromisoformat
+        ceil = math.ceil
+        for a in artifacts:
+            keep_days = retention_days(a["branch"])
+            if keep_days == 0:  # keep forever
+                continue
+            age_days = (now - parse_ts(a["created_at"])).days
+            if age_days > keep_days:
+                to_delete.append(a["key"])
+                freed_gib += ceil(a["size"] / GIB)
+        return to_delete, freed_gib
+    ```
+
+    Side effect of the bug fix: keep-forever entries no longer parse `created_at`, so a malformed timestamp on `main` no longer raises.
+verify:
+  test: |
+    from datetime import datetime, timedelta, timezone
+    _now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    _old = (_now - timedelta(days=400)).isoformat()
+    _keys, _gib = plan_cleanup([
+        {"key": "m", "branch": "main", "created_at": _old, "size": 1},
+        {"key": "r", "branch": "refs/heads/release/2.4", "created_at": _old, "size": 1},
+        {"key": "f", "branch": "feature/x", "created_at": _old, "size": 1},
+    ], now=_now)
+    assert _keys == ["f"], _keys
+    assert _gib == 1
+    assert retention_days("refs/heads/Feature/Login") == 14
+    assert retention_days("renovate/lodash-4.x") == 3
+  equivalence:
+    driver: |-
+      from datetime import datetime, timedelta, timezone
+      now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+      branches = [
+          "feature/login",
+          "refs/heads/Feature/Login",
+          "renovate/lodash-4.x",
+          "hotfix/cve-2026-1",
+          "experiment",
+          "dependabot/pip/requests",
+          " feature/cache-warmup ",
+      ]
+      arts = []
+      for i in range(3000):
+          created = now - timedelta(days=i % 120, hours=i % 24)
+          arts.append({
+              "key": f"art/{i}",
+              "branch": branches[i % len(branches)],
+              "created_at": created.isoformat(),
+              "size": (i * 7919 * 104729) % (5 * 1024 ** 3),
+          })
+      keys, gib = plan_cleanup(arts, now=now)
+      print(len(keys), keys[:5], keys[-3:], gib)

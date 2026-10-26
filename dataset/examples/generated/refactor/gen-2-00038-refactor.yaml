@@ -1,0 +1,122 @@
+id: gen-2-00038-refactor
+category: refactor
+language: python
+patterns:
+- torch-no-grad
+- keep-star-imports
+facts:
+- F-NOGRAD
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    log triage script, pegs a core for hours on the nightly logs. fix
+
+    ```python
+    import sys
+    import zlib
+    import torch
+    from torch import nn
+    from torch.nn.functional import *
+
+    N_FEATURES = 512
+    LABELS = ["ok", "warn", "anomaly"]
+
+
+    class LineClassifier(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(N_FEATURES, 64),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(64, len(LABELS)),
+            )
+
+        def forward(self, x):
+            return self.net(x)
+
+
+    def featurize(line):
+        vec = torch.zeros(N_FEATURES)
+        for tok in line.lower().split():
+            vec[zlib.crc32(tok.encode()) % N_FEATURES] += 1.0
+        return normalize(vec, dim=0)
+
+
+    def main(path):
+        model = LineClassifier()
+        model.load_state_dict(torch.load("models/logcls.pt", map_location="cpu"))
+        flagged = 0
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for lineno, line in enumerate(fh, 1):
+                probs = softmax(model(featurize(line)), dim=0)
+                label = LABELS[int(probs.argmax())]
+                if label != "ok":
+                    flagged += 1
+                    print(f"{lineno}\t{label}\t{probs.max().item():.2f}\t{line.rstrip()}")
+        print(f"flagged {flagged} lines", file=sys.stderr)
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1])
+    ```
+- role: assistant
+  content: |
+    ```python
+    import sys
+    import zlib
+    import torch
+    from torch import nn
+    from torch.nn.functional import *
+
+    N_FEATURES = 512
+    LABELS = ["ok", "warn", "anomaly"]
+
+
+    class LineClassifier(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(N_FEATURES, 64),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(64, len(LABELS)),
+            )
+
+        def forward(self, x):
+            return self.net(x)
+
+
+    def featurize(line):
+        vec = torch.zeros(N_FEATURES)
+        for tok in line.lower().split():
+            vec[zlib.crc32(tok.encode()) % N_FEATURES] += 1.0
+        return normalize(vec, dim=0)
+
+
+    def main(path):
+        model = LineClassifier()
+        model.load_state_dict(torch.load("models/logcls.pt", map_location="cpu"))
+        model.eval()
+        flagged = 0
+        with torch.no_grad(), open(path, encoding="utf-8", errors="replace") as fh:
+            for lineno, line in enumerate(fh, 1):
+                probs = softmax(model(featurize(line)), dim=0)
+                label = LABELS[int(probs.argmax())]
+                if label != "ok":
+                    flagged += 1
+                    print(f"{lineno}\t{label}\t{probs.max().item():.2f}\t{line.rstrip()}")
+        print(f"flagged {flagged} lines", file=sys.stderr)
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1])
+    ```
+
+    **Green Notes**
+    - **`torch.no_grad()` around the loop** (reduces E): every log line ran a forward pass that also recorded the autograd graph for a backward pass that never happens. In Green Metrics Tool micro-benchmarks, 100,000 CPU inferences used ~135 J with `no_grad()` instead of ~157 J, about 14% less. This script runs one inference per line, so the saving applies to every line of the nightly logs.
+    - **Bug fixed: `model.eval()` was missing.** The model was still in training mode, so dropout randomly zeroed hidden units on every call. The same line could get a different label on each run. Labels are now deterministic. Expect some lines to be flagged differently than before, because the old results were partly random.
+    - **Star import left unchanged:** `from torch.nn.functional import *` stays as it is. Switching to `import torch.nn.functional as F` or explicit names makes no measurable energy difference.
+verify:
+  static_only: needs torch and a trained model file (models/logcls.pt)

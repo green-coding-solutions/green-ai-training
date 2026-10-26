@@ -1,0 +1,83 @@
+id: gen-2-00122-refactor
+category: refactor
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    hi, this script clean our smart meter export before we load it to the warehouse. the file have around 1.5 milion lines every night and the script need more then 40 minutes. also the summary at the end always say 0 rows and 0 rejected, but the output file looks ok?? can you make it faster and fix it pls
+
+    ```bash
+    #!/bin/bash
+    # clean meter export before load into warehouse
+    # input: meter_id;timestamp;wh_start;wh_end;status
+    IN=$1
+    OUT=$2
+    REJ=0
+    TOTAL=0
+
+    echo "meter_id,day,wh" > $OUT
+
+    tail -n +2 $IN | while read line; do
+      TOTAL=$(expr $TOTAL + 1)
+      meter=$(echo $line | cut -d';' -f1)
+      ts=$(echo $line | cut -d';' -f2)
+      start=$(echo $line | cut -d';' -f3)
+      end=$(echo $line | cut -d';' -f4)
+      status=$(echo $line | cut -d';' -f5)
+
+      if [ "$status" != "OK" ]; then
+        REJ=$(expr $REJ + 1)
+        continue
+      fi
+
+      day=$(echo $ts | cut -c1-10)
+      used=$(expr $end - $start)
+      if [ $used -lt 0 ]; then
+        # meter reset or broken reading
+        REJ=$(expr $REJ + 1)
+        continue
+      fi
+
+      echo "$meter,$day,$used" >> $OUT
+    done
+
+    echo "done: $TOTAL rows, $REJ rejected"
+    ```
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # clean meter export before load into warehouse
+    # input: meter_id;timestamp;wh_start;wh_end;status
+    set -eu
+
+    in=${1:?usage: clean_meters.sh INPUT OUTPUT}
+    out=${2:?usage: clean_meters.sh INPUT OUTPUT}
+
+    printf '%s\n' 'meter_id,day,wh' > "$out"
+
+    awk -F';' -v OFS=',' -v ok='OK' -v out="$out" \
+        -v summary='done: %d rows, %d rejected\n' '
+      NR == 1 { next }                        # skip header
+      {
+        total++
+        used = $4 - $3
+        # rejected: bad status, or meter reset / broken reading
+        if ($5 != ok || used < 0) { rej++; next }
+        print $1, substr($2, 1, 10), used >> out
+      }
+      END     { printf summary, total, rej }
+    ' "$in"
+    ```
+
+    **Green Notes**
+    - **One awk pass instead of subprocesses per line** (reduces E): every `$(echo | cut)` and `$(expr)` starts new processes, so your loop started several of them for each of the 1.5 million lines. Process starts are the main cost here, not the parsing. In Green Metrics Tool micro-benchmarks on a 20,000-line access log, a `while read` loop with `$(echo | cut)` and `$(expr)` per field used ~1302 J. The same loop with builtins only used ~4.3 J (about 300× less), and one `awk` pass used ~1.0 J (over 1000× less than the subprocess loop, about 4× less than the builtin loop). awk now does all the splitting, math and writing in a single process.
+    - **Bug fixed, summary was always 0:** `tail ... | while` runs the loop in a subshell. `TOTAL` and `REJ` were counted there and were gone after the loop. awk keeps the counters and prints them in `END`, so the summary is now correct.
+
+    The header line is written once by `printf`, and awk appends the data rows after it. For normal data the output file has the same rows as before. One small difference: `read` without `-r` and the unquoted `echo $line` used to change lines with backslashes, repeated spaces or `*` in them. awk now takes the fields exactly as they are in the file.
+verify:
+  static_only: bash script that needs the nightly meter export file as input

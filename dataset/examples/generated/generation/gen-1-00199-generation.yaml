@@ -1,0 +1,58 @@
+id: gen-1-00199-generation
+category: generation
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    hello, i need bash script for archive old logs of our proxy server. logs are in /var/log/proxy/ and name is like access-2026-03-14.log. cron will start it every night. it should take the files older than 3 days, compress and put to /srv/archive/proxy. we keep the archive 1 year then delete. some old files there are already .gz from the time before, dont break them please. thank you!
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    SRC_DIR='/var/log/proxy'
+    DEST_DIR='/srv/archive/proxy'
+    AGE_DAYS=3
+    KEEP_DAYS=365
+
+    mkdir -p "$DEST_DIR"
+
+    # Plain logs: compress with zstd, check the result, then remove the original
+    find "$SRC_DIR" -maxdepth 1 -type f -name 'access-*.log' -mtime +"$AGE_DAYS" -print0 |
+    while IFS= read -r -d '' f; do
+        out="$DEST_DIR/${f##*/}.zst"
+        zstd -q -f -o "$out.tmp" -- "$f"
+        zstd -q -t "$out.tmp"
+        touch -r "$f" "$out.tmp"
+        mv -- "$out.tmp" "$out"
+        rm -- "$f"
+    done
+
+    # Logs that are already .gz: just move them, no second compression
+    find "$SRC_DIR" -maxdepth 1 -type f -name 'access-*.log.gz' -mtime +"$AGE_DAYS" \
+        -exec mv -n -t "$DEST_DIR" -- {} +
+
+    # Delete archives older than one year
+    find "$DEST_DIR" -maxdepth 1 -type f \( -name '*.zst' -o -name '*.gz' \) \
+        -mtime +"$KEEP_DAYS" -delete
+    ```
+
+    Cron example (03:15 every night):
+
+    ```text
+    15 3 * * * /usr/local/bin/archive-proxy-logs.sh
+    ```
+
+    **Green Notes**
+    - **Compress stored data with a fast codec** (reduces E and M): the logs stay on disk for a year, so compressing them is worth it. For data kept that long the break-even is reached quickly (an estimate of about 0.15 days for zstd). I used zstd at its default level. In Green Metrics Tool micro-benchmarks on 100 MB of text, zstd used about 4× less CPU energy than gzip, and xz used about 29× more than zstd.
+    - **No recompression of `.gz` files** (reduces E): they are only moved. Compressing already-compressed data costs CPU and gains almost nothing.
+    - The benchmarks compare energy, not file size. If disk space matters more than CPU for this archive, a stronger codec gives smaller files. You pay for it with much more CPU on every nightly run.
+    - The script tests each `.zst` file and keeps its original timestamp before removing the source. The one-year cleanup therefore counts from the log date, and a broken archive never replaces a good log.
+verify:
+  static_only: cron script that needs zstd and /var/log paths

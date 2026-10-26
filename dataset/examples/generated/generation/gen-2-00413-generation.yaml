@@ -1,0 +1,105 @@
+id: gen-2-00413-generation
+category: generation
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    # landing/stats.py
+    import httpx
+    from fastapi import APIRouter
+
+    router = APIRouter()
+
+    GITHUB_REPOS = ["acme/acme-cli", "acme/acme-sdk", "acme/acme-docs"]
+    PYPI_PACKAGE = "acme-sdk"
+    STATUS_URL = "https://status.acme.dev/api/v2/status.json"
+
+
+    @router.get("/api/landing-stats")
+    async def landing_stats():
+        """Numbers for the hero section of the landing page.
+
+        Returns {"stars": int, "downloads": int, "status": str}.
+        stars = sum of stargazers over GITHUB_REPOS
+        downloads = last month downloads of PYPI_PACKAGE (pypistats.org/api/packages/<name>/recent)
+        status = description from the status page
+        If one source is down, return None for that field and keep the others.
+        """
+        # TODO
+    ```
+- role: assistant
+  content: |-
+    ```python
+    # landing/stats.py
+    import asyncio
+
+    import httpx
+    from fastapi import APIRouter
+
+    router = APIRouter()
+
+    GITHUB_REPOS = ["acme/acme-cli", "acme/acme-sdk", "acme/acme-docs"]
+    PYPI_PACKAGE = "acme-sdk"
+    STATUS_URL = "https://status.acme.dev/api/v2/status.json"
+
+
+    async def _get_json(client: httpx.AsyncClient, url: str) -> dict:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        return resp.json()
+
+
+    def _pick(result, *path):
+        """Walk a key path in a JSON result. None if the request failed or the shape is wrong."""
+        if isinstance(result, BaseException):
+            return None
+        try:
+            for key in path:
+                result = result[key]
+        except (KeyError, TypeError):
+            return None
+        return result
+
+
+    @router.get("/api/landing-stats")
+    async def landing_stats():
+        """Numbers for the hero section of the landing page.
+
+        Returns {"stars": int, "downloads": int, "status": str}.
+        A source that fails gives None for its field, the others are still returned.
+        """
+        urls = [f"https://api.github.com/repos/{repo}" for repo in GITHUB_REPOS]
+        urls.append(f"https://pypistats.org/api/packages/{PYPI_PACKAGE}/recent")
+        urls.append(STATUS_URL)
+
+        async with httpx.AsyncClient(timeout=5.0, headers={"Accept": "application/json"}) as client:
+            results = await asyncio.gather(
+                *(_get_json(client, url) for url in urls),
+                return_exceptions=True,
+            )
+
+        repo_results = results[: len(GITHUB_REPOS)]
+        pypi_result, status_result = results[-2], results[-1]
+
+        star_counts = [_pick(r, "stargazers_count") for r in repo_results]
+        # A partial sum would show a wrong number, so one failed repo means None.
+        stars = None if any(c is None for c in star_counts) else sum(star_counts)
+
+        return {
+            "stars": stars,
+            "downloads": _pick(pypi_result, "data", "last_month"),
+            "status": _pick(status_result, "status", "description"),
+        }
+    ```
+
+    **Green Notes**
+    - **Concurrent I/O** (reduces E, idle wait time): the 5 upstream calls are independent, so they run together with one `asyncio.gather` on a shared `AsyncClient`. The request now takes as long as the slowest call, not the sum of all five, and the worker is not held waiting that long. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sequential `urllib`. At this request count the gain is mostly wall time, not CPU.
+    - **`return_exceptions=True` plus a 5 s timeout:** one slow or failing source cannot fail the whole endpoint or hang it. That matches your "None for that field" rule.
+    - `stars` is `None` if any repo fails, because a partial sum would be a wrong number on the page.

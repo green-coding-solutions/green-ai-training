@@ -1,0 +1,66 @@
+id: gen-12764612-00384-estimate
+category: estimate
+language: python
+patterns:
+- keep-star-imports
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    ```python
+    # shipping_api.py
+    # TODO(energy): star imports -> explicit names? ticket #212
+    import os
+    import logging
+    from flask import Flask, request, jsonify
+    from sympy import *
+
+    log = logging.getLogger(__name__)
+    app = Flask(__name__)
+
+    BASE_RATE = Rational(7, 100)
+    FREE_OVER = Integer(150)
+    CARRIER_URL = os.environ.get("CARRIER_URL", "")
+
+
+    @app.route("/quote", methods=["POST"])
+    def quote():
+        data = request.get_json(force=True)
+        try:
+            weight = Rational(str(data["weight_kg"]))
+            distance = Rational(str(data["distance_km"]))
+            subtotal = Rational(str(data["subtotal"]))
+        except (KeyError, ValueError, TypeError):
+            return jsonify(error="bad input"), 400
+
+        if subtotal >= FREE_OVER:
+            cost = Integer(0)
+        else:
+            cost = BASE_RATE * weight * (1 + distance / 100)
+
+        log.info("quote weight=%s distance=%s cost=%s", weight, distance, cost)
+        return jsonify(cost=float(cost))
+    ```
+
+    ?
+- role: assistant
+  content: |
+    I read the `?` as the question in your TODO: does swapping `from sympy import *` for explicit imports save energy?
+
+    **No, not measurably.** In Green Metrics Tool micro-benchmarks, 1,000 Python process starts that each ran `from sympy import *` used about 3103 J of CPU energy. The same starts with `import sympy` used about 3093 J. A built-in module showed the same result: `from posix import *` and `import posix` both used about 121 J. That is a tie, so I would close the ticket and leave the imports as they are.
+
+    **What does cost energy is loading sympy at all.** In the same benchmarks, a process start that imports sympy used about 3.1 J and 0.54 s. That is about 25× a start that imports only a built-in module (~0.12 J). Explicit names still load the whole package, so they don't change this.
+
+    **When it matters:**
+    - **Long-running workers** (gunicorn, uvicorn): you pay the import once per worker start. Per request it costs nothing, so there is little to gain.
+    - **A fresh process per request or per job** (CGI-style, short-lived containers, scale-to-zero cold starts): the import cost repeats every time. Only then is it worth asking whether sympy is needed on this path.
+
+    **How to get your own number:**
+    1. See what the import costs: `python -X importtime -c "import shipping_api" 2> imports.txt`, then look at the `sympy` lines.
+    2. Compare CPU time for many starts: `perf stat -r 50 python -c "import shipping_api"`, once with the star import and once with explicit names. Expect the two to match within noise.
+    3. For real energy, run both variants as Green Metrics Tool usage scenarios on the same machine.
+
+    Don't multiply my figures by your request count. They come from one machine and one setup.
+verify:
+  static_only: needs flask and sympy, which are beyond stdlib + numpy

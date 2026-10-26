@@ -1,0 +1,75 @@
+id: gen-2-00011-generation
+category: generation
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    hi, i need small bash script for our web server. it should read /var/log/auth.log and count the failed ssh logins per ip adress, then print the ips with 5 or more fails (sorted, most fails first) so i can put them on our blocklist. lines look like this:
+
+    ```text
+    Oct 22 03:14:07 web1 sshd[18842]: Failed password for root from 203.0.113.5 port 52144 ssh2
+    Oct 22 03:14:09 web1 sshd[18842]: Failed password for invalid user admin from 198.51.100.7 port 40022 ssh2
+    ```
+
+    the limit 5 should be changable. auth.log is quite big on some days. my first try was with while read and cut and it took forever, i dont know why.
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # Count failed SSH password logins per IP and print IPs at or above a limit.
+    # Usage: failed-logins.sh [-n MIN_FAILS] LOGFILE...
+    set -euo pipefail
+
+    usage='usage: failed-logins.sh [-n MIN_FAILS] LOGFILE...'
+    min=5
+
+    while getopts 'n:' opt; do
+      case $opt in
+        n) min=$OPTARG ;;
+        *) echo "$usage" >&2; exit 2 ;;
+      esac
+    done
+    shift $((OPTIND - 1))
+
+    if (( $# == 0 )); then
+      echo "$usage" >&2
+      exit 2
+    fi
+
+    case $min in
+      ''|*[!0-9]*) echo 'error: -n needs a positive integer' >&2; exit 2 ;;
+    esac
+
+    awk -v min="$min" '
+      /sshd\[[0-9]+\]: Failed password for / {
+        # search from the end: a user name could itself be the word from
+        for (i = NF - 1; i > 0; i--)
+          if ($i ~ /^from$/) { count[$(i + 1)]++; break }
+      }
+      END {
+        for (ip in count)
+          if (count[ip] >= min) printf "%d %s\n", count[ip], ip
+      }
+    ' "$@" | sort -k1,1nr -k2,2
+    ```
+
+    Run it like this (reading auth.log usually needs root):
+
+    ```bash
+    sudo ./failed-logins.sh /var/log/auth.log
+    sudo ./failed-logins.sh -n 10 /var/log/auth.log /var/log/auth.log.1
+    # rotated .gz files too:
+    sudo zcat -f /var/log/auth.log* | ./failed-logins.sh -
+    ```
+
+    Each output line is `<fails> <ip>`, for example `42 203.0.113.5`. Use `| cut -d' ' -f2` to get only the IPs for the blocklist.
+
+    **Green Notes**
+    - **One awk pass instead of a per-line loop** (reduces E): a `while read` loop with `$(echo "$line" | cut ...)` starts new processes for every line, and that is why your first try was so slow. Here one `awk` reads the whole file, and `sort` only sees the few IPs above the limit. In Green Metrics Tool micro-benchmarks that summarized a 20,000-line access log, one awk pass used over 1000× less CPU energy than a loop running `$(echo | cut)` and `$(expr)` for every field.
+    - **Builtins for argument checks** (reduces E): `getopts`, `case` and `(( ))` validate the input without starting any extra processes.
+verify:
+  static_only: bash script; reads system auth logs

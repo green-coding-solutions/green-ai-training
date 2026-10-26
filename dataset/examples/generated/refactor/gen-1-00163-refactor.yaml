@@ -1,0 +1,63 @@
+id: gen-1-00163-refactor
+category: refactor
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    hello, this script send the prediction files from our inference server to the monitoring box. cron run it every 5 minutes. the server cpu is quite busy during the send and my colegue say the compress is too heavy, but I dont know. can you make it better?
+
+    ```bash
+    #!/bin/bash
+    # send inference results to monitoring box
+    OUT=/var/lib/mlserve/results
+    HOST=monitor.internal
+    STAMP=$(date +%Y%m%d%H%M)
+
+    cd $OUT || exit 1
+    tar -cf - pred_*.json | xz -9e > /tmp/results_$STAMP.tar.xz
+    scp /tmp/results_$STAMP.tar.xz mlship@$HOST:/incoming/
+    rm pred_*.json
+    rm /tmp/results_$STAMP.tar.xz
+    ```
+
+    the monitoring box read the files and delete them after few minutes.
+- role: assistant
+  content: |
+    Your colleague is right: `xz -9e` is the heaviest setting of a heavy codec. Here is a version with `zstd`, no temp file, and a fix for a data-loss bug.
+
+    ```bash
+    #!/bin/bash
+    # ship inference results to the monitor box (cron, every 5 min)
+    set -euo pipefail
+
+    OUT='/var/lib/mlserve/results'
+    HOST='monitor.internal'
+    STAMP=$(date +%Y%m%d%H%M)
+    LIST=$(mktemp)
+    trap 'rm -f "$LIST"' EXIT
+
+    cd "$OUT"
+    find . -maxdepth 1 -name 'pred_*.json' -printf '%f\n' > "$LIST"
+    [ -s "$LIST" ] || exit 0
+
+    tar -cf - -T "$LIST" | zstd -q \
+      | ssh "mlship@$HOST" "cat > /incoming/results_$STAMP.tar.zst.part && mv /incoming/results_$STAMP.tar.zst.part /incoming/results_$STAMP.tar.zst"
+
+    xargs -d '\n' rm -f -- < "$LIST"
+    ```
+
+    **Bug fixed:** the old script ran `rm pred_*.json` even when `scp` failed. It also deleted files that arrived after `tar` had started. Now the script deletes only the files it packed, and only after the upload worked (`set -euo pipefail` stops it earlier). The `.part` and `mv` step means the monitor box never reads a half-written file.
+
+    **Green Notes**
+    - **Fast codec for data that is compressed often** (reduces E): in Green Metrics Tool micro-benchmarks on 100 MB of text, `zstd` at its default level used ~16 J to compress and `xz` at its default level ~458 J, about 29× more. You use `-9e`, which costs even more. Your JSON is compressed every 5 minutes and thrown away minutes later, so a cheap codec fits.
+    - **No temp file** (reduces E, storage): the archive streams from `tar` through `zstd` into `ssh`, so nothing is written to `/tmp` and read back.
+
+    The measurements compare energy, not file size. `xz` makes smaller files. That only matters if the link is slow or you pay per MB. If you are not sure, check the real size of a send.
+
+    The monitor box must read `.tar.zst` now. Use `tar --zstd -xf` or `zstd -dc | tar -x`, and update any code that expects `.tar.xz`. If `zstd` is not installed there, `gzip` is still much cheaper than `xz -9e`.
+verify:
+  static_only: bash script with ssh, cron and external hosts

@@ -1,0 +1,188 @@
+id: gen-2-00185-refactor
+category: refactor
+language: python
+patterns:
+- avoid-exception-flow
+- hoist-invariants
+facts:
+- F-EXC
+- F-ATTR
+messages:
+- role: user
+  content: |
+    We have a small CLI in our print farm. Before a job is queued, it reads the slicer G-code and reports travel distance vs print distance. Each printer has a Raspberry Pi next to it, and the tool runs there. Files are 2-8 million lines, so it is slow on the Pis.
+
+    Requirements:
+    - stdlib only. No numpy on the Pis.
+    - Keep the output format exactly the same. Another script parses it.
+    - Keep the CLI arguments the same.
+    - About half the lines are not G0/G1. They are M-codes, G92 resets and layer comments, and we skip them.
+
+    Can you clean it up and make it faster?
+
+    ```python
+    #!/usr/bin/env python3
+    """gcode-stats: sum travel and print moves in a G-code file."""
+    import argparse
+    import math
+    import sys
+
+    MOVE_KINDS = {"G0": "travel", "G1": "print"}
+
+
+    def parse_args(argv=None):
+        p = argparse.ArgumentParser(description="Summarize moves in a G-code file")
+        p.add_argument("path", help="G-code file, '-' for stdin")
+        p.add_argument("--unit", choices=["mm", "m"], default="mm")
+        return p.parse_args(argv)
+
+
+    def summarize(lines):
+        totals = {"travel": 0.0, "print": 0.0}
+        counts = {"travel": 0, "print": 0, "skipped": 0}
+        x = y = 0.0
+        for raw in lines:
+            line = raw.split(";", 1)[0].strip()
+            if not line:
+                counts["skipped"] += 1
+                continue
+            parts = line.split()
+            try:
+                kind = MOVE_KINDS[parts[0]]
+            except KeyError:
+                counts["skipped"] += 1
+                continue
+            nx, ny = x, y
+            for word in parts[1:]:
+                if word[0] == "X":
+                    nx = float(word[1:])
+                elif word[0] == "Y":
+                    ny = float(word[1:])
+            totals[kind] += math.sqrt((nx - x) ** 2 + (ny - y) ** 2)
+            counts[kind] += 1
+            x, y = nx, ny
+        return totals, counts
+
+
+    def main(argv=None):
+        args = parse_args(argv)
+        scale = 1000.0 if args.unit == "m" else 1.0
+        if args.path == "-":
+            totals, counts = summarize(sys.stdin)
+        else:
+            with open(args.path) as fh:
+                totals, counts = summarize(fh)
+        for kind in ("travel", "print"):
+            print(f"{kind:>7}: {counts[kind]:>9} moves  {totals[kind] / scale:12.3f} {args.unit}")
+        print(f"skipped: {counts['skipped']:>9} lines")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    ```python
+    #!/usr/bin/env python3
+    """gcode-stats: sum travel and print moves in a G-code file."""
+    import argparse
+    import math
+    import sys
+
+    MOVE_KINDS = {"G0": "travel", "G1": "print"}
+
+
+    def parse_args(argv=None):
+        p = argparse.ArgumentParser(description="Summarize moves in a G-code file")
+        p.add_argument("path", help="G-code file, '-' for stdin")
+        p.add_argument("--unit", choices=["mm", "m"], default="mm")
+        return p.parse_args(argv)
+
+
+    def summarize(lines):
+        totals = {"travel": 0.0, "print": 0.0}
+        counts = {"travel": 0, "print": 0, "skipped": 0}
+        sqrt = math.sqrt          # looked up once, not once per move
+        kind_of = MOVE_KINDS.get  # same for the dict method
+        x = y = 0.0
+        for raw in lines:
+            line = raw.split(";", 1)[0].strip()
+            if not line:
+                counts["skipped"] += 1
+                continue
+            parts = line.split()
+            kind = kind_of(parts[0])
+            if kind is None:
+                counts["skipped"] += 1
+                continue
+            nx, ny = x, y
+            for word in parts[1:]:
+                if word[0] == "X":
+                    nx = float(word[1:])
+                elif word[0] == "Y":
+                    ny = float(word[1:])
+            totals[kind] += sqrt((nx - x) ** 2 + (ny - y) ** 2)
+            counts[kind] += 1
+            x, y = nx, ny
+        return totals, counts
+
+
+    def main(argv=None):
+        args = parse_args(argv)
+        scale = 1000.0 if args.unit == "m" else 1.0
+        if args.path == "-":
+            totals, counts = summarize(sys.stdin)
+        else:
+            with open(args.path) as fh:
+                totals, counts = summarize(fh)
+        for kind in ("travel", "print"):
+            print(f"{kind:>7}: {counts[kind]:>9} moves  {totals[kind] / scale:12.3f} {args.unit}")
+        print(f"skipped: {counts['skipped']:>9} lines")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **`dict.get` instead of `try/except KeyError`** (reduces E): about half of your lines are not G0/G1, so the old code raised and caught an exception on every second line. Raising is the expensive part. In Green Metrics Tool micro-benchmarks with 10,000,000 dict lookups and about half the keys missing, `dict.get` used ~67 J and `try/except KeyError` ~76 J, so `get` used about 12% less.
+    - **Lookups moved out of the loop** (reduces E, small): `sqrt = math.sqrt` and `kind_of = MOVE_KINDS.get` save one lookup per line. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` before a 10,000,000-iteration loop saved about 4-5%. That loop did almost nothing else. Here the string splitting and float parsing on each line cost more, so expect a smaller gain.
+    - **Behavior unchanged:** CLI arguments, output format and float results stay the same. The math runs in the same order, so the totals match to the last digit. The file is still read line by line, so memory use stays flat on the Pis.
+verify:
+  module: true
+  equivalence:
+    driver: |
+      import os
+      import random
+      import tempfile
+
+      random.seed(7)
+      lines = []
+      for i in range(5000):
+          r = random.random()
+          if r < 0.3:
+              lines.append(f"G1 X{random.uniform(0, 200):.3f} Y{random.uniform(0, 200):.3f} E{random.uniform(0, 5):.4f}\n")
+          elif r < 0.45:
+              lines.append(f"G0 X{random.uniform(0, 200):.2f} Y{random.uniform(0, 200):.2f} F6000 ; travel\n")
+          elif r < 0.5:
+              lines.append(f"G1 Z{random.uniform(0, 10):.2f}\n")
+          elif r < 0.7:
+              lines.append(f"M{random.choice([104, 106, 107, 140])} S{random.randint(0, 255)}\n")
+          elif r < 0.85:
+              lines.append(f";LAYER:{i}\n")
+          elif r < 0.95:
+              lines.append("G92 E0\n")
+          else:
+              lines.append("\n")
+
+      totals, counts = summarize(lines)
+      print(repr(totals["travel"]), repr(totals["print"]), counts)
+
+      fd, path = tempfile.mkstemp(suffix=".gcode")
+      with os.fdopen(fd, "w") as fh:
+          fh.writelines(lines)
+      try:
+          main([path])
+          main([path, "--unit", "m"])
+      finally:
+          os.remove(path)

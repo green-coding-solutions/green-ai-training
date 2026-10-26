@@ -1,0 +1,127 @@
+id: gen-2-00228-review
+category: review
+language: sql
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    Hi, can you review our voucher load script? Some context first.
+
+    We are the frontend team for the product launch landing page. The page has a "redeem your partner code" field. It calls a small endpoint that checks the code in Postgres and sets `redeemed_at`. The codes come from our marketing agency as a Google Sheet, around 38,000 per delivery. I turned the sheet into SQL with a spreadsheet formula (`="INSERT INTO ... VALUES ('"&A2&"', ...` ) and pasted all rows into the file.
+
+    Requirements:
+    - Our deploy job only has `psql`, no Python or Node in that step.
+    - It must be safe to re-run. The agency sends a second batch in December, and some codes from the first batch will be in that sheet again.
+    - We do a dry run on staging first, and there we need the redemptions reset.
+    - It should stay readable for the next frontend dev, nobody on our team is a DB person.
+
+    Right now it takes very long in the deploy job and prints a wall of errors when I run it a second time.
+
+    ```sql
+    -- load_launch_vouchers.sql
+    -- run: psql "$DATABASE_URL" -f load_launch_vouchers.sql
+
+    CREATE TABLE IF NOT EXISTS launch_vouchers (
+        code          text PRIMARY KEY,
+        partner       text NOT NULL,
+        discount_pct  integer NOT NULL CHECK (discount_pct BETWEEN 5 AND 50),
+        valid_until   date NOT NULL,
+        redeemed_at   timestamptz
+    );
+
+    INSERT INTO launch_vouchers (code, partner, discount_pct, valid_until) VALUES ('LNCH-7Q2K-9XZA', 'techradar', 20, '2026-12-31');
+    INSERT INTO launch_vouchers (code, partner, discount_pct, valid_until) VALUES ('LNCH-3MPD-K41R', 'techradar', 20, '2026-12-31');
+    INSERT INTO launch_vouchers (code, partner, discount_pct, valid_until) VALUES ('LNCH-W8TE-2HQC', 'producthunt', 25, '2026-11-30');
+    INSERT INTO launch_vouchers (code, partner, discount_pct, valid_until) VALUES ('LNCH-55NB-ZR0P', 'devnewsletter', 15, '2027-01-15');
+    -- ... ~38,000 more lines like this, generated from the agency sheet ...
+    INSERT INTO launch_vouchers (code, partner, discount_pct, valid_until) VALUES ('LNCH-Y1VA-6JDM', 'producthunt', 25, '2026-11-30');
+
+    -- reset redemptions for the dry run on staging
+    UPDATE launch_vouchers SET redeemed_at = NULL;
+
+    SELECT partner, count(*) AS codes
+    FROM launch_vouchers
+    GROUP BY partner
+    ORDER BY partner;
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (campaign data load from the deploy job)
+
+    #### [Bug] Every run wipes all redemptions
+    - **Where:** `UPDATE launch_vouchers SET redeemed_at = NULL;`
+    - **Issue:** there is no `WHERE` and no check for staging. When you run the December load on production, every code that customers already redeemed becomes usable again.
+    - **Fix:** remove it from the load script. Put the reset in its own `reset_redemptions_staging.sql` and run that file only in the staging job.
+    - **Impact:** correctness. Customers could redeem codes twice.
+
+    #### [Bug] Re-runs fail row by row and the script keeps going
+    - **Where:** the plain `INSERT` statements, no `ON_ERROR_STOP`
+    - **Issue:** a code that already exists violates the primary key. Without `ON_ERROR_STOP`, psql prints the error and continues with the next line. That is your wall of errors. It also hides real errors, for example a `discount_pct` outside the `CHECK` range.
+    - **Fix:** `ON CONFLICT (code) DO NOTHING` for duplicates, and `ON_ERROR_STOP` for everything else (see the script below).
+    - **Impact:** correctness. The script becomes safe to re-run.
+
+    #### [Bug] Spreadsheet-built SQL breaks on quotes
+    - **Where:** the `="INSERT ... '"&A2&"'..."` formula
+    - **Issue:** the formula does not escape values. A partner name like `tom's guide` ends the string literal early, so that row fails or turns into a different statement.
+    - **Fix:** export the sheet as CSV and load it with `\copy`. CSV quoting handles apostrophes and commas.
+
+    #### [High] One statement and one commit per row
+    - **Where:** the ~38,000 `INSERT` lines
+    - **Issue:** psql runs in autocommit mode, so every line is its own round trip, its own transaction and its own commit. 38,000 rows become 38,000 commits. In Green Metrics Tool benchmarks on PostgreSQL 16 (500,000 rows in batches of 5,000, one commit per batch), `COPY` used about 22× less CPU energy than one `INSERT` per row. Your script commits after every single row, so it does even more per-row work than the loop in that benchmark.
+    - **Fix:** load the CSV with `\copy` into a temporary table in one transaction, then insert it into the real table with a single `INSERT ... SELECT`:
+
+      ```sql
+      -- load_launch_vouchers.sql
+      -- run from the folder with vouchers.csv:
+      --   psql "$DATABASE_URL" -f load_launch_vouchers.sql
+      -- vouchers.csv: header row code,partner,discount_pct,valid_until (dates as YYYY-MM-DD)
+      \set ON_ERROR_STOP on
+
+      CREATE TABLE IF NOT EXISTS launch_vouchers (
+          code          text PRIMARY KEY,
+          partner       text NOT NULL,
+          discount_pct  integer NOT NULL CHECK (discount_pct BETWEEN 5 AND 50),
+          valid_until   date NOT NULL,
+          redeemed_at   timestamptz
+      );
+
+      BEGIN;
+
+      -- staging table, dropped automatically at COMMIT
+      CREATE TEMP TABLE vouchers_in (
+          code          text,
+          partner       text,
+          discount_pct  integer,
+          valid_until   date
+      ) ON COMMIT DROP;
+
+      \copy vouchers_in (code, partner, discount_pct, valid_until) FROM 'vouchers.csv' WITH (FORMAT csv, HEADER true)
+
+      -- codes that already exist (earlier delivery) are skipped,
+      -- redeemed_at of existing codes is never touched
+      INSERT INTO launch_vouchers (code, partner, discount_pct, valid_until)
+      SELECT code, partner, discount_pct, valid_until
+      FROM vouchers_in
+      ON CONFLICT (code) DO NOTHING;
+
+      COMMIT;
+
+      SELECT partner, count(*) AS codes
+      FROM launch_vouchers
+      GROUP BY partner
+      ORDER BY partner;
+      ```
+    - **Impact:** E and wall time in every deploy run. 38,000 round trips and commits become one `\copy` stream and one commit.
+
+    Behavior changes to know about:
+    - The load is now all or nothing. One invalid row (bad date, discount out of range) stops the script and rolls back the whole delivery. Before, that row was skipped and the rest went in. Fix the sheet and run again.
+    - `\copy` reads `vouchers.csv` relative to the directory you start psql in, not the directory of the `.sql` file. In the deploy job, `cd` into the folder first or use an absolute path.
+    - If a code appears twice in one sheet, the first row wins and the second is skipped silently.
+
+    **Already good:** `code` as primary key, the `CHECK` on `discount_pct`, and the per-partner count at the end as a quick sanity check after each load.
+verify:
+  static_only: psql meta-commands (\set, \copy), temporary tables and ON COMMIT DROP need PostgreSQL, not SQLite

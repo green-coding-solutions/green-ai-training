@@ -1,0 +1,123 @@
+id: gen-12764612-00375-review
+category: review
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    hi, i am new to python at my job and I wrote this for our nightly data job. it takes company ids from a text file (about 800), asks our CRM for details of each one and writes a csv for the sales team. it works but it runs very long and I am not sure what is wrong with it. can you review?
+
+    ```python
+    import csv
+    import requests
+
+    API_KEY = "sk_live_51Hq9xT7aKd02LmZpQ"
+    BASE = "https://api.crmtool.example/v1/companies"
+
+    def load_ids(path):
+        with open(path) as f:
+            return [line.strip() for line in f if line.strip()]
+
+    def enrich(company_id):
+        try:
+            r = requests.get(
+                f"{BASE}/{company_id}",
+                headers={"Authorization": "Bearer " + API_KEY},
+            )
+            return r.json()
+        except:
+            return {}
+
+    def main():
+        ids = load_ids("company_ids.txt")
+        rows = []
+        for cid in ids:
+            data = enrich(cid)
+            rows.append({
+                "id": cid,
+                "name": data.get("name", ""),
+                "employees": data.get("employees", 0),
+                "country": data.get("country", ""),
+            })
+        with open("enriched.csv", "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["id", "name", "employees", "country"])
+            w.writeheader()
+            w.writerows(rows)
+
+    main()
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly job)
+
+    #### [Security] API key is written in the source code
+    - **Where:** `API_KEY = "sk_live_..."`
+    - **Issue:** anyone who can read the repo or a copy of the script can use the key. Since you pasted it here, treat it as leaked.
+    - **Fix:** rotate the key, and read the new one from an environment variable (`os.environ["CRM_API_KEY"]`).
+
+    #### [Bug] Errors are hidden and bad responses are used as data
+    - **Where:** `enrich()`, the bare `except:` and `r.json()`
+    - **Issue:** there is no status check, so a 404, 429 or 500 reply is parsed as if it were a company. Any error becomes an empty row without a message, so the sales team gets blank lines and you never learn why. There is also no timeout, so one stuck connection can block the whole night run.
+    - **Fix:** set a timeout, call `raise_for_status()`, catch only HTTP and JSON errors, and print which id failed.
+
+    #### [High] Requests run one after another
+    - **Where:** the `for cid in ids` loop calling `enrich(cid)`
+    - **Issue:** each request waits for the full network round trip before the next one starts. Most of the run is the program sitting idle and waiting for the CRM, with the machine kept up the whole time. The 800 calls do not depend on each other, so they can wait at the same time.
+    - **Fix:** use `asyncio` with `httpx.AsyncClient`, send the requests in parallel, and cap the parallel calls with a semaphore so you do not trigger the CRM's rate limit. `asyncio.gather` keeps the results in the same order as the ids, so the CSV looks the same as before.
+    - **Impact:** mainly shorter wall time, which means the job holds its machine for less time. In Green Metrics Tool micro-benchmarks with 10 requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. The CPU saving is modest, because the CPU work per request stays the same. I can't give you a number for your job. Measure it with `time` or `perf stat` before and after.
+
+    ```python
+    import asyncio
+    import csv
+    import os
+    import sys
+
+    import httpx
+
+    BASE = "https://api.crmtool.example/v1/companies"
+    FIELDS = ["id", "name", "employees", "country"]
+    MAX_PARALLEL = 10
+
+    def load_ids(path):
+        with open(path) as f:
+            return [line.strip() for line in f if line.strip()]
+
+    async def enrich(client, sem, company_id):
+        async with sem:
+            try:
+                r = await client.get(f"{BASE}/{company_id}")
+                r.raise_for_status()
+                data = r.json()
+            except (httpx.HTTPError, ValueError) as exc:
+                print(f"enrich failed for {company_id}: {exc}", file=sys.stderr)
+                data = {}
+        return {
+            "id": company_id,
+            "name": data.get("name", ""),
+            "employees": data.get("employees", 0),
+            "country": data.get("country", ""),
+        }
+
+    async def main():
+        ids = load_ids("company_ids.txt")
+        sem = asyncio.Semaphore(MAX_PARALLEL)
+        headers = {"Authorization": "Bearer " + os.environ["CRM_API_KEY"]}
+        async with httpx.AsyncClient(headers=headers, timeout=10.0) as client:
+            rows = await asyncio.gather(*(enrich(client, sem, cid) for cid in ids))
+        with open("enriched.csv", "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=FIELDS)
+            w.writeheader()
+            w.writerows(rows)
+
+    if __name__ == "__main__":
+        asyncio.run(main())
+    ```
+
+    Failed ids still get an empty row, as before, but now there is a message on stderr. If the CRM answers with many 429 errors, lower `MAX_PARALLEL`.
+
+    **Already good:** reading the ids once into a list and writing the CSV in one pass, with `newline=""` set correctly.
+verify:
+  static_only: needs network access to a CRM API and httpx

@@ -1,0 +1,49 @@
+id: gen-1-00268-no-change
+category: no-change
+language: python
+patterns:
+- memoize
+- context-tradeoff
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    lru_cache on parse_line? slow on big logs
+
+    ```python
+    import re
+    from datetime import datetime
+
+    LINE_RE = re.compile(r'^(\S+) (\w+) \[([^\]]+)\] (.*)$')
+
+    def parse_line(line):
+        m = LINE_RE.match(line)
+        if not m:
+            return None
+        ts, level, svc, msg = m.groups()
+        return datetime.fromisoformat(ts), level, svc, msg
+
+    def count_errors(path):
+        counts = {}
+        with open(path) as f:
+            for line in f:
+                rec = parse_line(line.rstrip('\n'))
+                if rec and rec[1] == 'ERROR':
+                    counts[rec[2]] = counts.get(rec[2], 0) + 1
+        return counts
+    ```
+- role: assistant
+  content: |
+    No, `lru_cache` won't help here. A cache only pays off when the same input comes back. Every log line has its own timestamp and message, so almost every call is a miss. You would pay for hashing the line and storing the result, and get nothing back. With a bounded cache the entries just get evicted. With an unbounded one, memory grows with the file.
+
+    In Green Metrics Tool micro-benchmarks, `lru_cache` used about 9× less CPU energy (~43 J vs ~4.7 J for 1,000,000 calls). But that input had only 200 distinct values. With mostly unique inputs, caching only adds overhead.
+
+    The code is already in good shape:
+    - the regex is compiled once at module level,
+    - the file is streamed line by line, so memory stays flat,
+    - counts are kept in a plain dict, with one pass over the data.
+
+    If it is still slow on big logs, profile it first (`python -m cProfile`) to see where the time goes. A cache would fit a function whose input has few distinct values, for example a lookup keyed by service name. It does not fit a function that gets the whole line.
+verify:
+  static_only: answer contains no code; the user's code is only analysed

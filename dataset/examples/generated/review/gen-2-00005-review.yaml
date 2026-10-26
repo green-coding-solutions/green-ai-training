@@ -1,0 +1,173 @@
+id: gen-2-00005-review
+category: review
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    hi, I'm a master student helping out in a hydrology lab. We have a Kubernetes cluster and every researcher (6 people right now) gets their own dev copy of our station data stack, so they can try changes to the API and run Dask analyses. I deploy the copies with this loop:
+
+    ```bash
+    for u in anna ben chen dana emil farah; do NAME=$u envsubst < dev-env.yaml | kubectl apply -f -; done
+    ```
+
+    The admin says our dev namespaces reserve a big part of the cluster, and the batch jobs for the real model runs are often pending. I don't really get what is wrong, the yaml works fine. Could you review it? (Services are in a separate file, I left them out.)
+
+    ```yaml
+    # dev-env.yaml, NAME is filled in by envsubst
+    apiVersion: v1
+    kind: Namespace
+    metadata:
+      name: dev-${NAME}
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: station-api, namespace: dev-${NAME}}
+    spec:
+      replicas: 3
+      selector: {matchLabels: {app: station-api}}
+      template:
+        metadata: {labels: {app: station-api}}
+        spec:
+          containers:
+            - name: api
+              image: registry.hydro-lab.example/station-api:dev
+              env:
+                - {name: DATABASE_URL, value: "postgresql://hydro:hydro2024@postgis:5432/stations"}
+                - {name: REDIS_URL, value: "redis://redis:6379/0"}
+                - {name: DASK_SCHEDULER, value: "tcp://dask-scheduler:8786"}
+              resources: {requests: {cpu: "1", memory: 2Gi}}
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: dask-scheduler, namespace: dev-${NAME}}
+    spec:
+      replicas: 1
+      selector: {matchLabels: {app: dask-scheduler}}
+      template:
+        metadata: {labels: {app: dask-scheduler}}
+        spec:
+          containers:
+            - name: scheduler
+              image: ghcr.io/dask/dask:2024.8.0
+              args: ["dask-scheduler"]
+              resources: {requests: {cpu: "1", memory: 2Gi}}
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: dask-worker, namespace: dev-${NAME}}
+    spec:
+      replicas: 8
+      selector: {matchLabels: {app: dask-worker}}
+      template:
+        metadata: {labels: {app: dask-worker}}
+        spec:
+          containers:
+            - name: worker
+              image: ghcr.io/dask/dask:2024.8.0
+              args: ["dask-worker", "tcp://dask-scheduler:8786", "--nthreads", "4", "--memory-limit", "16GB"]
+              resources: {requests: {cpu: "4", memory: 16Gi}}
+    ---
+    apiVersion: apps/v1
+    kind: StatefulSet
+    metadata: {name: postgis, namespace: dev-${NAME}}
+    spec:
+      serviceName: postgis
+      replicas: 1
+      selector: {matchLabels: {app: postgis}}
+      template:
+        metadata: {labels: {app: postgis}}
+        spec:
+          containers:
+            - name: db
+              image: postgis/postgis:16-3.4
+              env:
+                - {name: POSTGRES_USER, value: hydro}
+                - {name: POSTGRES_PASSWORD, value: hydro2024}
+                - {name: POSTGRES_DB, value: stations}
+              resources: {requests: {cpu: "2", memory: 8Gi}}
+              volumeMounts: [{name: data, mountPath: /var/lib/postgresql/data}]
+      volumeClaimTemplates:
+        - metadata: {name: data}
+          spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 100Gi}}}
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: redis, namespace: dev-${NAME}}
+    spec:
+      replicas: 1
+      selector: {matchLabels: {app: redis}}
+      template:
+        metadata: {labels: {app: redis}}
+        spec:
+          containers:
+            - {name: redis, image: "redis:7", resources: {requests: {cpu: "500m", memory: 1Gi}}}
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (per-researcher dev environments)
+
+    The YAML is valid. The problem is how much it keeps running and reserved: six full copies, all day, every day.
+
+    #### [Security] Database password in plain text
+    - **Where:** `POSTGRES_PASSWORD` and `DATABASE_URL`
+    - **Issue:** `hydro2024` sits in a file that is probably in git. It is the same in every copy, and anyone who can read the repo or the Deployments can see it.
+    - **Fix:** put it in a Secret (one per namespace, or created by your deploy loop) and read it with `valueFrom.secretKeyRef`. Build `DATABASE_URL` in the app from separate env vars, or store the whole URL in the Secret.
+
+    #### [High] Six full environments run around the clock
+    - **Where:** the whole manifest, applied once per researcher
+    - **Issue:** every copy runs 24/7, including nights and weekends when nobody uses it. Those are most of the hours in a week. Idle pods still hold their CPU and memory requests, so the nodes stay up and your batch jobs can't be scheduled there.
+    - **Fix:** label the dev namespaces and scale them to zero every evening. Researchers who need a long overnight run can opt out with a label.
+
+    ```yaml
+    # in dev-env.yaml
+    metadata:
+      name: dev-${NAME}
+      labels: {lab-dev: "true"}
+    ---
+    # once, in a shared namespace
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata: {name: dev-sleep, namespace: dev-ops}
+    spec:
+      schedule: "0 20 * * *"
+      timeZone: Europe/Berlin
+      jobTemplate:
+        spec:
+          template:
+            spec:
+              serviceAccountName: dev-scaler   # needs RBAC to scale deployments and statefulsets in dev-* namespaces
+              restartPolicy: Never
+              containers:
+                - name: scale
+                  image: bitnami/kubectl:1.30
+                  command: ["/bin/sh", "-c"]
+                  args:
+                    - |
+                      for ns in $(kubectl get ns -l 'lab-dev=true,keep-awake!=true' -o jsonpath='{.items[*].metadata.name}'); do
+                        kubectl scale deploy,statefulset --all --replicas=0 -n "$ns"
+                      done
+    ```
+
+    In the morning, each person starts their own copy with `kubectl scale deploy,statefulset --all --replicas=1 -n dev-anna`. For an overnight run: `kubectl label ns dev-anna keep-awake=true`, then remove the label with `keep-awake-`. Scaling the StatefulSet to zero keeps the PVC, so no data is lost. Also delete the namespaces of people who have left the group.
+
+    - **Impact:** reduces E and M. Copies that are not running reserve no nodes, so the autoscaler can remove nodes or your batch jobs can use them.
+
+    #### [Medium] Each dev copy reserves a production-size Dask cluster
+    - **Where:** `dask-worker` with `replicas: 8`, `station-api` with `replicas: 3`
+    - **Issue:** each copy requests 8 workers with 4 CPUs and 16Gi each, plus 3 API replicas. Across 6 copies that is 192 CPUs just for Dask workers, and most of the time they sit idle.
+    - **Fix:** use `replicas: 1` for both in dev. For a big analysis, scale up only while it runs: `kubectl scale deploy/dask-worker --replicas=8 -n dev-anna`, then back to 1.
+    - **Impact:** mainly M (reserved capacity), less E per minute. In Green Metrics Tool measurements of an idle preview environment, trimming 3 app replicas, Postgres, Redis and a worker down to 1 replica plus Postgres used only about 3% less CPU energy, and machine energy differed by less than 1%. So the gain here is not that idle pods burn a lot. It is that fewer reserved CPUs and memory mean fewer nodes, and room for your real jobs.
+
+    #### [Medium] Separate PostGIS with a 100Gi volume in every copy
+    - **Where:** `StatefulSet postgis`
+    - **Issue:** six database servers and six 100Gi volumes for dev data that is probably mostly the same.
+    - **Fix:** run one shared PostGIS in a `dev-shared` namespace with one database per researcher (`CREATE DATABASE anna;`), and point `DATABASE_URL` at `postgis.dev-shared.svc`. Redis can be shared the same way, with one DB index per person.
+    - **Impact:** reduces M and storage: one server and one volume instead of six. Check first that nobody needs a different PostGIS version or extensions.
+
+    **Already good:** every container sets resource requests, so the scheduler knows what is reserved. PostGIS uses a StatefulSet with a PVC, so scaling it to zero at night is safe.
+verify:
+  static_only: Kubernetes manifests, need a cluster to apply

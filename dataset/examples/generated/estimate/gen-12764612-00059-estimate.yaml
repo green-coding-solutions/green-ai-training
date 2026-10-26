@@ -1,0 +1,55 @@
+id: gen-12764612-00059-estimate
+category: estimate
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    hi, im not sure whats wrong with my docker file, a colleague said its "fat". its for our small tool csvtidy that cleans up csv exports from the warehouse system. gitlab CI builds it on every push. how much energy would we save if i fix it?
+
+    ```dockerfile
+    FROM python:3.12
+
+    RUN apt-get update && apt-get install -y build-essential git curl vim
+    RUN pip install pytest black mypy ipython
+
+    WORKDIR /app
+    COPY . .
+    RUN pip install -r requirements.txt
+
+    ENTRYPOINT ["python", "-m", "csvtidy"]
+    ```
+- role: assistant
+  content: |
+    Your colleague is right. The image carries a compiler, git, curl, vim and dev tools that the tool never uses when it runs. Also, `COPY . .` comes before `pip install`, so any code change reinstalls all dependencies.
+
+    I can't give you a number for your pipeline. Here is what was measured. In Green Metrics Tool micro-benchmarks, building a small Flask app image without a build cache:
+
+    - `python:3.12` with `build-essential`, `git`, `curl`, `vim` and dev tools (pytest, black, mypy, ipython): ~885 J and 157 s
+    - `python:3.12-slim`, runtime dependencies only, dependency layer before the source, `pip --no-cache-dir`: ~124 J and 25 s, about 7× less
+
+    Running the app afterwards cost the same with both images (serving 2,000 requests: ~17 J). So the saving is in the build, and in every pull and stored copy of the image. It repeats with each push, but the size of your total saving depends on your push count and cache hit rate.
+
+    ```dockerfile
+    FROM python:3.12-slim
+
+    WORKDIR /app
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY . .
+    ENTRYPOINT ["python", "-m", "csvtidy"]
+    ```
+
+    **Green Notes**
+    - **Small container images** (reduces E, M): slim base, no compiler or editors, and no dev tools in the image you ship.
+    - **Dependency layer first** (reduces E): with `requirements.txt` copied before the source, a code-only change reuses the cached install layer.
+    - Run `pytest`, `black` and `mypy` in a separate CI job with their own requirements file, not in the shipped image.
+    - *Not applied:* a multi-stage build. If a package in `requirements.txt` has no prebuilt wheel and needs a compiler, build it in a first stage and copy it over. Don't go back to the full image.
+
+    To measure your own case, compare the CI job duration and the image size before and after. For energy, run both builds in a Green Metrics Tool usage scenario, or use `perf stat` on the build as a CPU-time proxy.
+verify:
+  static_only: Dockerfile

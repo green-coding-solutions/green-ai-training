@@ -1,0 +1,128 @@
+id: gen-2-00404-review
+category: review
+language: css
+patterns:
+- remove-unused-css
+- css-animations
+facts:
+- F-UNUSED-CSS
+- F-ANIM
+messages:
+- role: user
+  content: |
+    Hi, I'm a backend dev (mostly Flask) and I made a small web page for our REST API. Users log in and manage their API keys there: list keys, create one, revoke one. My colleague looked at it and said "the CSS is a mess and the spinner is heavy", but I don't really understand what she means. I took the stylesheet from an old landing page template we had and added my own rules at the bottom. The page only has the header, the keys table with a status dot per key, the create form, and a spinner while the fetch to `/api/v1/keys` runs. I call `loadKeys()` on page load and again after every create or revoke.
+
+    The real CSS file is about 11 KB. This is a shortened version (the carousel and pricing parts are longer in reality):
+
+    ```css
+    :root {
+      --brand: #2d5bff;
+      --ok: #1f9d55;
+      --warn: #d97706;
+      --danger: #c0392b;
+      --text: #1c1f24;
+      --muted: #6b7280;
+    }
+
+    body { font-family: system-ui, sans-serif; color: var(--text); margin: 0; }
+
+    /* ---- from landing template ---- */
+    .hero { padding: 120px 24px; background: linear-gradient(135deg, #2d5bff, #7b2dff); color: #fff; text-align: center; }
+    .hero h1 { font-size: 3rem; margin-bottom: 16px; }
+    .carousel { position: relative; overflow: hidden; }
+    .carousel__track { display: flex; transition: transform 0.5s ease; }
+    .carousel__slide { min-width: 100%; }
+    .carousel__dot { width: 10px; height: 10px; border-radius: 50%; background: #ccc; }
+    .carousel__dot.is-active { background: var(--brand); }
+    .pricing { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; }
+    .pricing__card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px; }
+    .pricing__card--featured { border-color: var(--brand); box-shadow: 0 8px 24px rgba(45, 91, 255, 0.2); }
+    .testimonial { font-style: italic; color: var(--muted); }
+    .footer-newsletter input { padding: 12px; border-radius: 6px; }
+
+    /* ---- api keys page ---- */
+    .app-header { display: flex; justify-content: space-between; align-items: center; padding: 12px 24px; border-bottom: 1px solid #e5e7eb; }
+    .keys-table { width: 100%; border-collapse: collapse; }
+    .keys-table th, .keys-table td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #f0f0f0; }
+    .key-prefix { font-family: ui-monospace, monospace; }
+    .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+    .status-dot.active { background: var(--green); }
+    .status-dot.expiring { background: var(--warn); }
+    .status-dot.revoked { background: var(--danger); }
+    .btn-revoke { color: var(--danger); background: none; border: 1px solid var(--danger); border-radius: 4px; cursor: pointer; }
+    .spinner { width: 24px; height: 24px; border: 3px solid #e5e7eb; border-top-color: var(--brand); border-radius: 50%; }
+    ```
+
+    And this is the spinner part from `keys.js`:
+
+    ```javascript
+    const spinner = document.getElementById('spinner');
+    let angle = 0;
+
+    function spin() {
+      angle = (angle + 6) % 360;
+      spinner.style.transform = 'rotate(' + angle + 'deg)';
+      requestAnimationFrame(spin);
+    }
+
+    async function loadKeys() {
+      spinner.hidden = false;
+      requestAnimationFrame(spin);
+      const res = await fetch('/api/v1/keys');
+      const keys = await res.json();
+      renderKeys(keys);
+      spinner.hidden = true;
+    }
+    ```
+
+    Is it really that bad? What should I change?
+- role: assistant
+  content: |
+    **Workload:** web (API key management page)
+
+    #### [Bug] Active keys show no status dot
+    - **Where:** `.status-dot.active { background: var(--green); }`
+    - **Issue:** `--green` is not defined. The variable in `:root` is `--ok`. The dot for active keys is transparent, so it looks like it is missing.
+    - **Fix:** `.status-dot.active { background: var(--ok); }`
+
+    #### [Medium] Spinner is animated from JavaScript, and the loop never stops
+    - **Where:** `spin()` and `loadKeys()` in `keys.js`
+    - **Issue:** `spin()` schedules itself on every frame and has no exit. Hiding the spinner does not stop it. The loop keeps writing `style.transform` for as long as the tab is visible. Every `loadKeys()` call after a create or revoke starts one more loop, so the spinner also gets faster each time. If the fetch fails, `spinner.hidden = true` is never reached, so the spinner stays on screen.
+    - **Fix:** let CSS rotate the spinner. A `display: none` element (what `hidden` gives you) runs no animation, so the JS only toggles visibility:
+      ```css
+      .spinner {
+        width: 24px;
+        height: 24px;
+        border: 3px solid #e5e7eb;
+        border-top-color: var(--brand);
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+      }
+
+      @keyframes spin {
+        to { transform: rotate(360deg); }
+      }
+      ```
+      ```javascript
+      const spinner = document.getElementById('spinner');
+
+      async function loadKeys() {
+        spinner.hidden = false;
+        try {
+          const res = await fetch('/api/v1/keys');
+          renderKeys(await res.json());
+        } finally {
+          spinner.hidden = true;
+        }
+      }
+      ```
+      Delete `spin()` and `angle`. The `finally` hides the spinner when the request fails. The error itself still reaches the caller, as before.
+    - **Impact:** E on the client. The never-ending loops stop completely, because nothing runs while the spinner is hidden. While it is visible, the browser drives the rotation itself. In Green Metrics Tool browser benchmarks, a 20-second animation with CSS `@keyframes` used ~145 J CPU energy, compared with ~161 J for `requestAnimationFrame` with style updates, about 10% less.
+
+    #### [Low] Unused landing page rules
+    - **Where:** the `/* from landing template */` block: `.hero`, `.carousel*`, `.pricing*`, `.testimonial`, `.footer-newsletter`
+    - **Issue:** none of these classes appear on the keys page, but every visitor downloads them.
+    - **Fix:** search your templates for each class name. Then delete the block by hand. For a stylesheet this small, you don't need a PurgeCSS step in the build.
+    - **Impact:** network bytes only, not client CPU. In Green Metrics Tool browser benchmarks, a 16 KB stylesheet with mostly unused rules used ~783 J for 50 cold page loads, and the purged and minified 0.75 KB version used ~764 J, about 2% less. That is within measurement noise. The benefit is a smaller file on real networks and a stylesheet that is easier to maintain.
+verify:
+  static_only: CSS and browser DOM code

@@ -1,0 +1,67 @@
+id: gen-12764612-00076-no-change
+category: no-change
+language: python
+patterns:
+- batch-db-writes
+- context-tradeoff
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    Diff only please. Anything to squeeze out of this backfill CLI? It loads ~400k rows once per customer migration.
+
+    ```python
+    #!/usr/bin/env python3
+    """Backfill meter_readings from a gzipped CSV dump."""
+    import argparse
+    import csv
+    import gzip
+    import itertools
+
+    import psycopg
+
+    CHUNK = 10_000
+
+
+    def read_rows(path):
+        with gzip.open(path, "rt", newline="") as f:
+            reader = csv.reader(f)
+            next(reader)  # header
+            for meter_id, read_at, kwh in reader:
+                yield int(meter_id), read_at, float(kwh)
+
+
+    def main():
+        parser = argparse.ArgumentParser()
+        parser.add_argument("path")
+        parser.add_argument("--dsn", required=True)
+        args = parser.parse_args()
+
+        total = 0
+        rows = read_rows(args.path)
+        with psycopg.connect(args.dsn) as conn:
+            while chunk := list(itertools.islice(rows, CHUNK)):
+                with conn.cursor() as cur:
+                    with cur.copy(
+                        "COPY meter_readings (meter_id, read_at, kwh) FROM STDIN"
+                    ) as copy:
+                        for row in chunk:
+                            copy.write_row(row)
+                conn.commit()
+                total += len(chunk)
+                print(f"{total} rows loaded")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |-
+    No diff. This is already the efficient shape for a bulk load.
+
+    - **`COPY` in chunks of 10,000:** one statement streams a whole chunk, so you pay no per-row round trip and the commit cost is spread over many rows. In Green Metrics Tool micro-benchmarks that inserted 500,000 rows in batches of 5,000, `COPY` used about 22× less CPU energy than one `execute()` per row and about 8× less than `executemany()`.
+    - **Chunk size:** the batch advantage shows up with thousands of rows per batch. Your 10,000 is well inside that range, so tuning it would gain nothing worth measuring.
+    - **Streaming input:** the generator plus `islice` keeps memory bounded to one chunk, and gzip is read as a stream.
+
+    Switching to `executemany()` or a per-row loop would only make it slower. For a one-off migration job, I'd leave it as it is.

@@ -1,0 +1,49 @@
+id: gen-1-00184-conceptual
+category: conceptual
+language: text
+patterns:
+- compress-transmitted
+facts:
+- F-TEXT-COMPRESS
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    We're setting a compression policy for our REST API (Go service behind nginx, mobile apps plus a web dashboard). Requirements:
+    - Responses are dynamic JSON, built per user, so nothing can be cached or precompressed.
+    - Most responses are small (a few hundred bytes to a few KB). A few list endpoints return several hundred KB.
+    - We also return PDF invoices and PNG charts from the same API.
+    - Mobile clients are often on poor networks.
+    - Backend CPU is shared with other services.
+
+    Should we just turn on compression for everything, and which codec and level should we pick? I'd like to understand the trade-offs, not just get a config.
+- role: assistant
+  content: |
+    Don't compress everything. Compress the right responses with a cheap codec.
+
+    **What to compress**
+    - **Large JSON lists:** yes. Text like JSON shrinks a lot, and this is where mobile users on poor networks gain most.
+    - **Tiny JSON responses:** set a minimum size (nginx `gzip_min_length`). For a few hundred bytes the saving is small, and the headers and the CPU work can cost more than the bytes you save.
+    - **PDF and PNG:** skip them. They are already compressed, so you spend CPU and gain almost nothing.
+
+    **Why the codec matters, since your responses are dynamic**
+    You pay the compression cost on every request. In Green Metrics Tool micro-benchmarks with nginx serving 2,000 text requests, compression sent about 10× fewer bytes. But gzip level 5 on every request used about 7× the CPU energy of no compression, and about 4× that of precompressed files. That test ran on a local network, so it shows only the CPU side. On your real mobile networks, the byte saving is what you get in return.
+
+    The codec choice changes this cost a lot. In Green Metrics Tool measurements compressing 100 MB of text with default settings:
+    - **zstd:** ~16 J
+    - **gzip:** ~67 J (zstd used about 4× less)
+    - **brotli at its CLI default (quality 11):** ~3019 J (about 190× zstd)
+
+    These numbers compare energy only, not compressed size. Brotli at high quality gives smaller output, but that quality suits static files compressed once. It is wasteful per request.
+
+    **A sensible policy**
+    - Compress `application/json` (and other text types) above a minimum size.
+    - Use a fast codec: gzip at a low or moderate level, or zstd if all your clients send `Accept-Encoding: zstd`. Check client support first. Keep gzip as the fallback.
+    - Don't use brotli at high quality for dynamic responses. If you want brotli, use a low quality setting and measure it.
+    - Don't compress PDF, PNG or other already-compressed types.
+    - Static assets are different. Precompress them at build time, and a stronger codec is fine there.
+
+    **Check it on your own traffic**
+    Replay a realistic request mix with each setting. Compare bytes sent and CPU time (`perf stat`, or the CPU metrics of your load test). If your shared CPU is tight, a lower level may be the better trade.
+verify:
+  static_only: conceptual answer

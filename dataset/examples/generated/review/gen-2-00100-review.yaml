@@ -1,0 +1,144 @@
+id: gen-2-00100-review
+category: review
+language: python
+patterns:
+- select-columns
+- hoist-invariants
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+- F-ATTR
+messages:
+- role: user
+  content: |
+    hi, I made this endpoint for our house listing app. The mobile app calls it every time someone opens the map view. It's getting slow for big cities (Berlin has ~8000 active listings). The listings table has around 40 columns, including description, floor plan HTML, a photos JSON blob and so on. I'm not sure what is wrong with it. Can you review it?
+
+    ```python
+    import math
+    from flask import Flask, request, jsonify
+    import psycopg
+
+    app = Flask(__name__)
+    DSN = "dbname=homes user=api"
+
+    EARTH_RADIUS_KM = 6371.0
+
+
+    def distance_km(lat1, lon1, lat2, lon2):
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+        a = (math.sin(dlat / 2) ** 2
+             + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2))
+             * math.sin(dlon / 2) ** 2)
+        return 2 * EARTH_RADIUS_KM * math.asin(math.sqrt(a))
+
+
+    @app.get("/api/listings/nearby")
+    def nearby():
+        city = request.args["city"]
+        lat = float(request.args["lat"])
+        lon = float(request.args["lon"])
+        radius = request.args.get("radius", 5)
+
+        with psycopg.connect(DSN) as conn:
+            cur = conn.execute(f"SELECT * FROM listings WHERE city = '{city}' AND active")
+            cols = [c.name for c in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+        results = []
+        for row in rows:
+            d = distance_km(lat, lon, row["latitude"], row["longitude"])
+            if d <= radius:
+                results.append({
+                    "id": row["id"],
+                    "title": row["title"],
+                    "price": row["price"],
+                    "bedrooms": row["bedrooms"],
+                    "thumbnail_url": row["thumbnail_url"],
+                    "distance_km": round(d, 2),
+                })
+
+        results.sort(key=lambda r: r["distance_km"])
+        return jsonify(results)
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (REST API, runs on every map open)
+
+    #### [Security] SQL injection through `city`
+    - **Where:** `conn.execute(f"SELECT * ... city = '{city}' ...")`
+    - **Issue:** `city` comes straight from the query string. A value like `x' OR '1'='1` changes the query, and worse inputs can read other tables.
+    - **Fix:** pass it as a parameter: `conn.execute("... WHERE city = %s AND active", (city,))`.
+
+    #### [Bug] `radius` is a string when the client sends it
+    - **Where:** `radius = request.args.get("radius", 5)`
+    - **Issue:** query string values are strings. With `?radius=3`, `d <= radius` compares a float to `"3"` and raises `TypeError`, so the request fails with a 500 error. It only works today because the default `5` is an int.
+    - **Fix:** `request.args.get("radius", default=5.0, type=float)`.
+
+    #### [High] `SELECT *` loads every big text column for every listing
+    - **Where:** the listings query
+    - **Issue:** the endpoint uses 7 columns, but the query pulls all of them, including the description, the floor plan HTML and the photos JSON. For a big city, every map open makes Postgres read and send thousands of these blobs, and Python decodes each one into a string and copies it into a dict, only to throw it away.
+    - **Fix:** name the columns you use: `id, title, price, bedrooms, thumbnail_url, latitude, longitude`. Then you can unpack the tuples directly and drop the `dict(zip(...))` step.
+    - **Impact:** reduces E on the database and the app server, and the bytes moved between them, for every request. In Green Metrics Tool micro-benchmarks on a 52-column table with large text columns, naming the 10 needed columns instead of `SELECT *` used about 7× less energy at 2,500 and at 10,000 rows. Cost scales with the data each column carries, so your blob columns are the expensive part.
+
+    #### [Low] Repeated lookups and an invariant inside the distance loop
+    - **Where:** `distance_km`, called once per row
+    - **Issue:** every call looks up `math.radians`, `math.sin`, `math.cos`, ... again, and `math.cos(math.radians(lat1))` is the same value for every row because `lat1` is the user's position.
+    - **Fix:** compute `cos(radians(lat))` once per request and bind the math functions to local names before the loop.
+    - **Impact:** small. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local variable before a 10,000,000-iteration loop saved about 4-5%. It is only worth it here because the loop runs over thousands of rows on every request. The query fix matters much more.
+
+    ```python
+    import math
+    from flask import Flask, request, jsonify
+    import psycopg
+
+    app = Flask(__name__)
+    DSN = "dbname=homes user=api"
+
+    EARTH_RADIUS_KM = 6371.0
+
+    LISTINGS_SQL = """
+        SELECT id, title, price, bedrooms, thumbnail_url, latitude, longitude
+        FROM listings
+        WHERE city = %s AND active
+    """
+
+
+    @app.get("/api/listings/nearby")
+    def nearby():
+        city = request.args["city"]
+        lat = float(request.args["lat"])
+        lon = float(request.args["lon"])
+        radius = request.args.get("radius", default=5.0, type=float)
+
+        with psycopg.connect(DSN) as conn:
+            rows = conn.execute(LISTINGS_SQL, (city,)).fetchall()
+
+        radians, sin, cos, asin, sqrt = math.radians, math.sin, math.cos, math.asin, math.sqrt
+        cos_lat1 = cos(radians(lat))
+
+        results = []
+        for id_, title, price, bedrooms, thumb, lat2, lon2 in rows:
+            dlat = radians(lat2 - lat)
+            dlon = radians(lon2 - lon)
+            a = sin(dlat / 2) ** 2 + cos_lat1 * cos(radians(lat2)) * sin(dlon / 2) ** 2
+            d = 2 * EARTH_RADIUS_KM * asin(sqrt(a))
+            if d <= radius:
+                results.append({
+                    "id": id_,
+                    "title": title,
+                    "price": price,
+                    "bedrooms": bedrooms,
+                    "thumbnail_url": thumb,
+                    "distance_km": round(d, 2),
+                })
+
+        results.sort(key=lambda r: r["distance_km"])
+        return jsonify(results)
+    ```
+
+    The response is the same as before. The only behavior changes are the two fixes: `radius` now works when the client sends it, and `city` can no longer change the query.
+
+    **Already good:** the connection is closed by the `with` block, and the response only contains the fields the app needs.
+verify:
+  static_only: needs Flask, psycopg and a PostgreSQL database with the listings table

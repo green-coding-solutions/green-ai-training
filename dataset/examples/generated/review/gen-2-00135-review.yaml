@@ -1,0 +1,121 @@
+id: gen-2-00135-review
+category: review
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    hi, I wrote my first log shipper script. cron runs it every minute on our 12 app nodes and it posts the new lines of app.log to our log collector. On busy hours app.log grows maybe 20-50 MB per hour per node. A senior told me "use the best compression so we send less bytes", so I used xz -9e. But now the nodes show a CPU bump every minute, and sometimes the collector has gaps in the logs, some lines are just missing. I'm not sure what is wrong. Can you look at it?
+
+    ```bash
+    #!/usr/bin/env bash
+    # ship-logs.sh - runs every minute from cron on each app node
+    set -euo pipefail
+
+    LOG=/var/log/app/app.log
+    STATE=/var/lib/logship/offset
+    COLLECTOR='https://logs.internal.example/ingest'
+    TOKEN_FILE=/etc/logship/token
+    HOST=$(hostname -s)
+
+    mkdir -p "$(dirname "$STATE")"
+    offset=0
+    [[ -f "$STATE" ]] && offset=$(<"$STATE")
+
+    size=$(stat -c %s "$LOG")
+    if (( size < offset )); then
+      offset=0   # log was rotated
+    fi
+    if (( size == offset )); then
+      exit 0
+    fi
+
+    tmp=$(mktemp)
+    tail -c +"$((offset + 1))" "$LOG" | xz -9e > "$tmp"
+
+    curl -s -X POST \
+      -H "Authorization: Bearer $(<"$TOKEN_FILE")" \
+      -H 'Content-Type: application/x-xz' \
+      -H "X-Source-Host: $HOST" \
+      --data-binary @"$tmp" \
+      "$COLLECTOR"
+
+    stat -c %s "$LOG" > "$STATE"
+    rm -f "$tmp"
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (log shipping, every minute on every app node)
+
+    #### [Bug] Failed uploads still move the offset forward
+    - **Where:** `curl -s -X POST ...` followed by writing `$STATE`
+    - **Issue:** without `--fail`, curl exits with 0 even when the collector answers 401, 500 or 503. The script then saves the new offset, and that batch is gone for good. This is one likely source of your gaps. When curl does fail (network error), `set -e` stops the script before `rm`, so temp files pile up in `/tmp`.
+    - **Fix:** `curl -sS --fail ...` and remove the temp file with `trap '...' EXIT`.
+
+    #### [Bug] Lines written during the run are skipped, and runs can overlap
+    - **Where:** `stat -c %s "$LOG" > "$STATE"` at the end
+    - **Issue:** you ship the file up to the moment `tail` reads it, but you save the size from *after* compression and upload. Anything the app writes in between is never sent. The slower the compression, the bigger this window. Also, if one run takes longer than a minute, the next cron run starts with the same old offset and sends the same lines again.
+    - **Fix:** ship exactly the bytes up to the `size` you measured at the start, save that `size`, and use `flock` so only one run is active at a time.
+
+    #### [Security] Bearer token visible in the process list
+    - **Where:** `-H "Authorization: Bearer $(<"$TOKEN_FILE")"`
+    - **Issue:** the token ends up in curl's command line. Any local user can read it with `ps` while the upload runs.
+    - **Fix:** store the whole line `Authorization: Bearer <token>` in a root-only file and pass it with `-H @/etc/logship/auth-header`. curl then reads the header from the file.
+
+    #### [High] xz -9e for data that is compressed every minute and sent once
+    - **Where:** `| xz -9e > "$tmp"`
+    - **Issue:** every node compresses a fresh batch every minute. Each batch is sent once and decompressed once at the collector. That is a high-frequency, compress-once, read-once workload. Strong codecs like xz don't pay off here. In Green Metrics Tool benchmarks with default settings on 100 MB of English text, zstd used about 4× less CPU energy than gzip, and xz used about 29× more than zstd. That was xz at its default level. `-9e` is slower still. This is the CPU bump you see every minute.
+    - **Fix:** use `zstd -q -c` (default level). If the collector only understands gzip, `gzip -6` is still far cheaper than xz. The collector must accept the new format, so change its decoder or the `Content-Type` handling at the same time.
+    - **Impact:** reduces E on every node, every minute. The benchmark compared energy, not output size: zstd output will be somewhat larger than `xz -9e`. On an internal network that rarely matters. If the link is slow or metered, a higher zstd level is a middle ground. Measure it before you choose.
+
+    ```bash
+    #!/usr/bin/env bash
+    # ship-logs.sh - runs every minute from cron on each app node
+    set -euo pipefail
+
+    LOG=/var/log/app/app.log
+    STATE=/var/lib/logship/offset
+    COLLECTOR='https://logs.internal.example/ingest'
+    AUTH_HEADER_FILE=/etc/logship/auth-header   # "Authorization: Bearer <token>", mode 600
+    HOST=$(hostname -s)
+
+    exec 9>/var/lock/logship.lock
+    flock -n 9 || exit 0   # previous run still busy, skip this minute
+
+    mkdir -p "$(dirname "$STATE")"
+    offset=0
+    [[ -f "$STATE" ]] && offset=$(<"$STATE")
+
+    size=$(stat -c %s "$LOG")
+    if (( size < offset )); then
+      offset=0   # log was rotated
+    fi
+    if (( size == offset )); then
+      exit 0
+    fi
+
+    tmp=$(mktemp)
+    trap 'rm -f "$tmp"' EXIT
+
+    # exactly the bytes from offset up to the size measured above
+    head -c "$size" "$LOG" | tail -c +"$((offset + 1))" | zstd -q -c > "$tmp"
+
+    curl -sS --fail -X POST \
+      -H @"$AUTH_HEADER_FILE" \
+      -H 'Content-Type: application/zstd' \
+      -H "X-Source-Host: $HOST" \
+      --data-binary @"$tmp" \
+      "$COLLECTOR"
+
+    echo "$size" > "$STATE"
+    ```
+
+    I put `head -c` first on purpose. With `tail | head`, `tail` can be killed by SIGPIPE when the log grows, and `pipefail` would then abort the run.
+
+    **Already good:** the offset file means each run only reads new bytes, rotation is detected, `--data-binary` keeps the payload intact, and fixed strings are single-quoted.
+verify:
+  static_only: needs curl to a live collector endpoint, zstd/xz binaries, flock and files under /var; behavior reviewed by
+    hand

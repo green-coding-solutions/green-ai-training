@@ -1,0 +1,86 @@
+id: gen-2-00405-multi-turn
+category: multi-turn
+language: python
+patterns:
+- async-concurrent-io
+- context-tradeoff
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    gateway poll is slow, fix this
+
+    ```python
+    import json
+    import logging
+    import urllib.request
+
+    log = logging.getLogger("gateway")
+
+    NODES = [f"http://10.0.4.{i}/api/reading" for i in range(21, 33)]
+
+
+    def poll_all():
+        readings = {}
+        for url in NODES:
+            try:
+                with urllib.request.urlopen(url, timeout=5) as r:
+                    readings[url] = json.loads(r.read())
+            except Exception as exc:
+                log.warning("node %s failed: %s", url, exc)
+                readings[url] = None
+        return readings
+    ```
+- role: assistant
+  content: |
+    ```python
+    import asyncio
+    import json
+    import logging
+
+    import httpx
+
+    log = logging.getLogger("gateway")
+
+    NODES = [f"http://10.0.4.{i}/api/reading" for i in range(21, 33)]
+
+
+    async def fetch(client, url):
+        try:
+            r = await client.get(url)
+            r.raise_for_status()
+            return url, r.json()
+        except (httpx.HTTPError, json.JSONDecodeError) as exc:
+            log.warning("node %s failed: %s", url, exc)
+            return url, None
+
+
+    async def poll_all_async():
+        async with httpx.AsyncClient(timeout=5) as client:
+            results = await asyncio.gather(*(fetch(client, u) for u in NODES))
+        return dict(results)
+
+
+    def poll_all():
+        return asyncio.run(poll_all_async())
+    ```
+
+    **Green Notes**
+    - **Concurrent network calls** (reduces E): the 12 nodes are polled at the same time, so the poll takes about as long as the slowest node, not the sum of all. A dead node now costs one 5 s timeout, not 5 s on top of every other node.
+    - `poll_all()` keeps the same signature and the same result shape (`None` for a failed node), so callers do not change. Only the exceptions I catch are narrower: network, HTTP status and bad JSON errors.
+- role: user
+  content: |
+    we have no async anywhere else, team won't maintain it. keep it sync
+
+    ```python
+    ```
+- role: assistant
+  content: |
+    Fine. Keep your original function as it is. It is correct, and the energy gain here is small.
+
+    In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used about 7% less CPU energy than sync `urllib`, and about 17% less wall time. For a dozen nodes the gain is mostly time, not CPU.
+
+    If the poll overlaps with the next cron run when nodes are down, lower `timeout=5` to what a healthy node needs, for example `timeout=2`. That bounds the worst case without any new code structure.
+verify:
+  static_only: needs the httpx package and network access to sensor nodes

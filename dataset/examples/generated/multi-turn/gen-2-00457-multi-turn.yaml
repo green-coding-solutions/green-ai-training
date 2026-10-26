@@ -1,0 +1,152 @@
+id: gen-2-00457-multi-turn
+category: multi-turn
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    ?
+
+    ```yaml
+    name: Landing preview
+
+    on:
+      pull_request:
+        types: [opened, synchronize, reopened]
+
+    jobs:
+      preview:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+
+          - name: Set up SSH
+            run: |
+              mkdir -p ~/.ssh
+              echo "${{ secrets.PREVIEW_SSH_KEY }}" > ~/.ssh/id_ed25519
+              chmod 600 ~/.ssh/id_ed25519
+              ssh-keyscan -H ${{ secrets.PREVIEW_HOST }} >> ~/.ssh/known_hosts
+
+          - name: Sync sources
+            run: rsync -az --delete ./ deploy@${{ secrets.PREVIEW_HOST }}:/srv/previews/pr-${{ github.event.number }}/
+
+          - name: Start stack
+            run: |
+              ssh deploy@${{ secrets.PREVIEW_HOST }} "cd /srv/previews/pr-${{ github.event.number }} && \
+                PR=${{ github.event.number }} docker compose -p lp-pr-${{ github.event.number }} up -d --build --scale app=3 --scale worker=2"
+    ```
+- role: assistant
+  content: |
+    This workflow starts a full stack for every PR and never stops it. Every PR ever opened keeps its containers running on the preview host. I added a teardown on `closed` and sized the preview down.
+
+    ```yaml
+    name: Landing preview
+
+    on:
+      pull_request:
+        types: [opened, synchronize, reopened, closed]
+
+    jobs:
+      preview:
+        runs-on: ubuntu-latest
+        steps:
+          - name: Set up SSH
+            run: |
+              mkdir -p ~/.ssh
+              echo "${{ secrets.PREVIEW_SSH_KEY }}" > ~/.ssh/id_ed25519
+              chmod 600 ~/.ssh/id_ed25519
+              ssh-keyscan -H ${{ secrets.PREVIEW_HOST }} >> ~/.ssh/known_hosts
+
+          - uses: actions/checkout@v4
+            if: github.event.action != 'closed'
+
+          - name: Sync sources
+            if: github.event.action != 'closed'
+            run: rsync -az --delete ./ deploy@${{ secrets.PREVIEW_HOST }}:/srv/previews/pr-${{ github.event.number }}/
+
+          - name: Start stack
+            if: github.event.action != 'closed'
+            run: |
+              ssh deploy@${{ secrets.PREVIEW_HOST }} "cd /srv/previews/pr-${{ github.event.number }} && \
+                PR=${{ github.event.number }} docker compose -p lp-pr-${{ github.event.number }} up -d --build --scale app=1 --scale worker=1"
+
+          - name: Remove stack
+            if: github.event.action == 'closed'
+            run: |
+              ssh deploy@${{ secrets.PREVIEW_HOST }} "cd /srv/previews/pr-${{ github.event.number }} && \
+                PR=${{ github.event.number }} docker compose -p lp-pr-${{ github.event.number }} down -v --remove-orphans && \
+                cd .. && rm -rf pr-${{ github.event.number }}"
+    ```
+
+    **Green Notes**
+    - **Tear down on close** (reduces E, M): merging or closing a PR now removes its containers, volumes and files. An environment that no longer exists costs nothing, so this is the main saving.
+    - **Smaller preview** (reduces M): one app container and one worker are enough to check a landing page. This saves less than you might expect. In Green Metrics Tool micro-benchmarks, an idle preview with 3 app replicas, Postgres, Redis and a polling worker used only about 3% more CPU energy per minute than 1 replica plus Postgres. The hours a preview stays up matter far more than its size.
+
+    Behavior change: `down -v` deletes the preview's database volume. A reopened PR gets a fresh stack from the `reopened` event.
+- role: user
+  content: |
+    we cant delete on close. designers compare the preview with prod for a few days after merge. also I want to keep 3 replicas, they said it should look like prod
+
+    and there are old previews from closed PRs still running on the host
+- role: assistant
+  content: |
+    Both are fine. Here previews stay up after merge, and a nightly job removes the ones closed more than 3 days ago. The scale is back to your original numbers.
+
+    ```yaml
+    name: Landing preview
+
+    on:
+      pull_request:
+        types: [opened, synchronize, reopened, closed]
+      schedule:
+        - cron: '0 3 * * *'
+
+    jobs:
+      preview:
+        runs-on: ubuntu-latest
+        steps:
+          - name: Set up SSH
+            run: |
+              mkdir -p ~/.ssh
+              echo "${{ secrets.PREVIEW_SSH_KEY }}" > ~/.ssh/id_ed25519
+              chmod 600 ~/.ssh/id_ed25519
+              ssh-keyscan -H ${{ secrets.PREVIEW_HOST }} >> ~/.ssh/known_hosts
+
+          - uses: actions/checkout@v4
+            if: github.event_name == 'pull_request' && github.event.action != 'closed'
+
+          - name: Sync sources
+            if: github.event_name == 'pull_request' && github.event.action != 'closed'
+            run: rsync -az --delete ./ deploy@${{ secrets.PREVIEW_HOST }}:/srv/previews/pr-${{ github.event.number }}/
+
+          - name: Start stack
+            if: github.event_name == 'pull_request' && github.event.action != 'closed'
+            run: |
+              ssh deploy@${{ secrets.PREVIEW_HOST }} "cd /srv/previews/pr-${{ github.event.number }} && rm -f .closed && \
+                PR=${{ github.event.number }} docker compose -p lp-pr-${{ github.event.number }} up -d --build --scale app=3 --scale worker=2"
+
+          - name: Mark closed
+            if: github.event.action == 'closed'
+            run: ssh deploy@${{ secrets.PREVIEW_HOST }} "touch /srv/previews/pr-${{ github.event.number }}/.closed"
+
+          - name: Remove previews closed 3+ days ago
+            if: github.event_name == 'schedule'
+            run: |
+              ssh deploy@${{ secrets.PREVIEW_HOST }} 'bash -s' <<'EOF'
+              for f in $(find /srv/previews -maxdepth 2 -name .closed -mtime +2); do
+                d=$(dirname "$f"); n=${d##*/pr-}
+                (cd "$d" && PR=$n docker compose -p "lp-pr-$n" down -v --remove-orphans) && rm -rf "$d"
+              done
+              EOF
+    ```
+
+    **Green Notes**
+    - **Delayed teardown** (reduces E, M): closing a PR only drops a `.closed` marker. The nightly job removes the stack and files about 3 days later. Reopening a PR or pushing to it clears the marker. The saving comes from the hours the stack no longer runs.
+    - **3 replicas kept:** that is fine. As measured, idle replicas add little per minute.
+
+    The old previews have no `.closed` marker, so the job will not touch them. Remove them once by hand. `docker compose ls` on the host lists the running projects.
+verify:
+  static_only: GitHub Actions workflow that deploys over SSH to a remote host

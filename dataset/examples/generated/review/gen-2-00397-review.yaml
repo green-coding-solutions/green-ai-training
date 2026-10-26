@@ -1,0 +1,148 @@
+id: gen-2-00397-review
+category: review
+language: javascript
+patterns:
+- minify-assets
+facts:
+- F-MINIFY
+messages:
+- role: user
+  content: |
+    Hi, we open our small online tea shop next month. This is the cart drawer script, it load on every product page. My friend say I must minify it before go live, because not minified JS is bad for performance and also for the environment. Is it true? The file is only around 4 KB. Please review it, and tell me also if you see other problems.
+
+    ```javascript
+    // cart-drawer.js - included on every product page
+    const CART_KEY = 'tealeaf_cart';
+
+    function loadCart() {
+      return JSON.parse(localStorage.getItem(CART_KEY)) || [];
+    }
+
+    function saveCart(items) {
+      localStorage.setItem(CART_KEY, JSON.stringify(items));
+    }
+
+    function addToCart(product) {
+      const items = loadCart();
+      const qtyInput = document.querySelector('#qty');
+      const existing = items.find(i => i.sku === product.sku);
+      if (existing) {
+        existing.qty += qtyInput.value;
+      } else {
+        items.push({ sku: product.sku, name: product.name, price: product.price, qty: qtyInput.value });
+      }
+      saveCart(items);
+      console.log('cart updated', items);
+      renderDrawer(items);
+    }
+
+    function cartTotal(items) {
+      let total = 0;
+      for (const i of items) {
+        total += i.price * i.qty;
+      }
+      return total.toFixed(2);
+    }
+
+    function renderDrawer(items) {
+      const list = document.querySelector('#cart-items');
+      list.innerHTML = '';
+      for (const i of items) {
+        list.innerHTML += `<li>${i.name} × ${i.qty} <span>€${(i.price * i.qty).toFixed(2)}</span></li>`;
+      }
+      document.querySelector('#cart-total').textContent = '€' + cartTotal(items);
+
+      const note = new URLSearchParams(location.search).get('gift_note');
+      if (note) {
+        document.querySelector('#gift-note').innerHTML = 'Gift note: ' + note;
+      }
+    }
+
+    document.querySelectorAll('.add-to-cart').forEach(btn => {
+      btn.addEventListener('click', () => addToCart(JSON.parse(btn.dataset.product)));
+    });
+    ```
+- role: assistant
+  content: |
+    **Workload:** web
+
+    #### [Bug] Quantity is added as a string
+    - **Where:** `addToCart`, `existing.qty += qtyInput.value`
+    - **Issue:** `input.value` is always a string. The first add stores `"1"`. A second add of 2 gives `"1" + "2"` = `"12"`. The total then charges 12 items instead of 3.
+    - **Fix:** parse the quantity once and store a number. `Number(existing.qty)` also repairs carts that were already saved with string quantities.
+
+    ```javascript
+    function parseQty(value) {
+      const qty = Number.parseInt(value, 10);
+      return Number.isInteger(qty) && qty > 0 ? qty : 1;
+    }
+
+    function addToCart(product) {
+      const items = loadCart();
+      const qty = parseQty(document.querySelector('#qty').value);
+      const existing = items.find(i => i.sku === product.sku);
+      if (existing) {
+        existing.qty = Number(existing.qty) + qty;
+      } else {
+        items.push({ sku: product.sku, name: product.name, price: product.price, qty });
+      }
+      saveCart(items);
+      renderDrawer(items);
+    }
+    ```
+
+    #### [Security] Gift note from the URL goes into `innerHTML`
+    - **Where:** `renderDrawer`, `#gift-note`
+    - **Issue:** anyone can send a customer a link like `?gift_note=<img src=x onerror=...>`, and that code runs on your shop page (DOM XSS). The item names are also written with `innerHTML`. They come from `localStorage`, so they should not be trusted either.
+    - **Fix:** use `textContent` and build the elements yourself:
+
+    ```javascript
+    function renderDrawer(items) {
+      const list = document.querySelector('#cart-items');
+      list.replaceChildren(...items.map(i => {
+        const li = document.createElement('li');
+        const price = document.createElement('span');
+        price.textContent = `€${(i.price * i.qty).toFixed(2)}`;
+        li.append(`${i.name} × ${i.qty} `, price);
+        return li;
+      }));
+      document.querySelector('#cart-total').textContent = '€' + cartTotal(items);
+
+      const note = new URLSearchParams(location.search).get('gift_note');
+      if (note) {
+        document.querySelector('#gift-note').textContent = 'Gift note: ' + note;
+      }
+    }
+    ```
+
+    #### [Low] Not minified
+    - **Where:** the whole file
+    - **Issue:** your friend is only partly right. In Green Metrics Tool micro-benchmarks of a small booking page, an esbuild minified build (`--minify --drop:console`) used about 2% less client CPU energy than the unminified sources. That is within measurement noise. For a file this small, minification does not save measurable CPU in the browser. It saves bytes on the network, which helps shoppers on slow mobile connections a little.
+    - **Fix:** not needed for go-live. If you add a build step later, `esbuild cart-drawer.js --minify --drop:console --outfile=dist/cart-drawer.js` is enough. Until then, remove the `console.log` by hand.
+    - **Impact:** network bytes only, small.
+
+    **Already good:** no framework or extra library for a simple drawer, and the cart lives in `localStorage`, so showing the drawer needs no server request.
+verify:
+  green_block: 0
+  test: |-
+    let store = [];
+    function loadCart() { return JSON.parse(JSON.stringify(store)); }
+    function saveCart(items) { store = items; }
+    let rendered = null;
+    function renderDrawer(items) { rendered = items; }
+    let qtyValue = '2';
+    globalThis.document = { querySelector: () => ({ value: qtyValue }) };
+    const p = { sku: 'SEN-50', name: 'Sencha', price: 6.5 };
+    addToCart(p);
+    qtyValue = '3';
+    addToCart(p);
+    if (store[0].qty !== 5) throw new Error('expected qty 5, got ' + store[0].qty);
+    qtyValue = 'abc';
+    addToCart(p);
+    if (store[0].qty !== 6) throw new Error('invalid input should add 1');
+    if (parseQty('0') !== 1) throw new Error('zero should fall back to 1');
+    store = [{ sku: 'SEN-50', name: 'Sencha', price: 6.5, qty: '1' }];
+    qtyValue = '2';
+    addToCart(p);
+    if (store[0].qty !== 3) throw new Error('legacy string qty not repaired');
+    if (rendered !== store) throw new Error('renderDrawer not called with saved items');

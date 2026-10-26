@@ -1,0 +1,58 @@
+id: gen-12764612-00043-no-change
+category: no-change
+language: bash
+patterns:
+- compress-transmitted
+- context-tradeoff
+facts:
+- F-COMPRESS-BREAKEVEN
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # export-orders.sh <customer_id>
+    # Called by the API worker when a customer clicks "Download my orders".
+    # nginx serves the file from /var/cache/exports over the internal LAN.
+    set -euo pipefail
+
+    CUSTOMER_ID="$1"
+    EXPORT_DIR='/var/cache/exports'
+    TTL_MINUTES=15
+
+    case "$CUSTOMER_ID" in
+      ''|*[!0-9]*) echo 'invalid customer id' >&2; exit 2 ;;
+    esac
+
+    tmp="$(mktemp "$EXPORT_DIR/.orders-XXXXXX")"
+    out="$EXPORT_DIR/orders-$CUSTOMER_ID.csv"
+
+    psql "$ORDERS_DB_URL" -v cid="$CUSTOMER_ID" --csv -c \
+      'SELECT id, created_at, status, total_cents, currency FROM orders WHERE customer_id = :cid ORDER BY created_at' \
+      > "$tmp"
+
+    mv "$tmp" "$out"
+
+    # remove old exports
+    find "$EXPORT_DIR" -name 'orders-*.csv' -mmin "+$TTL_MINUTES" -delete
+
+    echo "/exports/orders-$CUSTOMER_ID.csv"
+    ```
+
+    ?
+- role: assistant
+  content: |
+    This script is already fine. I would not change it, and I would not add compression.
+
+    - **Short-lived data:** the file is deleted after 15 minutes. Compression costs CPU now and only pays back if the data is stored or sent for long enough. Break-even estimates for zstd are about 0.15 days of storage. That figure is an estimate from Green Coding Solutions' concept notes, not a direct measurement. A 15-minute file never gets there.
+    - **Cheap transfer:** the file goes over the internal LAN, so there is little transfer to save.
+    - **Column list and write path:** it selects only the five columns it needs and writes to a temp file, then renames it. A reader never sees a half-written file.
+    - **No loops or forks:** the script runs one `psql` and one `find`. There is nothing to replace with builtins.
+    - **Quoting:** literals use single quotes and variables use double quotes.
+
+    Compression would make sense in two cases:
+    - Customers download these files over slow links. Then let nginx compress the response, not the stored file.
+    - You keep exports for days. Then use a fast codec: in Green Metrics Tool micro-benchmarks, compressing 100 MB of text used about 16 J with zstd and about 67 J with gzip.
+verify:
+  static_only: bash script needs psql, a database and nginx

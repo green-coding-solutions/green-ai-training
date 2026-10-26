@@ -1,0 +1,121 @@
+id: gen-1-00202-review
+category: review
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    Can you review the nginx config for our model monitoring portal? Requirements and context:
+
+    - Same VM as the inference server (Triton on 127.0.0.1:8000). nginx and the model compete for CPU, and p99 latency of `/v1/predict` matters.
+    - `/v1/predict` gets about 2k requests per second from internal services. Responses are small JSON, around 300 bytes (label + score).
+    - The dashboard is a Vite build in `/srv/mlmon/dist`. It only changes when we deploy, about twice a week.
+    - `/models/` serves model cards: markdown-rendered HTML, JSON metrics and PNG plots, published by a CI job.
+    - A CDN sits in front of nginx for the external dashboard users.
+    - I want lower bandwidth, but not at the cost of inference latency.
+
+    ```nginx
+    worker_processes auto;
+
+    events { worker_connections 4096; }
+
+    http {
+        include mime.types;
+        default_type application/octet-stream;
+        sendfile on;
+
+        gzip on;
+        gzip_comp_level 9;
+        gzip_min_length 0;
+        gzip_proxied any;
+        gzip_types text/plain text/css text/html application/json
+                   application/javascript image/svg+xml image/png
+                   application/octet-stream;
+
+        upstream triton {
+            server 127.0.0.1:8000;
+            keepalive 32;
+        }
+
+        server {
+            listen 443 ssl http2;
+            server_name mlmon.example.internal;
+            ssl_certificate     /etc/ssl/mlmon/fullchain.pem;
+            ssl_certificate_key /etc/ssl/mlmon/privkey.pem;
+
+            root /srv/mlmon/dist;
+
+            location / {
+                try_files $uri /index.html;
+            }
+
+            location /v1/predict {
+                proxy_pass http://triton;
+                proxy_http_version 1.1;
+                proxy_set_header Connection '';
+            }
+
+            location /models/ {
+                alias /srv/mlmon/model-cards/;
+            }
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (inference gateway plus static dashboard)
+
+    #### [Bug] Compressed responses without `Vary: Accept-Encoding`
+    - **Where:** `http` block, `gzip on` without `gzip_vary`
+    - **Issue:** with `gzip_proxied any` and a CDN in front, a gzipped response can be cached and then handed to a client that did not send `Accept-Encoding: gzip`. That client gets bytes it cannot read.
+    - **Fix:** add `gzip_vary on;`. With `gzip_static` (below), nginx adds it for the files it serves, but keep it on for the proxied responses.
+    - **Impact:** correctness for CDN users.
+
+    #### [High] Static files are compressed again on every request
+    - **Where:** `location /` and `location /models/` with `gzip on` only
+    - **Issue:** the dashboard changes twice a week, but the JS, CSS, HTML and JSON are compressed from scratch for every request, on the same CPUs as the model. In Green Metrics Tool micro-benchmarks (nginx, 2,000 requests for text assets), compressing on every request cost about 4× the CPU energy of serving precompressed files, and both sent about 10× fewer bytes than uncompressed. Keep compression on, because the byte saving is what counts on real networks, but do the work once at build time.
+    - **Fix:** compress in the build or CI publish step and let nginx serve the `.gz` files:
+
+      ```bash
+      find dist /srv/mlmon/model-cards -type f \
+        \( -name '*.js' -o -name '*.css' -o -name '*.html' -o -name '*.json' -o -name '*.svg' \) \
+        -exec gzip -k -9 -f {} +
+      ```
+
+      ```nginx
+      gzip_static on;
+      ```
+
+      A high level is fine here, because it runs once per deploy. `gzip_static` needs `ngx_http_gzip_static_module`, which the Debian and Ubuntu packages include. nginx serves a `.gz` file even if the original is newer, so always regenerate them together with the originals.
+    - **Impact:** E on the shared CPU for every dashboard and model card request. Network stays low.
+
+    #### [High] Level 9 on the predict path
+    - **Where:** `gzip_comp_level 9;` and `gzip_min_length 0;` applied to `/v1/predict`
+    - **Issue:** every 300-byte response is compressed at the most expensive level. A response that small has almost nothing to save. The gzip header and trailer can make it bigger, and the CPU cost lands on the hot path, next to the model. This is the part that can hurt p99 latency. The responses go to internal services over a local network, where bytes are cheap.
+    - **Fix:** set a sane floor and a moderate level for anything still compressed on the fly:
+
+      ```nginx
+      gzip_comp_level 4;
+      gzip_min_length 1024;
+      ```
+
+      With 1024 bytes as the floor, `/v1/predict` is skipped. If you later add a batch endpoint with large JSON responses, those will be compressed at level 4, which is the right trade-off for dynamic data.
+    - **Impact:** E and latency on every prediction request.
+
+    #### [Medium] Already compressed types in `gzip_types`
+    - **Where:** `image/png`, `application/octet-stream`
+    - **Issue:** PNG plots are already compressed, so gzip spends CPU and gains nothing. `application/octet-stream` is the fallback type, so it can catch any file. `text/html` is also always compressed by nginx, so listing it only creates a warning in some versions.
+    - **Fix:**
+
+      ```nginx
+      gzip_types text/plain text/css application/json
+                 application/javascript image/svg+xml;
+      ```
+    - **Impact:** E, a bounded saving on the `/models/` plots.
+
+    **Already good:** `keepalive` to the upstream with `Connection ''` avoids a new TCP connection per prediction. `try_files` with an index fallback is the right setup for the SPA.
+verify:
+  static_only: nginx configuration review, no executable code

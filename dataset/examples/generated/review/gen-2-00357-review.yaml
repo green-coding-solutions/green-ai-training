@@ -1,0 +1,135 @@
+id: gen-2-00357-review
+category: review
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    hi, this is small tool we run in CI for every service (12 repo, each requirements.txt have 60-90 packages). it check if our pins are outdated and fail the job if yes. this step alone take like 40 sec, mostly it just wait. can you give me feedback pls?
+
+    ```python
+    #!/usr/bin/env python3
+    """check_pins.py - report outdated pins in requirements.txt"""
+    import json
+    import sys
+    import urllib.request
+
+    PYPI = "https://pypi.org/pypi/{}/json"
+
+
+    def read_pins(path):
+        pins = {}
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("#"):
+                    continue
+                name, version = line.split("==")
+                pins[name.lower()] = version
+        return pins
+
+
+    def latest_version(name):
+        with urllib.request.urlopen(PYPI.format(name)) as resp:
+            data = json.load(resp)
+        return data["info"]["version"]
+
+
+    def main():
+        path = sys.argv[1] if len(sys.argv) > 1 else "requirements.txt"
+        pins = read_pins(path)
+        outdated = []
+        for name, pinned in sorted(pins.items()):
+            latest = latest_version(name)
+            if latest > pinned:
+                outdated.append((name, pinned, latest))
+                print(f"{name:30} {pinned:>12} -> {latest}")
+        print(f"{len(outdated)} of {len(pins)} packages outdated")
+        sys.exit(1 if outdated else 0)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (CLI check in CI, runs on every pipeline)
+
+    #### [Bug] Versions are compared as strings
+    - **Where:** `if latest > pinned` in `main()`
+    - **Issue:** string comparison goes character by character. `"1.10.0" > "1.9.2"` is `False`, so a package pinned at `1.9.2` with `1.10.0` released is reported as up to date. `"10.0" > "9.0"` is also `False`.
+    - **Fix:** compare parsed versions:
+
+    ```python
+    from packaging.version import Version
+
+    if Version(latest) > Version(pinned):
+    ```
+
+    #### [Bug] Parser crashes on normal requirements lines
+    - **Where:** `read_pins()`, `line.split("==")`
+    - **Issue:** a blank line, `-r base.txt`, an unpinned `requests>=2`, an inline comment (`flask==3.0.0  # web`) or a marker (`; python_version < "3.11"`) either raises `ValueError` or puts junk into the version. Extras like `uvicorn[standard]==0.30.1` produce a name that PyPI answers with 404.
+    - **Fix:**
+
+    ```python
+    line = line.split("#", 1)[0].strip()
+    if not line or line.startswith("-") or "==" not in line:
+        continue
+    name, version = line.split("==", 1)
+    name = name.split("[", 1)[0].strip().lower()
+    pins[name] = version.split(";", 1)[0].strip()
+    ```
+
+    #### [Bug] One bad lookup stops or hangs the whole job
+    - **Where:** `latest_version()`
+    - **Issue:** `urlopen` has no timeout, so a stalled connection blocks the CI job until the runner's own timeout. A private package that is not on PyPI raises `HTTPError` and kills the run, and no other pins get checked.
+    - **Fix:** set a timeout, catch errors per package, report them, and still fail the job at the end (see the snippet below).
+
+    #### [Medium] 60-90 requests one after another
+    - **Where:** the `for` loop in `main()`
+    - **Issue:** each lookup waits for the full round trip before the next one starts. The job spends almost all of its time idle, and it holds a CI runner for that whole time on every pipeline of every service.
+    - **Fix:** run the lookups concurrently with one shared client and a limit, so PyPI is not flooded:
+
+    ```python
+    import asyncio
+    import httpx
+
+    async def fetch_latest(client, sem, name):
+        async with sem:
+            try:
+                resp = await client.get(PYPI.format(name))
+                resp.raise_for_status()
+                return name, resp.json()["info"]["version"], None
+            except httpx.HTTPError as exc:
+                return name, None, str(exc)
+
+    async def fetch_all(names):
+        sem = asyncio.Semaphore(10)
+        async with httpx.AsyncClient(timeout=10) as client:
+            return await asyncio.gather(*(fetch_latest(client, sem, n) for n in names))
+
+    def main():
+        path = sys.argv[1] if len(sys.argv) > 1 else "requirements.txt"
+        pins = read_pins(path)
+        outdated, failed = [], []
+        for name, latest, error in asyncio.run(fetch_all(sorted(pins))):
+            if error:
+                failed.append(name)
+                print(f"{name}: lookup failed ({error})", file=sys.stderr)
+            elif Version(latest) > Version(pins[name]):
+                outdated.append(name)
+                print(f"{name:30} {pins[name]:>12} -> {latest}")
+        print(f"{len(outdated)} of {len(pins)} packages outdated, {len(failed)} failed")
+        sys.exit(1 if outdated or failed else 0)
+    ```
+
+    `gather` returns results in input order, so the output stays sorted by name as before. The script now needs `httpx` and `packaging` in the CI image.
+
+    - **Impact:** mostly wall time and runner holding time. Instead of 60-90 sequential round trips you wait for about 10 lookups at a time. The CPU energy saving itself is modest: in Green Metrics Tool micro-benchmarks with 10 HTTP requests, sync `urllib` used ~9.1 J and 3.1 s, async `httpx` ~8.4 J and 2.6 s, about 7% less CPU energy and about 17% less wall time. The bigger gain here is that runners are freed sooner on every pipeline.
+
+    **Already good:** one small JSON request per package, and a clear exit code for CI.
+verify:
+  static_only: needs network access to PyPI and the httpx and packaging packages

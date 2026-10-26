@@ -1,0 +1,176 @@
+id: gen-2-00010-review
+category: review
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    Hi, i wrote small tool for check our backups. It walk the NAS folder and print every file that is not in the backup manifest. NAS have around 300k files and the manifest have about same amount of lines. On my test folder it run fine but on the real NAS it take forever, more then one hour. Our monitoring also use the exit code of this script. Can you review it please?
+
+    ```python
+    #!/usr/bin/env python3
+    """check_backup.py - list files in SRC that are missing from the backup manifest."""
+    import argparse
+    import os
+    import sys
+
+    MANIFEST_HEADER = "#manifest v2"
+
+
+    def load_manifest(path):
+        with open(path, encoding="utf-8") as f:
+            lines = [l.rstrip("\n") for l in f]
+        if not lines or lines[0] != MANIFEST_HEADER:
+            sys.exit("unsupported manifest format")
+        return lines[1:]
+
+
+    def find_missing(src, backed_up, skip_hidden=True):
+        missing = []
+        for root, dirs, files in os.walk(src):
+            if skip_hidden:
+                dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for name in files:
+                if skip_hidden and name.startswith("."):
+                    continue
+                rel = os.path.relpath(os.path.join(root, name), src)
+                if rel not in backed_up:
+                    missing.append(rel)
+        return missing
+
+
+    def main(argv=None):
+        p = argparse.ArgumentParser(description="Check a folder against a backup manifest")
+        p.add_argument("src")
+        p.add_argument("manifest")
+        p.add_argument("--include-hidden", action="store_true")
+        args = p.parse_args(argv)
+
+        backed_up = load_manifest(args.manifest)
+        missing = find_missing(args.src, backed_up, skip_hidden=not args.include_hidden)
+        for rel in sorted(missing):
+            print(rel)
+        print(f"{len(missing)} files missing from backup", file=sys.stderr)
+        sys.exit(len(missing))
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (CLI, about 300k files against a manifest of about 300k lines)
+
+    #### [Bug] Exit code can report success when files are missing
+    - **Where:** `sys.exit(len(missing))` in `main`
+    - **Issue:** exit codes are taken modulo 256 on Linux. With exactly 256 missing files, the script exits with 0, and your monitoring sees "all good". With 300 missing files it exits with 44, which looks like a random error code.
+    - **Fix:** return a fixed code and keep the count in the stderr message: `sys.exit(1 if missing else 0)`.
+
+    #### [High] Linear search through the manifest for every file
+    - **Where:** `if rel not in backed_up` in `find_missing`
+    - **Issue:** `backed_up` is a list, so every `in` check scans it from the start. That is up to 300k string comparisons per file, for 300k files: O(files × manifest lines). This is where the hour goes. Your test folder was small, so you did not see it.
+    - **Fix:** build a set once in `load_manifest` with `return set(lines[1:])`. Then each lookup is a hash check, O(1).
+    - **Impact:** E, the whole run goes from O(n·m) to O(n + m). Converting to a set is not free. In Green Metrics Tool micro-benchmarks, one membership test on a 10,000,000-element list used ~6.9 J, and converting to a set first and testing once used ~10.5 J, about 50% more. So a set only pays off with many lookups. Here you do one lookup per file, around 300k, so building it once is clearly worth it. Duplicate lines in the manifest don't matter for a membership check, and the output stays sorted as before.
+
+    **Already good:** hidden folders are pruned in place with `dirs[:]`, so `os.walk` never enters them. Output is sorted, so runs are easy to diff. The header check fails early on a wrong manifest.
+
+    Fixed version:
+
+    ```python
+    #!/usr/bin/env python3
+    """check_backup.py - list files in SRC that are missing from the backup manifest."""
+    import argparse
+    import os
+    import sys
+
+    MANIFEST_HEADER = "#manifest v2"
+
+
+    def load_manifest(path):
+        with open(path, encoding="utf-8") as f:
+            lines = [l.rstrip("\n") for l in f]
+        if not lines or lines[0] != MANIFEST_HEADER:
+            sys.exit("unsupported manifest format")
+        # One lookup per file follows, so build the set once.
+        return set(lines[1:])
+
+
+    def find_missing(src, backed_up, skip_hidden=True):
+        missing = []
+        for root, dirs, files in os.walk(src):
+            if skip_hidden:
+                dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for name in files:
+                if skip_hidden and name.startswith("."):
+                    continue
+                rel = os.path.relpath(os.path.join(root, name), src)
+                if rel not in backed_up:
+                    missing.append(rel)
+        return missing
+
+
+    def main(argv=None):
+        p = argparse.ArgumentParser(description="Check a folder against a backup manifest")
+        p.add_argument("src")
+        p.add_argument("manifest")
+        p.add_argument("--include-hidden", action="store_true")
+        args = p.parse_args(argv)
+
+        backed_up = load_manifest(args.manifest)
+        missing = find_missing(args.src, backed_up, skip_hidden=not args.include_hidden)
+        for rel in sorted(missing):
+            print(rel)
+        print(f"{len(missing)} files missing from backup", file=sys.stderr)
+        sys.exit(1 if missing else 0)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+verify:
+  module: true
+  test: |
+    import os, tempfile
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "src")
+        os.makedirs(src)
+        for i in range(256):
+            open(os.path.join(src, f"f{i:03d}.dat"), "w").close()
+        man = os.path.join(d, "manifest.txt")
+        with open(man, "w") as f:
+            f.write("#manifest v2\n")
+        assert isinstance(load_manifest(man), set)
+        try:
+            import io, contextlib
+            with contextlib.redirect_stdout(io.StringIO()):
+                main([src, man])
+        except SystemExit as e:
+            assert e.code == 1, e.code
+        else:
+            raise AssertionError("expected SystemExit")
+  equivalence:
+    driver: |-
+      import os, tempfile
+      with tempfile.TemporaryDirectory() as d:
+          src = os.path.join(d, "src")
+          for rel in ["a.txt", "docs/b.txt", "docs/c.txt", ".hidden/x.txt",
+                      "img/.thumbs", "img/p1.jpg", "img/p2.jpg"]:
+              full = os.path.join(src, rel)
+              os.makedirs(os.path.dirname(full), exist_ok=True)
+              open(full, "w").close()
+          partial = os.path.join(d, "partial.txt")
+          with open(partial, "w") as f:
+              f.write("#manifest v2\na.txt\ndocs/b.txt\nimg/p1.jpg\nimg/p1.jpg\n")
+          full_man = os.path.join(d, "full.txt")
+          with open(full_man, "w") as f:
+              f.write("#manifest v2\na.txt\ndocs/b.txt\ndocs/c.txt\nimg/p1.jpg\nimg/p2.jpg\n")
+          for man in (partial, full_man):
+              for extra in ([], ["--include-hidden"]):
+                  print("run", os.path.basename(man), extra)
+                  try:
+                      main([src, man] + extra)
+                  except SystemExit as e:
+                      print("failed:", e.code != 0)

@@ -1,0 +1,132 @@
+id: gen-2-00202-refactor
+category: refactor
+language: python
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+messages:
+- role: user
+  content: |
+    hi, this function build the "Customers also looked at" carousel on our product detail page. it run on every product page view, so it is called a lot. the products table have around 55 columns, also long ones like description html, specs json and seo text for google. we use sqlite3 with the Row factory. can you optimize it a bit and clean up? the output must stay same because frontend use it.
+
+    ```python
+    import sqlite3
+
+    PLACEHOLDER_IMG = "/static/img/no-image.png"
+
+
+    def format_price(cents, currency):
+        symbol = {"EUR": "€", "USD": "$", "GBP": "£"}.get(currency, currency + " ")
+        return f"{symbol}{cents / 100:.2f}"
+
+
+    def related_products(conn, product_id, limit=8):
+        """Carousel 'Customers also looked at' on the product detail page."""
+        cur = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,))
+        current = cur.fetchone()
+        if current is None:
+            return []
+
+        cur = conn.execute(
+            """
+            SELECT * FROM products
+            WHERE category_id = ?
+              AND id != ?
+              AND is_active = 1
+              AND stock_qty > 0
+            ORDER BY sales_rank
+            LIMIT ?
+            """,
+            (current["category_id"], product_id, limit),
+        )
+
+        items = []
+        for row in cur.fetchall():
+            items.append({
+                "id": row["id"],
+                "name": row["name"],
+                "url": "/p/" + row["slug"],
+                "price": format_price(row["price_cents"], row["currency"]),
+                "image": row["thumb_url"] or PLACEHOLDER_IMG,
+                "rating": round(row["rating_avg"] or 0, 1),
+            })
+        return items
+    ```
+- role: assistant
+  content: |
+    ```python
+    import sqlite3
+
+    PLACEHOLDER_IMG = "/static/img/no-image.png"
+
+    CAROUSEL_COLUMNS = "id, name, slug, price_cents, currency, thumb_url, rating_avg"
+
+
+    def format_price(cents, currency):
+        symbol = {"EUR": "€", "USD": "$", "GBP": "£"}.get(currency, currency + " ")
+        return f"{symbol}{cents / 100:.2f}"
+
+
+    def related_products(conn, product_id, limit=8):
+        """Carousel 'Customers also looked at' on the product detail page."""
+        current = conn.execute(
+            "SELECT category_id FROM products WHERE id = ?", (product_id,)
+        ).fetchone()
+        if current is None:
+            return []
+
+        rows = conn.execute(
+            f"""
+            SELECT {CAROUSEL_COLUMNS}
+            FROM products
+            WHERE category_id = ?
+              AND id != ?
+              AND is_active = 1
+              AND stock_qty > 0
+            ORDER BY sales_rank
+            LIMIT ?
+            """,
+            (current["category_id"], product_id, limit),
+        ).fetchall()
+
+        return [
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "url": "/p/" + row["slug"],
+                "price": format_price(row["price_cents"], row["currency"]),
+                "image": row["thumb_url"] or PLACEHOLDER_IMG,
+                "rating": round(row["rating_avg"] or 0, 1),
+            }
+            for row in rows
+        ]
+    ```
+
+    **Green Notes**
+    - **Select only the needed columns** (reduces E, M): the carousel uses 7 of about 55 columns. With `SELECT *`, every page view read and copied the description HTML, specs JSON and SEO text of up to 8 products, and then threw them away. In Green Metrics Tool micro-benchmarks on PostgreSQL, reading 500 rows from a 52-column products table with large text columns used about 5.5× less CPU energy when the query named the 10 needed columns instead of `SELECT *`. SQLite is a different engine, but the reason is the same: fewer bytes read and copied per row. The saving grows with the size of the columns you skip.
+    - **Category lookup:** the first query only needs `category_id`, so it no longer loads the whole product row with its long text columns.
+    - The output is the same: same keys, same order, same values. `CAROUSEL_COLUMNS` is a fixed constant, not user input, so the f-string is safe. All values still go through `?` parameters. A side effect: new wide columns added to `products` later won't slow down this query.
+verify:
+  equivalence:
+    driver: |-
+      import sqlite3
+      conn = sqlite3.connect(":memory:")
+      conn.row_factory = sqlite3.Row
+      conn.execute("""CREATE TABLE products (
+          id INTEGER PRIMARY KEY, sku TEXT, name TEXT, slug TEXT, category_id INTEGER,
+          price_cents INTEGER, currency TEXT, thumb_url TEXT, rating_avg REAL,
+          sales_rank INTEGER, stock_qty INTEGER, is_active INTEGER,
+          description_html TEXT, specs_json TEXT, seo_text TEXT)""")
+      rows = []
+      for i in range(1, 41):
+          rows.append((i, f"SKU{i:04d}", f"Product {i}", f"product-{i}", i % 3,
+                       999 + i * 50, ["EUR", "USD", "GBP", "CHF"][i % 4],
+                       None if i % 5 == 0 else f"/img/{i}.jpg",
+                       None if i % 7 == 0 else 3.0 + (i % 20) / 10,
+                       (i * 37) % 41, i % 4, 0 if i % 9 == 0 else 1,
+                       "<p>" + "x" * 2000 + "</p>", "{}", "seo " * 100))
+      conn.executemany("INSERT INTO products VALUES (" + ",".join("?" * 15) + ")", rows)
+      for pid in (1, 2, 3, 10, 999):
+          print(pid, related_products(conn, pid))
+      print(related_products(conn, 4, limit=3))

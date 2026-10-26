@@ -1,0 +1,104 @@
+id: gen-12764612-00262-multi-turn
+category: multi-turn
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    hello, we have image classifier api (pytorch, fastapi) and gitlab build this image every push. its very big and slow, can you make it better? sorry my english
+
+    ```dockerfile
+    FROM python:3.12
+
+    RUN apt-get update && apt-get install -y build-essential git curl vim htop
+
+    WORKDIR /app
+    COPY . .
+
+    RUN pip install -r requirements.txt
+    RUN pip install pytest black mypy ipython
+
+    EXPOSE 8000
+    CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ```
+
+    requirements.txt:
+    ```text
+    torch
+    torchvision
+    fastapi
+    uvicorn
+    pillow
+    python-multipart
+    ```
+- role: assistant
+  content: |
+    ```dockerfile
+    FROM python:3.12-slim
+
+    WORKDIR /app
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY app/ ./app/
+
+    EXPOSE 8000
+    CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ```
+
+    I assumed your code is in `app/`. Change the last `COPY` if model files live somewhere else.
+
+    **Green Notes**
+    - **Slim base image** (reduces E, M): `python:3.12-slim` instead of the full image. All your packages have prebuilt wheels, so `build-essential` is not needed.
+    - **Runtime dependencies only** (reduces E, M): `git`, `vim`, `htop`, `pytest`, `black`, `mypy` and `ipython` are removed. Run tests and linters in a separate CI job, not inside the production image.
+    - **Dependency layer first** (reduces E): `requirements.txt` is copied and installed before the source code. A code change in a push no longer reinstalls torch.
+    - **`--no-cache-dir`** keeps the pip download cache out of the image.
+
+    In Green Metrics Tool micro-benchmarks on a small Flask app, building the slim version used about 7× less energy than the full image with dev tools. Serving requests cost the same. So the saving is in every build, pull and stored copy, which fits CI on every push.
+- role: user
+  content: |
+    thanks! but now build fail. one line in our real requirements is `git+https://github.com/ourcompany/imgprep.git@v1.4` and it say git not found. maybe I put back the big image, is faster for me
+
+    I have deadline today
+- role: assistant
+  content: |
+    No need for the big image. Only the install step needs `git`, so put it in a build stage. The final image stays slim and has no `git`.
+
+    ```dockerfile
+    FROM python:3.12-slim AS builder
+
+    RUN apt-get update \
+        && apt-get install -y --no-install-recommends git \
+        && rm -rf /var/lib/apt/lists/*
+
+    WORKDIR /app
+    COPY requirements.txt .
+    RUN python -m venv /opt/venv \
+        && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
+
+
+    FROM python:3.12-slim
+
+    ENV PATH="/opt/venv/bin:$PATH"
+    COPY --from=builder /opt/venv /opt/venv
+
+    WORKDIR /app
+    COPY app/ ./app/
+
+    EXPOSE 8000
+    CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ```
+
+    Your `requirements.txt` does not change. Same `docker build` command in GitLab.
+
+    **Green Notes**
+    - **Build tools only in the build stage** (reduces E, M): `git` is installed in `builder` and not copied to the final image. The runtime image holds Python, the venv and your code.
+    - **Dependency layer first** is kept: the venv is rebuilt only when `requirements.txt` changes.
+
+    If `imgprep` needs a compiler, add `build-essential` to the `apt-get install` line in `builder` only. Do not add it to the final stage.
+verify:
+  static_only: Dockerfile build needs Docker, network and PyTorch packages

@@ -1,0 +1,149 @@
+id: gen-2-00107-refactor
+category: refactor
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    hi, this script is our perf gate in the nightly CI. it load the latencies from the k6 load test (around 30M samples, int64 microseconds, -1 when request timed out) and then check p50/p95/p99 against the baseline. the profiler say almost all the job time is in bucketize. can you make it faster? we can add packages to the CI image, numba is ok if it help.
+
+    ```python
+    import argparse
+    import json
+    import sys
+
+    import numpy as np
+
+    STEP_US = 50
+    N_BUCKETS = 400  # 0..20 ms, last bucket = overflow
+
+
+    def bucketize(samples, step_us, n_buckets):
+        counts = [0] * (n_buckets + 1)
+        for s in samples:
+            if s < 0:          # -1 = request timed out
+                continue
+            idx = int(s // step_us)
+            if idx > n_buckets:
+                idx = n_buckets
+            counts[idx] += 1
+        return counts
+
+
+    def percentile(counts, total, q, step_us):
+        target = q * total
+        cum = 0
+        for i, c in enumerate(counts):
+            cum += c
+            if cum >= target:
+                return (i + 1) * step_us
+
+
+    def main():
+        p = argparse.ArgumentParser()
+        p.add_argument("latencies")
+        p.add_argument("baseline")
+        p.add_argument("--tolerance", type=float, default=0.10)
+        args = p.parse_args()
+
+        samples = np.load(args.latencies)
+        counts = bucketize(samples, STEP_US, N_BUCKETS)
+        total = len(samples)
+
+        with open(args.baseline) as f:
+            baseline = json.load(f)
+
+        failed = False
+        for name, q in (("p50", 0.50), ("p95", 0.95), ("p99", 0.99)):
+            value = percentile(counts, total, q, STEP_US)
+            limit = baseline[name] * (1 + args.tolerance)
+            status = "OK" if value <= limit else "REGRESSION"
+            print(f"{name}: {value} us (baseline {baseline[name]} us, limit {limit:.0f}) {status}")
+            if value > limit:
+                failed = True
+
+        sys.exit(1 if failed else 0)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    ```python
+    import argparse
+    import json
+    import sys
+
+    import numpy as np
+    from numba import njit
+
+    STEP_US = 50
+    N_BUCKETS = 400  # 0..20 ms, last bucket = overflow
+
+
+    @njit
+    def bucketize(samples, step_us, n_buckets):
+        counts = np.zeros(n_buckets + 1, dtype=np.int64)
+        for i in range(samples.shape[0]):
+            s = samples[i]
+            if s < 0:          # -1 = request timed out
+                continue
+            idx = int(s // step_us)
+            if idx > n_buckets:
+                idx = n_buckets
+            counts[idx] += 1
+        return counts
+
+
+    def percentile(counts, total, q, step_us):
+        target = q * total
+        cum = 0
+        for i, c in enumerate(counts):
+            cum += c
+            if cum >= target:
+                return (i + 1) * step_us
+
+
+    def main():
+        p = argparse.ArgumentParser()
+        p.add_argument("latencies")
+        p.add_argument("baseline")
+        p.add_argument("--tolerance", type=float, default=0.10)
+        args = p.parse_args()
+
+        samples = np.load(args.latencies)
+        counts = bucketize(samples, STEP_US, N_BUCKETS)
+        total = int(counts.sum())  # timeouts are not in the buckets
+
+        with open(args.baseline) as f:
+            baseline = json.load(f)
+
+        failed = False
+        for name, q in (("p50", 0.50), ("p95", 0.95), ("p99", 0.99)):
+            value = percentile(counts, total, q, STEP_US)
+            limit = baseline[name] * (1 + args.tolerance)
+            status = "OK" if value <= limit else "REGRESSION"
+            print(f"{name}: {value} us (baseline {baseline[name]} us, limit {limit:.0f}) {status}")
+            if value > limit:
+                failed = True
+
+        sys.exit(1 if failed else 0)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **JIT-compile the hot loop with Numba** (reduces E): `bucketize` runs once per sample. In pure Python, every iteration boxes a numpy scalar, converts it and updates a list. `@njit` compiles the loop to machine code and writes into a numpy array. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples used ~40 J in a pure Python loop and ~9.5 J with Numba `@njit`, about 4× less. This is the same kind of CPU-bound numeric loop, and it runs every night.
+    - **Compile cost**: Numba compiles `bucketize` on the first call of each CI run. That is a fixed cost per run and small next to a loop over tens of millions of samples. Add `numba` to the CI image requirements.
+
+    **Bug fixed:** `total` was `len(samples)`, so it counted timeouts that never go into a bucket. With enough timeouts, the cumulative count never reached `q * total`. `percentile` then returned `None` and `value <= limit` crashed with a `TypeError`. Now `total` is the number of bucketed samples. The percentiles now cover completed requests only. That matches what the loop already did when it skipped the `-1` values.
+
+    Bucket counts are the same as before. `counts` is now an `int64` numpy array instead of a list, and `percentile` works with it unchanged. Numba compiles one version per input dtype, so keep the export as `int64`.
+verify:
+  static_only: needs numba, which is not in stdlib + numpy

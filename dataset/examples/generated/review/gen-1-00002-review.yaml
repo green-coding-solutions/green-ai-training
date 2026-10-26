@@ -1,0 +1,108 @@
+id: gen-1-00002-review
+category: review
+language: bash
+patterns:
+- bash-builtins
+- compress-transmitted
+facts:
+- F-BASH-SUBPROC
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    hello, can you please look at my script and tell me what is wrong or what can be better? its for our model server (image classification API). cron start it every 5 minutes. it make a short summary in syslog and then send the request log to our collector, so the data team can analyse it. the log have about 50k lines every time, format is `2026-10-25T10:00:01Z resnet50 200 34` (time, model, http status, latency in ms). the log file is rotated by other job every 5 min.
+
+    ```bash
+    #!/bin/bash
+    LOG=/var/log/infer/requests.log
+    TMP=/tmp/infer_report
+    TOKEN="tok_7f3a91c2d8e44b10"
+
+    total=0; err=0; sum_ms=0; max_ms=0
+    declare -A count
+
+    while read line; do
+        model=$(echo $line | cut -d' ' -f2)
+        status=$(echo $line | cut -d' ' -f3)
+        ms=$(echo $line | cut -d' ' -f4)
+        total=$(expr $total + 1)
+        sum_ms=$(expr $sum_ms + $ms)
+        if [ $status != "200" ]; then
+            err=$(expr $err + 1)
+        fi
+        if [ $ms -gt $max_ms ]; then
+            max_ms=$ms
+        fi
+        count[$model]=$(expr ${count[$model]:-0} + 1)
+    done < $LOG
+
+    echo "requests: $total errors: $err avg_ms: $(expr $sum_ms / $total) max_ms: $max_ms" | logger -t infer-report
+    for m in "${!count[@]}"; do
+        echo "$m ${count[$m]}" | logger -t infer-report
+    done
+
+    xz -9e -c $LOG > $TMP.xz
+    curl -s -H "Authorization: Bearer $TOKEN" --data-binary @$TMP.xz https://collector.example.com/upload
+    rm $TMP.xz
+    ```
+- role: assistant
+  content: |
+    **Workload:** AI/ML (inference service, cron job every 5 minutes)
+
+    #### [Security] Token in the script, predictable temp file
+    - **Where:** `TOKEN="tok_..."`, `-H "Authorization: Bearer $TOKEN"`, `TMP=/tmp/infer_report`
+    - **Issue:** the token is stored in the script (and in git, if the script is there). On the `curl` command line it is also visible to other users in `ps`. A fixed name in `/tmp` can be hijacked with a symlink.
+    - **Fix:** read the token from the environment (or a root-only file), pass the header on stdin, and use `mktemp`. Rotate the token you already published.
+
+    #### [Bug] Crashes or wrong numbers on empty or odd lines
+    - **Where:** `expr $sum_ms / $total`, `[ $status != "200" ]`, `echo $line`
+    - **Issue:** if the log is empty, `total` is 0 and `expr` fails with division by zero. A line with a missing field makes `[` or `expr` fail, and the counters go wrong. Unquoted `$line` is also split and glob-expanded.
+    - **Fix:** the one-pass `awk` below skips lines without a numeric latency and prints zeros for an empty log.
+
+    #### [High] Several processes started for every log line
+    - **Where:** the `while read` loop with `$(echo | cut)` and `$(expr)`
+    - **Issue:** every command substitution starts a subshell, and `cut` and `expr` are separate programs. With 50k lines, that is hundreds of thousands of process starts every 5 minutes, only to split a line into 3 fields.
+    - **Fix:** do all of it in one `awk` pass (see below). `read -r` with `$(( ))` and `case` would also work, but `awk` is shorter and faster.
+    - **Impact:** reduces E on every run, and the job finishes much sooner. In Green Metrics Tool micro-benchmarks on a 20,000-line access log, a loop with `echo | cut` and `expr` per field used over 1000× more CPU energy than one `awk` pass with identical output.
+
+    #### [Medium] `xz -9e` for data that is compressed every 5 minutes
+    - **Where:** `xz -9e -c $LOG > $TMP.xz`
+    - **Issue:** `xz` at the highest level is very expensive for CPU, and this job compresses new data all day. A fast codec is the better fit for data that is compressed often.
+    - **Fix:** `zstd -3`.
+    - **Impact:** reduces E per run. In Green Metrics Tool micro-benchmarks compressing 100 MB of text, `xz` used about 29× the energy of `zstd` at its default level. These numbers compare energy only. `xz` gives smaller files, which would matter for a slow link or long-term storage, not for a 5-minute upload.
+
+    ```bash
+    #!/bin/bash
+    set -euo pipefail
+
+    LOG=/var/log/infer/requests.log
+    : "${INFER_TOKEN:?set INFER_TOKEN in the cron environment}"
+    TMP=$(mktemp)
+    trap 'rm -f "$TMP"' EXIT
+
+    awk '
+    $4 ~ /^[0-9]+$/ {
+        total++
+        if ($3 != "200") err++
+        sum += $4
+        if ($4 > max) max = $4
+        count[$2]++
+    }
+    END {
+        printf "requests: %d errors: %d avg_ms: %d max_ms: %d\n", total, err, (total ? sum / total : 0), max
+        for (m in count) print m, count[m]
+    }' "$LOG" | logger -t infer-report
+
+    zstd -3 -q -c "$LOG" > "$TMP"
+    printf 'Authorization: Bearer %s\n' "$INFER_TOKEN" |
+        curl -sf -H @- -H 'Content-Encoding: zstd' --data-binary @"$TMP" https://collector.example.com/upload
+    ```
+
+    Differences to check:
+    - Lines without a numeric latency are now skipped instead of breaking the counters.
+    - The collector must accept zstd. If it only reads `xz`, ask the data team to change it, or use `gzip -6` as a middle way.
+    - The per-model lines still come out in no fixed order, like before.
+
+    **Already good:** the summary is written with `logger`, and the upload sends the data compressed.
+verify:
+  static_only: script reads /var/log, needs curl, logger, zstd and a network collector

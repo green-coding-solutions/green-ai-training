@@ -1,0 +1,50 @@
+id: gen-1-00110-no-change
+category: no-change
+language: python
+patterns:
+- none
+- select-columns
+facts:
+- F-PG-COLUMNS
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    Nightly products -> warehouse sync. products has 52 cols on the source side. Anything to trim? Diff only.
+
+    ```python
+    import psycopg
+
+    COLUMNS = (
+        "id", "sku", "name", "category_id", "price_cents",
+        "currency", "stock", "active", "updated_at",
+    )
+    BATCH = 5000
+
+
+    def sync_products(src_dsn, wh_dsn, since):
+        cols = ", ".join(COLUMNS)
+        with psycopg.connect(src_dsn) as src, psycopg.connect(wh_dsn) as wh:
+            with src.cursor(name="products_sync") as cur, wh.cursor() as out:
+                cur.itersize = BATCH
+                cur.execute(
+                    f"SELECT {cols} FROM products WHERE updated_at >= %s ORDER BY id",
+                    (since,),
+                )
+                out.execute("TRUNCATE stg_products")
+                with out.copy(f"COPY stg_products ({cols}) FROM STDIN") as copy:
+                    for row in cur:
+                        copy.write_row(row)
+                out.execute("CALL merge_products()")
+    ```
+- role: assistant
+  content: |
+    No diff. This is already the efficient version.
+
+    - **Column list:** you read 9 of 52 columns and skip the wide ones (descriptions, specs and so on). In Green Metrics Tool micro-benchmarks on a 52-column table, reading 2,500 rows with 8 columns used ~58 J. `SELECT *` on the same rows used ~465 J, about 8× more. The cost follows the data each column carries, and you already avoid that.
+    - **Load path:** `COPY` into a staging table is the cheap way to write many rows. In the same benchmarks, with 5,000-row batches, `COPY` used about 22× less energy than one INSERT per row.
+    - **Streaming:** the named cursor with `itersize` keeps memory flat, whatever the size of the change set.
+
+    Leave it as is.
+verify:
+  static_only: needs a running PostgreSQL server and psycopg

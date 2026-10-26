@@ -1,0 +1,119 @@
+id: gen-2-00119-refactor
+category: refactor
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    hi, this is from our MD analysis scripts. we call radial_histogram for every frame of the trajectory, each frame have some milion particles. profiler say almost all the time is inside this function. can you optimize it a bit and clean up? also one time it crashed with IndexError on a frame and i dont understand why, the check `r <= r_max` should protect it no?
+
+    ```python
+    import math
+    import random
+
+    def radial_histogram(positions, center, r_max, n_bins):
+        """Count particles in spherical shells around center."""
+        dr = r_max / n_bins
+        counts = [0] * n_bins
+        cx, cy, cz = center
+        for x, y, z in positions:
+            dx = x - cx
+            dy = y - cy
+            dz = z - cz
+            r = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if r <= r_max:
+                counts[int(r / dr)] += 1
+        return counts
+
+    def shell_density(counts, r_max):
+        n_bins = len(counts)
+        dr = r_max / n_bins
+        dens = []
+        for i, c in enumerate(counts):
+            r_in = i * dr
+            r_out = r_in + dr
+            vol = 4.0 / 3.0 * math.pi * (r_out ** 3 - r_in ** 3)
+            dens.append(c / vol)
+        return dens
+
+    def random_cloud(n, sigma, seed=0):
+        rng = random.Random(seed)
+        return [(rng.gauss(0, sigma), rng.gauss(0, sigma), rng.gauss(0, sigma)) for _ in range(n)]
+
+    if __name__ == "__main__":
+        pts = random_cloud(2_000_000, 1.5)
+        counts = radial_histogram(pts, (0.0, 0.0, 0.0), 6.0, 60)
+        for i, d in enumerate(shell_density(counts, 6.0)[:5]):
+            print(i, round(d, 3))
+    ```
+- role: assistant
+  content: |
+    ```python
+    import math
+    import random
+
+    def radial_histogram(positions, center, r_max, n_bins):
+        """Count particles in spherical shells around center."""
+        dr = r_max / n_bins
+        counts = [0] * n_bins
+        last = n_bins - 1
+        cx, cy, cz = center
+        sqrt = math.sqrt  # one lookup per call instead of one per particle
+        for x, y, z in positions:
+            dx = x - cx
+            dy = y - cy
+            dz = z - cz
+            r = sqrt(dx * dx + dy * dy + dz * dz)
+            if r <= r_max:
+                i = int(r / dr)
+                # r == r_max (or rounding in r / dr) gives i == n_bins
+                counts[i if i < n_bins else last] += 1
+        return counts
+
+    def shell_density(counts, r_max):
+        n_bins = len(counts)
+        dr = r_max / n_bins
+        dens = []
+        for i, c in enumerate(counts):
+            r_in = i * dr
+            r_out = r_in + dr
+            vol = 4.0 / 3.0 * math.pi * (r_out ** 3 - r_in ** 3)
+            dens.append(c / vol)
+        return dens
+
+    def random_cloud(n, sigma, seed=0):
+        rng = random.Random(seed)
+        return [(rng.gauss(0, sigma), rng.gauss(0, sigma), rng.gauss(0, sigma)) for _ in range(n)]
+
+    if __name__ == "__main__":
+        pts = random_cloud(2_000_000, 1.5)
+        counts = radial_histogram(pts, (0.0, 0.0, 0.0), 6.0, 60)
+        for i, d in enumerate(shell_density(counts, 6.0)[:5]):
+            print(i, round(d, 3))
+    ```
+
+    **Green Notes**
+    - **Local alias for `math.sqrt`** (reduces E): before, the loop looked up `sqrt` on the `math` module once for every particle. Now it does that once per call. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local variable before a 10,000,000-iteration loop saved about 4-5%. So this is a small gain, not a big speedup.
+    - **Bug fixed, the IndexError:** `r <= r_max` lets through a particle at exactly `r_max`. Then `int(r / dr)` is `n_bins`, which is one past the end of the list. Float rounding in `r / dr` can do the same thing for `r` just below `r_max`. These particles now go into the last bin, which is what `<= r_max` meant. Counts for every other particle stay the same.
+    - `shell_density` and `random_cloud` are unchanged. `shell_density` runs once per bin, not once per particle, so it is not worth touching.
+verify:
+  module: true
+  test: |
+    c = radial_histogram([(6.0, 0.0, 0.0), (7.0, 0.0, 0.0), (0.05, 0.0, 0.0)], (0.0, 0.0, 0.0), 6.0, 60)
+    assert len(c) == 60
+    assert c[59] == 1
+    assert c[0] == 1
+    assert sum(c) == 2
+    c2 = radial_histogram([(1.0, 1.0, 1.0)], (1.0, 1.0, 1.0), 2.0, 4)
+    assert c2 == [1, 0, 0, 0]
+  equivalence:
+    driver: |-
+      pts = random_cloud(20000, 1.5, seed=3)
+      c = radial_histogram(pts, (0.1, -0.2, 0.0), 6.0, 60)
+      print(c)
+      print([round(d, 6) for d in shell_density(c, 6.0)])
+      c = radial_histogram(pts, (0.0, 0.0, 0.0), 3.0, 30)
+      print(c)

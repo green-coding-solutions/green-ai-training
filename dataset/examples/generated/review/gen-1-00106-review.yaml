@@ -1,0 +1,75 @@
+id: gen-1-00106-review
+category: review
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    review this dockerfile for our orders api
+
+    ```dockerfile
+    FROM python:3.12
+
+    RUN apt-get update && apt-get install -y build-essential git curl vim htop
+
+    WORKDIR /app
+    COPY . .
+
+    RUN pip install -r requirements.txt
+    RUN pip install pytest black mypy ipython
+
+    ENV DATABASE_URL=postgresql://orders:hunter2@db:5432/orders
+    ENV LOG_LEVEL=info
+
+    EXPOSE 8000
+    CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (REST API, image rebuilt in CI)
+
+    #### [Security] Database password baked into the image
+    - **Where:** `ENV DATABASE_URL=postgresql://orders:hunter2@...`
+    - **Issue:** anyone who can pull the image can read the password with `docker inspect` or `docker history`. It also stays in every stored copy of the image.
+    - **Fix:** remove the line. Pass `DATABASE_URL` at runtime (orchestrator secret or env file), and rotate this password.
+
+    #### [High] Full base image with build and dev tools
+    - **Where:** `FROM python:3.12`, the `apt-get install` line, `pip install pytest black mypy ipython`
+    - **Issue:** the full base image plus compilers, `git`, `vim`, `htop` and test tools are not needed to serve the API. They make every build, pull and stored copy larger.
+    - **Fix:** use `python:3.12-slim` and install only runtime dependencies. Keep test and lint tools in a separate requirements file or a separate CI stage.
+    - **Impact:** reduces E for every build, pull and registry copy. In Green Metrics Tool micro-benchmarks, building a small Flask app image on a slim base with runtime dependencies only used about 7× less energy than the full base with dev tools. Serving requests afterwards cost the same. The saving repeats with every CI build.
+
+    #### [Medium] Source copied before dependencies are installed
+    - **Where:** `COPY . .` before `pip install`
+    - **Issue:** any code change invalidates the layer cache, so all dependencies are downloaded and installed again on every build.
+    - **Fix:** copy `requirements.txt` first, install, then copy the source.
+
+    #### [Low] pip cache kept in the image
+    - **Where:** `pip install -r requirements.txt`
+    - **Fix:** add `--no-cache-dir`.
+
+    ```dockerfile
+    FROM python:3.12-slim
+
+    WORKDIR /app
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY . .
+
+    ENV LOG_LEVEL=info
+
+    EXPOSE 8000
+    CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ```
+
+    - If a package in `requirements.txt` has no wheel and needs a compiler, install `build-essential` in a build stage and copy the installed packages into the slim stage. Check this with a test build first.
+    - Add a `.dockerignore` with `.git`, `.env` and `__pycache__`, so `COPY . .` does not pull them into the image.
+
+    **Already good:** `LOG_LEVEL` as an env default, and the exec-form `CMD`.
+verify:
+  static_only: Dockerfile review, needs docker build and registry access

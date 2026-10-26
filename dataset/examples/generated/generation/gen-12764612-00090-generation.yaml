@@ -1,0 +1,52 @@
+id: gen-12764612-00090-generation
+category: generation
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    diff only, no explanation. Need `parse_frame(line)` for our LoRa gateway (Pi, reads the radio module over UART, ~50 frames/s). Frame lines look like:
+
+    `RX dev=3F2A rssi=-87 snr=7.5 data=0A1B2C`
+
+    dev = 4 hex chars, rssi = int, snr = float (can be negative), data = hex bytes, can be empty. Return a dict with dev, rssi, snr and data as bytes. Return None for anything else (the module also prints boot banners and `ERR` lines).
+- role: assistant
+  content: |
+    ```python
+    import re
+
+    _FRAME_RE = re.compile(
+        r"RX dev=(?P<dev>[0-9A-F]{4}) "
+        r"rssi=(?P<rssi>-?\d+) "
+        r"snr=(?P<snr>-?\d+(?:\.\d+)?) "
+        r"data=(?P<data>(?:[0-9A-F]{2})*)"
+    )
+
+    def parse_frame(line: str) -> dict | None:
+        m = _FRAME_RE.fullmatch(line.strip())
+        if m is None:
+            return None
+        return {
+            "dev": m["dev"],
+            "rssi": int(m["rssi"]),
+            "snr": float(m["snr"]),
+            "data": bytes.fromhex(m["data"]),
+        }
+    ```
+
+    **Green Notes**
+    - **Compile the regex once at module level** (reduces E): the pattern is fixed and `parse_frame` runs for every frame. In Green Metrics Tool micro-benchmarks, a precompiled pattern used about 18% less energy than inline `re.match(pattern, s)`. The gain is small because Python's `re` caches compiled patterns. It is also free here, since the pattern is a constant.
+    - **`fullmatch` with a strict hex-pair group** rejects boot banners and truncated frames in one pass. It also guarantees `bytes.fromhex` never sees an odd-length string.
+verify:
+  module: false
+  test: |-
+    r = parse_frame("RX dev=3F2A rssi=-87 snr=7.5 data=0A1B2C\n")
+    assert r == {"dev": "3F2A", "rssi": -87, "snr": 7.5, "data": b"\x0a\x1b\x2c"}
+    assert parse_frame("RX dev=00FF rssi=-100 snr=-3 data=")["data"] == b""
+    assert parse_frame("RX dev=00FF rssi=-100 snr=-3 data=ABC") is None
+    assert parse_frame("ERR timeout") is None
+    assert parse_frame("LoRa module v1.2 ready") is None
+    assert parse_frame("RX dev=3F2 rssi=-87 snr=7.5 data=0A") is None

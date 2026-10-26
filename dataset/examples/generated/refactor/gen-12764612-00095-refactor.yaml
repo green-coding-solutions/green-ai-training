@@ -1,0 +1,98 @@
+id: gen-12764612-00095-refactor
+category: refactor
+language: javascript
+patterns:
+- dom-size
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    hi, we have a web page on our IoT gateway for the technicians, it show all the sensor devices that are paired (now around 6000, it grow every month). the page is very slow to open on the old tablet and sometime freeze. can you make the code more better? sorry for my english
+
+    ```javascript
+    const tableBody = document.getElementById('device-body');
+
+    async function loadDevices() {
+      const res = await fetch('/api/gateway/devices');
+      const devices = await res.json();
+      document.getElementById('count').textContent = devices.length + ' devices';
+
+      devices.forEach(function (d) {
+        const tr = document.createElement('tr');
+        tr.className = 'device-row';
+        const fields = [d.id, d.name, d.type, d.battery + '%', d.lastSeen, d.status];
+        fields.forEach(function (f) {
+          const td = document.createElement('td');
+          const wrap = document.createElement('div');
+          wrap.className = 'cell';
+          const inner = document.createElement('span');
+          inner.className = 'cell-text';
+          inner.textContent = f;
+          wrap.appendChild(inner);
+          td.appendChild(wrap);
+          tr.appendChild(td);
+        });
+        tableBody.appendChild(tr);
+      });
+    }
+
+    loadDevices();
+    ```
+- role: assistant
+  content: |
+    The page builds about 19 elements for every device and adds each row to the live table one by one. I changed it to show 100 devices per page and to build each page in a fragment. Please add `prev` and `next` buttons and a `page-info` element to your HTML.
+
+    ```javascript
+    const PAGE_SIZE = 100;
+    const tableBody = document.getElementById('device-body');
+    const pageInfo = document.getElementById('page-info');
+    const prevBtn = document.getElementById('prev');
+    const nextBtn = document.getElementById('next');
+
+    let devices = [];
+    let page = 0;
+
+    function renderPage() {
+      const start = page * PAGE_SIZE;
+      const fragment = document.createDocumentFragment();
+
+      for (const d of devices.slice(start, start + PAGE_SIZE)) {
+        const tr = document.createElement('tr');
+        tr.className = 'device-row';
+        for (const value of [d.id, d.name, d.type, d.battery + '%', d.lastSeen, d.status]) {
+          const td = document.createElement('td');
+          td.textContent = value;
+          tr.appendChild(td);
+        }
+        fragment.appendChild(tr);
+      }
+      tableBody.replaceChildren(fragment);
+
+      const pages = Math.max(1, Math.ceil(devices.length / PAGE_SIZE));
+      pageInfo.textContent = 'Page ' + (page + 1) + ' / ' + pages;
+      prevBtn.disabled = page === 0;
+      nextBtn.disabled = page >= pages - 1;
+    }
+
+    prevBtn.addEventListener('click', function () { page--; renderPage(); });
+    nextBtn.addEventListener('click', function () { page++; renderPage(); });
+
+    async function loadDevices() {
+      const res = await fetch('/api/gateway/devices');
+      devices = await res.json();
+      document.getElementById('count').textContent = devices.length + ' devices';
+      renderPage();
+    }
+
+    loadDevices();
+    ```
+
+    **Green Notes**
+    - **Paginate the table** (reduces E on the client): the DOM now holds at most 100 rows, not 6000, so the old tablet has far less to build, style and lay out. It also stays fast when the gateway grows to 20,000 devices. In Green Metrics Tool browser benchmarks, 30 page loads of a 10,000-row table with 14 elements per row used ~1036 J. The same data paginated to 100 rows per page as a plain table built in a `DocumentFragment` used ~457 J, about 56% less.
+    - **No wrapper elements** (reduces E): the `div` and `span` inside every cell are gone, so a row is 7 elements, not 19. Put the padding and font rules from `.cell` and `.cell-text` on `td` in your CSS.
+    - **One DOM update per page** (reduces E): rows are built in a `DocumentFragment` and swapped in with `replaceChildren`, so the table is updated once per page.
+
+    Behavior changes: the browser search (Ctrl+F) now finds only the current page. If technicians need to find a device by name, add a filter field that works on the `devices` array before `renderPage()`. The data is still fully loaded in one request, as before.
+verify:
+  static_only: needs a browser DOM (document, fetch), not available in plain Node

@@ -1,0 +1,85 @@
+id: gen-12764612-00269-generation
+category: generation
+language: python
+patterns:
+- keep-star-imports
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    i am new to python, first week in a small data team. This is the top of our etl_daily.py that a colleague wrote:
+
+    ```python
+    from csv import *
+    from pathlib import *
+
+    def load_day(path):
+        with open(path, newline="") as f:
+            return list(DictReader(f))
+    ```
+
+    I need to add a function `merge_daily(folder, out_file)` that puts all the .csv files of a folder into one csv file, with only one header line at the top. Files are named like 2024-05-01.csv, so sorted by name is the right order. Something in this file feels wrong to me but I dont know what. can you also tell me?
+- role: assistant
+  content: |
+    ```python
+    from csv import *
+    from pathlib import *
+
+    def merge_daily(folder, out_file):
+        out_path = Path(out_file).resolve()
+        files = sorted(Path(folder).glob("*.csv"))
+        header = None
+        rows = 0
+        with open(out_path, "w", newline="", encoding="utf-8") as out:
+            w = writer(out)
+            for f in files:
+                if f.resolve() == out_path:
+                    continue  # skip the output file on re-runs
+                with open(f, newline="", encoding="utf-8") as src:
+                    r = reader(src)
+                    first = next(r, None)
+                    if first is None:
+                        continue  # empty file
+                    if header is None:
+                        header = first
+                        w.writerow(header)
+                    elif first != header:
+                        raise ValueError(f"{f.name}: header differs from the first file")
+                    for row in r:
+                        w.writerow(row)
+                        rows += 1
+        return rows
+    ```
+
+    It reads one row at a time and writes it straight out, so memory stays flat however many days you merge. It returns the number of data rows written. If a file has a different header, it stops with an error instead of mixing columns. Keep `load_day` as it is.
+
+    About the top of your file: nothing is broken. The two star imports work. They are only a style question. With explicit imports (`from csv import reader, writer, DictReader`) a reader can see where a name comes from, and a star import can silently replace a name you defined yourself. That is why I called my variable `w` and not `writer`.
+
+    **Green Notes**
+    - **Star imports left as they are** (no measurable effect on E): in Green Metrics Tool micro-benchmarks, 1,000 Python process starts with `from sympy import *` used about the same energy as with `import sympy` (about 3103 J vs 3093 J). Changing them gives no energy gain, so change them only if you like the readability.
+verify:
+  test: |-
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "2024-05-02.csv"), "w", newline="") as f:
+            f.write("id,v\n3,c\n4,d\n")
+        with open(os.path.join(d, "2024-05-01.csv"), "w", newline="") as f:
+            f.write("id,v\n1,a\n2,b\n")
+        with open(os.path.join(d, "empty.csv"), "w") as f:
+            f.write("")
+        out = os.path.join(d, "merged.csv")
+        n = merge_daily(d, out)
+        assert n == 4, n
+        with open(out, newline="") as f:
+            got = list(reader(f))
+        assert got == [["id", "v"], ["1", "a"], ["2", "b"], ["3", "c"], ["4", "d"]], got
+        # re-run must not read its own output
+        assert merge_daily(d, out) == 4
+        with open(os.path.join(d, "2024-05-03.csv"), "w", newline="") as f:
+            f.write("id,x\n5,e\n")
+        try:
+            merge_daily(d, out)
+            raise AssertionError("expected ValueError")
+        except ValueError:
+            pass

@@ -1,0 +1,79 @@
+id: gen-2-00327-generation
+category: generation
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS
+messages:
+- role: user
+  content: |
+    I need an upload script for our field gateways (Raspberry Pi CM4 class, Cortex-A72, Raspberry Pi OS, bash 5). Setup:
+
+    - A daemon writes sensor readings as NDJSON to `/var/lib/gw/spool/`. It starts a new file every minute, named like `2026-10-25T14-03.ndjson`, about 200 KB each. The file for the current minute is still being written.
+    - The uplink is an LTE modem on a metered data plan. Some sites have bad coverage and lose the link for hours.
+    - Cron should run the script every 5 minutes and POST the finished files to `https://ingest.example.com/v1/batches`.
+    - Auth: bearer token from `/etc/gw/token`. Also send the header `X-Gateway-Id` with the content of `/etc/gw/id`.
+    - The ingest API accepts `Content-Type: application/x-ndjson` and `Content-Encoding` of `gzip`, `zstd` or `br`. A colleague says to use brotli because it compresses smallest.
+    - After a long outage, don't send one huge request. Max 30 files per POST.
+    - Delete files only after a 2xx response. If an upload fails, keep the files for the next run.
+    - Two runs must never overlap.
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # Upload finished sensor spool files to the ingest API. Cron: every 5 minutes.
+    set -euo pipefail
+
+    SPOOL_DIR='/var/lib/gw/spool'
+    INGEST_URL='https://ingest.example.com/v1/batches'
+    MAX_FILES=30
+
+    # Skip this run if the previous one is still uploading.
+    exec 9>/run/gw-upload.lock
+    flock -n 9 || exit 0
+
+    token="$(</etc/gw/token)"
+    gateway_id="$(</etc/gw/id)"
+    tmp="$(mktemp)"
+    trap 'rm -f -- "$tmp"' EXIT
+
+    # Finished files only: the daemon still writes the current minute's file.
+    # Sorted by name, so batches go out in time order.
+    mapfile -d '' files < <(find "$SPOOL_DIR" -maxdepth 1 -name '*.ndjson' -mmin +1 -print0 | sort -z)
+    (( ${#files[@]} )) || exit 0
+
+    for (( i = 0; i < ${#files[@]}; i += MAX_FILES )); do
+      batch=("${files[@]:i:MAX_FILES}")
+
+      # awk 1 adds a missing final newline, so lines from two files never merge.
+      awk 1 "${batch[@]}" | zstd -q -c > "$tmp"
+
+      # No word splitting in assignments, so the substitution needs no outer quotes.
+      status=$(curl -sS -o /dev/null -w '%{http_code}' \
+        --max-time 120 --retry 2 \
+        -H "Authorization: Bearer $token" \
+        -H "X-Gateway-Id: $gateway_id" \
+        -H 'Content-Type: application/x-ndjson' \
+        -H 'Content-Encoding: zstd' \
+        --data-binary "@$tmp" \
+        "$INGEST_URL") || status=000
+
+      if [[ $status == 2?? ]]; then
+        rm -f -- "${batch[@]}"
+      else
+        echo "upload failed (HTTP $status), keeping ${#batch[@]} files for the next run" >&2
+        exit 1
+      fi
+    done
+    ```
+
+    The script stops at the first failed batch. Older files are sent first, so the order on the server stays correct after an outage.
+
+    **Green Notes**
+    - **Compress transmitted data with a fast codec** (reduces network and E): NDJSON sensor readings are repetitive text and shrink a lot. The modem sends fewer bytes on the metered plan and spends less time transmitting. zstd at its default level keeps the CPU cost on the gateway low. In Green Metrics Tool benchmarks that compressed 100 MB of English text with CLI defaults, zstd used ~16 J and gzip ~67 J, so zstd used about 4× less. Decompressing on the ingest side is cheap too (zstd ~5.3 J per 100 MB).
+    - *Not applied:* brotli. The `brotli` CLI defaults to quality 11. In the same benchmarks it used ~3019 J on 100 MB, about 190× more than zstd. That is fine for static files you compress once, but not for data compressed every 5 minutes on a small ARM board. Those measurements compare energy, not file size. If data plan cost is your main limit, compare the output size of `zstd` and `brotli` on one day of your own spool files before you switch.
+    - **Fallback:** if a gateway image has no `zstd`, use `gzip -6` and `Content-Encoding: gzip`. It is still a moderate cost and the API accepts it.
+verify:
+  static_only: bash script needs zstd, curl, flock and a live ingest endpoint

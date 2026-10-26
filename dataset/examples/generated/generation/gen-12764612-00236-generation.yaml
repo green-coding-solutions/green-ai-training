@@ -1,0 +1,55 @@
+id: gen-12764612-00236-generation
+category: generation
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    helm values-preview.yaml for PR previews of our embedding-service chart (fastapi + sentence-transformers, redis cache, queue worker)
+- role: assistant
+  content: |
+    ```yaml
+    # values-preview.yaml: used only for per-PR preview releases
+    nameOverride: embedding-preview
+
+    replicaCount: 1
+
+    autoscaling:
+      enabled: false
+
+    resources:
+      requests:
+        cpu: 250m
+        memory: 1Gi
+      limits:
+        memory: 2Gi
+
+    # reviewers test the API, not the cache or the queue
+    redis:
+      enabled: false
+
+    worker:
+      enabled: false
+
+    podAnnotations:
+      preview/ttl: "48h"
+
+    ingress:
+      enabled: true
+      host: pr-{{ PR_NUMBER }}.preview.example.com
+    ```
+
+    Replace `{{ PR_NUMBER }}` in your pipeline, for example with `--set ingress.host=pr-$PR_NUMBER.preview.example.com`. The key names assume your chart exposes `redis.enabled` and `worker.enabled`, so adjust them to its values schema.
+
+    Run `helm uninstall` for the release when the PR closes or merges. Add a nightly job that removes releases whose `preview/ttl` has expired.
+
+    **Green Notes**
+    - **Minimize environments** (reduces E, M): one replica and no Redis or worker keeps each preview small. In Green Metrics Tool micro-benchmarks, an idle preview with 3 app replicas, Postgres, Redis and a polling worker used ~269 J CPU energy per 60 s, and 1 replica plus Postgres used ~262 J, only about 3% less. Idle services cost little per minute.
+    - **Tear down previews** (reduces E, M): the real saving is previews that no longer exist. Uninstalling on merge and expiring old ones removes all their hours, and frees the memory they reserve.
+
+    *Not applied:* scale-to-zero at night. It needs a scheduler or KEDA in your cluster, and a TTL cleanup already covers most of the idle hours.
+verify:
+  static_only: helm values file, needs a cluster and the chart

@@ -1,0 +1,81 @@
+id: gen-1-00205-estimate
+category: estimate
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    We run the landing page for our SaaS product on Flask. The feature cards, FAQ answers and testimonials come from a content file that marketing edits. On every page render we pass each text through this helper to get safe HTML with bold and inline code:
+
+    ```python
+    import html
+    import re
+
+    _BOLD = re.compile(r"\*\*(.+?)\*\*")
+    _CODE = re.compile(r"`([^`]+)`")
+
+    def render_inline(text: str) -> str:
+        out = html.escape(text)
+        out = _BOLD.sub(r"<strong>\1</strong>", out)
+        out = _CODE.sub(r"<code>\1</code>", out)
+        return out
+    ```
+
+    There are only a few dozen distinct texts on the page, and the page is rendered for every visitor. A colleague says we should wrap it in `functools.lru_cache`. Requirements: keep the output exactly the same, no extra dependencies, and no cache that can grow without limit.
+
+    How much energy would that save? I need a number for a short internal write-up.
+- role: assistant
+  content: |
+    I can't give you a trustworthy number for your page, but I can tell you the direction and how to get your own number.
+
+    A cache pays off when the same inputs come back again and again. That is your case: a few dozen distinct texts, rendered for every visitor. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations that drew from 200 distinct values used ~43 J uncached and ~4.7 J with `@functools.lru_cache`, about 9× less. That test measured a pure function with many repeated inputs. Your helper is similar, but the figure is not a prediction for your traffic.
+
+    Also keep in mind that `render_inline` is only a small part of a page render. Template rendering and the network stay the same, so the saving for the whole request is much smaller than the saving for this one function.
+
+    Your function is safe to cache. The output depends only on the text, and it returns an immutable `str`. Output stays identical:
+
+    ```python
+    import html
+    import re
+    from functools import lru_cache
+
+    _BOLD = re.compile(r"\*\*(.+?)\*\*")
+    _CODE = re.compile(r"`([^`]+)`")
+
+
+    @lru_cache(maxsize=256)
+    def render_inline(text: str) -> str:
+        out = html.escape(text)
+        out = _BOLD.sub(r"<strong>\1</strong>", out)
+        out = _CODE.sub(r"<code>\1</code>", out)
+        return out
+    ```
+
+    `maxsize=256` keeps memory bounded and is well above your few dozen texts. When marketing edits the file and you reload, old entries just fall out of the cache, because the text is the key.
+
+    Don't use this for text that is mostly unique, for example user comments. There the cache rarely hits and only adds overhead.
+
+    How to measure it for your write-up:
+
+    - Run the app under a realistic load and read `render_inline.cache_info()`. The hit rate shows whether the inputs really repeat.
+    - Time many renders with and without the decorator, using `time` or `perf stat` for a CPU-time proxy.
+    - For energy, run the same page-render scenario twice in a Green Metrics Tool usage scenario and compare.
+verify:
+  test: |
+    assert render_inline("**a** and `b` <i>") == "<strong>a</strong> and <code>b</code> &lt;i&gt;"
+    render_inline.cache_clear()
+    for _ in range(5):
+        render_inline("**x**")
+    info = render_inline.cache_info()
+    assert info.misses == 1 and info.hits == 4
+    assert info.maxsize == 256
+  equivalence:
+    driver: |-
+      import re, html
+      src_texts = ["**Fast** setup", "Use `pip install` <now>", "plain & simple", "**a** `b` **c**"]
+      for t in src_texts:
+          print(render_inline(t))
+          print(render_inline(t))

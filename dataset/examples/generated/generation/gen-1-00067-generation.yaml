@@ -1,0 +1,74 @@
+id: gen-1-00067-generation
+category: generation
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    hi, im new to python and not sure what im doing wrong. i want a small command line script where i give a number N and it tells me which starting number up to N has the longest collatz chain (the 3n+1 thing, halve if even, 3n+1 if odd, until it reaches 1). i tried it myself with normal loops and it works for 1000 but for 5 million i waited like 20 minutes and gave up. is my computer just slow? can you write it so it works with big N
+- role: assistant
+  content: |
+    Your computer is fine. The work is simply a very large number of tiny integer steps, and plain Python is slow at that. Compiling the hot loop with Numba fixes it.
+
+    ```python
+    import argparse
+
+    try:
+        from numba import njit
+    except ImportError:  # still runs without numba, just much slower
+        def njit(*args, **kwargs):
+            if args and callable(args[0]):
+                return args[0]
+            return lambda func: func
+
+
+    @njit(cache=True)
+    def longest_chain(limit):
+        """Return (start, length) of the longest Collatz chain for starts 2..limit."""
+        best_start = 1
+        best_len = 1
+        for start in range(2, limit + 1):
+            n = start
+            length = 1
+            while n != 1:
+                if n % 2 == 0:
+                    n //= 2
+                else:
+                    n = 3 * n + 1
+                length += 1
+            if length > best_len:
+                best_len = length
+                best_start = start
+        return best_start, best_len
+
+
+    def main():
+        parser = argparse.ArgumentParser(description="Find the longest Collatz chain up to N.")
+        parser.add_argument("limit", type=int, nargs="?", default=1_000_000)
+        args = parser.parse_args()
+        if args.limit < 2:
+            parser.error("N must be at least 2")
+        start, length = longest_chain(args.limit)
+        print(f"Longest chain up to {args.limit}: start {start}, {length} numbers")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    Install it once with `pip install numba`, then run `python collatz.py 5000000`. The first run takes a moment to compile. After that, `cache=True` reuses the compiled code.
+
+    **Green Notes**
+    - **JIT-compiled hot loop** (reduces E): the nested loops are pure integer arithmetic with no Python objects inside, which is the case where Numba helps. In Green Metrics Tool micro-benchmarks, a numeric loop over 10,000,000 samples used about 4× less CPU energy with `@njit` than as a pure Python loop.
+    - **Compile once, keep the cache:** `cache=True` avoids paying the compile cost again on every launch of the CLI.
+    - *Not applied:* Numba for small N. For values like 1000 the compile time is more than the loop itself, so plain Python is fine there. Numba is only worth the extra dependency for big runs like yours.
+verify:
+  module: true
+  green_block: 0
+  test: |
+    assert longest_chain(10) == (9, 20)
+    assert longest_chain(30) == (27, 112)
+  static_only: null

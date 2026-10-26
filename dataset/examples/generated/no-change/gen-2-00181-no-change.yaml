@@ -1,0 +1,70 @@
+id: gen-2-00181-no-change
+category: no-change
+language: python
+patterns:
+- regex-precompile
+- context-tradeoff
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    Hi, my colleage say in code review that i must use re.compile for all the regex in our checkout endpoint, because otherwise python compile the regex again on every request and it waste CPU. Is this true? The endpoint get maybe 20-30 request per minute in peak time. Should i change it before merge?
+
+    ```python
+    import re
+    from decimal import Decimal
+
+    POSTCODE_PATTERNS = {
+        "DE": r"[0-9]{5}",
+        "AT": r"[0-9]{4}",
+        "CH": r"[0-9]{4}",
+        "NL": r"[0-9]{4} ?[A-Z]{2}",
+        "FR": r"[0-9]{5}",
+        "PL": r"[0-9]{2}-[0-9]{3}",
+    }
+
+    VOUCHER_RE = r"[A-Z0-9]{4}-[A-Z0-9]{4}"
+
+
+    class CheckoutError(ValueError):
+        pass
+
+
+    def validate_checkout(payload: dict) -> dict:
+        country = (payload.get("country") or "").strip().upper()
+        postcode = (payload.get("postcode") or "").strip().upper()
+        voucher = (payload.get("voucher") or "").strip().upper()
+
+        pattern = POSTCODE_PATTERNS.get(country)
+        if pattern is None:
+            raise CheckoutError(f"we don't ship to {country!r}")
+        if not re.fullmatch(pattern, postcode):
+            raise CheckoutError(f"invalid postcode for {country}: {postcode!r}")
+
+        if voucher and not re.fullmatch(VOUCHER_RE, voucher):
+            raise CheckoutError("voucher code has wrong format")
+
+        items = payload.get("items") or []
+        if not items:
+            raise CheckoutError("cart is empty")
+        total = sum(Decimal(str(i["price"])) * int(i["qty"]) for i in items)
+
+        return {
+            "country": country,
+            "postcode": postcode,
+            "voucher": voucher or None,
+            "total": str(total),
+        }
+    ```
+- role: assistant
+  content: |
+    No, you don't need to change it. Python does not compile these patterns again on every request.
+
+    - **`re` keeps its own cache.** `re.fullmatch(pattern, s)` checks an internal cache of compiled patterns before it compiles anything. Each worker process compiles your few patterns once. Every later request reuses them.
+    - **The measured difference is small.** In Green Metrics Tool micro-benchmarks, 1,000,000 matches with an inline `re.match(pattern, s)` used ~21 J. A precompiled pattern used ~18 J, about 18% less. Your endpoint runs at most two matches per request. Parsing the request, the database work and the response cost far more than those two matches.
+    - **The expensive case doesn't apply here.** In the same benchmarks, forcing a recompile on every call cost about 200× more per match. That happens when patterns are built at runtime, for example from user input or a growing list, or when there are so many distinct patterns that the cache (several hundred entries) overflows. Your patterns are constant strings in a fixed dict.
+
+    If your team likes `re.compile` as a style choice, that is fine too: you get named constants, and a broken pattern fails at import time instead of on the first checkout. Just don't treat it as a performance fix. At this traffic it makes no practical difference.
+verify:
+  static_only: no-change answer without code; the user's code stays as it is

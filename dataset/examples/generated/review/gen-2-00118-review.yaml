@@ -1,0 +1,169 @@
+id: gen-2-00118-review
+category: review
+language: python
+patterns:
+- regex-precompile
+- async-concurrent-io
+facts:
+- F-REGEX
+- F-HTTP
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import re
+
+    import requests
+    from fastapi import FastAPI, HTTPException
+    from pydantic import BaseModel
+
+    from .db import comments
+
+    app = FastAPI()
+
+    USERS_API = "http://users.internal:8080"
+    NOTIFY_API = "http://notify.internal:8080"
+
+
+    class CommentIn(BaseModel):
+        author_id: int
+        body: str
+
+
+    def find_mentions(body: str, members: list[dict]) -> list[dict]:
+        mentioned = []
+        for member in members:
+            pattern = r"(?<!\w)@" + member["handle"] + r"\b"
+            if re.search(pattern, body, re.IGNORECASE):
+                mentioned.append(member)
+        return mentioned
+
+
+    @app.post("/projects/{project_id}/comments", status_code=201)
+    async def create_comment(project_id: int, comment: CommentIn):
+        resp = requests.get(f"{USERS_API}/projects/{project_id}/members", timeout=5)
+        if resp.status_code == 404:
+            raise HTTPException(404, "project not found")
+        members = resp.json()
+
+        if comment.author_id not in [m["id"] for m in members]:
+            raise HTTPException(403, "not a project member")
+
+        comment_id = await comments.insert(project_id, comment.author_id, comment.body)
+
+        for member in find_mentions(comment.body, members):
+            if member["id"] == comment.author_id:
+                continue
+            requests.post(
+                f"{NOTIFY_API}/notifications",
+                json={
+                    "user_id": member["id"],
+                    "type": "mention",
+                    "project_id": project_id,
+                    "comment_id": comment_id,
+                },
+                timeout=5,
+            )
+
+        return {"id": comment_id}
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (REST API, runs on every comment)
+
+    #### [Bug] Handles go into the regex unescaped
+    - **Where:** `find_mentions`, `r"(?<!\w)@" + member["handle"] + r"\b"`
+    - **Issue:** the handle is read as regex syntax. `j.doe` also matches `@jxdoe`. A handle with `+`, `(` or `[` raises `re.error`, and then every comment in that project fails with a 500. If users pick their own handles, they control a pattern your server runs on every comment.
+    - **Fix:** don't build patterns from data. Extract the `@handle` tokens with one fixed pattern and compare them as strings. See the code below.
+
+    #### [High] Blocking HTTP calls inside `async def`
+    - **Where:** `requests.get` and the `requests.post` loop in `create_comment`
+    - **Issue:** FastAPI runs `async def` handlers on the event loop. Every `requests` call blocks that loop. While one comment waits for the members service and then for each notification in turn, no other request on that worker makes progress. The wait grows with the number of mentions.
+    - **Fix:** use one shared `httpx.AsyncClient`, `await` the members call, and send the notifications together with `asyncio.gather`.
+    - **Impact:** mostly wall time and worker holding time, less so CPU energy. In Green Metrics Tool micro-benchmarks, 10 HTTP requests with async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. The bigger gain here is that one slow comment no longer stalls the other requests on its worker.
+
+    #### [Medium] A new regex per member on every comment
+    - **Where:** `find_mentions`
+    - **Issue:** each comment builds one pattern per project member. Python's `re` keeps a cache of compiled patterns (512 entries). Across many projects and members, the distinct patterns outgrow that cache, so they get recompiled on every call. In Green Metrics Tool micro-benchmarks, a recompile on every call cost about 200× more per match than a cached pattern. Precompiling one static pattern saved only about 18% in the same benchmarks. So the win comes from not building patterns per member. `re.compile` alone does not give it.
+    - **Fix:** one module-level pattern, one `findall` over the body, then a set lookup per member.
+    - **Impact:** E per comment. The work drops from one compile plus one scan per member to one scan of the body.
+
+    ```python
+    import asyncio
+    import re
+    from contextlib import asynccontextmanager
+
+    import httpx
+    from fastapi import FastAPI, HTTPException
+    from pydantic import BaseModel
+
+    from .db import comments
+
+    USERS_API = "http://users.internal:8080"
+    NOTIFY_API = "http://notify.internal:8080"
+
+    # @handle not preceded by a word char (skips e-mail addresses), dots only inside the handle
+    MENTION_RE = re.compile(r"(?<!\w)@([\w-]+(?:\.[\w-]+)*)")
+
+    http = httpx.AsyncClient(timeout=5)
+
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        yield
+        await http.aclose()
+
+
+    app = FastAPI(lifespan=lifespan)
+
+
+    class CommentIn(BaseModel):
+        author_id: int
+        body: str
+
+
+    def find_mentions(body: str, members: list[dict]) -> list[dict]:
+        handles = {h.lower() for h in MENTION_RE.findall(body)}
+        return [m for m in members if m["handle"].lower() in handles]
+
+
+    @app.post("/projects/{project_id}/comments", status_code=201)
+    async def create_comment(project_id: int, comment: CommentIn):
+        resp = await http.get(f"{USERS_API}/projects/{project_id}/members")
+        if resp.status_code == 404:
+            raise HTTPException(404, "project not found")
+        members = resp.json()
+
+        if comment.author_id not in [m["id"] for m in members]:
+            raise HTTPException(403, "not a project member")
+
+        comment_id = await comments.insert(project_id, comment.author_id, comment.body)
+
+        to_notify = [
+            m for m in find_mentions(comment.body, members)
+            if m["id"] != comment.author_id
+        ]
+        await asyncio.gather(*(
+            http.post(
+                f"{NOTIFY_API}/notifications",
+                json={
+                    "user_id": m["id"],
+                    "type": "mention",
+                    "project_id": project_id,
+                    "comment_id": comment_id,
+                },
+            )
+            for m in to_notify
+        ))
+
+        return {"id": comment_id}
+    ```
+
+    Notes on behavior:
+    - Mentions now match whole handles only. `@jane-doe` no longer also notifies `jane`. Each member is still notified once, in member order, and matching stays case-insensitive.
+    - `MENTION_RE` assumes handles use letters, digits, `_`, `-` and inner dots. Adjust it if your handles allow more characters.
+    - Error handling is unchanged. A failed notification still turns into a 500 after the comment is saved. If clients retry on 500, they create duplicate comments. Use `gather(..., return_exceptions=True)` and log the failures if you want the comment to succeed anyway.
+verify:
+  static_only: FastAPI handler that needs fastapi, httpx, pydantic and internal HTTP services

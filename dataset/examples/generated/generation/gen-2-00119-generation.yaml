@@ -1,0 +1,114 @@
+id: gen-2-00119-generation
+category: generation
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    Add an e2e job to our CI for `acmectl`. Requirements:
+
+    - runs on our self-hosted runner (label `e2e-k8s`). It sits in the cluster and has kubectl, helm and jq.
+    - its own namespace per run, deploy the platform chart from `deploy/acme-platform` with image tag `main`
+    - then run `bin/acmectl e2e --endpoint <api url>` with the binary built in `test`
+
+    The suite only hits the API, and the API only needs Postgres. Chart toggles: `api.replicaCount` (default 3), `worker.enabled`, `redis.enabled`, `opensearch.enabled` (all default true). The API service is `<release>-api` on 8080.
+
+    Current workflow:
+
+    ```yaml
+    name: ci
+    on:
+      pull_request:
+      push:
+        branches: [main]
+
+    jobs:
+      test:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+          - uses: actions/setup-go@v5
+            with:
+              go-version-file: go.mod
+          - run: go test ./...
+          - run: go build -o bin/acmectl ./cmd/acmectl
+          - uses: actions/upload-artifact@v4
+            with:
+              name: acmectl
+              path: bin/acmectl
+    ```
+
+    Just give me what to add.
+- role: assistant
+  content: |
+    Add this under `jobs:` in `ci.yml`. The `test` job stays as it is.
+
+    ```yaml
+      e2e:
+        needs: test
+        runs-on: [self-hosted, e2e-k8s]
+        concurrency:
+          group: ${{ github.workflow }}-e2e-${{ github.event.pull_request.number || github.ref }}
+          cancel-in-progress: true
+        env:
+          NS: acmectl-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+        steps:
+          - uses: actions/checkout@v4
+          - uses: actions/download-artifact@v4
+            with:
+              name: acmectl
+              path: bin
+          - run: chmod +x bin/acmectl
+          - name: Deploy platform
+            run: |
+              kubectl create namespace "$NS"
+              kubectl label namespace "$NS" ci/ephemeral=true
+              helm install platform deploy/acme-platform \
+                --namespace "$NS" \
+                --set image.tag=main \
+                --set api.replicaCount=1 \
+                --set worker.enabled=false \
+                --set redis.enabled=false \
+                --set opensearch.enabled=false \
+                --wait --timeout 5m
+          - name: Run e2e
+            run: ./bin/acmectl e2e --endpoint "http://platform-api.$NS.svc:8080"
+          - name: Tear down
+            if: always()
+            run: kubectl delete namespace "$NS" --wait=false --ignore-not-found
+    ```
+
+    New file `.github/workflows/e2e-sweep.yml` catches namespaces left behind by a crashed runner:
+
+    ```yaml
+    name: e2e-sweep
+    on:
+      schedule:
+        - cron: "17 * * * *"
+      workflow_dispatch:
+
+    jobs:
+      sweep:
+        runs-on: [self-hosted, e2e-k8s]
+        steps:
+          - name: Delete ephemeral namespaces older than 2h
+            run: |
+              cutoff=$(date -u -d '-2 hours' +%Y-%m-%dT%H:%M:%SZ)
+              kubectl get namespaces -l ci/ephemeral=true -o json \
+                | jq -r --arg cutoff "$cutoff" \
+                    '.items[] | select(.metadata.creationTimestamp < $cutoff) | .metadata.name' \
+                | xargs -r kubectl delete namespace --wait=false
+    ```
+
+    **Green Notes**
+    - **Teardown with `if: always()`** (reduces E and M): the namespace exists only while the job runs, and it is also removed on failed or cancelled runs. Most of the saving is here. In Green Metrics Tool measurements of a preview environment idling for 60 seconds, the stack itself cost little per minute. What adds up is the hours an environment stays up.
+    - **API at 1 replica + Postgres only** (reduces M): the worker, Redis and OpenSearch are off, so the job reserves less cluster memory and has fewer pods to schedule. In the same measurements, 1 app replica plus Postgres used only about 3% less CPU energy than 3 replicas plus Postgres, Redis and a worker. The bigger gain is the reserved capacity, not idle CPU.
+    - **`cancel-in-progress`** (reduces E and M): a new push to the same PR stops the old run, and its teardown step deletes the old namespace. Only one stack per PR runs at a time.
+    - **Hourly sweep**: a safety net, so a lost runner can't leave a stack running for days.
+
+    If your chart names the values or the API service differently, adjust the `--set` keys and the endpoint.
+verify:
+  static_only: GitHub Actions workflow, needs a Kubernetes cluster and a self-hosted runner

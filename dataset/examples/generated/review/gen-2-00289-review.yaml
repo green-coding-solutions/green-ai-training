@@ -1,0 +1,145 @@
+id: gen-2-00289-review
+category: review
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    hourly cron on the bastion, review pls
+
+    ```python
+    #!/usr/bin/env python3
+    """Hourly: summarize failed SSH logins and flag known-bad IPs."""
+    import json
+    import re
+    import sys
+    import urllib.request
+    from collections import Counter
+    from datetime import datetime, timezone
+
+    REPUTATION_URL = "https://intel.internal.example/v1/ip/"
+    API_TOKEN = "rk_live_7f3a9c21e4b04d8f"
+    FAILED = re.compile(r"Failed password for (?:invalid user )?(\S+) from (\S+) port \d+")
+
+
+    def parse(path):
+        attempts = Counter()
+        users = {}
+        with open(path) as f:
+            for line in f:
+                m = FAILED.search(line)
+                if not m:
+                    continue
+                user, ip = m.groups()
+                attempts[ip] += 1
+                users.setdefault(ip, set()).add(user)
+        return attempts, users
+
+
+    def reputation(ip):
+        req = urllib.request.Request(REPUTATION_URL + ip,
+                                     headers={"Authorization": f"Bearer {API_TOKEN}"})
+        with urllib.request.urlopen(req) as resp:
+            return json.load(resp)
+
+
+    def main(path, out_path):
+        attempts, users = parse(path)
+        rows = []
+        for ip, count in attempts.most_common():
+            rep = reputation(ip)
+            rows.append({
+                "ip": ip,
+                "attempts": count,
+                "users": sorted(users[ip]),
+                "score": rep.get("score", 0),
+                "listed": rep.get("listed", False),
+            })
+        report = {
+            "generated": datetime.now(timezone.utc).isoformat(),
+            "source": path,
+            "flagged": [r for r in rows if r["listed"] or r["score"] >= 80],
+            "all": rows,
+        }
+        with open(out_path, "w") as f:
+            json.dump(report, f, indent=2)
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1], sys.argv[2])
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (hourly log processing cron)
+
+    #### [Bug] One slow or failing lookup stops the whole report
+    - **Where:** `reputation()`, `urlopen(req)`
+    - **Issue:** `urlopen` has no timeout. If the reputation API hangs, the cron run hangs too, and the next hourly runs pile up behind it. Any `HTTPError` (429, 500) or `URLError` propagates out of `main()`, so no report is written at all.
+    - **Fix:** set a timeout and catch errors per IP. Mark the row as failed and keep going (see the code below).
+
+    #### [Bug] Non-UTF-8 bytes in auth.log crash the parser
+    - **Where:** `open(path)` in `parse()`
+    - **Issue:** attackers can send arbitrary bytes as user names. sshd logs them, and a strict UTF-8 decode raises `UnicodeDecodeError` partway through the file.
+    - **Fix:** `open(path, encoding="utf-8", errors="replace")`.
+
+    #### [Security] API token hard-coded in the script
+    - **Where:** `API_TOKEN = "rk_live_..."`
+    - **Issue:** the token ends up in git and in every copy of the script on the bastion.
+    - **Fix:** read it from the environment (`os.environ["REPUTATION_TOKEN"]`) or from a file only root can read. Then rotate the token that was committed.
+
+    #### [Medium] Reputation lookups run one after another
+    - **Where:** the `for ip, count in attempts.most_common()` loop calling `reputation(ip)`
+    - **Issue:** a public SSH host sees many distinct IPs per hour. Each lookup waits for a full round trip before the next one starts. Each `urlopen` also opens a new connection with its own TLS handshake. So the run takes about as long as all the round trips added together.
+    - **Fix:** use one `httpx.AsyncClient`, which reuses connections, and run the lookups concurrently. A semaphore caps the number of requests in flight so the API is not flooded:
+
+    ```python
+    import asyncio
+    import os
+
+    import httpx
+
+    REPUTATION_URL = "https://intel.internal.example/v1/ip/"
+
+
+    async def fetch_reputations(ips, limit=20):
+        sem = asyncio.Semaphore(limit)
+        headers = {"Authorization": f"Bearer {os.environ['REPUTATION_TOKEN']}"}
+        async with httpx.AsyncClient(headers=headers, timeout=10.0) as client:
+            async def one(ip):
+                async with sem:
+                    try:
+                        r = await client.get(REPUTATION_URL + ip)
+                        r.raise_for_status()
+                        return r.json()
+                    except httpx.HTTPError:
+                        return None
+            return await asyncio.gather(*(one(ip) for ip in ips))
+
+
+    def main(path, out_path):
+        attempts, users = parse(path)
+        ranked = attempts.most_common()
+        reps = asyncio.run(fetch_reputations([ip for ip, _ in ranked]))
+        rows = []
+        for (ip, count), rep in zip(ranked, reps):
+            rows.append({
+                "ip": ip,
+                "attempts": count,
+                "users": sorted(users[ip]),
+                "score": (rep or {}).get("score", 0),
+                "listed": (rep or {}).get("listed", False),
+                "lookup_failed": rep is None,
+            })
+        ...  # report building and writing unchanged
+    ```
+
+    `gather` returns results in input order, so the rows keep the `most_common()` order. One behavior change: a failed lookup no longer stops the run. That row gets `"lookup_failed": true` and is not flagged, so check this field if you alert on the report.
+
+    - **Impact:** the gain is mostly wall time, plus less time spent holding a process and connections open on the bastion. CPU energy drops only a little. In Green Metrics Tool micro-benchmarks, 10 HTTP requests with async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. The more IPs a run looks up, the more waiting the concurrent lookups remove.
+
+    **Already good:** the regex is compiled once at module level, the log is read in a single streaming pass, and each IP is looked up only once.
+verify:
+  static_only: needs httpx and network access to the reputation API

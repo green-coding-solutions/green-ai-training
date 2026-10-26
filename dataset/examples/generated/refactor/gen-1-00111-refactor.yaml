@@ -1,0 +1,150 @@
+id: gen-1-00111-refactor
+category: refactor
+language: html
+patterns:
+- dom-size
+- lazy-load-images
+facts:
+- F-DOM-SIZE
+- F-LAZY-IMG
+messages:
+- role: user
+  content: |
+    ?
+
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <title>Gateway logs - last 24h</title>
+      <link rel="stylesheet" href="/static/logview.css">
+    </head>
+    <body>
+      <header class="top">
+        <img src="/static/img/banner-logs.png" alt="Log overview" width="1200" height="160">
+        <h1>Gateway logs, last 24h</h1>
+      </header>
+
+      <section class="summary">
+        <img src="/static/img/errors-total.png" alt="Errors per hour" width="900" height="300">
+      </section>
+
+      <section class="service-charts">
+        <img src="/static/img/svc-auth.png" alt="auth errors" width="400" height="200">
+        <img src="/static/img/svc-billing.png" alt="billing errors" width="400" height="200">
+        <img src="/static/img/svc-ingest.png" alt="ingest errors" width="400" height="200">
+        <img src="/static/img/svc-router.png" alt="router errors" width="400" height="200">
+        <img src="/static/img/svc-search.png" alt="search errors" width="400" height="200">
+        <img src="/static/img/svc-export.png" alt="export errors" width="400" height="200">
+      </section>
+
+      <div id="log-table"></div>
+
+      <script src="/static/logs-24h.js"></script>
+      <script>
+        // LOGS has about 10,000 entries: {time, level, host, message}
+        var container = document.getElementById('log-table');
+        var table = document.createElement('table');
+        container.appendChild(table);
+
+        LOGS.forEach(function (e) {
+          var tr = document.createElement('tr');
+          tr.className = 'row ' + e.level;
+          [e.time, e.level, e.host, e.message].forEach(function (v) {
+            var td = document.createElement('td');
+            var wrap = document.createElement('div');
+            wrap.className = 'cell';
+            var inner = document.createElement('span');
+            inner.className = 'cell-text';
+            inner.textContent = v;
+            wrap.appendChild(inner);
+            td.appendChild(wrap);
+            tr.appendChild(td);
+          });
+          table.appendChild(tr);
+        });
+      </script>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <title>Gateway logs - last 24h</title>
+      <link rel="stylesheet" href="/static/logview.css">
+    </head>
+    <body>
+      <header class="top">
+        <img src="/static/img/banner-logs.png" alt="Log overview" width="1200" height="160">
+        <h1>Gateway logs, last 24h</h1>
+      </header>
+
+      <section class="summary">
+        <img src="/static/img/errors-total.png" alt="Errors per hour" width="900" height="300">
+      </section>
+
+      <section class="service-charts">
+        <img src="/static/img/svc-auth.png" alt="auth errors" width="400" height="200" loading="lazy">
+        <img src="/static/img/svc-billing.png" alt="billing errors" width="400" height="200" loading="lazy">
+        <img src="/static/img/svc-ingest.png" alt="ingest errors" width="400" height="200" loading="lazy">
+        <img src="/static/img/svc-router.png" alt="router errors" width="400" height="200" loading="lazy">
+        <img src="/static/img/svc-search.png" alt="search errors" width="400" height="200" loading="lazy">
+        <img src="/static/img/svc-export.png" alt="export errors" width="400" height="200" loading="lazy">
+      </section>
+
+      <nav class="pager" aria-label="Log pages">
+        <button id="prev" type="button">Previous</button>
+        <span id="page-info"></span>
+        <button id="next" type="button">Next</button>
+      </nav>
+      <table id="log-table"><tbody id="log-body"></tbody></table>
+
+      <script src="/static/logs-24h.js"></script>
+      <script>
+        var PAGE_SIZE = 100;
+        var body = document.getElementById('log-body');
+        var info = document.getElementById('page-info');
+        var prev = document.getElementById('prev');
+        var next = document.getElementById('next');
+        var pages = Math.max(1, Math.ceil(LOGS.length / PAGE_SIZE));
+        var page = 0;
+
+        function render() {
+          var frag = document.createDocumentFragment();
+          var start = page * PAGE_SIZE;
+          LOGS.slice(start, start + PAGE_SIZE).forEach(function (e) {
+            var tr = document.createElement('tr');
+            tr.className = 'row ' + e.level;
+            [e.time, e.level, e.host, e.message].forEach(function (v) {
+              var td = document.createElement('td');
+              td.textContent = v;
+              tr.appendChild(td);
+            });
+            frag.appendChild(tr);
+          });
+          body.replaceChildren(frag);
+          info.textContent = 'Page ' + (page + 1) + ' of ' + pages;
+          prev.disabled = page === 0;
+          next.disabled = page === pages - 1;
+        }
+
+        prev.addEventListener('click', function () { page--; render(); });
+        next.addEventListener('click', function () { page++; render(); });
+        render();
+      </script>
+    </body>
+    </html>
+    ```
+
+    **Green Notes**
+    - **Avoid excessive DOM size** (reduces E): the page built about 10,000 rows with a `div` and a `span` around every cell, and appended each row to the live table one by one. Now it renders 100 rows per page, drops the wrappers, and builds each page in a `DocumentFragment` that goes into the DOM once. In Green Metrics Tool micro-benchmarks, 30 page loads of a 10,000-row table built the first way used ~1036 J. The paginated plain `<table>` built in a fragment used ~457 J, about 56% less.
+    - **Defer offscreen images** (reduces network, some E): the six per-service charts now have `loading="lazy"`. The banner and the summary chart stay eager because they are above the fold. In Green Metrics Tool micro-benchmarks, lazy loading used about 12% less on page loads without scrolling. When visitors scrolled to the end it made no difference. So it only helps if many people never reach the charts. The `width` and `height` attributes stay, so the layout does not jump.
+
+    Behavior changes: only 100 log lines exist in the page at a time, so the browser's find (Ctrl+F) only sees the current page. If you use `.cell` or `.cell-text` in `logview.css` for styling, move those rules to `td`.
+verify:
+  static_only: HTML page with browser DOM script, needs a browser to run

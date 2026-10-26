@@ -1,0 +1,63 @@
+id: gen-2-00053-generation
+category: generation
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    bash script for cron (every 5 min): POST each order batch in /var/spool/shop/outbound/*.ndjson to the 3PL api, they want gzip bodies
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # Push finished order batches to the 3PL API. Cron: */5 * * * *
+    set -euo pipefail
+
+    SPOOL_DIR='/var/spool/shop/outbound'
+    SENT_DIR='/var/spool/shop/sent'
+    FAILED_DIR='/var/spool/shop/failed'
+    API_URL='https://api.3pl.example.com/v1/orders/batch'
+    LOCK_FILE='/var/lock/push-orders.lock'
+    : "${TPL_API_TOKEN:?TPL_API_TOKEN is not set}"
+
+    # Skip this run if the previous one is still busy.
+    exec 9>"$LOCK_FILE"
+    flock -n 9 || exit 0
+
+    mkdir -p "$SENT_DIR" "$FAILED_DIR"
+    shopt -s nullglob
+
+    for batch in "$SPOOL_DIR"/*.ndjson; do
+      name=${batch##*/}
+
+      # Compress in the pipe, no temp file on disk.
+      status=$(gzip -6 -c -- "$batch" | curl --silent --show-error \
+          --output /dev/null --write-out '%{http_code}' \
+          --max-time 60 --retry 3 --retry-delay 5 \
+          -H "Authorization: Bearer $TPL_API_TOKEN" \
+          -H 'Content-Type: application/x-ndjson' \
+          -H 'Content-Encoding: gzip' \
+          --data-binary @- \
+          "$API_URL") || status='000'
+
+      case "$status" in
+        2??) mv -- "$batch" "$SENT_DIR/" ;;
+        429) echo "rate limited on $name, retrying next run" >&2 ;;
+        4??) echo "rejected $name (HTTP $status)" >&2
+             mv -- "$batch" "$FAILED_DIR/" ;;
+        *)   echo "failed $name (HTTP $status), retrying next run" >&2 ;;
+      esac
+    done
+    ```
+
+    The shop must write each batch under a temp name (for example `.ndjson.tmp`) and rename it when done. Otherwise the script can pick up a half-written file. 4xx batches go to `failed/` so one bad file doesn't block the queue. 5xx and network errors stay in the spool for the next run.
+
+    **Green Notes**
+    - **Compress transmitted data** (reduces network): NDJSON order records are repetitive text and shrink well with gzip. Fewer bytes go over the link on every run.
+    - **Fast codec for data compressed often** (reduces E): this runs every 5 minutes, so the compression cost repeats all day. gzip at a moderate level fits that. In Green Metrics Tool benchmarks compressing 100 MB of text with default settings, gzip used ~67 J, xz ~458 J and brotli (quality 11) ~3019 J. Those benchmarks compared energy only, not compression ratio.
+    - *Not applied:* zstd. In the same benchmark it used ~16 J, about 4× less than gzip, but the 3PL only accepts gzip. Switch to `zstd -c` and `Content-Encoding: zstd` if they add support for it.
+verify:
+  static_only: needs curl, network access and the partner API

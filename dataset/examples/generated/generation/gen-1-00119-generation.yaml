@@ -1,0 +1,61 @@
+id: gen-1-00119-generation
+category: generation
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # hourly orders delta: postgres -> warehouse loader
+    set -euo pipefail
+
+    since="${1:?since timestamp}"
+    WH_HOST=etl@wh-loader.internal
+
+    # TODO export shop.orders rows with updated_at > $since as csv
+    #      columns: id, customer_id, status, total_cents, updated_at
+    # TODO compress, the link to wh-loader is slow
+    # TODO on wh-loader: write to /srv/incoming/orders_<timestamp>.csv
+    #      (loader picks up *.csv, must not see half-written files)
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # hourly orders delta: postgres -> warehouse loader
+    set -euo pipefail
+
+    since="${1:?since timestamp}"
+    WH_HOST=etl@wh-loader.internal
+
+    printf -v ts '%(%Y%m%dT%H%M%S)T' -1
+    dest="/srv/incoming/orders_${ts}.csv"
+    tmp="/srv/incoming/.orders_${ts}.part"
+
+    # export -> compress -> send -> decompress on the loader, one stream, no temp file here
+    psql -X -q -v ON_ERROR_STOP=1 -v since="$since" <<'SQL' \
+      | zstd -q \
+      | ssh "$WH_HOST" "zstd -d -q -c > '$tmp' && mv '$tmp' '$dest'"
+    COPY (
+      SELECT id, customer_id, status, total_cents, updated_at
+      FROM shop.orders
+      WHERE updated_at > :'since'
+      ORDER BY updated_at, id
+    ) TO STDOUT WITH (FORMAT csv, HEADER true);
+    SQL
+    ```
+
+    The loader needs `zstd` installed. The file is written as `.part` and renamed at the end, so the loader never sees a half-written CSV. `set -o pipefail` makes the script fail if `psql`, `zstd` or `ssh` fails. `since` is passed as a psql variable and quoted by `:'since'`, so it can't inject SQL.
+
+    **Green Notes**
+    - **Compress the stream with a fast codec** (reduces network and E): CSV compresses well, so far fewer bytes cross the slow link. You run this every hour, so the codec cost repeats. In Green Metrics Tool micro-benchmarks on 100 MB of text, zstd at its default level used about 4× less compression energy than gzip, and brotli at quality 11 used about 190× more than zstd. That is why `zstd` with defaults is used and not `xz` or `brotli`.
+    - **One pipe, no intermediate files** (reduces E): the data is never written to disk on the DB host just to be compressed and sent.
+    - *Note:* those benchmarks compare energy, not compression ratio. If the link is so slow that a smaller file matters more, a stronger zstd level is a trade-off you would need to measure.
+verify:
+  static_only: needs postgres (psql), ssh and zstd

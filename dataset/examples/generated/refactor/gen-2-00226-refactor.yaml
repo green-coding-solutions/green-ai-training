@@ -1,0 +1,156 @@
+id: gen-2-00226-refactor
+category: refactor
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    fix this, takes minutes on a busy day's access log
+
+    ```python
+    import sys
+    from collections import Counter
+
+
+    def parse_line(line):
+        parts = line.split()
+        if len(parts) < 10:
+            return None
+        return {
+            "ip": parts[0],
+            "ts": parts[3].lstrip("["),
+            "method": parts[5].strip('"'),
+            "path": parts[6],
+            "status": int(parts[8]),
+            "bytes": 0 if parts[9] == "-" else int(parts[9]),
+        }
+
+
+    def summarize(lines):
+        errors = []
+        per_path = Counter()
+        total_bytes = 0
+        for line in lines:
+            entry = parse_line(line)
+            if entry is None:
+                continue
+            total_bytes += entry["bytes"]
+            if entry["status"] >= 500:
+                errors.insert(0, entry)  # newest first
+                per_path[entry["path"]] += 1
+        return errors, per_path, total_bytes
+
+
+    def main(path):
+        with open(path) as f:
+            errors, per_path, total_bytes = summarize(f)
+        print(f"total bytes: {total_bytes}")
+        print("top failing paths:")
+        for p, n in per_path.most_common(5):
+            print(f"  {n:6d}  {p}")
+        print("latest errors:")
+        for e in errors[:20]:
+            print(f"  {e['ts']} {e['status']} {e['method']} {e['path']}")
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1])
+    ```
+- role: assistant
+  content: |
+    ```python
+    import sys
+    from collections import Counter
+
+
+    def parse_line(line):
+        parts = line.split()
+        if len(parts) < 10 or not parts[8].isdigit():
+            return None
+        return {
+            "ip": parts[0],
+            "ts": parts[3].lstrip("["),
+            "method": parts[5].strip('"'),
+            "path": parts[6],
+            "status": int(parts[8]),
+            "bytes": 0 if parts[9] == "-" else int(parts[9]),
+        }
+
+
+    def summarize(lines):
+        errors = []
+        per_path = Counter()
+        total_bytes = 0
+        for line in lines:
+            entry = parse_line(line)
+            if entry is None:
+                continue
+            total_bytes += entry["bytes"]
+            if entry["status"] >= 500:
+                errors.append(entry)
+                per_path[entry["path"]] += 1
+        errors.reverse()  # newest first
+        return errors, per_path, total_bytes
+
+
+    def main(path):
+        with open(path) as f:
+            errors, per_path, total_bytes = summarize(f)
+        print(f"total bytes: {total_bytes}")
+        print("top failing paths:")
+        for p, n in per_path.most_common(5):
+            print(f"  {n:6d}  {p}")
+        print("latest errors:")
+        for e in errors[:20]:
+            print(f"  {e['ts']} {e['status']} {e['method']} {e['path']}")
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1])
+    ```
+
+    **Green Notes**
+    - **`append` + one `reverse()` instead of `insert(0, ...)`** (reduces E): every front insert shifted all errors collected so far. On a bad day with many 5xx lines, that grows quadratically. Appending is O(1), and the single reverse at the end is O(n). In Green Metrics Tool micro-benchmarks, 1,000,000 `list.insert(0, x)` calls used over 1000× more CPU energy than 1,000,000 `append` calls. The returned list is identical, still newest first.
+    - **Bug fixed:** nginx logs malformed requests with `"-"` as the request line. The fields then shift, `int(parts[8])` raises `ValueError`, and the whole run crashes. Such lines are now skipped like other unparseable lines.
+    - If nothing else uses the full `errors` list, a `deque(maxlen=20)` with `appendleft` would keep only the entries the report prints and keep memory flat.
+verify:
+  module: true
+  test: |
+    bad = '1.2.3.4 - - [24/Oct/2026:10:00:00 +0000] "-" 400 0 "-" "-"\n'
+    errors, per_path, total = summarize([bad])
+    assert errors == [] and total == 0
+    ok = '1.2.3.4 - - [24/Oct/2026:10:00:01 +0000] "GET /a HTTP/1.1" 502 10 "-" "x"\n'
+    errors, per_path, total = summarize([ok, ok.replace("10:00:01", "10:00:02")])
+    assert [e["ts"] for e in errors] == ["24/Oct/2026:10:00:02", "24/Oct/2026:10:00:01"]
+    assert per_path["/a"] == 2 and total == 20
+  equivalence:
+    driver: |
+      import random
+      random.seed(5)
+      paths = ["/api/orders", "/api/cart", "/login", "/static/app.js", "/health"]
+      statuses = [200, 200, 200, 301, 404, 500, 502, 503]
+      lines = []
+      for i in range(3000):
+          st = random.choice(statuses)
+          b = random.choice(["-", str(random.randint(0, 50000))])
+          lines.append(
+              f'10.0.0.{i % 250} - - [24/Oct/2026:10:{i // 60 % 60:02d}:{i % 60:02d} +0000] '
+              f'"GET {random.choice(paths)} HTTP/1.1" {st} {b} "-" "curl/8.0"\n'
+          )
+      lines.append("garbage\n")
+      errors, per_path, total = summarize(lines)
+      print(total, len(errors))
+      print(per_path.most_common())
+      for e in errors[:50]:
+          print(e)
+  benchmark:
+    driver: |
+      lines = [
+          f'10.0.0.{i % 250} - - [24/Oct/2026:10:00:{i % 60:02d} +0000] "GET /api/orders HTTP/1.1" 502 {i} "-" "curl/8.0"\n'
+          for i in range(50000)
+      ]
+      summarize(lines)
+    min_speedup: 1.5

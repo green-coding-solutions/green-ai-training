@@ -1,0 +1,170 @@
+id: gen-2-00223-generation
+category: generation
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    ```python
+    # warehouse/pick_queue.py
+    from dataclasses import dataclass, field
+    from datetime import datetime
+
+
+    @dataclass
+    class Order:
+        order_id: str
+        shipping: str          # "express" or "standard"
+        created_at: datetime
+        lines: list = field(default_factory=list)
+
+
+    class PickQueue:
+        """Orders waiting to be picked in the warehouse.
+
+        Rules from ops:
+        - express orders are always picked before standard orders
+        - within each class: first come, first picked
+        - requeue(): picker hands an order back (item is being restocked),
+          it must be the next one picked from its class again
+        - pending_ids() is used by the dashboard, in picking order
+
+        On sale days the queue holds 30-50k orders, pickers call
+        next_order() a few times per second.
+        """
+
+        def add(self, order: Order) -> None:
+            # TODO
+            ...
+
+        def requeue(self, order: Order) -> None:
+            # TODO
+            ...
+
+        def next_order(self) -> Order | None:
+            # TODO
+            ...
+
+        def pending_ids(self) -> list[str]:
+            # TODO
+            ...
+
+        def __len__(self) -> int:
+            # TODO
+            ...
+    ```
+    ?
+- role: assistant
+  content: |
+    Use one `deque` per shipping class. Express priority then needs no search for an insert position, and a requeued order goes back to the front in constant time.
+
+    ```python
+    # warehouse/pick_queue.py
+    from collections import deque
+    from dataclasses import dataclass, field
+    from datetime import datetime
+    from itertools import chain
+
+
+    @dataclass
+    class Order:
+        order_id: str
+        shipping: str          # "express" or "standard"
+        created_at: datetime
+        lines: list = field(default_factory=list)
+
+
+    class PickQueue:
+        """Orders waiting to be picked in the warehouse.
+
+        Express orders are picked before standard orders, FIFO within each
+        class. A requeued order is the next one picked from its class.
+        """
+
+        def __init__(self) -> None:
+            self._express: deque[Order] = deque()
+            self._standard: deque[Order] = deque()
+
+        def _queue_for(self, order: Order) -> deque:
+            if order.shipping == "express":
+                return self._express
+            if order.shipping == "standard":
+                return self._standard
+            raise ValueError(f"unknown shipping class: {order.shipping!r}")
+
+        def add(self, order: Order) -> None:
+            self._queue_for(order).append(order)
+
+        def requeue(self, order: Order) -> None:
+            self._queue_for(order).appendleft(order)
+
+        def next_order(self) -> Order | None:
+            if self._express:
+                return self._express.popleft()
+            if self._standard:
+                return self._standard.popleft()
+            return None
+
+        def pending_ids(self) -> list[str]:
+            return [o.order_id for o in chain(self._express, self._standard)]
+
+        def __len__(self) -> int:
+            return len(self._express) + len(self._standard)
+    ```
+
+    An unknown `shipping` value raises `ValueError` in `add()` and `requeue()`. Without that check, the order would be silently lost. If several threads share one instance, guard the methods with a `threading.Lock`. A single `popleft()` is atomic, but the express/standard check in `next_order()` is not.
+
+    **Green Notes**
+    - **Avoid front insertion** (reduces E): `appendleft()` and `popleft()` on a `deque` are O(1). With a list, every `insert(0, …)` for a requeue and every `pop(0)` for a pick shifts all the tens of thousands of waiting orders. In Green Metrics Tool micro-benchmarks, 1,000,000 `list.insert(0, x)` calls used ~1515 J and 1,000,000 `list.append(x)` calls ~1.2 J, a difference of over 1000×.
+    - *Not applied:* `pending_ids()` builds a new list on each call. That is one O(n) pass per dashboard refresh, which is fine. Picking itself never walks the queue.
+verify:
+  test: |-
+    from datetime import datetime
+
+    def mk(i, s):
+        return Order(i, s, datetime(2026, 1, 1))
+
+    q = PickQueue()
+    assert len(q) == 0
+    assert q.next_order() is None
+    q.add(mk("s1", "standard"))
+    q.add(mk("e1", "express"))
+    q.add(mk("s2", "standard"))
+    q.add(mk("e2", "express"))
+    assert len(q) == 4
+    assert q.pending_ids() == ["e1", "e2", "s1", "s2"]
+
+    first = q.next_order()
+    assert first.order_id == "e1"
+    q.requeue(first)
+    assert q.pending_ids() == ["e1", "e2", "s1", "s2"]
+    assert q.next_order().order_id == "e1"
+    assert q.next_order().order_id == "e2"
+
+    s = q.next_order()
+    assert s.order_id == "s1"
+    q.add(mk("e3", "express"))
+    q.requeue(s)
+    assert q.pending_ids() == ["e3", "s1", "s2"]
+    assert [q.next_order().order_id for _ in range(3)] == ["e3", "s1", "s2"]
+    assert q.next_order() is None
+    assert len(q) == 0
+
+    try:
+        q.add(mk("x1", "overnight"))
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+    assert len(q) == 0
+
+    big = PickQueue()
+    for i in range(50000):
+        big.add(mk(f"o{i}", "standard"))
+    for _ in range(50000):
+        o = big.next_order()
+        big.requeue(o)
+        assert big.next_order() is o
+    assert len(big) == 0

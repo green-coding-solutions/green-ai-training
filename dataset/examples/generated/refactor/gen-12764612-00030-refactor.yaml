@@ -1,0 +1,123 @@
+id: gen-12764612-00030-refactor
+category: refactor
+language: python
+patterns:
+- regex-precompile
+- batch-db-writes
+facts:
+- F-REGEX
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    We have a warehouse stock import endpoint (POST /api/stock/import). Partners send up to about 5,000 rows per request as JSON. This function does the work and is called from the view. Please refactor it for performance and cleanliness.
+
+    Requirements:
+    - Same response shape: `{"accepted": n, "rejected": [{"row": i, "error": "..."}]}`
+    - Same validation rules and same error texts
+    - Existing SKUs are updated, new ones inserted (upsert)
+    - Keep it plain stdlib + DB-API, no ORM
+
+    ```python
+    import re
+    import sqlite3
+
+
+    def import_stock_rows(conn, rows):
+        """Called by POST /api/stock/import. rows = list of dicts from the JSON body."""
+        accepted = 0
+        rejected = []
+        cur = conn.cursor()
+        for i, row in enumerate(rows):
+            sku = row.get("sku", "").strip().upper()
+            qty = row.get("qty")
+
+            if not re.match(r"^[A-Z]{3}-\d{5}$", sku):
+                rejected.append({"row": i, "error": "bad sku"})
+                continue
+            if not re.match(r"^\d{1,6}$", str(qty)):
+                rejected.append({"row": i, "error": "bad qty"})
+                continue
+
+            cur.execute(
+                "INSERT INTO stock (sku, qty) VALUES (?, ?) "
+                "ON CONFLICT(sku) DO UPDATE SET qty = excluded.qty",
+                (sku, int(qty)),
+            )
+            conn.commit()
+            accepted += 1
+
+        return {"accepted": accepted, "rejected": rejected}
+    ```
+- role: assistant
+  content: |
+    ```python
+    import re
+
+    SKU_RE = re.compile(r"^[A-Z]{3}-\d{5}$")
+    QTY_RE = re.compile(r"^\d{1,6}$")
+
+    UPSERT_SQL = (
+        "INSERT INTO stock (sku, qty) VALUES (?, ?) "
+        "ON CONFLICT(sku) DO UPDATE SET qty = excluded.qty"
+    )
+
+
+    def import_stock_rows(conn, rows):
+        """Called by POST /api/stock/import. rows = list of dicts from the JSON body."""
+        valid = []
+        rejected = []
+
+        for i, row in enumerate(rows):
+            sku = row.get("sku", "").strip().upper()
+            qty = row.get("qty")
+
+            if not SKU_RE.match(sku):
+                rejected.append({"row": i, "error": "bad sku"})
+                continue
+            if not QTY_RE.match(str(qty)):
+                rejected.append({"row": i, "error": "bad qty"})
+                continue
+
+            valid.append((sku, int(qty)))
+
+        if valid:
+            with conn:  # one transaction: commit on success, rollback on error
+                conn.cursor().executemany(UPSERT_SQL, valid)
+
+        return {"accepted": len(valid), "rejected": rejected}
+    ```
+
+    **Green Notes**
+    - **Batch the writes** (reduces E and wall time): the old code ran one `execute()` and one `commit()` per row. Now all valid rows go through one `executemany()` and one commit, so a 5,000-row upload does one commit instead of up to 5,000. In Green Metrics Tool micro-benchmarks on PostgreSQL with psycopg 3, inserting 500,000 rows in 5,000-row batches used about 2.8× less CPU energy with `executemany()` than with one `execute()` per row. The gap shrinks a lot with batches of around 100 rows, so this matters for your large uploads, not for small ones. Your database and driver may give different ratios.
+    - **Compile the regexes once** (reduces E, small): the patterns now live at module level instead of being passed to `re.match` on every row. Python caches compiled patterns, so the gain is modest. In Green Metrics Tool micro-benchmarks, 1,000,000 matches with a precompiled pattern used about 18% less CPU energy than inline `re.match`. It also keeps the rules in one named place.
+    - **Behavior change:** the import is now all-or-nothing for the database part. Before, each row was committed on its own, so a database error halfway left a partial import. Now an error rolls back every row of the request. Validation rejects are unchanged: bad rows are still reported and skipped, and the valid rows are still saved. If duplicate SKUs appear in one upload, the last one wins, as before.
+verify:
+  test: |
+    import sqlite3
+    c = sqlite3.connect(":memory:")
+    c.execute("CREATE TABLE stock (sku TEXT PRIMARY KEY, qty INTEGER)")
+    res = import_stock_rows(c, [{"sku": "abc-12345", "qty": 5}, {"sku": "bad", "qty": 1}])
+    assert res == {"accepted": 1, "rejected": [{"row": 1, "error": "bad sku"}]}
+    assert c.execute("SELECT sku, qty FROM stock").fetchall() == [("ABC-12345", 5)]
+    res = import_stock_rows(c, [])
+    assert res == {"accepted": 0, "rejected": []}
+  equivalence:
+    driver: |-
+      import sqlite3
+      conn = sqlite3.connect(":memory:")
+      conn.execute("CREATE TABLE stock (sku TEXT PRIMARY KEY, qty INTEGER)")
+      rows = [
+          {"sku": "abc-12345", "qty": 10},
+          {"sku": "  xyz-00001 ", "qty": "25"},
+          {"sku": "abc-12345", "qty": 99},
+          {"sku": "ab-1234", "qty": 3},
+          {"sku": "QRS-77777", "qty": None},
+          {"sku": "QRS-77777", "qty": 1234567},
+          {"qty": 4},
+          {"sku": "LMN-55555", "qty": 0},
+      ]
+      print(import_stock_rows(conn, rows))
+      print(conn.execute("SELECT sku, qty FROM stock ORDER BY sku").fetchall())
+      print(import_stock_rows(conn, [{"sku": "LMN-55555", "qty": 7}]))
+      print(conn.execute("SELECT sku, qty FROM stock ORDER BY sku").fetchall())

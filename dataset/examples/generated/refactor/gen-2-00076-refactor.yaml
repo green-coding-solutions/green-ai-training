@@ -1,0 +1,57 @@
+id: gen-2-00076-refactor
+category: refactor
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    Landing page deploy. It runs in CI on every push to main and on every PR branch, and the upload step ties up the runner for far too long. Only send me what changes.
+
+    ```bash
+    #!/usr/bin/env bash
+    # Push the landing page build to the edge nodes.
+    set -euo pipefail
+
+    BUILD_DIR="dist"
+    RELEASE="$(git rev-parse --short HEAD)"
+    EDGE_HOSTS=("edge-fra-1" "edge-fra-2" "edge-ams-1" "edge-iad-1")
+    REMOTE_ROOT="/srv/landing/releases"
+
+    npm ci
+    npm run build
+
+    for host in "${EDGE_HOSTS[@]}"; do
+      echo "==> $host"
+      tar -C "$BUILD_DIR" -cf - . | xz -9 | ssh "deploy@$host" \
+        "mkdir -p $REMOTE_ROOT/$RELEASE && xz -d | tar -C $REMOTE_ROOT/$RELEASE -xf -"
+      ssh "deploy@$host" "ln -sfn $REMOTE_ROOT/$RELEASE /srv/landing/current"
+    done
+
+    echo "Deployed $RELEASE to ${#EDGE_HOSTS[@]} hosts"
+    ```
+- role: assistant
+  content: |
+    Replace the loop with this:
+
+    ```bash
+    archive="$(mktemp)"
+    trap 'rm -f "$archive"' EXIT
+    tar -C "$BUILD_DIR" -cf - . | zstd -q -c > "$archive"
+
+    for host in "${EDGE_HOSTS[@]}"; do
+      echo "==> $host"
+      ssh "deploy@$host" \
+        "mkdir -p $REMOTE_ROOT/$RELEASE && zstd -d -q -c | tar -C $REMOTE_ROOT/$RELEASE -xf -" < "$archive"
+      ssh "deploy@$host" "ln -sfn $REMOTE_ROOT/$RELEASE /srv/landing/current"
+    done
+    ```
+
+    **Green Notes**
+    - **Compress once, not once per host** (reduces E): the build used to be compressed 4 times, once for each edge node. Now it is compressed once, and the same archive goes to every host.
+    - **zstd instead of `xz -9`** (reduces E): this runs on every push, so the codec should be a fast one. In Green Metrics Tool benchmarks with default settings on 100 MB of text, xz used about 29× more CPU energy than zstd. `-9` is xz's most expensive preset, so your setting costs even more than the default. Those benchmarks measured energy, not compression ratio. xz usually makes smaller archives, but on a CI-to-edge link the few extra bytes cost less than all that CPU time.
+    - **Requirement:** `zstd` must be installed on the CI runner and on all four edge nodes. The deployed files are identical.
+verify:
+  static_only: Needs git, npm, ssh access to remote edge hosts and zstd on both ends.

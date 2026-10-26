@@ -1,0 +1,107 @@
+id: gen-2-00042-generation
+category: generation
+language: html
+patterns:
+- lazy-load-images
+facts:
+- F-LAZY-IMG
+messages:
+- role: user
+  content: |
+    hi, our log pipeline make a handover page for the on-call every morning at 7. On top it have the error rate chart for all clusters, then the table of open alerts, then one section per service (around 35 services) with 2 png charts each, ingest lag and error count. The charts are rendered by our script before, they are all 1200x400.
+
+    Most of the people only look the top chart and the alerts, then they jump with a link to the one service they own. Can you write the html template? we use jinja, variables is:
+    - date
+    - overall_chart (path of png)
+    - alerts (list, each have service, severity, message, since)
+    - services (list, each have name, slug, lag_chart, errors_chart)
+
+    Please no framework, just plain html + a bit css
+- role: assistant
+  content: |
+    ```html
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>On-call handover {{ date }}</title>
+      <style>
+        body { font-family: system-ui, sans-serif; max-width: 1240px; margin: 0 auto; padding: 0 1rem; color: #1f2328; }
+        img { display: block; max-width: 100%; height: auto; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #d0d7de; vertical-align: top; }
+        .sev-critical { color: #b42318; font-weight: 600; }
+        .sev-warning { color: #9a6700; }
+        nav ul { display: flex; flex-wrap: wrap; gap: .4rem 1rem; list-style: none; padding: 0; }
+        section { margin-top: 2.5rem; }
+        figure { margin: 1rem 0; }
+        figcaption { font-size: .9rem; color: #57606a; }
+      </style>
+    </head>
+    <body>
+      <header>
+        <h1>On-call handover – {{ date }}</h1>
+      </header>
+
+      <figure>
+        <img src="{{ overall_chart }}" width="1200" height="400"
+             alt="Error rate of all clusters">
+        <figcaption>Error rate, all clusters</figcaption>
+      </figure>
+
+      <h2>Open alerts</h2>
+      <table>
+        <thead>
+          <tr><th>Service</th><th>Severity</th><th>Message</th><th>Since</th></tr>
+        </thead>
+        <tbody>
+          {% for a in alerts %}
+          <tr>
+            <td>{{ a.service }}</td>
+            <td class="sev-{{ a.severity | lower }}">{{ a.severity }}</td>
+            <td>{{ a.message }}</td>
+            <td>{{ a.since }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="4">No open alerts.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+
+      <nav aria-label="Services">
+        <h2>Services</h2>
+        <ul>
+          {% for s in services %}
+          <li><a href="#svc-{{ s.slug }}">{{ s.name }}</a></li>
+          {% endfor %}
+        </ul>
+      </nav>
+
+      {% for s in services %}
+      <section id="svc-{{ s.slug }}">
+        <h2>{{ s.name }}</h2>
+        <figure>
+          <img src="{{ s.lag_chart }}" width="1200" height="400" loading="lazy"
+               alt="Ingest lag of {{ s.name }}">
+          <figcaption>Ingest lag</figcaption>
+        </figure>
+        <figure>
+          <img src="{{ s.errors_chart }}" width="1200" height="400" loading="lazy"
+               alt="Error count of {{ s.name }}">
+          <figcaption>Error count</figcaption>
+        </figure>
+        <p><a href="#">Back to top</a></p>
+      </section>
+      {% endfor %}
+    </body>
+    </html>
+    ```
+
+    The `width`/`height` on every chart reserve the space before the image loads. Without them, the anchor jump to a service would land in the wrong place while the lazy charts above it load. Render with Jinja autoescape on: alert messages come from logs and can contain `<` or `&`.
+
+    **Green Notes**
+    - **Defer offscreen images** (reduces network, E): the service charts use `loading="lazy"`. A reader who jumps to one service only downloads the charts near that section, not all of them. In Green Metrics Tool browser benchmarks of an article with 15 photos, loaded 20 times without scrolling, lazy loading below the fold used ~325 J CPU energy vs ~368 J eager, about 12% less. Your readers mostly skip the service sections, so this is the case that pays off.
+    - **Top chart stays eager**: it is above the fold and the one image everybody looks at. Lazy loading it would only delay it. For readers who do scroll through every service, the same benchmark showed no saving (about 1% difference, within noise), so lazy loading costs nothing there either.
+verify:
+  static_only: HTML/Jinja template, no executable code

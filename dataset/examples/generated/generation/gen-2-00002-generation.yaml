@@ -1,0 +1,96 @@
+id: gen-2-00002-generation
+category: generation
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    hi, im pretty new to python so sorry if this is a dumb question. we have one landing page template (landing.html) and marketing wants a copy of it for every city we are in. the template has placeholders like `{{ city }}`, `{{headline}}`, `{{ cta_text }}`, `{{price}}`. sometimes with spaces inside the braces, sometimes not, because the marketing people edit the file by hand.
+
+    the data is in cities.csv (they export it from excel), columns are: slug, city, headline, cta_text, price. around 400 rows. i need a script that writes one file per row to dist/<slug>/index.html.
+
+    i tried str.replace("{{ city }}", ...) but it misses the ones without spaces and the page ends up with `{{city}}` in it. someone said use regex but i dont really know how. can you write it?
+- role: assistant
+  content: |
+    Yes, a regex is the right tool here. One pattern matches every placeholder, with or without spaces, and a small function looks up the value for each one.
+
+    ```python
+    import csv
+    import html
+    import re
+    from pathlib import Path
+
+    # Compiled once when the script starts, reused for every page.
+    PLACEHOLDER = re.compile(r"\{\{\s*(\w+)\s*\}\}")
+    SLUG = re.compile(r"[a-z0-9-]+")
+
+
+    def render(template: str, values: dict[str, str]) -> str:
+        def fill(match: re.Match) -> str:
+            key = match.group(1)
+            if key not in values:
+                raise KeyError(f"no column for placeholder {{{{ {key} }}}}")
+            return html.escape(values[key])
+
+        return PLACEHOLDER.sub(fill, template)
+
+
+    def build(template_path="landing.html", csv_path="cities.csv", out_dir="dist"):
+        template = Path(template_path).read_text(encoding="utf-8")
+        # utf-8-sig drops the invisible BOM that Excel puts at the start of CSV exports
+        with open(csv_path, newline="", encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                slug = row["slug"].strip()
+                if not SLUG.fullmatch(slug):
+                    raise ValueError(f"invalid slug: {slug!r}")
+                target = Path(out_dir) / slug / "index.html"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(render(template, row), encoding="utf-8")
+
+
+    if __name__ == "__main__":
+        build()
+    ```
+
+    How the pattern works: `\{\{` and `\}\}` match the literal braces. `\s*` allows any number of spaces, including none. `(\w+)` captures the name, for example `city` or `cta_text`. `PLACEHOLDER.sub(fill, template)` calls `fill` for every match and puts its return value in place of the placeholder.
+
+    **Green Notes**
+    - **Compile regex once, outside loops** (reduces E): both patterns are compiled at module level and reused for every row, and one `sub` call fills all placeholders in a single pass over the template. In Green Metrics Tool micro-benchmarks with 1,000,000 matches, a precompiled pattern used about 18% less CPU energy than inline `re.match` (~18 J vs ~21 J). The gap is small because Python's `re` caches compiled patterns itself. The expensive case is building patterns dynamically so they get recompiled on every call, which cost about 200× more per match.
+
+    Two things that keep the pages correct:
+    - A typo in the template like `{{ cyty }}` stops the script with a clear error, instead of shipping a page with braces in it.
+    - `html.escape` turns `&`, `<` and quotes in the CSV into safe HTML, so a headline like "Fast & cheap" doesn't break the markup. This also means values are plain text. If marketing needs HTML in a column, that column must skip the escaping. The slug check stops a bad value like `../` from writing files outside `dist/`.
+verify:
+  module: true
+  test: |-
+    import tempfile
+    from pathlib import Path
+
+    assert render("<h1>{{city}}</h1><p>{{ headline }}</p>", {"city": "Köln", "headline": "A & B"}) == "<h1>Köln</h1><p>A &amp; B</p>"
+    assert render("{{  price  }} EUR", {"price": "9"}) == "9 EUR"
+
+    try:
+        render("{{ missing }}", {})
+        raise AssertionError("expected KeyError")
+    except KeyError:
+        pass
+
+    with tempfile.TemporaryDirectory() as d:
+        t = Path(d, "t.html")
+        t.write_text("<title>{{ city }}</title><a>{{cta_text}}</a>", encoding="utf-8")
+        c = Path(d, "c.csv")
+        c.write_text("\ufeffslug,city,cta_text\nkoeln,Köln,Jetzt buchen\nberlin,Berlin,Los\n", encoding="utf-8")
+        build(t, c, Path(d, "dist"))
+        assert Path(d, "dist", "koeln", "index.html").read_text(encoding="utf-8") == "<title>Köln</title><a>Jetzt buchen</a>"
+        assert Path(d, "dist", "berlin", "index.html").read_text(encoding="utf-8") == "<title>Berlin</title><a>Los</a>"
+
+        bad = Path(d, "bad.csv")
+        bad.write_text("slug,city,cta_text\n../x,X,Y\n", encoding="utf-8")
+        try:
+            build(t, bad, Path(d, "dist"))
+            raise AssertionError("expected ValueError")
+        except ValueError:
+            pass

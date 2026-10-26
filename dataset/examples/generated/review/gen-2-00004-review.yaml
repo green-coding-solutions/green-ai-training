@@ -1,0 +1,128 @@
+id: gen-2-00004-review
+category: review
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    Sitemap for our programmatic landing pages (city × service, de/en, ~40k URLs). Flask serves the result at /sitemap.xml and rebuilds it on every request. Crawlers fetch it a lot. Review it. Diff only, skip the essay.
+
+    ```python
+    # seo/sitemap.py
+    from datetime import date
+
+    BASE_URL = "https://www.umzugsprofi.de"
+    CITY_PRIORITY = 0.8
+    DEFAULT_PRIORITY = 0.5
+
+
+    def load_pages(rows):
+        """rows from the CMS export: (locale, slug, type, updated_iso, noindex)"""
+        pages = []
+        for locale, slug, kind, updated, noindex in rows:
+            pages.append({
+                "locale": locale,
+                "slug": slug,
+                "type": kind,
+                "updated": date.fromisoformat(updated),
+                "noindex": noindex == "1",
+            })
+        return pages
+
+
+    def build_sitemap(pages):
+        xml = '<?xml version="1.0" encoding="UTF-8"?>\n'
+        xml += '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+        for page in pages:
+            if page.get("noindex"):
+                continue
+            loc = f"{BASE_URL}/{page['locale']}/{page['slug']}/"
+            priority = CITY_PRIORITY if page["type"] == "city" else DEFAULT_PRIORITY
+            xml += "  <url>\n"
+            xml += f"    <loc>{loc}</loc>\n"
+            xml += f"    <lastmod>{page['updated'].isoformat()}</lastmod>\n"
+            xml += f"    <priority>{priority}</priority>\n"
+            xml += "  </url>\n"
+        xml += "</urlset>\n"
+        return xml
+    ```
+- role: assistant
+  content: |
+    **Workload:** web
+
+    #### [Bug] `<loc>` is not XML-escaped
+    - **Where:** `loc = f"{BASE_URL}/..."` in `build_sitemap`
+    - **Issue:** if a CMS slug contains `&`, `<` or `>`, the sitemap is no longer valid XML, and crawlers may reject the whole file.
+    - **Fix:** wrap it in `xml.sax.saxutils.escape(...)`.
+
+    #### [High] String built with `+=` on every request
+    - **Where:** the `xml += ...` lines in the loop
+    - **Issue:** each page adds five concatenations to a growing string. This happens for every page on every crawler hit. The f-strings don't help, because f-strings in a loop behave like `+=`.
+    - **Fix:** append one f-string per page to a list and `"".join()` it once at the end.
+    - **Impact:** reduces E per request, and the gap grows with the page count. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces with `"".join()` used roughly 260× less CPU energy than `+=`.
+
+    ```python
+    from xml.sax.saxutils import escape
+
+    BASE_URL = "https://www.umzugsprofi.de"
+    CITY_PRIORITY = 0.8
+    DEFAULT_PRIORITY = 0.5
+
+
+    def build_sitemap(pages):
+        parts = [
+            '<?xml version="1.0" encoding="UTF-8"?>\n',
+            '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n',
+        ]
+        for page in pages:
+            if page.get("noindex"):
+                continue
+            loc = escape(f"{BASE_URL}/{page['locale']}/{page['slug']}/")
+            priority = CITY_PRIORITY if page["type"] == "city" else DEFAULT_PRIORITY
+            parts.append(
+                "  <url>\n"
+                f"    <loc>{loc}</loc>\n"
+                f"    <lastmod>{page['updated'].isoformat()}</lastmod>\n"
+                f"    <priority>{priority}</priority>\n"
+                "  </url>\n"
+            )
+        parts.append("</urlset>\n")
+        return "".join(parts)
+    ```
+
+    `load_pages` is unchanged. The output is byte-identical for slugs without XML special characters.
+verify:
+  green_block: 0
+  test: |
+    from datetime import date
+    out = build_sitemap([
+        {"locale": "de", "slug": "umzug-koeln-&-bonn", "type": "city", "updated": date(2026, 9, 1), "noindex": False},
+        {"locale": "en", "slug": "hidden", "type": "service", "updated": date(2026, 9, 2), "noindex": True},
+    ])
+    assert "umzug-koeln-&amp;-bonn" in out
+    assert "&-bonn" not in out
+    assert "hidden" not in out
+    assert out.startswith('<?xml version="1.0" encoding="UTF-8"?>\n')
+    assert out.endswith("</urlset>\n")
+    assert "<priority>0.8</priority>" in out
+  equivalence:
+    driver: |-
+      import random
+      from datetime import date, timedelta
+      random.seed(7)
+      cities = ["berlin", "koeln", "muenchen", "hamburg", "leipzig", "bonn"]
+      services = ["umzug", "entruempelung", "klaviertransport", "lagerung"]
+      pages = []
+      for i in range(3000):
+          pages.append({
+              "locale": random.choice(["de", "en"]),
+              "slug": f"{random.choice(services)}-{random.choice(cities)}-{i}",
+              "type": random.choice(["city", "service"]),
+              "updated": date(2026, 1, 1) + timedelta(days=random.randint(0, 290)),
+              "noindex": random.random() < 0.1,
+          })
+      print(build_sitemap(pages))
+      print(build_sitemap([]))

@@ -1,0 +1,95 @@
+id: gen-12764612-00220-estimate
+category: estimate
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    hi, i am physics student and not good at programming. i have script for my climate project, it download temperature file for each weather station and calculate mean. it is very slow, i think something is wrong in it? my friend say i should use async and it will save energy. how much energy I would save? i run it maybe few times every week
+
+    ```python
+    import requests
+    import numpy as np
+
+    STATIONS = ["DE001", "DE002", "DE003", "DE004", "DE005", "DE006",
+                "DE007", "DE008", "DE009", "DE010", "DE011", "DE012"]
+    URL = "https://climate-data.example.org/daily/{}/2023.csv"
+
+
+    def load_station(station):
+        resp = requests.get(URL.format(station), timeout=30)
+        resp.raise_for_status()
+        rows = [line.split(",") for line in resp.text.splitlines()[1:]]
+        return np.array([float(r[2]) for r in rows])
+
+
+    def main():
+        means = {}
+        for st in STATIONS:
+            temps = load_station(st)
+            means[st] = temps.mean()
+        for st, m in means.items():
+            print(st, round(m, 2))
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    Nothing is wrong with your script. It is slow because it downloads the files one after another and waits for each server answer. Most of that time the CPU does nothing.
+
+    **What async changes:** it lets all downloads wait at the same time. Your waiting time drops a lot. The CPU work stays the same, because parsing the text and computing the mean still has to happen.
+
+    **Measured reference:** in Green Metrics Tool micro-benchmarks with 10 HTTP requests, sync `urllib` used ~9.1 J and 3.1 s. Async `httpx` used ~8.4 J and 2.6 s. That is about 7% less CPU energy and about 17% less wall time. So for a small number of requests the gain is mostly time, and the energy gain is small. Your result will depend on how slow the server is, so I can't give you a number for your script.
+
+    **For your case:** a script you run a few times a week does not save meaningful energy with async. It would mainly save you waiting time. If the waiting bothers you, this is the async version:
+
+    ```python
+    import asyncio
+    import httpx
+    import numpy as np
+
+    STATIONS = ["DE001", "DE002", "DE003", "DE004", "DE005", "DE006",
+                "DE007", "DE008", "DE009", "DE010", "DE011", "DE012"]
+    URL = "https://climate-data.example.org/daily/{}/2023.csv"
+
+
+    def parse(text):
+        rows = [line.split(",") for line in text.splitlines()[1:]]
+        return np.array([float(r[2]) for r in rows])
+
+
+    async def fetch(client, station):
+        resp = await client.get(URL.format(station))
+        resp.raise_for_status()
+        return parse(resp.text)
+
+
+    async def load_all():
+        async with httpx.AsyncClient(timeout=30) as client:
+            results = await asyncio.gather(*(fetch(client, st) for st in STATIONS))
+        return dict(zip(STATIONS, results))
+
+
+    def main():
+        data = asyncio.run(load_all())
+        for st, temps in data.items():
+            print(st, round(temps.mean(), 2))
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    The output order stays the same. It needs `pip install httpx`, and it is more code to read than your loop. If simple code matters more to you, keeping your version is fine.
+
+    **How to measure it yourself:**
+    - Quick check of time: run `time python script.py` for both versions.
+    - CPU proxy: run `perf stat -e power/energy-pkg/ python script.py` on Linux, if your machine supports it.
+    - Real energy: run both versions as Green Metrics Tool usage scenarios on the same machine and compare CPU energy and duration.
+verify:
+  static_only: needs network access and the httpx package

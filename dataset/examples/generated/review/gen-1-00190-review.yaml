@@ -1,0 +1,125 @@
+id: gen-1-00190-review
+category: review
+language: python
+patterns:
+- batch-db-writes
+- vectorize-or-jit
+facts:
+- F-PG-INSERT
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    review pls
+
+    ```python
+    import numpy as np
+    import psycopg
+
+    GRID = 20
+
+    def load_clicks(conn, day):
+        with conn.cursor() as cur:
+            cur.execute("SELECT x, y, vw, vh FROM clicks WHERE day = %s", (day,))
+            rows = cur.fetchall()
+        return np.array(rows, dtype=np.float64)
+
+    def to_cells(clicks):
+        cells = []
+        for i in range(len(clicks)):
+            x, y, vw, vh = clicks[i]
+            cx = int(x / vw * GRID)
+            cy = int(y / vh * GRID)
+            if cx < 0:
+                cx = 0
+            if cx >= GRID:
+                cx = GRID - 1
+            if cy < 0:
+                cy = 0
+            if cy >= GRID:
+                cy = GRID - 1
+            cells.append(cy * GRID + cx)
+        return cells
+
+    def save_cells(conn, page, day, cells):
+        with conn.cursor() as cur:
+            for c in cells:
+                cur.execute(
+                    f"INSERT INTO click_cells (page, day, cell) "
+                    f"VALUES ('{page}', '{day}', {c})"
+                )
+                conn.commit()
+
+    def run(dsn, page, day):
+        with psycopg.connect(dsn) as conn:
+            clicks = load_clicks(conn, day)
+            save_cells(conn, page, day, to_cells(clicks))
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly heatmap job for a landing page)
+
+    #### [Security] SQL built with f-strings
+    - **Where:** `save_cells`, the `INSERT` statement
+    - **Issue:** `page` and `day` are pasted into the SQL text. If `page` ever comes from a URL or a form, this is SQL injection. A quote in a slug also breaks the insert.
+    - **Fix:** pass values as parameters. The COPY version below does this.
+
+    #### [High] One INSERT and one commit per row
+    - **Where:** `save_cells` loop
+    - **Issue:** every click cell costs one round trip and one commit. The cost grows with the number of clicks.
+    - **Fix:** stream all rows in a single `COPY ... FROM STDIN`, in one transaction.
+    - **Impact:** reduces E and wall time per row. In Green Metrics Tool micro-benchmarks with 5,000-row batches, COPY used about 22× less CPU energy than one `execute()` per row. With batches of only about 100 rows the gap was small, but here you write a whole day of clicks at once.
+
+    #### [Medium] Pure Python loop over a numeric array
+    - **Where:** `to_cells`
+    - **Issue:** this is a tight loop of arithmetic and clamping on floats, run once per click. The interpreter overhead dominates.
+    - **Fix:** compile it with Numba `@njit` and return a NumPy array.
+    - **Impact:** reduces E per click. In Green Metrics Tool micro-benchmarks, a pure Python quantization loop used about 4× more CPU energy than the same loop with Numba. This only pays off because the job is a large, repeated numeric loop. The first call also pays a compile cost, which `cache=True` avoids on later runs.
+
+    ```python
+    import numpy as np
+    import psycopg
+    from numba import njit
+
+    GRID = 20
+
+    def load_clicks(conn, day):
+        with conn.cursor() as cur:
+            cur.execute("SELECT x, y, vw, vh FROM clicks WHERE day = %s", (day,))
+            rows = cur.fetchall()
+        return np.array(rows, dtype=np.float64)
+
+    @njit(cache=True)
+    def to_cells(clicks):
+        out = np.empty(len(clicks), dtype=np.int64)
+        for i in range(len(clicks)):
+            cx = int(clicks[i, 0] / clicks[i, 2] * GRID)
+            cy = int(clicks[i, 1] / clicks[i, 3] * GRID)
+            if cx < 0:
+                cx = 0
+            if cx >= GRID:
+                cx = GRID - 1
+            if cy < 0:
+                cy = 0
+            if cy >= GRID:
+                cy = GRID - 1
+            out[i] = cy * GRID + cx
+        return out
+
+    def save_cells(conn, page, day, cells):
+        with conn.cursor() as cur:
+            with cur.copy("COPY click_cells (page, day, cell) FROM STDIN") as copy:
+                for c in cells.tolist():
+                    copy.write_row((page, day, c))
+
+    def run(dsn, page, day):
+        with psycopg.connect(dsn) as conn:
+            clicks = load_clicks(conn, day)
+            save_cells(conn, page, day, to_cells(clicks))
+    ```
+
+    Behavior change: the old code committed after every row, so a crash left partial data. Now the whole day is written in one transaction, so it is all or nothing. The `with psycopg.connect(...)` block commits on success.
+
+    **Already good:** `load_clicks` uses a parameterized query and fetches only the four columns it needs.
+verify:
+  static_only: needs a Postgres server and the numba package

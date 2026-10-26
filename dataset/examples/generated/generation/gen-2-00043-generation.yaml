@@ -1,0 +1,122 @@
+id: gen-2-00043-generation
+category: generation
+language: python
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+messages:
+- role: user
+  content: |
+    ```python
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+
+    from alerts import post_to_slack
+
+    DB_PATH = "/var/lib/logshipper/events.db"
+    SERVICES = ("checkout", "auth", "search")
+
+    # events: one row per parsed log line
+    #   id, ts (UTC, "YYYY-MM-DDTHH:MM:SS"), host, service, level, logger,
+    #   message, stack_trace, request_id, user_id, http_method, path,
+    #   status, duration_ms, headers_json, request_body, raw_line
+
+
+    def fetch_recent_errors(conn, service, minutes=15):
+        """ERROR lines of one service from the last `minutes` minutes, newest first."""
+        # TODO
+        ...
+
+
+    def format_alert(service, rows):
+        lines = [f"*{service}*: {len(rows)} errors in the last 15 min"]
+        for ts, request_id, message in rows[:20]:
+            lines.append(f"`{ts}` {request_id or '-'} {message[:200]}")
+        return "\n".join(lines)
+
+
+    def main():
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            for service in SERVICES:
+                rows = fetch_recent_errors(conn, service)
+                if rows:
+                    post_to_slack(format_alert(service, rows))
+        finally:
+            conn.close()
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```python
+    from datetime import datetime, timedelta, timezone
+
+
+    def fetch_recent_errors(conn, service, minutes=15):
+        """ERROR lines of one service from the last `minutes` minutes, newest first."""
+        since = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
+        cur = conn.execute(
+            """
+            SELECT ts, request_id, message
+            FROM events
+            WHERE service = ?
+              AND level = 'ERROR'
+              AND ts >= ?
+            ORDER BY ts DESC
+            """,
+            (service, since),
+        )
+        return cur.fetchall()
+    ```
+
+    The `ts >= ?` comparison works on text because your `ts` format is fixed-width UTC, so string order matches time order.
+
+    **Green Notes**
+    - **Select only the needed columns** (reduces E and M): `format_alert` uses only `ts`, `request_id` and `message`. So the query skips `stack_trace`, `headers_json`, `request_body` and `raw_line`, the large text columns of a log row. This matters most during an incident, when the alert job reads many error rows for each service. In Green Metrics Tool micro-benchmarks on a 52-column PostgreSQL table with large text columns, `SELECT *` used about 5.5-7× the energy of naming the 10 needed columns.
+    - **Column order matches the unpacking:** `for ts, request_id, message in rows` needs exactly these three columns in this order. `SELECT *` would fail at that line, because each row would have 17 values.
+verify:
+  test: |-
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        """CREATE TABLE events (
+            id INTEGER PRIMARY KEY, ts TEXT, host TEXT, service TEXT, level TEXT,
+            logger TEXT, message TEXT, stack_trace TEXT, request_id TEXT, user_id TEXT,
+            http_method TEXT, path TEXT, status INTEGER, duration_ms REAL,
+            headers_json TEXT, request_body TEXT, raw_line TEXT)"""
+    )
+    now = datetime.now(timezone.utc)
+
+    def t(mins):
+        return (now - timedelta(minutes=mins)).strftime("%Y-%m-%dT%H:%M:%S")
+
+    data = [
+        (t(1), "checkout", "ERROR", "payment timeout", "req-1"),
+        (t(5), "checkout", "ERROR", "card declined", None),
+        (t(3), "checkout", "INFO", "ok", "req-2"),
+        (t(30), "checkout", "ERROR", "old error", "req-3"),
+        (t(2), "auth", "ERROR", "bad token", "req-4"),
+    ]
+    for ts, svc, lvl, msg, rid in data:
+        conn.execute(
+            "INSERT INTO events (ts, service, level, message, request_id, stack_trace, raw_line) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (ts, svc, lvl, msg, rid, "x" * 5000, "y" * 500),
+        )
+
+    res = fetch_recent_errors(conn, "checkout")
+    assert res == [(t(1), "req-1", "payment timeout"), (t(5), None, "card declined")], res
+    assert all(len(r) == 3 for r in res)
+    assert fetch_recent_errors(conn, "auth") == [(t(2), "req-4", "bad token")]
+    assert fetch_recent_errors(conn, "search") == []
+    assert len(fetch_recent_errors(conn, "checkout", minutes=60)) == 3

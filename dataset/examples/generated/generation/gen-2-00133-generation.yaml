@@ -1,0 +1,72 @@
+id: gen-2-00133-generation
+category: generation
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    hi, sorry I'm pretty new to Docker. I need a Dockerfile for our checkout worker. It's a Celery worker for our webshop. It sends the order confirmation emails and reserves stock after a payment comes in.
+
+    The repo looks like this:
+
+    ```text
+    checkout-worker/
+      worker/            # python package, celery app is worker/app.py (app = Celery(...))
+      templates/emails/  # jinja2 templates for the emails
+      tests/
+      requirements.txt   # celery[redis], psycopg[binary], jinja2, sentry-sdk
+      requirements-dev.txt  # pytest, black, mypy
+    ```
+
+    We start it with `celery -A worker.app worker --loglevel=info --concurrency=2`.
+
+    Right now I use one I copied from a tutorial. It starts with `FROM python:3.12`, then `apt-get install build-essential git curl`, then `COPY . .` and installs both requirements files. It works, but my teammate says it is way too big. Also, every time I only change an email template, the build installs all the packages again and takes ages in GitLab. I don't really understand what I'm doing wrong. Can you write a proper one?
+- role: assistant
+  content: |
+    Your tutorial Dockerfile is not broken. It just does two things that cost you on every build. It copies all files before installing the packages, so any change invalidates the install step. It also installs compilers and dev tools that the worker never uses at runtime.
+
+    ```dockerfile
+    FROM python:3.12-slim
+
+    ENV PYTHONDONTWRITEBYTECODE=1 \
+        PYTHONUNBUFFERED=1
+
+    WORKDIR /app
+
+    # Dependencies first: this layer is reused as long as requirements.txt is unchanged
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    # Source and templates last: changes here only rebuild these small layers
+    COPY worker/ ./worker/
+    COPY templates/ ./templates/
+
+    RUN useradd --create-home appuser
+    USER appuser
+
+    CMD ["celery", "-A", "worker.app", "worker", "--loglevel=info", "--concurrency=2"]
+    ```
+
+    Add a `.dockerignore` next to it, so `.git`, tests and local files don't end up in the build context:
+
+    ```text
+    .git
+    .venv
+    __pycache__/
+    *.pyc
+    tests/
+    requirements-dev.txt
+    .env
+    ```
+
+    Run `pytest`, `black` and `mypy` in a separate CI job with `requirements-dev.txt`, not inside the production image. The image also runs as a non-root user, which Celery recommends anyway.
+
+    **Green Notes**
+    - **Slim base, runtime dependencies only** (reduces E, M): `celery`, `redis`, `psycopg[binary]`, `jinja2` and `sentry-sdk` all ship prebuilt wheels, so `build-essential`, `git` and `curl` are not needed. In Green Metrics Tool measurements of building a small Flask app image without a build cache, a full `python:3.12` image with build tools and dev packages used ~885 J. The slim image with runtime dependencies only and the dependency layer first used ~124 J, about 7× less. Serving 2,000 requests afterwards cost the same with both images (~17 J), so the worker's behavior does not change.
+    - **Dependency layer before the source** (reduces E): a template edit now reuses the cached `pip install` layer and only copies a few files. Your CI builds often, so this saving repeats on every pipeline run, push and pull of the image.
+    - *Not applied:* multi-stage build. It only helps when a package has to be compiled. If you later add a dependency without a wheel, install the compiler in a builder stage and copy only the installed packages into the slim stage.
+verify:
+  static_only: Dockerfile, needs docker and packages from PyPI

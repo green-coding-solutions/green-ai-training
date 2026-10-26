@@ -1,0 +1,147 @@
+id: gen-2-00374-review
+category: review
+language: python
+patterns:
+- keep-star-imports
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    review pls, this scores every transaction batch in our fraud worker
+
+    ```python
+    from math import *
+
+    FEATURES = ["log_amount", "hour_sin", "hour_cos", "n_tx_24h", "account_age_days"]
+
+
+    def features(row):
+        h = 2 * pi * row["hour"] / 24
+        return {
+            "log_amount": log1p(row["amount"]),
+            "hour_sin": sin(h),
+            "hour_cos": cos(h),
+            "n_tx_24h": row["n_tx_24h"],
+            "account_age_days": row["account_age_days"],
+        }
+
+
+    def sigmoid(z):
+        return 1 / (1 + exp(-z))
+
+
+    def score(row, model):
+        f = features(row)
+        z = model["bias"]
+        for w, name in zip(model["weights"], FEATURES):
+            mu, sd = model["stats"][name]
+            z += w * (f[name] - mu) / sd
+        return sigmoid(z)
+
+
+    def score_batch(rows, model, threshold=0.5):
+        results = []
+        for row in rows:
+            p = score(row, model)
+            results.append({"id": row["id"], "p": round(p, 4), "flag": p >= threshold})
+        return results
+    ```
+- role: assistant
+  content: |
+    **Workload:** AI/ML (per-batch inference)
+
+    #### [Bug] `sigmoid` crashes on large negative scores
+    - **Where:** `sigmoid`, `exp(-z)`
+    - **Issue:** `math.exp` raises `OverflowError` once its argument goes above about 709. One outlier row with a very negative `z` (for example a very old account with a negative weight) makes `exp(-z)` overflow and kills the whole batch.
+    - **Fix:** use the numerically stable form. Compute `exp(-z)` for `z >= 0` and `exp(z) / (1 + exp(z))` for `z < 0`. Both only ever call `exp` on values ≤ 0. Results for normal inputs stay the same.
+
+    #### [Bug] Weight/feature mismatch is silently ignored
+    - **Where:** `zip(model["weights"], FEATURES)` in `score`
+    - **Issue:** `zip` stops at the shorter input. If a model file was trained before `hour_cos` was added, it has 4 weights and the last feature is just dropped. Every score is wrong and nothing fails.
+    - **Fix:** `zip(..., strict=True)` (Python 3.10+). It raises `ValueError` on a length mismatch.
+
+    **Star import:** keep `from math import *` as it is. In Green Metrics Tool micro-benchmarks, star imports and plain `import` showed no measurable energy difference. Changing it is a style choice, not an optimization.
+
+    No efficiency issues worth changing. The per-row work is a few float operations, and the loop is straightforward.
+
+    ```python
+    from math import *
+
+    FEATURES = ["log_amount", "hour_sin", "hour_cos", "n_tx_24h", "account_age_days"]
+
+
+    def features(row):
+        h = 2 * pi * row["hour"] / 24
+        return {
+            "log_amount": log1p(row["amount"]),
+            "hour_sin": sin(h),
+            "hour_cos": cos(h),
+            "n_tx_24h": row["n_tx_24h"],
+            "account_age_days": row["account_age_days"],
+        }
+
+
+    def sigmoid(z):
+        if z >= 0:
+            return 1 / (1 + exp(-z))
+        e = exp(z)
+        return e / (1 + e)
+
+
+    def score(row, model):
+        f = features(row)
+        z = model["bias"]
+        for w, name in zip(model["weights"], FEATURES, strict=True):
+            mu, sd = model["stats"][name]
+            z += w * (f[name] - mu) / sd
+        return sigmoid(z)
+
+
+    def score_batch(rows, model, threshold=0.5):
+        results = []
+        for row in rows:
+            p = score(row, model)
+            results.append({"id": row["id"], "p": round(p, 4), "flag": p >= threshold})
+        return results
+    ```
+verify:
+  green_block: 0
+  test: |
+    assert sigmoid(-1000) == 0.0
+    assert sigmoid(1000) == 1.0
+    assert abs(sigmoid(0.3) - 1 / (1 + exp(-0.3))) < 1e-12
+    assert abs(sigmoid(-0.3) - 1 / (1 + exp(0.3))) < 1e-12
+    bad = {"bias": 0.0, "weights": [0.1] * 4, "stats": {n: (0.0, 1.0) for n in FEATURES}}
+    try:
+        score({"amount": 10.0, "hour": 3, "n_tx_24h": 1, "account_age_days": 5}, bad)
+        raise AssertionError("mismatch not detected")
+    except ValueError:
+        pass
+  equivalence:
+    driver: |-
+      import random
+      random.seed(11)
+      model = {
+          "bias": -1.2,
+          "weights": [0.9, 0.2, -0.15, 0.35, -0.4],
+          "stats": {
+              "log_amount": (3.8, 1.3),
+              "hour_sin": (0.0, 0.7),
+              "hour_cos": (0.0, 0.7),
+              "n_tx_24h": (4.0, 3.0),
+              "account_age_days": (420.0, 310.0),
+          },
+      }
+      rows = [
+          {
+              "id": i,
+              "amount": round(random.uniform(0.5, 2500.0), 2),
+              "hour": random.randint(0, 23),
+              "n_tx_24h": random.randint(0, 30),
+              "account_age_days": random.randint(0, 3000),
+          }
+          for i in range(2000)
+      ]
+      for r in score_batch(rows, model):
+          print(r["id"], r["p"], r["flag"])

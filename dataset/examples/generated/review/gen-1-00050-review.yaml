@@ -1,0 +1,186 @@
+id: gen-1-00050-review
+category: review
+language: python
+patterns:
+- memoize
+- simple-conditions
+facts:
+- F-LRU
+- F-COND
+messages:
+- role: user
+  content: |
+    Please review this script. It runs every night on a small VM over the syslog files that our gateways and app servers ship to a central box. The fleet is a few hundred hosts, host names look like `role-region-number`, and the files are big. Requirements: Python 3.11, standard library only, and the output format on stdout must stay the same because a cron job greps it. I want a review for correctness and for wasted work. I don't want a big rewrite.
+
+    ```python
+    #!/usr/bin/env python3
+    """Summarize syslog lines per role/region and severity bucket."""
+    import re
+    import sys
+    from collections import Counter
+
+    HOST_RE = re.compile(r"^([a-z]+)-([a-z]+)-(\d+)$")
+
+
+    def parse_pri(line):
+        return int(line[1:line.index(">")])
+
+
+    def host_group(host):
+        m = HOST_RE.match(host)
+        if m is None:
+            return {"role": "other", "region": "other"}
+        return {"role": m.group(1), "region": m.group(2)}
+
+
+    def severity_bucket(pri):
+        if pri % 8 <= 3:
+            return "error"
+        elif pri % 8 == 4:
+            return "warn"
+        elif pri % 8 > 4 and pri % 8 < 7:
+            return "info"
+        else:
+            return "debug"
+
+
+    def summarize(lines):
+        counts = Counter()
+        for line in lines:
+            pri = parse_pri(line)
+            host = line.split(None, 4)[3]
+            grp = host_group(host)
+            counts[(grp["role"], grp["region"], severity_bucket(pri))] += 1
+        return counts
+
+
+    def main(path):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            counts = summarize(f)
+        for key in sorted(counts):
+            print(*key, counts[key])
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1])
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly log batch)
+
+    #### [Bug] One malformed line aborts the whole run
+    - **Where:** `parse_pri` and `line.split(None, 4)[3]` in `summarize`
+    - **Issue:** a truncated line (for example at a log rotation), a blank line or a line without `<pri>` raises `ValueError` or `IndexError`. The script dies and you get no summary for the night.
+    - **Fix:** parse in one function that returns `None` for bad lines. Count them and report the count on stderr. The stdout format stays the same.
+
+    #### [High] Same pure computation repeated for every line
+    - **Where:** `host_group`, called once per line
+    - **Issue:** the result depends only on the host name. The fleet has a few hundred hosts, so the regex match and the new dict are redone millions of times for the same few hundred inputs.
+    - **Fix:** wrap it in `functools.lru_cache` with a `maxsize`, and return a tuple instead of a dict. A cached dict is one shared object, so any caller that changes it would change the result for every later line from that host. The bound keeps memory flat if odd host names show up.
+    - **Impact:** reduces E for every line. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over 200 distinct values used about 9× less CPU energy with `lru_cache`. This only works because the inputs repeat. For mostly unique inputs, such as the message text, a cache would only add overhead.
+
+    #### [Medium] Modulo repeated in a mixed range chain
+    - **Where:** `severity_bucket`
+    - **Issue:** the modulo is computed up to five times per call, and the branches mix `<=`, `==` and `>`/`<` range checks.
+    - **Fix:** compute the modulo once and look the result up in a dict with plain equality keys. Every value maps to the same bucket as before.
+    - **Impact:** reduces E per line, modestly. In Green Metrics Tool micro-benchmarks of 10 million classifications, simple equality branches used about 16% less CPU energy than complex range and modulo conditions. That saving is only for this one step, not for the whole script.
+
+    ```python
+    #!/usr/bin/env python3
+    """Summarize syslog lines per role/region and severity bucket."""
+    import re
+    import sys
+    from collections import Counter
+    from functools import lru_cache
+
+    HOST_RE = re.compile(r"^([a-z]+)-([a-z]+)-(\d+)$")
+
+    BUCKET_BY_SEVERITY = {
+        0: "error", 1: "error", 2: "error", 3: "error",
+        4: "warn",
+        5: "info", 6: "info",
+        7: "debug",
+    }
+
+
+    def parse_line(line):
+        parts = line.split(None, 4)
+        if len(parts) < 4:
+            return None
+        head = parts[0]
+        end = head.find(">")
+        if end < 2 or head[0] != "<":
+            return None
+        try:
+            return int(head[1:end]), parts[3]
+        except ValueError:
+            return None
+
+
+    @lru_cache(maxsize=1024)
+    def host_group(host):
+        m = HOST_RE.match(host)
+        if m is None:
+            return ("other", "other")
+        return (m.group(1), m.group(2))
+
+
+    def severity_bucket(pri):
+        return BUCKET_BY_SEVERITY[pri % 8]
+
+
+    def summarize(lines):
+        counts = Counter()
+        skipped = 0
+        for line in lines:
+            parsed = parse_line(line)
+            if parsed is None:
+                skipped += 1
+                continue
+            pri, host = parsed
+            role, region = host_group(host)
+            counts[(role, region, severity_bucket(pri))] += 1
+        return counts, skipped
+
+
+    def main(path):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            counts, skipped = summarize(f)
+        for key in sorted(counts):
+            print(*key, counts[key])
+        if skipped:
+            print(f"skipped {skipped} malformed lines", file=sys.stderr)
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1])
+    ```
+
+    **Already good:** the regex is compiled once at module level, the file is streamed line by line, and `Counter` aggregates in a single pass.
+verify:
+  module: true
+  test: |
+    assert [severity_bucket(p) for p in range(16)] == (["error"] * 4 + ["warn", "info", "info", "debug"]) * 2
+    assert host_group("gw-eu-12") == ("gw", "eu")
+    assert host_group("weird") == ("other", "other")
+    assert parse_line("<134>Oct 25 03:14:07 gw-eu-12 nginx[212]: hi") == (134, "gw-eu-12")
+    assert parse_line("garbage") is None
+    assert parse_line("") is None
+    assert parse_line("<x>Oct 25 03:14:07 gw-eu-12 a: b") is None
+    assert host_group.cache_info().maxsize == 1024
+  equivalence:
+    driver: |-
+      import os, tempfile
+      hosts = ["gw-eu-%d" % i for i in range(1, 30)] + ["db-us-%d" % i for i in range(1, 20)] + ["weird", "Edge_9", "app-ap-7"]
+      seed = 12345
+      lines = []
+      for i in range(5000):
+          seed = (seed * 1103515245 + 12345) % 2147483648
+          pri = seed % 192
+          host = hosts[(seed >> 8) % len(hosts)]
+          lines.append("<%d>Oct 25 03:14:%02d %s nginx[%d]: msg %d\n" % (pri, i % 60, host, i, i))
+      fd, path = tempfile.mkstemp(suffix=".log")
+      with os.fdopen(fd, "w") as f:
+          f.writelines(lines)
+      main(path)
+      os.unlink(path)

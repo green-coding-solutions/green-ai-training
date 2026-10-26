@@ -1,0 +1,134 @@
+id: gen-12764612-00325-review
+category: review
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    hello, can you review this please? its the message store for our chat rooms REST api (flask on top, this is only the service part). people open the room and see the newest messages first, so I do insert(0). some rooms are very busy. I am not sure if something is wrong, it works in my tests.
+
+    ```python
+    import threading
+    import time
+
+    MAX_PER_ROOM = 1000
+
+
+    class RoomStore:
+        def __init__(self):
+            self._rooms = {}
+            self._lock = threading.Lock()
+
+        def add_message(self, room, user, text):
+            with self._lock:
+                msgs = self._rooms.setdefault(room, [])
+                msg = {"id": len(msgs) + 1, "user": user, "text": text, "ts": time.time()}
+                msgs.insert(0, msg)
+                if len(msgs) > MAX_PER_ROOM:
+                    msgs.pop()
+            return msg
+
+        def latest(self, room, limit=50):
+            with self._lock:
+                return self._rooms.get(room, [])[:limit]
+
+
+    def get_messages(store, room, limit_param):
+        limit = int(limit_param or 50)
+        return {"room": room, "messages": store.latest(room, limit)}
+    ```
+- role: assistant
+  content: |
+    **Workload:** web backend (REST API, in-memory state per room)
+
+    #### [Bug] Message ids repeat once a room is full
+    - **Where:** `add_message`, `"id": len(msgs) + 1`
+    - **Issue:** after the room reaches `MAX_PER_ROOM`, the list length stays at 1000. Every new message gets id 1001. Clients that use the id for paging or de-duplication will break.
+    - **Fix:** use a counter that only goes up (`itertools.count`).
+
+    #### [Bug] `limit` from the query string is not checked
+    - **Where:** `get_messages`, `int(limit_param or 50)`
+    - **Issue:** `?limit=abc` raises `ValueError`, which becomes a 500. `?limit=-5` slices `[:-5]` and returns almost the whole room, without the 5 oldest. A huge value is also accepted.
+    - **Fix:** parse safely and clamp to `1..MAX_PER_ROOM`.
+
+    #### [Medium] Front insert into a list on every message
+    - **Where:** `msgs.insert(0, msg)` and `msgs.pop()`
+    - **Issue:** `insert(0, ...)` moves every element one slot, so each message costs O(size of room). In Green Metrics Tool micro-benchmarks, 1,000,000 front inserts into a growing list used ~1515 J, while 1,000,000 `append` calls used ~1.2 J. Your list is capped at 1000, so the shift per message is bounded and the real gain will be much smaller than in that test. It is still wasted work on the hottest path of your busiest rooms. It also runs while holding the lock, so other requests for the store wait longer.
+    - **Fix:** a `deque(maxlen=MAX_PER_ROOM)` with `appendleft`. Front insert is O(1), and the oldest message is dropped automatically from the other end, so the manual `pop()` is not needed.
+    - **Impact:** E (CPU per message) and lock hold time. To see the real saving for your traffic, measure `add_message` with `perf stat` or `time` on a replayed busy room.
+
+    #### [Low] Slicing does not work on a deque
+    - **Where:** `latest`
+    - **Issue:** `deque[:limit]` is not allowed. Use `itertools.islice`. Keep the lock in `latest`: iterating a deque while another thread appends raises `RuntimeError`.
+
+    **Already good:** the lock around all shared state, and the cap per room, so memory per room is bounded. The order is the same as before (newest first).
+
+    ```python
+    import itertools
+    import threading
+    import time
+    from collections import deque
+
+    MAX_PER_ROOM = 1000
+    DEFAULT_LIMIT = 50
+
+
+    class RoomStore:
+        def __init__(self):
+            self._rooms = {}
+            self._ids = itertools.count(1)
+            self._lock = threading.Lock()
+
+        def add_message(self, room, user, text):
+            with self._lock:
+                msg = {"id": next(self._ids), "user": user, "text": text, "ts": time.time()}
+                msgs = self._rooms.get(room)
+                if msgs is None:
+                    msgs = self._rooms[room] = deque(maxlen=MAX_PER_ROOM)
+                msgs.appendleft(msg)
+            return msg
+
+        def latest(self, room, limit=DEFAULT_LIMIT):
+            with self._lock:
+                return list(itertools.islice(self._rooms.get(room, ()), limit))
+
+
+    def parse_limit(value):
+        try:
+            limit = int(value)
+        except (TypeError, ValueError):
+            return DEFAULT_LIMIT
+        return max(1, min(limit, MAX_PER_ROOM))
+
+
+    def get_messages(store, room, limit_param):
+        limit = parse_limit(limit_param)
+        return {"room": room, "messages": store.latest(room, limit)}
+    ```
+verify:
+  test: |
+    store = RoomStore()
+    ids = [store.add_message("r", "u", "t")["id"] for _ in range(MAX_PER_ROOM + 20)]
+    assert len(set(ids)) == len(ids)
+    assert len(store.latest("r", 5000)) == MAX_PER_ROOM
+    assert store.latest("r", 3)[0]["id"] == ids[-1]
+    assert [m["id"] for m in store.latest("r", 2)] == [ids[-1], ids[-2]]
+    assert parse_limit("-4") == 1
+    assert parse_limit("abc") == DEFAULT_LIMIT
+    assert parse_limit(None) == DEFAULT_LIMIT
+    assert parse_limit("999999") == MAX_PER_ROOM
+    assert isinstance(store._rooms["r"], deque)
+    assert store.latest("nope") == []
+  equivalence:
+    driver: |-
+      MAX_PER_ROOM = 5
+      store = RoomStore()
+      for i in range(8):
+          store.add_message("a", "u%d" % (i % 3), "msg %d" % i)
+      store.add_message("b", "x", "hello")
+      for room, lim in (("a", "3"), ("a", None), ("b", "10"), ("zzz", "5"), ("a", "2")):
+          res = get_messages(store, room, lim)
+          print(room, [(m["user"], m["text"]) for m in res["messages"]])

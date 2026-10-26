@@ -1,0 +1,168 @@
+id: gen-2-00191-review
+category: review
+language: python
+patterns:
+- simple-conditions
+facts:
+- F-COND
+messages:
+- role: user
+  content: |
+    Can you review the transform step of our goods-movement loader? Some context and requirements:
+
+    - It runs hourly in Airflow on the MSEG delta extract from SAP. That is about 3-4M rows per day, semicolon CSV.
+    - Finance signed off exactly these movement types: 101/102, 201/202, 261/262, 311/312, 551/552, 601/602. Even codes are the reversals and must flip the sign.
+    - Anything else has to go to the reject file. The job must never crash because of a single bad row.
+    - Quantities stay `Decimal`, and the output format must not change because the warehouse model reads it.
+    - A colleague wants to rewrite `classify_movement` as `match/case` "for speed". Is that worth it?
+
+    ```python
+    import csv
+    import logging
+    from decimal import Decimal
+
+    log = logging.getLogger("mm_loader")
+
+
+    def classify_movement(mvt):
+        """Map an SAP movement type to (category, sign). None = unsupported."""
+        reversal = mvt % 2 == 0
+        base = mvt - 1 if reversal else mvt
+
+        if 101 <= base < 200 and base % 10 == 1:
+            category, sign = "receipt", 1
+        elif 201 <= base < 300 and base % 20 == 1:
+            category, sign = "issue", -1
+        elif 311 <= base < 320 and base % 2 == 1:
+            category, sign = "transfer", 0
+        elif 551 <= base < 600 and base % 50 == 1:
+            category, sign = "scrap", -1
+        elif 601 <= base < 700 and base % 100 == 1:
+            category, sign = "delivery", -1
+        else:
+            return None
+        return category, -sign if reversal else sign
+
+
+    def transform(in_path, out_path, reject_path):
+        rejected = 0
+        with open(in_path, newline="") as src, \
+             open(out_path, "w", newline="") as out, \
+             open(reject_path, "w", newline="") as rej:
+            reader = csv.DictReader(src, delimiter=";")
+            writer = csv.writer(out)
+            rejects = csv.writer(rej)
+            writer.writerow(["doc_no", "plant", "material", "category", "qty"])
+            for row in reader:
+                mvt = int(row["BWART"])
+                result = classify_movement(mvt)
+                if result is None:
+                    rejects.writerow([row["MBLNR"], mvt])
+                    rejected += 1
+                    continue
+                category, sign = result
+                qty = Decimal(row["MENGE"].replace(",", "."))
+                writer.writerow([row["MBLNR"], row["WERKS"], row["MATNR"], category, sign * qty])
+        log.info("done, %d rows rejected", rejected)
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (runs on every row, millions of rows per day)
+
+    #### [Bug] The guards accept movement types that are not signed off
+    - **Where:** `classify_movement`, all five branches
+    - **Issue:** the range/modulo checks match more than the 12 codes on your list. `base % 10 == 1` lets 111 to 191 through. `base % 20 == 1` lets 221, 241 and 281 through. `base % 2 == 1` lets 313 to 319 through. These rows are loaded instead of rejected. For example, 161 (a return to the vendor) ends up as a receipt with a positive quantity.
+    - **Fix:** look up the exact codes (see the code below).
+
+    #### [Bug] Non-numeric movement types abort the whole run
+    - **Where:** `int(row["BWART"])` in `transform`
+    - **Issue:** custom movement types like `Z01`, or an empty field, raise `ValueError`. This stops the file in the middle and breaks the "never crash on a bad row" requirement.
+    - **Fix:** look up the raw string code and skip `int()`. Unknown codes then go to the reject file like any other unsupported type.
+
+    #### [Medium] Complex guard chain evaluated on every row
+    - **Where:** `classify_movement`
+    - **Issue:** each row costs a modulo and a subtraction, and then up to five range-plus-modulo tests. Only 12 exact values are valid, so a single equality lookup does the same job.
+    - **Fix:** a dict from code to `(category, sign)`. This is one hash lookup per row, and it also fixes both bugs above.
+    - **Impact:** reduces E per row. In Green Metrics Tool micro-benchmarks, 10,000,000 classifications with simple equality conditions used about 16% less CPU energy than complex range/modulo conditions. CSV parsing and `Decimal` cost more per row than this function, so the overall gain for the job is moderate. The correctness fix is the main reason to change it.
+
+    ```python
+    import csv
+    import logging
+    from decimal import Decimal
+
+    log = logging.getLogger("mm_loader")
+
+    # Signed-off movement types -> (category, sign). Even codes are reversals.
+    MOVEMENT_TYPES = {
+        "101": ("receipt", 1),   "102": ("receipt", -1),
+        "201": ("issue", -1),    "202": ("issue", 1),
+        "261": ("issue", -1),    "262": ("issue", 1),
+        "311": ("transfer", 0),  "312": ("transfer", 0),
+        "551": ("scrap", -1),    "552": ("scrap", 1),
+        "601": ("delivery", -1), "602": ("delivery", 1),
+    }
+
+
+    def classify_movement(code):
+        """Map a movement type code to (category, sign). None = not signed off."""
+        return MOVEMENT_TYPES.get(code.strip())
+
+
+    def transform(in_path, out_path, reject_path):
+        rejected = 0
+        with open(in_path, newline="") as src, \
+             open(out_path, "w", newline="") as out, \
+             open(reject_path, "w", newline="") as rej:
+            reader = csv.DictReader(src, delimiter=";")
+            writer = csv.writer(out)
+            rejects = csv.writer(rej)
+            writer.writerow(["doc_no", "plant", "material", "category", "qty"])
+            for row in reader:
+                code = row["BWART"].strip()
+                result = classify_movement(code)
+                if result is None:
+                    rejects.writerow([row["MBLNR"], code])
+                    rejected += 1
+                    continue
+                category, sign = result
+                qty = Decimal(row["MENGE"].replace(",", "."))
+                writer.writerow([row["MBLNR"], row["WERKS"], row["MATNR"], category, sign * qty])
+        log.info("done, %d rows rejected", rejected)
+    ```
+
+    For the 12 signed-off codes the output is unchanged. `classify_movement` now takes the string code, so update any other callers that pass an `int`.
+
+    **On `match/case`:** it won't make this faster. In the same benchmarks, `match` and `if/elif` with the same conditions differed by about 1%, which is noise. What matters is how simple the conditions are, not the syntax.
+
+    **Already good:** the file is streamed row by row, so memory stays flat. Quantities stay `Decimal`. Unsupported rows go to a reject file instead of being silently dropped.
+verify:
+  green_block: 0
+  test: |
+    import os, tempfile
+    assert classify_movement("161") is None
+    assert classify_movement("313") is None
+    assert classify_movement("Z01") is None
+    assert classify_movement(" 262 ") == ("issue", 1)
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "in.csv")
+    with open(p, "w", newline="") as f:
+        f.write("MBLNR;WERKS;MATNR;BWART;MENGE\n1;1000;M1;Z01;1,000\n2;1000;M1;161;2,000\n3;1000;M1;101;3,000\n")
+    transform(p, os.path.join(d, "o.csv"), os.path.join(d, "r.csv"))
+    assert open(os.path.join(d, "r.csv")).read().split() == ["1,Z01", "2,161"]
+    assert open(os.path.join(d, "o.csv")).read().split()[1] == "3,1000,M1,receipt,3.000"
+  equivalence:
+    driver: |-
+      import os, tempfile
+      d = tempfile.mkdtemp()
+      src = os.path.join(d, "in.csv")
+      codes = ["101", "102", "201", "202", "261", "262", "311", "312",
+               "551", "552", "601", "602", "103", "999"]
+      with open(src, "w", newline="") as f:
+          f.write("MBLNR;WERKS;MATNR;BWART;MENGE\n")
+          for i, c in enumerate(codes):
+              f.write(f"49000000{i:02d};{1000 + i % 3};MAT-{i};{c};{i + 1},{i * 125 % 1000:03d}\n")
+      out = os.path.join(d, "out.csv")
+      rej = os.path.join(d, "rej.csv")
+      transform(src, out, rej)
+      print(open(out).read())
+      print(open(rej).read())

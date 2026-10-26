@@ -1,0 +1,148 @@
+id: gen-2-00190-generation
+category: generation
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    ```python
+    # scripts/test_owners_report.py
+    # reads junit xml from the nightly artifacts (last 30 days, all jobs)
+    # and prints tests / failures per owning team
+
+    import sys
+    from collections import Counter
+    from pathlib import Path
+    import xml.etree.ElementTree as ET
+
+    OWNERS = {
+        "tests.api": "team-api",
+        "tests.api.payments": "team-payments",
+        "tests.web": "team-frontend",
+        "tests.web.checkout": "team-checkout",
+        "tests.infra": "team-platform",
+        "tests.e2e": "team-qa",
+    }
+
+
+    def owner_for(classname: str) -> str:
+        # longest dotted prefix of classname that is in OWNERS, else "unowned"
+        # "tests.api.payments.test_refund.TestRefund" -> "team-payments"
+        # "tests.apiv2.test_x.T" -> "unowned"
+        ...
+
+
+    def main(artifact_dir: str) -> None:
+        tests = Counter()
+        failures = Counter()
+        for xml_file in Path(artifact_dir).glob("**/junit*.xml"):
+            root = ET.parse(xml_file).getroot()
+            for case in root.iter("testcase"):
+                team = owner_for(case.get("classname", ""))
+                tests[team] += 1
+                if case.find("failure") is not None or case.find("error") is not None:
+                    failures[team] += 1
+
+        # TODO print table: team, tests, failed, rate. most failures first
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1] if len(sys.argv) > 1 else "artifacts")
+    ```
+    ?
+- role: assistant
+  content: |
+    Here is `owner_for` and the report output, filled in:
+
+    ```python
+    # scripts/test_owners_report.py
+    # reads junit xml from the nightly artifacts (last 30 days, all jobs)
+    # and prints tests / failures per owning team
+
+    import sys
+    from collections import Counter
+    from functools import lru_cache
+    from pathlib import Path
+    import xml.etree.ElementTree as ET
+
+    OWNERS = {
+        "tests.api": "team-api",
+        "tests.api.payments": "team-payments",
+        "tests.web": "team-frontend",
+        "tests.web.checkout": "team-checkout",
+        "tests.infra": "team-platform",
+        "tests.e2e": "team-qa",
+    }
+
+
+    @lru_cache(maxsize=4096)
+    def owner_for(classname: str) -> str:
+        """Owner of the longest dotted prefix of classname in OWNERS, else 'unowned'."""
+        parts = classname.split(".")
+        for end in range(len(parts), 0, -1):
+            owner = OWNERS.get(".".join(parts[:end]))
+            if owner is not None:
+                return owner
+        return "unowned"
+
+
+    def main(artifact_dir: str) -> None:
+        tests = Counter()
+        failures = Counter()
+        for xml_file in Path(artifact_dir).glob("**/junit*.xml"):
+            root = ET.parse(xml_file).getroot()
+            for case in root.iter("testcase"):
+                team = owner_for(case.get("classname", ""))
+                tests[team] += 1
+                if case.find("failure") is not None or case.find("error") is not None:
+                    failures[team] += 1
+
+        print(f"{'team':<16} {'tests':>8} {'failed':>8} {'rate':>7}")
+        for team in sorted(tests, key=lambda t: (-failures[t], t)):
+            rate = failures[team] / tests[team]
+            print(f"{team:<16} {tests[team]:>8} {failures[team]:>8} {rate:>7.2%}")
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1] if len(sys.argv) > 1 else "artifacts")
+    ```
+
+    Prefixes only match on whole dotted parts, so `tests.apiv2` does not match `tests.api`. When two teams have the same number of failures, they are sorted by name, so the output stays the same from run to run.
+
+    **Green Notes**
+    - **Memoize the owner lookup** (reduces E): `owner_for` runs for every testcase in every report of 30 days of runs. But the suite has only a few hundred distinct classnames. So after the first call for a classname, each lookup is a single cache hit, not a split, several joins and several dict lookups. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations with inputs from only 200 distinct values used ~4.7 J with `lru_cache` instead of ~43 J, about 9× less. This only pays off because the inputs repeat this much.
+    - The cache is bounded, so memory stays capped even for a very large suite. It assumes `OWNERS` does not change while the script runs.
+verify:
+  module: true
+  test: |-
+    import io, os, tempfile, contextlib
+    assert owner_for("tests.api.payments.test_refund.TestRefund") == "team-payments"
+    assert owner_for("tests.api.test_orders.TestList") == "team-api"
+    assert owner_for("tests.web.checkout.test_cart.T") == "team-checkout"
+    assert owner_for("tests.apiv2.test_x.T") == "unowned"
+    assert owner_for("") == "unowned"
+
+    d = tempfile.mkdtemp()
+    os.makedirs(os.path.join(d, "run1"))
+    with open(os.path.join(d, "run1", "junit-api.xml"), "w") as f:
+        f.write(
+            '<testsuite>'
+            '<testcase classname="tests.api.test_orders.T" name="a"/>'
+            '<testcase classname="tests.api.test_orders.T" name="b"><failure message="x"/></testcase>'
+            '<testcase classname="tests.web.test_home.T" name="c"><error message="y"/></testcase>'
+            '<testcase classname="misc.T" name="d"/>'
+            '</testsuite>'
+        )
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        main(d)
+    out = buf.getvalue().splitlines()
+    assert out[0].split() == ["team", "tests", "failed", "rate"]
+    assert out[1].split()[:3] == ["team-api", "2", "1"]
+    assert out[2].split()[:3] == ["team-frontend", "1", "1"]
+    assert out[3].split()[:3] == ["unowned", "1", "0"]
+    assert len(out) == 4
+    assert owner_for.cache_info().hits >= 1

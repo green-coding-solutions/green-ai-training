@@ -1,0 +1,94 @@
+id: gen-2-00406-estimate
+category: estimate
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    hello. we have rest api for our mobile app and for 3 internal services (billing, search, reports). nginx is in front, config is like this:
+
+    ```nginx
+    upstream api_backend {
+        server 127.0.0.1:9000;
+        keepalive 16;
+    }
+
+    server {
+        listen 443 ssl http2;
+        server_name api.example.com;
+
+        gzip on;
+        gzip_comp_level 5;
+        gzip_types application/json text/plain;
+        gzip_proxied any;
+
+        location /v1/ {
+            proxy_pass http://api_backend;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Host $host;
+        }
+    }
+    ```
+
+    the internal services call the same api over the datacenter network, so I think the compresion is waste of cpu for them. how much energy we will save if we turn it of? and the mobile app still need it right? sorry for my english
+- role: assistant
+  content: |
+    Yes, keep compression for the mobile app. Turning it off for the internal services is a reasonable idea, but I can't give you a number for your API.
+
+    What I can give you is a measurement. In Green Metrics Tool benchmarks, nginx served 2,000 requests for text assets (client and server CPU energy):
+
+    - no compression: ~7.3 J, with 253 MB transferred
+    - gzip level 5 on every request: ~54 J, with 29 MB transferred
+
+    So compressing on every request cost about 7× the CPU energy of no compression. It also sent about 10× fewer bytes. That test ran on a local Docker network, where transfer was almost free. It shows only the CPU side. It used static text assets, not your JSON, so treat it as a direction, not a forecast.
+
+    What this means for you:
+
+    - **Internal services:** on a fast datacenter link the bytes are cheap and the CPU cost stays. Turning compression off for them should save CPU.
+    - **Mobile app:** on real mobile networks the byte saving is what counts, so keep gzip there.
+
+    The cleanest way is two entry points. For example, one `server` block for the public hostname and one for an internal hostname or listener:
+
+    ```nginx
+    # public: mobile app
+    server {
+        listen 443 ssl http2;
+        server_name api.example.com;
+
+        gzip on;
+        gzip_comp_level 5;
+        gzip_types application/json text/plain;
+
+        location /v1/ {
+            proxy_pass http://api_backend;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Host $host;
+        }
+    }
+
+    # internal: billing, search, reports
+    server {
+        listen 443 ssl http2;
+        server_name api.internal.example.com;
+
+        gzip off;
+
+        location /v1/ {
+            proxy_pass http://api_backend;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Host $host;
+        }
+    }
+    ```
+
+    Check one thing first: some internal clients may send `Accept-Encoding: gzip` and be fine without it, but a client that needs small responses over a slow link (for example a cross-region call) should stay on the public block.
+
+    To measure your own saving, replay the same set of API requests against both configs, in a Green Metrics Tool usage scenario or at least with `perf stat` on the nginx process. Compare CPU time and bytes sent. Don't extrapolate the benchmark figures to your traffic.
+verify:
+  static_only: nginx config, no runnable code

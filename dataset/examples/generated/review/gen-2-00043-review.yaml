@@ -1,0 +1,99 @@
+id: gen-2-00043-review
+category: review
+language: bash
+patterns:
+- bash-builtins
+- compress-stored
+facts:
+- F-BASH-SUBPROC
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    runs after every run of our MD sweep (~300 runs). review pls
+
+    ```bash
+    #!/bin/bash
+    # postprocess.sh <run_dir>  -- called by the sweep driver after each MD run
+    run=$1
+    cd $run
+    rm -rf scratch/*
+
+    # thermo summary: columns are step temp pe ke press
+    n=0
+    tmax=0
+    tsum=0
+    while read line; do
+        if echo "$line" | grep -q '^#'; then
+            continue
+        fi
+        temp=$(echo "$line" | awk '{print $2}')
+        pe=$(echo "$line" | awk '{print $3}')
+        tsum=$(echo "$tsum + $temp" | bc -l)
+        if [ $(echo "$temp > $tmax" | bc -l) -eq 1 ]; then
+            tmax=$temp
+        fi
+        n=$(expr $n + 1)
+    done < log.thermo
+    tavg=$(echo "$tsum / $n" | bc -l)
+    echo "$run steps=$n tavg=$tavg tmax=$tmax last_pe=$pe" >> ../summary.txt
+
+    # radial distribution function
+    grep -v '^#' traj.xyz > scratch/frames.tmp
+    gzip -9 scratch/frames.tmp   # save scratch quota
+    zcat scratch/frames.tmp.gz | ./rdf_calc > rdf.dat
+    rm scratch/frames.tmp.gz
+
+    # archive raw output for the paper (kept ~2 years)
+    xz -9 log.thermo traj.xyz
+    mv log.thermo.xz traj.xyz.xz /archive/md_sweep/$(basename $run)/
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (post-processing after every simulation run)
+
+    #### [Bug] `rm -rf scratch/*` can run in the wrong directory
+    - **Where:** `cd $run` followed by `rm -rf scratch/*`
+    - **Issue:** if `cd` fails, the script keeps running in the sweep driver's directory. That happens with a missing run dir, a typo, or a path with a space, because `$run` is unquoted. `rm -rf scratch/*` then wipes the driver's `scratch/`, and the summary line goes to the wrong `../summary.txt`.
+    - **Fix:**
+      ```bash
+      run=$1
+      cd -- "$run" || exit 1
+      ```
+      Also quote it in the archive path: `$(basename "$run")`.
+
+    #### [High] About ten processes per thermo line
+    - **Where:** the `while read` loop over `log.thermo`
+    - **Issue:** every line starts `echo | grep`, two `echo | awk` pipelines, two `bc` calls and one `expr`. That is about ten process starts per line, for every line of every run. The math itself is trivial. The process starts are the cost. In Green Metrics Tool micro-benchmarks summarizing a 20,000-line log, a loop that ran `$(echo | cut)` and `$(expr)` for every field used ~1302 J. One `awk` pass with identical output used ~1.0 J, over 1000× less.
+    - **Fix:** do the whole summary in one `awk` pass:
+      ```bash
+      awk -v run="$run" '
+          NF == 0 || $1 ~ /^#/ { next }
+          { n++; tsum += $2; if ($2 > tmax) tmax = $2; pe = $3 }
+          BEGIN { tmax = 0 }
+          END { printf "%s steps=%d tavg=%.6f tmax=%s last_pe=%s\n", run, n, tsum / n, tmax, pe }
+      ' log.thermo >> ../summary.txt
+      ```
+    - **Impact:** E, per run. You go from about ten processes per line to one process per run. `steps`, `tmax` and `last_pe` come out the same as before. `tavg` now has 6 decimals instead of the 20 that `bc -l` printed.
+
+    #### [Medium] Compressing a scratch file that is deleted seconds later
+    - **Where:** `gzip -9 scratch/frames.tmp` / `zcat` / `rm`
+    - **Issue:** each run writes a full copy of the trajectory, compresses it, decompresses it right away and deletes it. You pay for compression and decompression, and the quota saving only lasts while `rdf_calc` runs. Green Coding Solutions estimates (this is not a direct measurement) that even zstd only pays off once the data stays stored about 0.15 days. `gzip -9` costs more than zstd.
+    - **Fix:** pipe straight into `rdf_calc`. `rdf_calc` already reads stdin, so no temp file is needed:
+      ```bash
+      grep -v '^#' traj.xyz | ./rdf_calc > rdf.dat
+      ```
+    - **Impact:** E per run, and it grows with trajectory size. It also removes one full write and read of the trajectory on scratch, and no scratch quota is used at all.
+
+    #### [Medium] `xz -9` on every run's archive
+    - **Where:** `xz -9 log.thermo traj.xyz`
+    - **Issue:** compressing data you keep for two years is right. But this runs on the full trajectory for every run in the sweep. In Green Metrics Tool measurements compressing 100 MB of text, zstd at its default level used ~16 J and xz at its default level ~458 J, about 29× more. `-9` is a stronger setting than the default that was measured.
+    - **Fix:**
+      ```bash
+      zstd -q --rm log.thermo traj.xyz
+      mv log.thermo.zst traj.xyz.zst "/archive/md_sweep/$(basename "$run")/"
+      ```
+    - **Impact:** E per run, and it grows with trajectory size. These measurements compare energy, not compression ratio, and `xz -9` files are usually smaller. If archive quota is tight, compare the file sizes on one run before you switch. Anyone reading the archive then needs `zstd -d` or `zstdcat` instead of `xz -d`.
+verify:
+  static_only: needs an MD run directory, ./rdf_calc and zstd; the bash snippets are syntax checked

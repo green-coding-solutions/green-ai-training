@@ -1,0 +1,64 @@
+id: gen-2-00050-estimate
+category: estimate
+language: sql
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    hi, we have a ETL job that sync shipments from our postgres into the warehouse every 10 minutes. it pull all rows changed since last run, normaly 3000-5000 rows. the extract query is this:
+
+    ```sql
+    SELECT *
+    FROM shipments
+    WHERE updated_at > %(last_run)s
+    ORDER BY updated_at;
+    ```
+
+    shipments table has 45 columns, also `label_pdf` (bytea, ~80 KB each), `customs_xml` (text) and `tracking_events` (jsonb, can be quite big). in the warehouse we load only 8 columns: shipment_id, order_id, carrier, status, shipped_at, delivered_at, weight_g, updated_at. the python loader read rows as dict by name.
+
+    my colleague say SELECT * is fine because "postgres read the whole row anyway". how much energy we would save if we list the columns? is it worth to change?
+- role: assistant
+  content: |
+    Yes, it is worth it. Your colleague's point does not hold for wide rows. PostgreSQL stores large values like `label_pdf`, `customs_xml` and `tracking_events` out of line (TOAST). It only fetches and decompresses them when the query asks for those columns. With `SELECT *` the server fetches every PDF, XML document and event list. It sends them to the ETL client, the client decodes them, and then the loader throws them away. With 8 named columns all of that work is skipped.
+
+    Measured reference: Green Metrics Tool ran micro-benchmarks on PostgreSQL 16 with psycopg 3, client and server on the same machine. The test read rows 1,000 times from a 52-column products table with large text columns:
+
+    - 2,500 rows: `SELECT *` ~470 J vs. the 10 needed columns ~64 J, about 7× less
+    - 10,000 rows: ~1869 J vs. ~274 J, also about 7× less
+    - Column sweep at 2,500 rows: 8 columns ~58 J, all 52 columns ~465 J, about 8× the 8-column query
+
+    The cost scales with the data each column carries. Your case has the same shape: a few thousand rows, a few big columns you never use. So expect a large gap. I can't give you your number, though. Your bytea and jsonb values are not the benchmark's text columns. And your warehouse is probably not on the same machine, so network transfer comes on top. The saving repeats on every run, all day.
+
+    The change:
+
+    ```sql
+    SELECT shipment_id, order_id, carrier, status,
+           shipped_at, delivered_at, weight_g, updated_at
+    FROM shipments
+    WHERE updated_at > %(last_run)s
+    ORDER BY updated_at;
+    ```
+
+    Your loader reads rows by name, so nothing else changes. If a new column is added to `shipments` later, it no longer slips silently into the extract.
+
+    To measure it for your data:
+
+    1. Check how much data the skipped columns carry in a typical window:
+
+       ```sql
+       SELECT count(*) AS shipment_rows,
+              pg_size_pretty(sum(pg_column_size(label_pdf))) AS label_pdf,
+              pg_size_pretty(sum(pg_column_size(customs_xml))) AS customs_xml,
+              pg_size_pretty(sum(pg_column_size(tracking_events))) AS tracking_events
+       FROM shipments
+       WHERE updated_at > now() - interval '10 minutes';
+       ```
+
+    2. Run one extract with each query against a copy of the table. Measure both sides, because the server sends the data and the client decodes it. Use `pg_stat_statements` (`total_exec_time`) for the database and `perf stat` or RAPL around the ETL process. For real energy figures, run both variants as Green Metrics Tool usage scenarios.
+verify:
+  static_only: PostgreSQL query with psycopg placeholder; needs a running database with the shipments table

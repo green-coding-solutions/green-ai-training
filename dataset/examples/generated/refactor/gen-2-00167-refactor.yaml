@@ -1,0 +1,188 @@
+id: gen-2-00167-refactor
+category: refactor
+language: python
+patterns:
+- vectorize-or-jit
+- async-concurrent-io
+facts:
+- F-NUMBA
+- F-HTTP
+messages:
+- role: user
+  content: |
+    We run this every morning on a small box at the test site. It pulls yesterday's raw accelerometer traces from about 40 field loggers through the site gateway and packs them into int16 archive files. Each trace is around 8.6M float32 samples. The whole thing takes ~25 minutes now and it's getting in the way of the morning analysis.
+
+    Can you refactor it? Requirements:
+    - CLI stays exactly the same (cron calls it, and so does one other script)
+    - the .i16 and .json files must stay byte-identical, the downstream reader is strict
+    - the gateway falls over with more than 8 parallel connections
+    - httpx and numba are already in the venv, Python 3.11
+
+    ```python
+    #!/usr/bin/env python3
+    """Pull raw traces from the field loggers and pack them into int16 archive files."""
+    import argparse
+    import json
+    import math
+    import pathlib
+    import urllib.request
+
+    import numpy as np
+
+    FULL_SCALE_G = 16.0
+    LEVELS = 32767
+
+
+    def fetch_trace(base_url, logger_id, day):
+        url = f"{base_url}/loggers/{logger_id}/raw?day={day}"
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            return np.frombuffer(resp.read(), dtype="<f4")
+
+
+    def quantize(samples, full_scale):
+        step = full_scale / LEVELS
+        out = np.empty(len(samples), dtype=np.int16)
+        clipped = 0
+        for i in range(len(samples)):
+            q = math.floor(float(samples[i]) / step + 0.5)
+            if q > LEVELS:
+                q = LEVELS
+                clipped += 1
+            elif q < -LEVELS:
+                q = -LEVELS
+                clipped += 1
+            out[i] = q
+        return out, clipped
+
+
+    def main():
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--base-url", default="http://gateway.site3.lan:8080")
+        ap.add_argument("--day", required=True)
+        ap.add_argument("--out", type=pathlib.Path, default=pathlib.Path("archive"))
+        ap.add_argument("loggers", nargs="+")
+        args = ap.parse_args()
+        args.out.mkdir(parents=True, exist_ok=True)
+
+        for logger_id in args.loggers:
+            samples = fetch_trace(args.base_url, logger_id, args.day)
+            codes, clipped = quantize(samples, FULL_SCALE_G)
+            codes.tofile(args.out / f"{logger_id}_{args.day}.i16")
+            meta = {
+                "logger": logger_id,
+                "day": args.day,
+                "step_g": FULL_SCALE_G / LEVELS,
+                "n": len(codes),
+                "clipped": clipped,
+            }
+            (args.out / f"{logger_id}_{args.day}.json").write_text(json.dumps(meta))
+            print(f"{logger_id}: {len(codes)} samples, {clipped} clipped")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    ```python
+    #!/usr/bin/env python3
+    """Pull raw traces from the field loggers and pack them into int16 archive files."""
+    import argparse
+    import asyncio
+    import json
+    import math
+    import pathlib
+
+    import httpx
+    import numpy as np
+    from numba import njit
+
+    FULL_SCALE_G = 16.0
+    LEVELS = 32767
+    MAX_PARALLEL = 8  # the gateway can't take more connections than this
+
+
+    @njit(cache=True)
+    def _quantize_kernel(samples, step, levels, out):
+        clipped = 0
+        for i in range(samples.shape[0]):
+            q = math.floor(float(samples[i]) / step + 0.5)
+            if q > levels:
+                q = levels
+                clipped += 1
+            elif q < -levels:
+                q = -levels
+                clipped += 1
+            out[i] = q
+        return clipped
+
+
+    def quantize(samples, full_scale):
+        # The pure Python loop raised on NaN/inf through math.floor. The compiled loop
+        # would not, so check explicitly.
+        if not np.isfinite(samples).all():
+            raise ValueError("trace contains NaN or inf samples")
+        out = np.empty(len(samples), dtype=np.int16)
+        clipped = _quantize_kernel(samples, full_scale / LEVELS, LEVELS, out)
+        return out, int(clipped)
+
+
+    async def fetch_trace(client, base_url, logger_id, day):
+        resp = await client.get(f"{base_url}/loggers/{logger_id}/raw?day={day}")
+        resp.raise_for_status()
+        return np.frombuffer(resp.content, dtype="<f4")
+
+
+    async def process_logger(client, sem, args, logger_id):
+        async with sem:
+            samples = await fetch_trace(client, args.base_url, logger_id, args.day)
+        codes, clipped = quantize(samples, FULL_SCALE_G)
+        codes.tofile(args.out / f"{logger_id}_{args.day}.i16")
+        meta = {
+            "logger": logger_id,
+            "day": args.day,
+            "step_g": FULL_SCALE_G / LEVELS,
+            "n": len(codes),
+            "clipped": clipped,
+        }
+        (args.out / f"{logger_id}_{args.day}.json").write_text(json.dumps(meta))
+        return f"{logger_id}: {len(codes)} samples, {clipped} clipped"
+
+
+    async def run(args):
+        sem = asyncio.Semaphore(MAX_PARALLEL)
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            lines = await asyncio.gather(
+                *(process_logger(client, sem, args, lid) for lid in args.loggers)
+            )
+        for line in lines:
+            print(line)
+
+
+    def main():
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--base-url", default="http://gateway.site3.lan:8080")
+        ap.add_argument("--day", required=True)
+        ap.add_argument("--out", type=pathlib.Path, default=pathlib.Path("archive"))
+        ap.add_argument("loggers", nargs="+")
+        args = ap.parse_args()
+        args.out.mkdir(parents=True, exist_ok=True)
+        asyncio.run(run(args))
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **JIT-compile the quantize loop with Numba** (reduces E): every sample of every trace went through the interpreter. That loop is the CPU hot spot of the run. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples used ~40 J in a pure Python loop and ~9.5 J with `@njit`, about 4× less. `cache=True` writes the compiled code to disk, so the compile step does not repeat every morning.
+    - **Concurrent downloads with httpx** (reduces idle time and resource holding): up to `MAX_PARALLEL` traces download at once instead of one after another, and the client reuses connections to the gateway. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. The main gain here is a shorter run, not a big CPU saving.
+
+    Behavior:
+    - The `.i16` and `.json` files are byte-identical. The kernel uses the same float64 expression, the same rounding and the same clipping. `clipped` is converted back to a plain `int` for the JSON.
+    - The CLI is unchanged. The summary lines still come in argument order, but they all print at the end, not as each logger finishes.
+    - `httpx` does not raise on 4xx/5xx by default. `raise_for_status()` keeps the old fail-on-HTTP-error behavior.
+    - NaN or inf in a trace now raises `ValueError` before anything is written for that logger. Before, it raised `ValueError` or `OverflowError` partway through the loop.
+    - If one logger fails, the run still aborts and the other downloads in flight are cancelled. Files from loggers that already finished stay on disk, as before. Which loggers those are now depends on finish order.
+verify:
+  static_only: needs the logger gateway over the network plus the httpx and numba packages

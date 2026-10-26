@@ -1,0 +1,110 @@
+id: gen-2-00051-review
+category: review
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    Hi, I'm a PhD student and I wrote the Docker image for our lab's climate ensemble runs. GitLab builds it every time someone pushes to the repo, and then our SLURM jobs pull it on the compute nodes. My supervisor says the image is "way too big" and the build is slow, but I honestly don't know what is wrong with it. It works! Could you look at it?
+
+    ```dockerfile
+    FROM python:3.12
+
+    RUN apt-get update
+    RUN apt-get install -y build-essential gfortran git curl vim wget htop
+
+    WORKDIR /opt/climate-sim
+
+    COPY . .
+
+    RUN pip install --upgrade pip
+    RUN pip install -r requirements.txt
+
+    ENV PYTHONUNBUFFERED=1
+
+    CMD ["python", "run_ensemble.py", "--config", "configs/default.yaml"]
+    ```
+
+    requirements.txt:
+
+    ```text
+    numpy==2.1.3
+    scipy==1.14.1
+    xarray==2024.10.0
+    netCDF4==1.7.2
+    pyyaml==6.0.2
+    matplotlib==3.9.2
+    jupyterlab
+    ipython
+    pytest
+    black
+    ```
+
+    The repo also has our notebooks, the .git folder and a data/ folder with test inputs.
+- role: assistant
+  content: |
+    **Workload:** data pipeline (batch simulation jobs on a cluster)
+
+    Your supervisor is right. The image works, but it carries a lot that the jobs never use. Every push builds all of it again, and every node pulls all of it.
+
+    #### [Bug] `apt-get update` in its own layer
+    - **Where:** the first two `RUN` lines
+    - **Issue:** Docker caches the `apt-get update` layer on its own. If you later change the install line, it can reuse an old package index, and the install then fails or installs outdated packages.
+    - **Fix:** run update and install in one `RUN`. With the fixes below you don't need apt at all.
+
+    #### [High] Full base image plus compilers and tools
+    - **Where:** `FROM python:3.12` and the `apt-get install` line
+    - **Issue:** `python:3.12` is the full Debian image with compilers already included. You then add `build-essential`, `gfortran`, `git`, `curl`, `vim`, `wget` and `htop`. Your pinned packages (numpy, scipy, netCDF4, matplotlib, ...) all install from prebuilt wheels on Python 3.12, so nothing gets compiled. The batch jobs also never use an editor or `htop`.
+    - **Fix:** use `python:3.12-slim` and drop the apt line. If you later add a package without a wheel, install the compilers in a separate build stage and copy only the result into the final image.
+    - **Impact:** reduces E and network for every build, every pull to a node, and every stored copy. In Green Metrics Tool measurements of a small Flask app, a slim base image with runtime dependencies only and the dependency layer first used about 7× less energy to build. Running the app afterwards cost the same with both images. Your runs get the same speed, and the saving comes from the builds and pulls.
+
+    #### [Medium] Dev tools installed in the job image
+    - **Where:** `jupyterlab`, `ipython`, `pytest`, `black` in `requirements.txt`
+    - **Issue:** the cluster jobs only run `run_ensemble.py`. JupyterLab alone brings in a large dependency tree, and every build downloads and installs it.
+    - **Fix:** move them to a `requirements-dev.txt` for your laptop and for the test job:
+
+    ```text
+    # requirements-dev.txt
+    -r requirements.txt
+    jupyterlab
+    ipython
+    pytest
+    black
+    ```
+
+    #### [Medium] Source copied before the dependencies
+    - **Where:** `COPY . .` before `pip install`
+    - **Issue:** any change to any file, even a notebook, invalidates the pip layer. When the builder keeps its layer cache, every push still reinstalls all packages. `COPY . .` also copies `.git`, the notebooks and `data/` into the image.
+    - **Fix:** copy `requirements.txt` first, install, then copy the source. Add `--no-cache-dir` so pip's download cache does not end up in the layer. Add a `.dockerignore`. Keep `data/` out only if the jobs read their inputs from the cluster file system.
+
+    Putting it together:
+
+    ```dockerfile
+    FROM python:3.12-slim
+
+    ENV PYTHONUNBUFFERED=1
+
+    WORKDIR /opt/climate-sim
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY . .
+
+    CMD ["python", "run_ensemble.py", "--config", "configs/default.yaml"]
+    ```
+
+    ```text
+    # .dockerignore
+    .git
+    notebooks/
+    data/
+    **/__pycache__
+    ```
+
+    **Already good:** pinned versions for the scientific stack, and exec-form `CMD`.
+verify:
+  static_only: Dockerfile review; needs docker build and the project's files

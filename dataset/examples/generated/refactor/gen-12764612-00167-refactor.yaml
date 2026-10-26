@@ -1,0 +1,50 @@
+id: gen-12764612-00167-refactor
+category: refactor
+language: sql
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+messages:
+- role: user
+  content: |
+    ?
+
+    ```sql
+    -- gateway_ui: low battery list (device, site, battery, last seen)
+    SELECT *
+    FROM readings r
+    JOIN devices d ON d.id = r.device_id
+    WHERE r.battery_pct < 20
+      AND r.recorded_at >= '2026-10-01 00:00:00'
+    ORDER BY r.battery_pct ASC, r.recorded_at DESC
+    LIMIT 50;
+    ```
+- role: assistant
+  content: |
+    ```sql
+    -- gateway_ui: low battery list (device, site, battery, last seen)
+    SELECT d.name, d.site, r.battery_pct, r.recorded_at
+    FROM readings r
+    JOIN devices d ON d.id = r.device_id
+    WHERE r.battery_pct < 20
+      AND r.recorded_at >= '2026-10-01 00:00:00'
+    ORDER BY r.battery_pct ASC, r.recorded_at DESC
+    LIMIT 50;
+    ```
+
+    **Green Notes**
+    - **Select only the needed columns** (reduces E): the comment says the page shows device, site, battery and last seen, so the query now returns only those four columns. `SELECT *` also pulled every column of both tables, which on a gateway usually includes big ones like raw payloads and diagnostics. Each skipped column is data the database no longer reads, sends and parses. In Green Metrics Tool micro-benchmarks on PostgreSQL, reading 2,500 rows from a 52-column products table with large text columns, `SELECT *` used about 7× more energy than naming 10 columns (~470 J vs ~64 J, repeated 1,000 times). The saving grows with the size of the skipped columns. That was a different table, so treat it as direction, not as your number.
+
+    The rows, filter, order and limit are the same. The result now has 4 columns, and the duplicate `id` columns from the join are gone. If the page also needs something else, such as `rssi`, add it to the list instead of going back to `*`.
+verify:
+  sql:
+    setup: CREATE TABLE devices (id INTEGER PRIMARY KEY, name TEXT, site TEXT, firmware TEXT, notes TEXT); CREATE TABLE readings
+      (id INTEGER PRIMARY KEY, device_id INTEGER, recorded_at TEXT, temperature_c REAL, humidity_pct REAL, battery_pct INTEGER,
+      rssi INTEGER, raw_payload TEXT, diagnostics_json TEXT); INSERT INTO devices VALUES (1, 'sensor-a', 'hall-1', 'v1.2',
+      'north wall'), (2, 'sensor-b', 'hall-2', 'v1.3', 'near door'), (3, 'sensor-c', 'yard', 'v1.3', 'roof'); INSERT INTO
+      readings VALUES (1, 1, '2026-10-05 10:00:00', 21.5, 40.0, 15, -70, 'raw-bytes-aaaaaaaa', '{"ok":true}'), (2, 2, '2026-10-06
+      11:00:00', 19.0, 45.5, 8, -80, 'raw-bytes-bbbbbbbb', '{"ok":true}'), (3, 3, '2026-10-07 12:00:00', 18.2, 50.1, 90, -60,
+      'raw-bytes-cccccccc', '{"ok":true}'), (4, 1, '2026-09-20 09:00:00', 22.0, 41.0, 12, -72, 'raw-bytes-dddddddd', '{"ok":true}');
+    compare: false

@@ -1,0 +1,111 @@
+id: gen-12764612-00351-generation
+category: generation
+language: python
+patterns:
+- deque-or-append
+- string-join
+facts:
+- F-LISTINS
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    I need a Python function for the "What's new" section on our marketing landing page. The backend reads `CHANGELOG.txt` and renders HTML for the page.
+
+    Requirements:
+    - Each line looks like `2025-03-14 | feature | Dark mode for the dashboard`. Blank lines and lines starting with `#` are ignored.
+    - The file is appended to by the release script, so it is oldest first. The page must show the newest first.
+    - Entries are grouped by month. Each month gets an `<h3>` like "March 2025", then a `<ul>` of entries. Newest month first, newest entry first inside a month.
+    - Optional `max_months` argument to show only the latest N months.
+    - Escape the text, it is typed by humans. A bad line should raise a `ValueError` with the line number.
+    - The file has about 15k lines now and keeps growing.
+
+    Function takes an iterable of lines and returns the HTML string.
+- role: assistant
+  content: |
+    ```python
+    import html
+    from datetime import date
+    from itertools import groupby
+
+    MONTHS = [
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December",
+    ]
+
+
+    def _parse_line(line: str, number: int) -> tuple[date, str, str]:
+        parts = [p.strip() for p in line.split("|", 2)]
+        if len(parts) != 3:
+            raise ValueError(f"line {number}: expected 'date | tag | text'")
+        try:
+            day = date.fromisoformat(parts[0])
+        except ValueError:
+            raise ValueError(f"line {number}: bad date {parts[0]!r}") from None
+        return day, parts[1], parts[2]
+
+
+    def render_changelog(lines, max_months: int | None = None) -> str:
+        entries = []
+        for number, raw in enumerate(lines, 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            entries.append(_parse_line(line, number))
+
+        # Stable sort: a no-op cost for an already ordered file, and safe if
+        # someone adds a line out of order. Then read it from the back.
+        entries.sort(key=lambda e: e[0])
+
+        out = []
+        months_shown = 0
+        newest_first = reversed(entries)
+        for (year, month), group in groupby(newest_first, key=lambda e: (e[0].year, e[0].month)):
+            if max_months is not None and months_shown >= max_months:
+                break
+            months_shown += 1
+            out.append('<section class="release-month">')
+            out.append(f"<h3>{MONTHS[month - 1]} {year}</h3>")
+            out.append("<ul>")
+            for day, tag, text in group:
+                out.append(
+                    f'<li><time datetime="{day.isoformat()}">{day:%b} {day.day}</time> '
+                    f'<span class="tag">{html.escape(tag)}</span> {html.escape(text)}</li>'
+                )
+            out.append("</ul>")
+            out.append("</section>")
+        return "\n".join(out)
+    ```
+
+    Entries with the same date show in reverse file order, so the last line written is shown first.
+
+    **Green Notes**
+    - **Append, then read in reverse** (reduces E): the list is built with `append()` and walked with `reversed()`, instead of `insert(0, entry)` to keep newest first. Every front insert shifts all existing items, so 15k lines would cost O(n²) work, and it gets worse as the file grows. In Green Metrics Tool micro-benchmarks, 1,000,000 front inserts used over 1000× more CPU energy than 1,000,000 appends.
+    - **`"\n".join(out)`** (reduces E): the HTML is collected in a list and joined once. Repeated `+=` on a growing string copies it again and again. In the same benchmarks, joining 1,000,000 pieces used about 260× less CPU energy than `+=`.
+    - A `deque` with `appendleft()` would also work, but you only need one pass over the data, so a plain list is simpler.
+verify:
+  test: |-
+    lines = [
+        "# header",
+        "2025-01-05 | new | Alpha",
+        "",
+        "2025-01-20 | fix | Beta",
+        "2025-02-01 | new | <Gamma>",
+    ]
+    out = render_changelog(lines)
+    assert out.index("February 2025") < out.index("January 2025")
+    assert out.index("Beta") < out.index("Alpha")
+    assert "&lt;Gamma&gt;" in out
+    assert "<Gamma>" not in out
+    one = render_changelog(lines, max_months=1)
+    assert "February 2025" in one and "January" not in one
+    try:
+        render_changelog(["2025-01-05 | new | ok", "oops"])
+        raise AssertionError("expected ValueError")
+    except ValueError as e:
+        assert "line 2" in str(e)
+    try:
+        render_changelog(["2025-13-45 | new | x"])
+        raise AssertionError("expected ValueError")
+    except ValueError as e:
+        assert "line 1" in str(e)

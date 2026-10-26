@@ -1,0 +1,81 @@
+id: gen-12764612-00051-review
+category: review
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    review pls, md analysis image, CI builds it on every push
+
+    ```dockerfile
+    FROM python:3.12
+
+    ENV DEBIAN_FRONTEND=noninteractive
+    ENV PYTHONUNBUFFERED=1
+    ENV ZENODO_TOKEN=zk_live_8f3a91c27d54e0b6
+
+    RUN apt-get update && apt-get install -y build-essential git curl wget vim htop
+
+    WORKDIR /opt/mdtraj-analysis
+    COPY . .
+
+    RUN pip install -r requirements.txt
+    RUN pip install pytest black mypy ipython jupyterlab
+
+    CMD ["python", "run_analysis.py", "--config", "config/default.yaml"]
+    ```
+
+    requirements.txt has numpy, scipy, MDAnalysis, matplotlib, pyyaml.
+- role: assistant
+  content: |
+    **Workload:** data pipeline (scientific analysis job, image built in CI on every push)
+
+    #### [Security] Token baked into the image
+    - **Where:** `ENV ZENODO_TOKEN=...`
+    - **Issue:** anyone who can pull the image can read the token with `docker inspect` or `docker history`. It is also now in your git history. Rotate it.
+    - **Fix:** pass it at run time, and remove the line from the Dockerfile:
+      ```bash
+      docker run --rm -e ZENODO_TOKEN mdtraj-analysis
+      ```
+
+    #### [High] Full base image plus dev tools in a CI-built image
+    - **Where:** `FROM python:3.12`, the `apt-get install` line, the second `pip install`
+    - **Issue:** the full image, compilers, editors and dev tools (pytest, black, mypy, ipython, jupyterlab) are not needed to run the analysis. They make every build, pull and stored copy bigger. In Green Metrics Tool micro-benchmarks of a small Flask app image built without a cache, the full base with build tools and dev packages used ~885 J to build. The slim base with runtime dependencies only used ~124 J, about 7× less. Serving requests afterwards cost the same with both. The saving is in the build, and your CI repeats it on every push.
+    - **Fix:** slim base, runtime packages only. Dev tools go to a separate file or CI step.
+    - **Impact:** E and M, repeated for every build, pull and stored copy. Runtime energy stays the same.
+
+    #### [High] Source copied before dependencies are installed
+    - **Where:** `COPY . .` before `pip install`
+    - **Issue:** any code change invalidates the layer cache, so all packages are downloaded and installed again on every push.
+    - **Fix:** copy `requirements.txt` first, install, then copy the source.
+    - **Impact:** E on every CI build where only code changed.
+
+    #### [Low] pip cache kept in the image
+    - **Where:** `RUN pip install -r requirements.txt`
+    - **Fix:** add `--no-cache-dir`.
+
+    Rewritten file:
+
+    ```dockerfile
+    FROM python:3.12-slim
+
+    ENV PYTHONUNBUFFERED=1
+
+    WORKDIR /opt/mdtraj-analysis
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY . .
+
+    CMD ["python", "run_analysis.py", "--config", "config/default.yaml"]
+    ```
+
+    numpy, scipy, matplotlib and pyyaml ship prebuilt wheels, so the compiler is not needed for them. Check that MDAnalysis installs from a wheel for your platform. If one package fails to build, it needs a compiler, so tell me and we can look at it. Also check that `git` and `curl` are not called by `run_analysis.py`. If you want pytest in CI, install it in the test step, not in the image you ship.
+
+    **Already good:** `PYTHONUNBUFFERED` gives you live logs, and the `CMD` uses the exec form.
+verify:
+  static_only: Dockerfile review, needs docker build

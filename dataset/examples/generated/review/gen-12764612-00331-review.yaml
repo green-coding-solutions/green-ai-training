@@ -1,0 +1,149 @@
+id: gen-12764612-00331-review
+category: review
+language: html
+patterns:
+- dom-size
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    Hi, I am a PhD student in a chemistry lab. I made this page to look at the peak list from our mass spectrometer runs (the file peaks.json has around 12,000 peaks). It works but the page is slow to open and scrolling is laggy. I don't know what is wrong. Can you review it?
+
+    ```html
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <meta charset="utf-8">
+    <title>Peak list</title>
+    <style>
+      table { border-collapse: collapse; font-family: sans-serif; }
+      td, th { border: 1px solid #ccc; padding: 4px 8px; }
+      .cell { display: block; }
+      .val { font-variant-numeric: tabular-nums; }
+    </style>
+    </head>
+    <body>
+    <h1>Peak list</h1>
+    <table id="peaks">
+      <thead>
+        <tr><th>#</th><th>m/z</th><th>Intensity</th><th>Charge</th><th>Sample</th></tr>
+      </thead>
+      <tbody id="body"></tbody>
+    </table>
+    <script>
+    fetch('peaks.json')
+      .then(r => r.json())
+      .then(peaks => {
+        const body = document.getElementById('body');
+        peaks.forEach((p, i) => {
+          const tr = document.createElement('tr');
+          tr.innerHTML =
+            '<td><div class="cell"><span class="val">' + (i + 1) + '</span></div></td>' +
+            '<td><div class="cell"><span class="val">' + p.mz + '</span></div></td>' +
+            '<td><div class="cell"><span class="val">' + p.intensity + '</span></div></td>' +
+            '<td><div class="cell"><span class="val">' + p.charge + '</span></div></td>' +
+            '<td><div class="cell"><span class="val">' + p.sample + '</span></div></td>';
+          body.appendChild(tr);
+        });
+      });
+    </script>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (client-side page, runs in the browser on every open)
+
+    #### [Security] Data is inserted as HTML
+    - **Where:** `tr.innerHTML = ... + p.sample + ...`
+    - **Issue:** the values from `peaks.json` are parsed as HTML. A sample name like `<img src=x onerror=...>` would run code in the page. Sample names are often typed by people or come from other tools.
+    - **Fix:** build cells with `textContent` (see the code below). It shows the value as plain text.
+
+    #### [Bug] Failed load shows an empty page
+    - **Where:** `fetch('peaks.json').then(r => r.json())`
+    - **Issue:** if the file is missing, `r.json()` fails and nothing tells you why. You just see an empty table.
+    - **Fix:** check `r.ok` and show a message.
+
+    #### [High] 12,000 rows in the DOM at once
+    - **Where:** the `forEach` that appends every peak to `#body`
+    - **Issue:** the browser must build, lay out and paint all rows, even though you see maybe 30 at a time. Each row also has 5 cells, and each cell has a `div` and a `span` around the number. That is about 15 elements per row, so roughly 180,000 elements. Rows are also added to the live table one by one. The `div` and `span` wrappers add nothing here, because the `td` can hold the number directly.
+    - **Fix:** show 100 rows per page with Previous/Next buttons, use plain `td` cells, and build each page in a `DocumentFragment`. In Green Metrics Tool micro-benchmarks, a 10,000-row table with 14 elements per row, appended row by row, used ~1036 J over 30 page loads. The same data paginated to 100 rows per page as a plain table in a `DocumentFragment` used ~457 J, about 56% less. Your numbers will differ, but the cause is the same.
+    - **Impact:** E and M on the client. Open time, memory and scrolling should all improve a lot.
+
+    ```html
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <meta charset="utf-8">
+    <title>Peak list</title>
+    <style>
+      table { border-collapse: collapse; font-family: sans-serif; }
+      td, th { border: 1px solid #ccc; padding: 4px 8px; font-variant-numeric: tabular-nums; }
+    </style>
+    </head>
+    <body>
+    <h1>Peak list</h1>
+    <p id="status">Loading...</p>
+    <p>
+      <button id="prev">Previous</button>
+      <span id="page"></span>
+      <button id="next">Next</button>
+    </p>
+    <table id="peaks">
+      <thead>
+        <tr><th>#</th><th>m/z</th><th>Intensity</th><th>Charge</th><th>Sample</th></tr>
+      </thead>
+      <tbody id="body"></tbody>
+    </table>
+    <script>
+    const PAGE_SIZE = 100;
+    let peaks = [];
+    let page = 0;
+
+    function render() {
+      const body = document.getElementById('body');
+      const frag = document.createDocumentFragment();
+      const start = page * PAGE_SIZE;
+      peaks.slice(start, start + PAGE_SIZE).forEach((p, i) => {
+        const tr = document.createElement('tr');
+        [start + i + 1, p.mz, p.intensity, p.charge, p.sample].forEach(v => {
+          const td = document.createElement('td');
+          td.textContent = v;
+          tr.appendChild(td);
+        });
+        frag.appendChild(tr);
+      });
+      body.replaceChildren(frag);
+      const pages = Math.max(1, Math.ceil(peaks.length / PAGE_SIZE));
+      document.getElementById('page').textContent = 'Page ' + (page + 1) + ' of ' + pages;
+      document.getElementById('prev').disabled = page === 0;
+      document.getElementById('next').disabled = page >= pages - 1;
+    }
+
+    document.getElementById('prev').onclick = () => { page--; render(); };
+    document.getElementById('next').onclick = () => { page++; render(); };
+
+    fetch('peaks.json')
+      .then(r => {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then(data => {
+        peaks = data;
+        document.getElementById('status').textContent = peaks.length + ' peaks';
+        render();
+      })
+      .catch(err => {
+        document.getElementById('status').textContent = 'Could not load peaks.json: ' + err.message;
+      });
+    </script>
+    </body>
+    </html>
+    ```
+
+    The row number in the first column still counts from the whole list, so peak 101 is "101" on page 2. If you need to search all peaks, filter `peaks` first and paginate the result.
+
+    **Already good:** one `fetch` call, and the data is loaded once and kept in a variable.
+verify:
+  static_only: html page needs a browser DOM and a fetch of peaks.json

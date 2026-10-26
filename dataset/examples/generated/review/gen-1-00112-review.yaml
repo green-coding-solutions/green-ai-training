@@ -1,0 +1,115 @@
+id: gen-1-00112-review
+category: review
+language: python
+patterns:
+- batch-db-writes
+- torch-no-grad
+facts:
+- F-PG-INSERT
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    Hello, can you look on my code please? It run on a small gateway PC near the pumps in our factory. Every 5 seconds we get about 500 vibration messages from the MQTT queue, the model check if it is a anomaly and we save all to Postgres. Is working but the CPU of the gateway is always high and I dont know why.
+
+    ```python
+    import json
+    import psycopg
+    import torch
+
+    from vib_model import load_model
+
+    model = load_model("/opt/gateway/vib_ae.pt")
+    model.eval()
+    THRESHOLD = 0.8
+    DSN = "dbname=gateway user=gw"
+
+
+    def handle_batch(messages):
+        conn = psycopg.connect(DSN)
+        cur = conn.cursor()
+        alarms = 0
+        for msg in messages:
+            data = json.loads(msg)
+            x = torch.tensor(data["samples"], dtype=torch.float32).unsqueeze(0)
+            recon = model(x)
+            err = float(((recon - x) ** 2).mean())
+            alarm = err > THRESHOLD
+            if alarm:
+                alarms += 1
+            cur.execute(
+                f"INSERT INTO vibration_events (device, ts, score, alarm) "
+                f"VALUES ('{data['device']}', {data['ts']}, {err}, {alarm})"
+            )
+            conn.commit()
+        conn.close()
+        return alarms
+    ```
+- role: assistant
+  content: |
+    **Workload:** IoT gateway (data pipeline, runs every 5 seconds for about 500 messages)
+
+    #### [Security] SQL built with an f-string
+    - **Where:** `cur.execute(f"INSERT ...")`
+    - **Issue:** `data['device']` comes from the network. A device name with a quote in it breaks the query, and a bad message can inject SQL.
+    - **Fix:** pass values as parameters, see the code below.
+
+    #### [High] Inference tracks gradients
+    - **Where:** `recon = model(x)`
+    - **Issue:** `model.eval()` does not switch off autograd. Every forward pass still builds a graph that you never use.
+    - **Fix:** wrap the scoring in `torch.no_grad()`.
+    - **Impact:** reduces E per message, on the CPU you already see as busy. In Green Metrics Tool micro-benchmarks, 100,000 PyTorch CPU inferences used ~157 J without `no_grad` and ~135 J with it, about 14% less. The results stay the same.
+
+    #### [High] One INSERT and one commit per row
+    - **Where:** the `cur.execute(...)` and `conn.commit()` inside the loop
+    - **Issue:** 500 messages mean 500 statements and 500 commits per poll. Each commit is a separate write to disk.
+    - **Fix:** collect the rows, then write them with one `executemany()` and one commit.
+    - **Impact:** reduces E and I/O per poll, from 500 round trips and commits to one batch. In Green Metrics Tool micro-benchmarks (PostgreSQL 16, one commit per batch), with 5,000 rows per batch `executemany()` used about 2.8× less energy than one `execute()` per row, and `COPY` about 22× less. With only 100 rows per batch the differences were small. Your 500 rows are in between, so `executemany()` is a good fit. Only switch to `COPY` if your batches grow to thousands of rows.
+
+    #### [Low] Connection is not closed on errors
+    - **Where:** `conn.close()` at the end
+    - **Issue:** if one message is broken (bad JSON, missing key), the exception skips `close()` and the connection leaks. On a gateway that runs for months this adds up.
+    - **Fix:** use the connection as a context manager.
+
+    ```python
+    import json
+    import psycopg
+    import torch
+
+    from vib_model import load_model
+
+    model = load_model("/opt/gateway/vib_ae.pt")
+    model.eval()
+    THRESHOLD = 0.8
+    DSN = "dbname=gateway user=gw"
+
+
+    def handle_batch(messages):
+        rows = []
+        alarms = 0
+        with torch.no_grad():
+            for msg in messages:
+                data = json.loads(msg)
+                x = torch.tensor(data["samples"], dtype=torch.float32).unsqueeze(0)
+                recon = model(x)
+                err = float(((recon - x) ** 2).mean())
+                alarm = err > THRESHOLD
+                if alarm:
+                    alarms += 1
+                rows.append((data["device"], data["ts"], err, alarm))
+
+        with psycopg.connect(DSN) as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    "INSERT INTO vibration_events (device, ts, score, alarm) "
+                    "VALUES (%s, %s, %s, %s)",
+                    rows,
+                )
+        return alarms
+    ```
+
+    **Behavior change:** the whole poll is now one transaction. If one message is broken, nothing from that poll is saved, while before the earlier rows were already committed. If you want to keep the good rows, catch the error per message in the first loop and skip the bad one.
+
+    **Already good:** `model.eval()` is called once at start, and the model is loaded once outside the handler.
+verify:
+  static_only: needs torch, a trained model file and a PostgreSQL server

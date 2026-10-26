@@ -1,0 +1,131 @@
+id: gen-2-00031-refactor
+category: refactor
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    from dataclasses import dataclass
+
+
+    @dataclass
+    class Turn:
+        role: str
+        content: str
+
+
+    def build_prompt_ids(tokenizer, system, turns, max_tokens, reserve_for_output=512):
+        """Fit the chat history into the context window, newest turns win."""
+        budget = max_tokens - reserve_for_output
+        sys_ids = tokenizer.encode(f"<|system|>\n{system}\n")
+        budget -= len(sys_ids)
+        if budget <= 0:
+            raise ValueError("system prompt does not fit into the context window")
+
+        ids = []
+        for turn in reversed(turns):
+            turn_ids = tokenizer.encode(f"<|{turn.role}|>\n{turn.content}\n")
+            if len(ids) + len(turn_ids) > budget:
+                break
+            for tok in reversed(turn_ids):
+                ids.insert(0, tok)
+
+        return sys_ids + ids + tokenizer.encode("<|assistant|>\n")
+
+
+    def left_pad(batch, pad_id):
+        width = max(len(ids) for ids in batch)
+        input_ids = [[pad_id] * (width - len(ids)) + ids for ids in batch]
+        attention_mask = [[0] * (width - len(ids)) + [1] * len(ids) for ids in batch]
+        return input_ids, attention_mask
+    ```
+- role: assistant
+  content: |
+    The main cost is in `build_prompt_ids`. It calls `ids.insert(0, tok)` once per token, and every call shifts all the tokens already kept.
+
+    ```python
+    from dataclasses import dataclass
+
+
+    @dataclass
+    class Turn:
+        role: str
+        content: str
+
+
+    def build_prompt_ids(tokenizer, system, turns, max_tokens, reserve_for_output=512):
+        """Fit the chat history into the context window, newest turns win."""
+        budget = max_tokens - reserve_for_output
+        sys_ids = tokenizer.encode(f"<|system|>\n{system}\n")
+        budget -= len(sys_ids)
+        if budget <= 0:
+            raise ValueError("system prompt does not fit into the context window")
+
+        kept = []  # newest turn first
+        used = 0
+        for turn in reversed(turns):
+            turn_ids = tokenizer.encode(f"<|{turn.role}|>\n{turn.content}\n")
+            if used + len(turn_ids) > budget:
+                break
+            kept.append(turn_ids)
+            used += len(turn_ids)
+
+        ids = list(sys_ids)
+        for turn_ids in reversed(kept):
+            ids.extend(turn_ids)
+        ids.extend(tokenizer.encode("<|assistant|>\n"))
+        return ids
+
+
+    def left_pad(batch, pad_id):
+        width = max(len(ids) for ids in batch)
+        input_ids = [[pad_id] * (width - len(ids)) + ids for ids in batch]
+        attention_mask = [[0] * (width - len(ids)) + [1] * len(ids) for ids in batch]
+        return input_ids, attention_mask
+    ```
+
+    **Green Notes**
+    - **Append, then reverse once, instead of `list.insert(0, ...)`** (reduces E): a front insert moves every element already in the list. So filling a long context token by token costs O(n²) element moves on every request. Collecting whole turns with `append` and joining them in one pass is O(n). In Green Metrics Tool micro-benchmarks, 1,000,000 × `list.insert(0, x)` used ~1515 J, while 1,000,000 × `list.append(x)` used ~1.2 J (over 1000× difference).
+    - The output is the same: same token order, and the same rule that stops at the first turn that doesn't fit.
+    - `left_pad` is unchanged. It already builds each row in one pass.
+verify:
+  test: |
+    class _T:
+        def encode(self, s):
+            return [ord(c) for c in s]
+    t = _T()
+    turns = [Turn("user", "a"), Turn("assistant", "b")]
+    out = build_prompt_ids(t, "s", turns, 1000, reserve_for_output=0)
+    assert out == t.encode("<|system|>\ns\n<|user|>\na\n<|assistant|>\nb\n<|assistant|>\n")
+    only_last = build_prompt_ids(t, "s", turns, len(t.encode("<|system|>\ns\n")) + 17, reserve_for_output=0)
+    assert only_last == t.encode("<|system|>\ns\n<|assistant|>\nb\n<|assistant|>\n")
+    try:
+        build_prompt_ids(t, "s", turns, 5, reserve_for_output=0)
+        assert False
+    except ValueError:
+        pass
+    assert left_pad([[1, 2, 3], [4]], 0) == ([[1, 2, 3], [0, 0, 4]], [[1, 1, 1], [0, 0, 1]])
+  equivalence:
+    driver: |-
+      class Tok:
+          def encode(self, text):
+              return [ord(c) for c in text]
+      tok = Tok()
+      turns = [
+          Turn("user", "hi there"),
+          Turn("assistant", "hello! how can I help?"),
+          Turn("user", "summarize the doc " * 5),
+      ]
+      for max_tokens in (30, 60, 120, 170, 200, 600):
+          try:
+              print(max_tokens, build_prompt_ids(tok, "be brief", turns, max_tokens, reserve_for_output=20))
+          except ValueError as e:
+              print(max_tokens, "error", e)
+      print(build_prompt_ids(tok, "x", [], 100, reserve_for_output=0))
+      print(left_pad([[1, 2, 3], [4], [5, 6]], 0))

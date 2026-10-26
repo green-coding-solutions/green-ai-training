@@ -1,0 +1,89 @@
+id: gen-2-00255-estimate
+category: estimate
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    hi, I wrote this script to get a summary of our thumbnail worker log. cron runs it every 15 min, the log has around 30k lines by the evening. My senior looked at it and said it is "forking like crazy" and burns CPU and power for nothing. I don't really understand what is wrong, it works and prints the right numbers. How much energy would we actually save if I change it?
+
+    log lines look like this:
+    `2026-10-21T08:14:02 INFO job=resize duration_ms=231 status=ok`
+
+    ```bash
+    #!/bin/bash
+    # summary of worker log, run by cron every 15 min
+    LOG=/var/log/thumbnailer/worker.log
+
+    total=0
+    failed=0
+    sum_ms=0
+    slow=0
+
+    while read line; do
+        level=$(echo $line | cut -d' ' -f2)
+        if [ "$level" != "INFO" ] && [ "$level" != "ERROR" ]; then
+            continue
+        fi
+        status=$(echo $line | cut -d' ' -f5 | cut -d= -f2)
+        ms=$(echo $line | cut -d' ' -f4 | cut -d= -f2)
+        total=$(expr $total + 1)
+        sum_ms=$(expr $sum_ms + $ms)
+        if [ "$status" = "failed" ]; then
+            failed=$(expr $failed + 1)
+        fi
+        if [ $ms -gt 2000 ]; then
+            slow=$(expr $slow + 1)
+        fi
+    done < $LOG
+
+    avg=$(expr $sum_ms / $total)
+    echo "jobs: $total  failed: $failed  slow(>2s): $slow  avg: ${avg}ms"
+    ```
+- role: assistant
+  content: |
+    Your senior is right, and the cause is easy to see once you count. For every log line, each `$( ... )` starts a subshell, each `| cut` starts a `cut` process, and each `expr` is a separate program. That adds up to about ten new processes per line. The arithmetic is cheap. Starting processes is what costs the CPU time.
+
+    **What was measured:** in Green Metrics Tool micro-benchmarks, a 20,000-line access log was summarized three ways, all with identical output:
+
+    - `while read` loop with `$(echo | cut)` and `$(expr)` per field (about ten processes per line): ~1302 J, 238 s
+    - same loop with bash builtins only (`read -r`, `$(( ))`, `case`): ~4.3 J, 0.72 s, about 300× less
+    - one `awk` pass over the file: ~1.0 J, 0.21 s, over 1000× less than the subprocess loop and about 4× less than the builtin loop
+
+    Your script has the same shape as the slow version, so the same kind of saving applies. Here it is as one `awk` pass. Splitting on spaces and `=` makes the duration field `$6` and the status field `$8`:
+
+    ```bash
+    #!/bin/bash
+    # summary of worker log, run by cron every 15 min
+    LOG=/var/log/thumbnailer/worker.log
+
+    awk -F '[ =]' '
+        $2 !~ /^(INFO|ERROR)$/ { next }
+        {
+            ms = $6 + 0
+            total++
+            sum_ms += ms
+            if ($8 ~ /^failed$/) failed++
+            if (ms > 2000) slow++
+        }
+        END {
+            avg = total ? int(sum_ms / total) : 0
+            printf "jobs: %d  failed: %d  slow(>2s): %d  avg: %dms\n", total, failed, slow, avg
+        }
+    ' "$LOG"
+    ```
+
+    For well-formed lines like your example, the output is the same. One difference: with an empty log, the old script failed with an `expr` division-by-zero error. The new one prints `avg: 0ms`.
+
+    **How much you save:** I can't give you a number in joules for your server, and you shouldn't scale the benchmark figures. Your saving depends on two things: lines per run (it grows during the day) and runs per day (every 15 minutes, all day). The old script starts about ten processes per line, on every run. The awk version starts one process for the whole file, no matter how long the log gets.
+
+    **How to measure it yourself**, using a copy of a real evening log:
+
+    - Quick CPU-time proxy: `time bash old_summary.sh` vs `time bash new_summary.sh`. Compare the `user` + `sys` times.
+    - CPU energy, if `perf` can read RAPL on your machine: `perf stat -e power/energy-pkg/ bash old_summary.sh`, then the same for the new one.
+    - For a repeatable figure: run both scripts in a Green Metrics Tool usage scenario on the same log file.
+verify:
+  static_only: bash script reading a fixed production log path; no bash runner in verify

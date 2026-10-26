@@ -1,0 +1,115 @@
+id: gen-2-00103-review
+category: review
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import re
+
+    import torch
+    import torch.nn as nn
+    from flask import Flask, jsonify, request
+
+    QUEUES = ["billing", "shipping", "returns", "technical", "account"]
+    VOCAB_SIZE = 4096
+
+
+    class TicketRouter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(VOCAB_SIZE, 256),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(256, len(QUEUES)),
+            )
+
+        def forward(self, x):
+            return self.net(x)
+
+
+    model = TicketRouter()
+    model.load_state_dict(torch.load("models/ticket_router.pt", map_location="cpu"))
+
+    app = Flask(__name__)
+
+
+    def featurize(text):
+        vec = torch.zeros(VOCAB_SIZE)
+        for tok in re.findall(r"[a-z0-9]+", text.lower()):
+            vec[hash(tok) % VOCAB_SIZE] += 1.0
+        return vec.unsqueeze(0)
+
+
+    @app.post("/api/tickets/route")
+    def route_ticket():
+        payload = request.get_json()
+        text = f"{payload.get('subject', '')} {payload.get('body', '')}"
+        logits = model(featurize(text))
+        probs = torch.softmax(logits, dim=1)[0]
+        best = int(probs.argmax())
+        return jsonify({
+            "queue": QUEUES[best],
+            "confidence": round(float(probs[best]), 3),
+            "scores": {q: round(float(p), 3) for q, p in zip(QUEUES, probs.detach())},
+        })
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (model inference on every ticket request)
+
+    #### [Bug] Token buckets change with every process start
+    - **Where:** `featurize()`, `hash(tok) % VOCAB_SIZE`
+    - **Issue:** Python randomizes `str` hashes per process unless `PYTHONHASHSEED` is fixed. Each worker and each restart maps the same word to a different bucket. The model gets inputs that don't match training, and two workers can route the same ticket to different queues.
+    - **Fix:** use a stable hash such as `zlib.crc32(tok.encode()) % VOCAB_SIZE`, and use the same function in the training script. If training also used `hash()`, the saved weights fit one random mapping only. Retrain with the stable hash.
+
+    #### [Bug] Dropout is active while serving
+    - **Where:** after `load_state_dict()`, `model.eval()` is never called
+    - **Issue:** the module stays in training mode. `Dropout` zeroes random activations on every call, so the same ticket gets a different queue or confidence from one request to the next.
+    - **Fix:** call `model.eval()` right after loading the weights.
+
+    #### [High] Autograd graph built on every request
+    - **Where:** `route_ticket()`, the forward pass and `softmax`
+    - **Issue:** without `torch.no_grad()`, PyTorch records every operation and keeps intermediate tensors for a backward pass that never runs. Every request pays for this. In Green Metrics Tool micro-benchmarks, 100,000 PyTorch CPU inferences used ~157 J without `torch.no_grad()` and ~135 J with it, about 14% less CPU energy.
+    - **Fix:** wrap the forward pass and `softmax` in `torch.no_grad()`. After that, the `.detach()` is not needed. Note that `eval()` and `no_grad()` do different things, so you need both.
+    - **Impact:** E per request, plus M because no activations are kept for backward.
+
+    ```python
+    import zlib
+
+    model = TicketRouter()
+    model.load_state_dict(torch.load("models/ticket_router.pt", map_location="cpu"))
+    model.eval()
+
+
+    def featurize(text):
+        vec = torch.zeros(VOCAB_SIZE)
+        for tok in re.findall(r"[a-z0-9]+", text.lower()):
+            vec[zlib.crc32(tok.encode()) % VOCAB_SIZE] += 1.0
+        return vec.unsqueeze(0)
+
+
+    @app.post("/api/tickets/route")
+    def route_ticket():
+        payload = request.get_json()
+        text = f"{payload.get('subject', '')} {payload.get('body', '')}"
+        with torch.no_grad():
+            probs = torch.softmax(model(featurize(text)), dim=1)[0]
+        best = int(probs.argmax())
+        return jsonify({
+            "queue": QUEUES[best],
+            "confidence": round(float(probs[best]), 3),
+            "scores": {q: round(float(p), 3) for q, p in zip(QUEUES, probs)},
+        })
+    ```
+
+    **Already good:** the model is loaded once at startup, not on every request, and `map_location="cpu"` avoids device surprises.
+verify:
+  static_only: needs torch and flask, which are beyond stdlib + numpy

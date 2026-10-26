@@ -1,0 +1,87 @@
+id: gen-2-00000-generation
+category: generation
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    ```python
+    import csv
+    from collections import Counter
+
+
+    # finance master data, ~800 dept codes
+    def load_cost_centers(path):
+        with open(path, newline="") as f:
+            return {row["dept_code"]: row["cost_center"] for row in csv.DictReader(f)}
+
+
+    def map_expense_rows(rows, cost_centers, default="UNASSIGNED"):
+        """Attach a cost center to every expense row.
+
+        rows: iterable of dicts from the legacy expense export (~2M rows per night).
+        About half of the dept codes in the export are old codes that are not in
+        cost_centers anymore.
+
+        Returns (mapped_rows, unmapped) where unmapped is a Counter of the
+        dept codes that had no cost center.
+        """
+        # TODO
+        ...
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```python
+    import csv
+    from collections import Counter
+
+
+    # finance master data, ~800 dept codes
+    def load_cost_centers(path):
+        with open(path, newline="") as f:
+            return {row["dept_code"]: row["cost_center"] for row in csv.DictReader(f)}
+
+
+    def map_expense_rows(rows, cost_centers, default="UNASSIGNED"):
+        """Attach a cost center to every expense row.
+
+        rows: iterable of dicts from the legacy expense export.
+        Returns (mapped_rows, unmapped) where unmapped is a Counter of the
+        dept codes that had no cost center. Input rows are not modified.
+        """
+        mapped = []
+        unmapped = Counter()
+        for row in rows:
+            code = row["dept_code"]
+            cost_center = cost_centers.get(code)
+            if cost_center is None:
+                unmapped[code] += 1
+                cost_center = default
+            mapped.append({**row, "cost_center": cost_center})
+        return mapped, unmapped
+    ```
+
+    **Green Notes**
+    - **No exceptions for expected control flow** (reduces E): about half of the codes miss, so `try/except KeyError` would raise an exception on every second row. `dict.get` handles a miss without raising. In Green Metrics Tool micro-benchmarks with 10,000,000 dict lookups and about half of the keys missing, `dict.get` used ~67 J and `try/except KeyError` ~76 J, about 12% less with `get`.
+
+    A row without a `dept_code` field still raises `KeyError`. That is a broken export, not an expected miss, so it should fail loudly.
+verify:
+  test: |-
+    rows = [
+        {"dept_code": "A1", "amount": "10.00"},
+        {"dept_code": "OLD9", "amount": "5.50"},
+        {"dept_code": "OLD9", "amount": "1.20"},
+        {"dept_code": "B2", "amount": "3.00"},
+    ]
+    mapped, unmapped = map_expense_rows(rows, {"A1": "CC-100", "B2": "CC-200"})
+    assert [r["cost_center"] for r in mapped] == ["CC-100", "UNASSIGNED", "UNASSIGNED", "CC-200"]
+    assert unmapped == Counter({"OLD9": 2})
+    assert "cost_center" not in rows[0]
+    assert mapped[1]["amount"] == "5.50"
+    m2, u2 = map_expense_rows(rows[:1], {}, default="X")
+    assert m2[0]["cost_center"] == "X" and u2 == Counter({"A1": 1})

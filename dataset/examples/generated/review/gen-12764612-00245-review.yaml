@@ -1,0 +1,164 @@
+id: gen-12764612-00245-review
+category: review
+language: css
+patterns:
+- css-animations
+- dom-size
+facts:
+- F-DOM-SIZE
+- F-ANIM
+messages:
+- role: user
+  content: |
+    Please review the category page of our webshop (sneakers, about 6,000 products in the biggest category). Requirements from the shop owner: the look must stay the same, the pulsing "Sale" badge must stay, and the category filter on top must keep working. Mobile and desktop both matter. I pasted the stylesheet and the script that builds the grid. I want to know what is wrong or risky before we ship it for the autumn sale.
+
+    ```css
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 16px;
+    }
+    .card {
+      background: #fff;
+      border: 1px solid #e5e5e5;
+      border-radius: 8px;
+    }
+    .card-inner { padding: 12px; }
+    .card-media { position: relative; }
+    .card-media-frame { aspect-ratio: 1 / 1; overflow: hidden; }
+    .card-media-frame img { width: 100%; height: 100%; object-fit: cover; }
+    .card-body { margin-top: 8px; }
+    .card-title-wrap { min-height: 2.6em; }
+    .card-title { font-size: 14px; margin: 0; }
+    .card-price-row { display: flex; justify-content: space-between; }
+    .card-price { font-weight: 600; }
+    .badge-sale {
+      position: absolute;
+      top: 8px;
+      left: 8px;
+      background: #d6336c;
+      color: #fff;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 12px;
+    }
+    ```
+
+    ```js
+    const grid = document.querySelector('.grid');
+
+    async function loadCatalog(category) {
+      const res = await fetch('/api/products?category=' + encodeURIComponent(category));
+      const products = await res.json();
+      grid.innerHTML = '';
+      products.forEach(p => {
+        const card = document.createElement('div');
+        card.className = 'card';
+        card.innerHTML = `
+          <div class="card-inner">
+            <div class="card-media">
+              <div class="card-media-frame"><img src="${p.image}" alt="${p.name}"></div>
+              ${p.onSale ? '<span class="badge-sale">Sale</span>' : ''}
+            </div>
+            <div class="card-body">
+              <div class="card-title-wrap"><h3 class="card-title">${p.name}</h3></div>
+              <div class="card-price-row"><span class="card-price">${p.priceFormatted}</span></div>
+            </div>
+          </div>`;
+        grid.appendChild(card);
+      });
+    }
+
+    function pulseBadges(t) {
+      document.querySelectorAll('.badge-sale').forEach(b => {
+        b.style.transform = `scale(${1 + 0.08 * Math.sin(t / 300)})`;
+      });
+      requestAnimationFrame(pulseBadges);
+    }
+    requestAnimationFrame(pulseBadges);
+
+    document.querySelector('#category').addEventListener('change', e => loadCatalog(e.target.value));
+    loadCatalog('sneakers');
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (e-commerce category page)
+
+    #### [Security] Product data is written into the page as HTML
+    - **Where:** `card.innerHTML = ...` in `loadCatalog`
+    - **Issue:** `p.name`, `p.image` and `p.priceFormatted` go straight into markup. If any of them contains a quote or a tag (for example from a supplier feed), it breaks the card or runs script in your shop.
+    - **Fix:** build the cards with `textContent` and property assignment, as in the next finding.
+
+    #### [High] The whole category is in the DOM at once
+    - **Where:** `products.forEach(...)` appending every product to `.grid`
+    - **Issue:** 6,000 cards are built with 9 elements each, so the page holds more than 50,000 elements, appended one by one to the live DOM. Every style recalculation, layout and scroll has to deal with all of them, even though a visitor sees a dozen at a time. In Green Metrics Tool micro-benchmarks, 30 page loads of a table with 10,000 rows built from 14 elements per row, appended to the live DOM, used ~1036 J. The same data paginated to 100 rows per page, with plain elements built in a `DocumentFragment`, used ~457 J, about 56% less. That was a table, not a product grid, but the cause is the same.
+    - **Fix:** keep the array in memory, render one page of 100 products, and drop the wrapper elements. The category filter keeps working, because it still loads and filters the array:
+      ```js
+      const PAGE_SIZE = 100;
+      let products = [];
+
+      function renderPage(page) {
+        const frag = document.createDocumentFragment();
+        for (const p of products.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)) {
+          const card = document.createElement('article');
+          card.className = 'card';
+
+          const img = document.createElement('img');
+          img.src = p.image;
+          img.alt = p.name;
+          img.loading = 'lazy';
+          card.append(img);
+
+          if (p.onSale) {
+            const badge = document.createElement('span');
+            badge.className = 'badge-sale';
+            badge.textContent = 'Sale';
+            card.append(badge);
+          }
+
+          const title = document.createElement('h3');
+          title.className = 'card-title';
+          title.textContent = p.name;
+
+          const price = document.createElement('span');
+          price.className = 'card-price';
+          price.textContent = p.priceFormatted;
+
+          card.append(title, price);
+          frag.append(card);
+        }
+        grid.replaceChildren(frag);
+      }
+
+      async function loadCatalog(category) {
+        const res = await fetch('/api/products?category=' + encodeURIComponent(category));
+        products = await res.json();
+        renderPage(0);
+      }
+      ```
+      Add Previous / Next buttons that call `renderPage`. A "Load more" button would grow the DOM again. The CSS gets shorter too, because the five wrapper classes go away:
+      ```css
+      .card { position: relative; display: grid; gap: 8px; padding: 12px; background: #fff; border: 1px solid #e5e5e5; border-radius: 8px; }
+      .card img { width: 100%; aspect-ratio: 1 / 1; object-fit: cover; }
+      .card-title { font-size: 14px; margin: 0; min-height: 2.6em; }
+      .card-price { font-weight: 600; }
+      ```
+    - **Impact:** E on the client for every visit, and also memory (M). It grows with the size of the category. Visitors now see 100 products per page instead of an endless list, so tell the shop owner. The look of each card stays the same. Add `contain-intrinsic-size`-free fixed `aspect-ratio` as you already do, so the layout does not jump while images load.
+
+    #### [Medium] Badge pulse is driven by JavaScript on every frame
+    - **Where:** `pulseBadges` with `requestAnimationFrame`
+    - **Issue:** the script runs on every frame, queries the DOM, and writes an inline style to every badge, forever, also in background tabs that are still open. A CSS animation on `transform` does the same job in the browser's own animation pipeline without running your script. In Green Metrics Tool micro-benchmarks of a 20-second animation, `requestAnimationFrame` with style updates used ~161 J of CPU energy and CSS `@keyframes` ~145 J, about 10% less. The gain is moderate, and it grows with the number of animated elements and the time the tab stays open.
+    - **Fix:** delete `pulseBadges` and put the same motion in the stylesheet (the period of about 1.9 s matches your `t / 300`):
+      ```css
+      .badge-sale { animation: badge-pulse 1.9s ease-in-out infinite; }
+
+      @keyframes badge-pulse {
+        0%, 100% { transform: scale(1); }
+        50%      { transform: scale(1.08); }
+      }
+      ```
+    - **Impact:** E on the client. With 100 cards per page there are far fewer badges than before, so the animation stays cheap.
+
+    **Already good:** `aspect-ratio` on the image avoids layout shifts, the animation only touches `transform` (no layout), and the category is URL-encoded in the request.
+verify:
+  static_only: browser CSS/JS (DOM rendering and CSS animation), needs a real browser

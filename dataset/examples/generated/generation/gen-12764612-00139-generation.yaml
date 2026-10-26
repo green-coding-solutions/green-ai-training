@@ -1,0 +1,101 @@
+id: gen-12764612-00139-generation
+category: generation
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    I need a Python function for our nightly product import (wholesale feed, CSV, a few million rows). The `pack_size` column is free text from the suppliers, for example `6 x 330ml`, `1,5 l`, `2x500 g`, `0.75L`, `1 kg`. I want it as a number in the base unit plus the kind of unit: ml for volume, g for mass. So `6 x 330ml` becomes `(1980, "volume")` and `2x500 g` becomes `(1000, "mass")`.
+
+    Requirements:
+    - decimal comma and decimal point both possible
+    - units: ml, cl, dl, l, g, kg, any case
+    - if the text can't be parsed, don't crash, return None
+    - plus a small function that reads the CSV from a file object, adds `quantity` and `kind` columns, writes the result to another file object and returns how many rows could not be parsed
+    - only the standard library please
+- role: assistant
+  content: |
+    ```python
+    import csv
+    import re
+    from functools import lru_cache
+
+    _PACK = re.compile(
+        r"^(?:(?P<count>\d+)\s*[x×]\s*)?"
+        r"(?P<amount>\d+(?:[.,]\d+)?)\s*"
+        r"(?P<unit>ml|cl|dl|l|kg|g)$",
+        re.IGNORECASE,
+    )
+
+    # unit -> (factor to base unit, kind)
+    _UNITS = {
+        "ml": (1, "volume"),
+        "cl": (10, "volume"),
+        "dl": (100, "volume"),
+        "l": (1000, "volume"),
+        "g": (1, "mass"),
+        "kg": (1000, "mass"),
+    }
+
+
+    @lru_cache(maxsize=8192)
+    def parse_pack_size(text):
+        """Return (quantity in ml or g, "volume" | "mass"), or None if not parseable."""
+        match = _PACK.match(text.strip())
+        if match is None:
+            return None
+        count = int(match.group("count") or 1)
+        amount = float(match.group("amount").replace(",", "."))
+        factor, kind = _UNITS[match.group("unit").lower()]
+        return round(count * amount * factor), kind
+
+
+    def add_quantity_columns(src, dst):
+        """Copy CSV from src to dst with quantity and kind columns. Return the number of unparseable rows."""
+        reader = csv.DictReader(src)
+        fields = list(reader.fieldnames) + ["quantity", "kind"]
+        writer = csv.DictWriter(dst, fieldnames=fields, lineterminator="\n")
+        writer.writeheader()
+        rejected = 0
+        for row in reader:
+            parsed = parse_pack_size(row["pack_size"])
+            if parsed is None:
+                rejected += 1
+                row["quantity"], row["kind"] = "", ""
+            else:
+                row["quantity"], row["kind"] = parsed
+            writer.writerow(row)
+        return rejected
+    ```
+
+    **Green Notes**
+    - **Memoize the parser** (reduces E): supplier feeds repeat the same few pack-size strings over and over, so with millions of rows only a small set of distinct texts is parsed. The rest are cache hits. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over 200 distinct inputs used about 9× less CPU energy with `lru_cache`.
+    - **Bounded cache** (reduces M): `maxsize` caps memory, and the function returns an immutable tuple or `None`, so cached results can't be changed by the caller.
+    - *Not applied:* caching on the row level. It only helps because the input texts repeat. If a feed had mostly unique strings, the cache would only add overhead, so check the distinct count of `pack_size` in a sample first.
+verify:
+  test: |-
+    import io
+    assert parse_pack_size("6 x 330ml") == (1980, "volume")
+    assert parse_pack_size("1,5 l") == (1500, "volume")
+    assert parse_pack_size("2x500 g") == (1000, "mass")
+    assert parse_pack_size("0.75L") == (750, "volume")
+    assert parse_pack_size("1 kg") == (1000, "mass")
+    assert parse_pack_size("25 CL") == (250, "volume")
+    assert parse_pack_size("junk") is None
+    assert parse_pack_size("") is None
+    before = parse_pack_size.cache_info().hits
+    parse_pack_size("6 x 330ml")
+    assert parse_pack_size.cache_info().hits == before + 1
+    src = io.StringIO("sku,pack_size\nA,6 x 330ml\nB,1.5 l\nC,6 x 330ml\nD,junk\n")
+    dst = io.StringIO()
+    assert add_quantity_columns(src, dst) == 1
+    assert dst.getvalue().splitlines() == [
+        "sku,pack_size,quantity,kind",
+        "A,6 x 330ml,1980,volume",
+        "B,1.5 l,1500,volume",
+        "C,6 x 330ml,1980,volume",
+        "D,junk,,",
+    ]

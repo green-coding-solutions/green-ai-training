@@ -1,0 +1,48 @@
+id: gen-1-00042-conceptual
+category: conceptual
+language: text
+patterns:
+- string-join
+- context-tradeoff
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    Question for our ETL code review. We have a Python pipeline that reads rows from a staging table and builds one big SQL script as a string (one `INSERT` line per row) before it hands the script to another tool. Right now it looks like this:
+
+    ```python
+    script = ""
+    for row in rows:
+        script += f"INSERT INTO dim_customer VALUES ({row['id']}, '{row['name']}');\n"
+    ```
+
+    A colleague says to change it to `"".join()`. Another one says an f-string is the fix, because "f-strings are the fast way to build strings". I need to know:
+
+    1. Which one is right?
+    2. Is it always worth changing, or only for big jobs? Some of our jobs write only 20-30 lines.
+    3. Does it matter that the pieces come from a generator and not a list?
+
+    Please keep it short, I have to put the answer in the review thread.
+- role: assistant
+  content: |
+    Your first colleague is right. The f-string is not the fix.
+
+    **1. join vs f-string.** An f-string only changes how each piece is formatted. If you still do `script += f"..."`, you still copy the growing string on every step. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces used ~469 J with `+=` and ~455 J with f-string concatenation in a loop, so they behave the same. `"".join()` used ~1.8 J, roughly 260× less CPU energy. Use the f-string for each line, and `join` to combine the lines.
+
+    **2. When it matters.** It matters when the number of pieces is large, because the cost of `+=` grows with the size of the string. For 20-30 lines the difference is negligible. Don't touch those jobs just for this. Fix the loops that handle thousands of rows or more. `join` is not harder to read, so it is fine as the default in new code.
+
+    **3. Generators.** `join` accepts any iterable of strings, so a generator works and you don't need an extra list in your code:
+
+    ```python
+    script = "".join(
+        f"INSERT INTO dim_customer VALUES ({row['id']}, '{row['name']}');\n"
+        for row in rows
+    )
+    ```
+
+    The pieces must already be `str`. Convert numbers inside the f-string, as above, or `join` raises a `TypeError`.
+
+    Separate issue for the review: `'{row['name']}'` puts raw data into SQL. A name like `O'Brien` breaks the script, and it is an injection risk if the staging data is not fully trusted. Use parameterized queries or proper escaping if you can.
+verify:
+  static_only: conceptual answer

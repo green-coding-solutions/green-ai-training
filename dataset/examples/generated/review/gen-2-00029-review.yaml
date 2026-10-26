@@ -1,0 +1,81 @@
+id: gen-2-00029-review
+category: review
+language: html
+patterns:
+- lazy-load-images
+facts:
+- F-LAZY-IMG
+messages:
+- role: user
+  content: |
+    profile page template from our api (GET /u/<name>, Flask renders it, 60 shots per page). fix this
+
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>{{ user.display_name }} · Shotlog</title>
+      <link rel="stylesheet" href="/static/profile.css">
+    </head>
+    <body>
+      <header class="profile-head">
+        <img class="cover" src="{{ user.cover_url }}" alt="" loading="lazy" width="1600" height="400">
+        <img class="avatar" src="{{ user.avatar_url }}" alt="{{ user.display_name }}" width="96" height="96">
+        <h1>{{ user.display_name }}</h1>
+        <p class="bio">{{ user.bio | safe }}</p>
+        <span class="stats">{{ user.shot_count }} shots · {{ user.follower_count }} followers</span>
+      </header>
+
+      <main class="grid">
+        {% for shot in shots %}
+        <figure class="shot">
+          <a href="/s/{{ shot.id }}">
+            <img src="{{ shot.thumb_url }}" alt="{{ shot.caption }}" width="400" height="400">
+          </a>
+          <figcaption>{{ shot.caption }} · {{ shot.likes }} likes</figcaption>
+        </figure>
+        {% endfor %}
+      </main>
+
+      {% if has_more %}
+      <a class="more" href="?page={{ page + 1 }}">Load more</a>
+      {% endif %}
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (server-rendered page, one render per profile view)
+
+    #### [Security] Stored XSS through the bio
+    - **Where:** `{{ user.bio | safe }}`
+    - **Issue:** `| safe` turns off Jinja's autoescaping. Any user can put a `<script>` in their bio, and it runs for every visitor of their profile.
+    - **Fix:** drop `| safe` so the bio gets escaped. If bios need formatting, clean the HTML with an allowlist sanitizer when it is saved, and only mark it safe after that.
+
+    #### [Medium] Lazy loading is on the wrong images
+    - **Where:** the `.cover` image and the `<img>` inside the `{% for shot in shots %}` loop
+    - **Issue:** the cover is the first thing visitors see, but it has `loading="lazy"`, so the browser holds it back until layout is done. All thumbnails in the grid load eagerly, including the ones far below the fold that many visitors never scroll to.
+    - **Fix:** load the cover eagerly. Lazy-load the thumbnails, except the first row:
+      ```html
+      <img class="cover" src="{{ user.cover_url }}" alt="" width="1600" height="400">
+      ...
+      {% for shot in shots %}
+      <figure class="shot">
+        <a href="/s/{{ shot.id }}">
+          <img src="{{ shot.thumb_url }}" alt="{{ shot.caption }}" width="400" height="400"
+               {% if loop.index > 4 %}loading="lazy"{% endif %}>
+        </a>
+        <figcaption>{{ shot.caption }} · {{ shot.likes }} likes</figcaption>
+      </figure>
+      {% endfor %}
+      ```
+      Set the `4` to the number of columns your grid shows in the first row.
+    - **Impact:** reduces network and client E on every profile view where the visitor stops before the end of the grid. In Green Metrics Tool page-load benchmarks (an article with 15 photos), lazy loading below the fold used about 12% less energy when visitors did not scroll. When they scrolled to the end, the difference was about 1%, which is noise. So the saving depends on how far people really scroll on profiles.
+
+    **Already good:**
+    - `width`/`height` on every image, so lazy thumbnails don't shift the layout when they load.
+    - The grid is paginated, which limits how much one page view can pull.
+verify:
+  static_only: Jinja HTML template, lazy-loading behavior needs a real browser to check

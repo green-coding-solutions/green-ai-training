@@ -1,0 +1,82 @@
+id: gen-2-00214-generation
+category: generation
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    hi, I'm pretty new to linux. our IoT gateway (a small ARM box) writes every sensor message to /var/log/gateway/readings.log, one line per message, like this:
+
+    ```text
+    2026-10-24T08:15:02Z dev=th-0042 rssi=-71 bat=87 temp=21.4 hum=48
+    2026-10-24T08:15:03Z dev=door-0007 rssi=-80 bat=14 open=0
+    2026-10-24T08:15:03Z gw: mqtt reconnect ok
+    2026-10-24T08:15:05Z dev=th-0042 rssi=-70 bat=87 temp=21.5 hum=48
+    ```
+
+    I need a script that shows for each device how many messages it sent, when it was last seen and its last battery value. After that, a list of the devices where the battery is below some limit (20 for now), so we can send someone to change them. The file has around 60k lines per day.
+
+    I tried a while read loop with cut to get the fields, but it ran for many minutes and the whole gateway got slow. Other services started lagging. I don't really understand what I did wrong. Can you write it so it works on the gateway?
+- role: assistant
+  content: |
+    Your loop was slow because every `$(echo ... | cut ...)` starts new processes for every line. On a small ARM box those process starts cost far more than the actual work. This version reads the file once with a single `awk` process:
+
+    ```bash
+    #!/usr/bin/env bash
+    # Per-device summary of the gateway log, plus a list of low batteries.
+    # Usage: sensor-report.sh [logfile] [low_battery_limit]
+    set -euo pipefail
+
+    log=${1:-/var/log/gateway/readings.log}
+    low=${2:-20}
+
+    if [[ ! -r $log ]]; then
+      printf 'cannot read %s\n' "$log" >&2
+      exit 1
+    fi
+
+    # One pass over the whole log: count, last timestamp, last battery per device.
+    summary=$(awk -v none='-' '
+    {
+      dev = ""; bat = ""
+      for (i = 2; i <= NF; i++) {
+        if ($i ~ /^dev=/)      dev = substr($i, 5)
+        else if ($i ~ /^bat=/) bat = substr($i, 5)
+      }
+      if (dev == "") next              # gateway lines (gw: ...) have no device
+      count[dev]++
+      last[dev] = $1
+      if (bat != "") battery[dev] = bat
+    }
+    END {
+      for (d in count)
+        printf "%s\t%d\t%s\t%s\n", d, count[d], last[d], ((d in battery) ? battery[d] : none)
+    }' "$log" | LC_ALL=C sort)
+
+    printf 'device\tmsgs\tlast_seen\tbattery\n'
+    if [[ -n $summary ]]; then
+      printf '%s\n' "$summary"
+    fi
+
+    # Filter the small summary, not the big log.
+    low_list=$(awk -F'\t' -v low="$low" '
+      NF == 4 && $4 ~ /^[0-9.]+$/ && $4 + 0 < low + 0 {
+        printf "%s (battery %s, last seen %s)\n", $1, $4, $3
+      }' <<<"$summary")
+
+    printf '\nLow battery (below %s):\n' "$low"
+    printf '%s\n' "${low_list:-none}"
+    ```
+
+    Run it with `./sensor-report.sh`, or pass a different file and limit: `./sensor-report.sh /tmp/readings.log 25`. The awk code is plain POSIX, so it also works with BusyBox `awk`. Devices that never reported a battery show `-`.
+
+    **Green Notes**
+    - **One awk pass instead of a per-line loop with `cut`** (reduces E): one process reads the file once, so you no longer pay a process start for every field of every line. In Green Metrics Tool micro-benchmarks that summarized a 20,000-line log, one `awk` pass used ~1.0 J. A `while read` loop that ran `$(echo | cut)` and `$(expr)` for each field used ~1302 J. That is over 1000× less CPU energy.
+    - **No command substitution inside a loop** (reduces E): each `$(...)` call runs only once. The low-battery check filters the short per-device summary, so it does not scan the log again. If you ever need a bash loop, split fields with `read -r` and parameter expansion instead of `cut`. In the same benchmark, the loop that used only builtins was about 300× cheaper than the loop that started subprocesses.
+
+    "Last seen" is the timestamp of the device's last line in the file. This is only correct if the gateway appends lines in time order, which it normally does.
+verify:
+  static_only: bash script reading a gateway log file

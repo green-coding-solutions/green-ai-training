@@ -1,0 +1,145 @@
+id: gen-2-00371-refactor
+category: refactor
+language: python
+patterns:
+- select-columns
+- torch-no-grad
+facts:
+- F-PG-SELECT
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    fix this. nightly sentiment job, gets slower every week. reviews has ~40 cols incl raw_html and attachments jsonb
+
+    ```python
+    from datetime import date, timedelta
+
+    import psycopg
+    import torch
+
+    from model import SentimentNet
+    from tokenizer import encode_batch
+
+    DSN = "postgresql://etl@db-replica/shop"
+    BATCH = 256
+
+
+    def load_model(path):
+        model = SentimentNet()
+        model.load_state_dict(torch.load(path, map_location="cpu"))
+        return model
+
+
+    def fetch_unscored(conn, since):
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM reviews "
+                "WHERE created_at >= %s AND sentiment IS NULL ORDER BY id",
+                (since,),
+            )
+            return cur.fetchall()
+
+
+    def score(model, rows):
+        results = []
+        for i in range(0, len(rows), BATCH):
+            chunk = rows[i:i + BATCH]
+            ids = [r[0] for r in chunk]
+            texts = [r[5] for r in chunk]  # body
+            logits = model(encode_batch(texts))
+            probs = torch.softmax(logits, dim=-1)[:, 1]
+            results.extend(zip(ids, probs.tolist()))
+        return results
+
+
+    def write_scores(conn, scores):
+        with conn.cursor() as cur:
+            cur.executemany(
+                "UPDATE reviews SET sentiment = %s WHERE id = %s",
+                [(p, review_id) for review_id, p in scores],
+            )
+        conn.commit()
+
+
+    def main():
+        model = load_model("models/sentiment-v3.pt")
+        with psycopg.connect(DSN) as conn:
+            rows = fetch_unscored(conn, date.today() - timedelta(days=1))
+            write_scores(conn, score(model, rows))
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    ```python
+    from datetime import date, timedelta
+
+    import psycopg
+    import torch
+
+    from model import SentimentNet
+    from tokenizer import encode_batch
+
+    DSN = "postgresql://etl@db-replica/shop"
+    BATCH = 256
+
+
+    def load_model(path):
+        model = SentimentNet()
+        model.load_state_dict(torch.load(path, map_location="cpu"))
+        model.eval()
+        return model
+
+
+    def fetch_unscored(conn, since):
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, body FROM reviews "
+                "WHERE created_at >= %s AND sentiment IS NULL ORDER BY id",
+                (since,),
+            )
+            return cur.fetchall()
+
+
+    def score(model, rows):
+        results = []
+        with torch.no_grad():
+            for i in range(0, len(rows), BATCH):
+                chunk = rows[i:i + BATCH]
+                ids = [review_id for review_id, _ in chunk]
+                texts = [body for _, body in chunk]
+                logits = model(encode_batch(texts))
+                probs = torch.softmax(logits, dim=-1)[:, 1]
+                results.extend(zip(ids, probs.tolist()))
+        return results
+
+
+    def write_scores(conn, scores):
+        with conn.cursor() as cur:
+            cur.executemany(
+                "UPDATE reviews SET sentiment = %s WHERE id = %s",
+                [(p, review_id) for review_id, p in scores],
+            )
+        conn.commit()
+
+
+    def main():
+        model = load_model("models/sentiment-v3.pt")
+        with psycopg.connect(DSN) as conn:
+            rows = fetch_unscored(conn, date.today() - timedelta(days=1))
+            write_scores(conn, score(model, rows))
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **Select only the needed columns** (reduces E, M, network): the job uses `id` and `body`, but `SELECT *` pulled `raw_html`, `attachments` and the other ~37 columns for every review. Postgres had to read them, the replica had to send them, and Python held them all in memory. In Green Metrics Tool micro-benchmarks on a 52-column table with large text columns, naming the 10 needed columns used about 5.5× less CPU energy at 500 rows and about 7× less at 2,500 rows. The saving grows with the size of the skipped columns, so it grows as `raw_html` and `attachments` grow. The rows are also unpacked by name now. `r[5]` would silently read the wrong column after the next schema change.
+    - **`torch.no_grad()` for inference** (reduces E, M): without it, PyTorch builds the autograd graph for every batch and keeps the activations for a backward pass that never runs. In Green Metrics Tool micro-benchmarks, 100,000 CPU inferences used about 14% less CPU energy with `torch.no_grad()`.
+    - **Bug fix: `model.eval()`**: the model was left in training mode. If `SentimentNet` has dropout or batch norm layers, the scores were noisy and changed from run to run. They are deterministic now, so they can differ slightly from what earlier runs stored.
+verify:
+  static_only: needs torch, psycopg, a Postgres server and the user's model/tokenizer modules

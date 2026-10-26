@@ -1,0 +1,67 @@
+id: gen-12764612-00204-refactor
+category: refactor
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    ```bash
+    #!/bin/bash
+    # archive finished build dirs from the CI box
+    SRC=/var/ci/builds
+    DEST=/mnt/artifacts
+    DAYS=30
+
+    for dir in $(find $SRC -mindepth 1 -maxdepth 1 -type d -mtime +1); do
+      name=$(basename $dir)
+      tar -cf - -C $SRC $name | bzip2 -9 > $DEST/$name.tar.bz2
+      if bzip2 -t $DEST/$name.tar.bz2; then
+        rm -rf $dir
+      fi
+    done
+
+    find $DEST -name "*.tar.bz2" -mtime +$DAYS -delete
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```bash
+    #!/bin/bash
+    # archive finished build dirs from the CI box
+    set -o pipefail
+
+    SRC=/var/ci/builds
+    DEST=/mnt/artifacts
+    DAYS=30
+
+    while IFS= read -r -d '' dir; do
+      name=$(basename "$dir")
+      out="$DEST/$name.tar.zst"
+      if tar -cf - -C "$SRC" "$name" | zstd -q -f -o "$out.tmp" && zstd -q -t "$out.tmp"; then
+        mv "$out.tmp" "$out"
+        rm -rf "$dir"
+      else
+        rm -f "$out.tmp"
+        echo "archive failed: $name" >&2
+      fi
+    done < <(find "$SRC" -mindepth 1 -maxdepth 1 -type d -mtime +1 -print0)
+
+    find "$DEST" -type f \( -name '*.tar.bz2' -o -name '*.tar.zst' \) -mtime +"$DAYS" -delete
+    ```
+
+    **Green Notes**
+    - **Fast codec for data you compress often** (reduces E): `bzip2 -9` is replaced by `zstd` at its default level. This job compresses every build dir, and each archive is read again by `-t` and later when someone restores it. In Green Metrics Tool micro-benchmarks on English text with default settings, compressing 100 MB used about 16 J with zstd and about 106 J with bzip2. Decompressing 100 MB used about 5.3 J with zstd and about 52 J with bzip2.
+    - **Compression is kept, not dropped** (reduces storage): the archives live for 30 days, so compressing them is worth it. Those measurements compare energy, not file size. zstd at its default level may produce somewhat larger files than `bzip2 -9`. If the artifact volume gets tight, raise the zstd level and check the size and energy again.
+
+    **Fixes**
+    - **Bug:** the old pipe only checked the exit code of `bzip2`. If `tar` failed halfway, the truncated archive still passed `bzip2 -t` and the build dir was deleted. `set -o pipefail` plus the `&&` check now keeps the source when tar or zstd fails.
+    - **Bug:** unquoted `$dir`, `$SRC` and `$name` broke on paths with spaces. The loop now reads null-separated `find` output and quotes all variables.
+    - The archive is written to a `.tmp` file and renamed only after the test passes, so no half-written `.tar.zst` is left in `/mnt/artifacts`.
+
+    The cleanup line removes both `.tar.bz2` and `.tar.zst`, so existing bzip2 archives age out on the same 30-day schedule. Restores now use `tar --zstd -xf` or `zstd -dc file | tar -xf -`.
+verify:
+  static_only: needs a CI build tree, tar and zstd installed, and writes to system paths

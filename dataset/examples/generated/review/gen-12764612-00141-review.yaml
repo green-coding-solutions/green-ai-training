@@ -1,0 +1,73 @@
+id: gen-12764612-00141-review
+category: review
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS
+messages:
+- role: user
+  content: |
+    Review please. Hourly cron, pushes our price/stock feed to the 6 marketplace partners. Just give me the diff, no essay.
+
+    ```bash
+    #!/usr/bin/env bash
+    # push hourly price/stock feed to marketplace partners
+    set -euo pipefail
+
+    PARTNERS_FILE=/etc/shop/partners.txt   # name url token
+    OUT=$(mktemp -d)
+    trap 'rm -rf "$OUT"' EXIT
+
+    /usr/local/bin/export-feed --format ndjson > "$OUT/feed.ndjson"
+
+    while read -r name url token; do
+        echo "pushing feed to $name"
+        brotli -q 11 -c "$OUT/feed.ndjson" > "$OUT/$name.ndjson.br"
+        curl -fsS -X POST "$url" \
+            -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/x-ndjson" \
+            -H "Content-Encoding: br" \
+            --data-binary "@$OUT/$name.ndjson.br"
+    done < "$PARTNERS_FILE"
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (hourly cron, data compressed on every run)
+
+    #### [High] Maximum-quality brotli on data that is compressed every hour
+    - **Where:** `brotli -q 11` in the loop
+    - **Issue:** quality 11 is the most expensive setting. The feed is regenerated every hour and thrown away after the upload, so nothing amortizes that cost. In Green Metrics Tool micro-benchmarks on 100 MB of text, brotli at its default quality 11 used ~3019 J to compress, gzip (level 6) ~67 J and zstd ~16 J. That is about 45× gzip and about 190× zstd. Decompression on the partner side was about the same for all of them.
+    - **Fix:** use `gzip -c`, which any HTTP endpoint that accepts `Content-Encoding: gzip` can take. `zstd -c` is cheaper still, but only if the partners accept `Content-Encoding: zstd`.
+    - **Impact:** E, the CPU cost of compression on every run drops by more than an order of magnitude. Those figures compare energy only, not compressed size. Brotli q11 usually gives smaller files, which only matters if upload bandwidth is the bottleneck.
+
+    #### [Medium] Same file compressed once per partner
+    - **Where:** compression inside the `while` loop
+    - **Issue:** the input is identical for all 6 partners, so you compress it 6 times per run.
+    - **Fix:** compress once before the loop and reuse the file.
+    - **Impact:** E, 6 compressions → 1 per run.
+
+    ```diff
+    -while read -r name url token; do
+    -    echo "pushing feed to $name"
+    -    brotli -q 11 -c "$OUT/feed.ndjson" > "$OUT/$name.ndjson.br"
+    +gzip -c "$OUT/feed.ndjson" > "$OUT/feed.ndjson.gz"
+    +
+    +while read -r name url token; do
+    +    echo "pushing feed to $name"
+         curl -fsS -X POST "$url" \
+             -H "Authorization: Bearer $token" \
+             -H "Content-Type: application/x-ndjson" \
+    -        -H "Content-Encoding: br" \
+    -        --data-binary "@$OUT/$name.ndjson.br"
+    +        -H "Content-Encoding: gzip" \
+    +        --data-binary "@$OUT/feed.ndjson.gz"
+     done < "$PARTNERS_FILE"
+    ```
+
+    Check that each partner accepts gzip bodies before you ship this.
+
+    **Already good:** `read -r`, quoted variables, `mktemp` with a `trap` cleanup, and `curl -f` so HTTP errors fail the run.
+verify:
+  static_only: needs export-feed, a partners file and network access; the script only calls curl, gzip and brotli

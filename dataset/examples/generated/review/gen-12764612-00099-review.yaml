@@ -1,0 +1,53 @@
+id: gen-12764612-00099-review
+category: review
+language: sql
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    review pls. log list page, it only shows time, level, service and message
+
+    ```sql
+    -- log_events: id bigint, logged_at timestamptz, service text, level text,
+    -- message text, host text, trace_id text, user_id bigint,
+    -- stack_trace text, raw_line text, context jsonb
+
+    SELECT *
+    FROM log_events
+    WHERE service = 'checkout'
+      AND level IN ('ERROR', 'WARN')
+    ORDER BY logged_at DESC
+    LIMIT 50 OFFSET 100;
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (log viewer list page)
+
+    #### [Bug] Unstable paging
+    - **Where:** `ORDER BY logged_at DESC` with `OFFSET`
+    - **Issue:** many log lines share the same timestamp. Their order between two requests is not guaranteed, so rows can repeat or vanish when users go from page to page.
+    - **Fix:** add a unique tie-breaker: `ORDER BY logged_at DESC, id DESC`.
+
+    #### [High] `SELECT *` on a table with big text columns
+    - **Where:** the select list
+    - **Issue:** the page shows four fields, but the query also reads `stack_trace`, `raw_line` and `context`. These are the largest values in a log row. They are read, sent to the app and then dropped, for every page view.
+    - **Fix:** name the columns the list needs. Load `stack_trace`, `raw_line` and `context` by `id` only when a user opens one entry.
+      ```sql
+      SELECT id, logged_at, level, service, message
+      FROM log_events
+      WHERE service = 'checkout'
+        AND level IN ('ERROR', 'WARN')
+      ORDER BY logged_at DESC, id DESC
+      LIMIT 50 OFFSET 100;
+      ```
+    - **Impact:** E and network, on every page view. In Green Metrics Tool micro-benchmarks on a 52-column table with large text columns, naming 10 needed columns used about 5.5× to 7× less energy than `SELECT *`. The saving grows with the size of the skipped columns. Your table is narrower, so expect a smaller gap. It still scales with how long your stack traces and raw lines are.
+
+    **Already good:** the filter is in the query and `LIMIT` caps the rows per page.
+verify:
+  static_only: Postgres-specific schema (jsonb, timestamptz); the answer query intentionally returns fewer columns than SELECT
+    *, so results cannot be compared

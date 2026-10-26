@@ -1,0 +1,73 @@
+id: gen-2-00215-no-change
+category: no-change
+language: python
+patterns:
+- hoist-invariants
+- context-tradeoff
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    hi, we run a pallet detector on edge box in our warehouse (8 camera, every camera send one frame each 2 seconds). my team lead send me article with "python speed tips" and it say to put `floor = math.floor`, `ceil = math.ceil`, `append = results.append`, `labels = self.labels` in local variable before the loop, so python dont lookup them every time. should i do this in `postprocess`? we want the box use less power. after the threshold there is usualy 5-30 detection per frame.
+
+    ```python
+    import math
+    import numpy as np
+    import onnxruntime as ort
+
+
+    class PalletDetector:
+        def __init__(self, model_path, labels, conf_thres=0.4, input_size=640):
+            self.session = ort.InferenceSession(
+                model_path, providers=["CPUExecutionProvider"]
+            )
+            self.input_name = self.session.get_inputs()[0].name
+            self.labels = labels
+            self.conf_thres = conf_thres
+            self.input_size = input_size
+
+        def preprocess(self, img):
+            # img: HxWx3 uint8, already letterboxed to input_size x input_size
+            x = img.astype(np.float32) / 255.0
+            return np.transpose(x, (2, 0, 1))[np.newaxis, ...]
+
+        def postprocess(self, raw, orig_w, orig_h):
+            # raw: (N, 6) -> cx, cy, w, h, objectness_logit, class_id
+            scores = 1.0 / (1.0 + np.exp(-raw[:, 4]))
+            keep = scores > self.conf_thres
+            boxes = raw[keep]
+            scores = scores[keep]
+
+            sx = orig_w / self.input_size
+            sy = orig_h / self.input_size
+            results = []
+            for (cx, cy, w, h, _, cls), score in zip(boxes, scores):
+                x1 = max(0, math.floor((cx - w / 2) * sx))
+                y1 = max(0, math.floor((cy - h / 2) * sy))
+                x2 = min(orig_w, math.ceil((cx + w / 2) * sx))
+                y2 = min(orig_h, math.ceil((cy + h / 2) * sy))
+                results.append({
+                    "label": self.labels[int(cls)],
+                    "score": round(float(score), 3),
+                    "box": [x1, y1, x2, y2],
+                })
+            return results
+
+        def detect(self, img, orig_w, orig_h):
+            x = self.preprocess(img)
+            raw = self.session.run(None, {self.input_name: x})[0][0]
+            return self.postprocess(raw, orig_w, orig_h)
+    ```
+- role: assistant
+  content: |
+    No, I would leave `postprocess` as it is. That tip helps only in very tight loops, and this loop is not one.
+
+    - **The loop is tiny.** It runs once for each kept detection, so a few dozen times per frame at most. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local variable saved about 4-5%, and that was in a loop with 10,000,000 iterations. A few percent of a few dozen iterations is not something you can measure on the box.
+    - **The real work happens somewhere else.** Each frame spends its time in `session.run` (the forward pass) and in `preprocess` on the full image array. Both run in native code. The Python loop is a very small part of each frame.
+    - **The per-row work is already vectorized.** The sigmoid and the threshold over all `N` candidate rows run in numpy before the loop. So `np.exp` is looked up once per frame, not once per row. That is the part that matters, and you already did it.
+    - **Readability.** Names like `floor = math.floor` and `append = results.append` make the code harder to read and give you nothing back here.
+
+    If you want to know where the power goes, profile one frame (for example with `cProfile`, or by timing `preprocess`, `session.run` and `postprocess` separately). Then measure the whole box under a real camera load, with `perf stat` or RAPL on the gateway. I expect the forward pass to dominate, but check it before you change anything.
+verify:
+  static_only: answer has no code; the user's code needs onnxruntime and a model file

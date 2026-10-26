@@ -1,0 +1,97 @@
+id: gen-2-00182-generation
+category: generation
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    hi, every night we get a fixed width file from our old mainframe system (customers.dat, around 400k lines) and we must convert it to csv before we load it with \copy into postgres. Layout of one line (60 chars):
+
+    pos 1-8    customer id (padded with spaces)
+    pos 9-38   name, filled with spaces at the end
+    pos 39-46  date opened YYYYMMDD
+    pos 47-57  balance in cents, 11 digits with leading zeros
+    pos 58     sign + or -
+    pos 59-60  country code
+
+    output should be: customer_id,name,opened_on,balance,country with date like 2024-03-01 and balance like -1234.56 . lines which are broken should not stop the whole job, just write them in some reject file with line number so we can check it later. can you write me bash script for this? we have only bash and the normal linux tools on the etl server
+- role: assistant
+  content: |
+    The script does all the parsing in a single `awk` pass. It writes to a temp file and renames it at the end, so `\copy` never sees a half-written CSV.
+
+    ```bash
+    #!/usr/bin/env bash
+    # Convert the nightly fixed-width customer export to CSV for \copy into Postgres.
+    # Usage: convert_customers.sh customers.dat customers.csv [rejects.txt]
+    set -euo pipefail
+
+    in=${1:?usage: $0 INPUT.dat OUTPUT.csv [REJECTS.txt]}
+    out=${2:?usage: $0 INPUT.dat OUTPUT.csv [REJECTS.txt]}
+    rej=${3:-${out%.csv}.rejects.txt}
+
+    tmp=$(mktemp "${out}.XXXXXX")
+    trap 'rm -f "$tmp"' EXIT
+
+    # LC_ALL=C: substr() counts bytes, which is what fixed-width positions mean.
+    LC_ALL=C awk \
+        -v rej="$rej" \
+        -v header='customer_id,name,opened_on,balance,country' \
+        -v lenfmt='%d: length %d, expected 60\n' \
+        -v emptyid='empty customer_id' \
+        -v sep=': ' \
+        -v zero='0' \
+        -v dot='.' \
+        -v zamt='0.00' '
+    BEGIN {
+        print header
+        printf "" > rej          # create / truncate the reject file
+        bad = 0
+    }
+    {
+        sub(/\r$/, "")           # tolerate CRLF line endings
+        if (length($0) != 60) {
+            printf lenfmt, NR, length($0) > rej
+            bad++; next
+        }
+
+        id      = substr($0,  1,  8); gsub(/ /, "", id)
+        name    = substr($0,  9, 30); gsub(/^ +| +$/, "", name)
+        d       = substr($0, 39,  8)
+        cents   = substr($0, 47, 11)
+        sign    = substr($0, 58,  1)
+        country = substr($0, 59,  2); gsub(/ /, "", country)
+
+        reason = ""
+        if (id == "")                  reason = emptyid
+        else if (d !~ /^[0-9]+$/)      reason = "bad date \"" d "\""
+        else if (cents !~ /^[0-9]+$/)  reason = "bad balance \"" cents "\""
+        else if (sign !~ /^[+-]$/)     reason = "bad sign \"" sign "\""
+        if (reason != "") { print NR sep reason > rej; bad++; next }
+
+        # Balance as string math: no float rounding, works in every awk.
+        sub(/^0+/, "", cents)
+        while (length(cents) < 3) cents = zero cents
+        amount = substr(cents, 1, length(cents) - 2) dot substr(cents, length(cents) - 1)
+        if (sign ~ /-/ && amount != zamt) amount = sign amount
+
+        gsub(/"/, "\"\"", name)   # CSV-escape quotes, name is always quoted
+        printf "%s,\"%s\",%s-%s-%s,%s,%s\n", id, name,
+               substr(d, 1, 4), substr(d, 5, 2), substr(d, 7, 2), amount, country
+    }
+    END {
+        printf "%d rows written, %d rejected (see %s)\n", NR - bad, bad, rej > "/dev/stderr"
+    }
+    ' "$in" > "$tmp"
+
+    mv "$tmp" "$out"
+    ```
+
+    **Green Notes**
+    - **One `awk` pass instead of a `while read` loop with `cut`** (reduces E): cutting six fields per line with `$(echo "$line" | cut -c...)` would start several processes for each of your 400k lines, every night. Here the whole file is handled by one process. In Green Metrics Tool micro-benchmarks on a 20,000-line log, a `while read` loop with `$(echo | cut)` and `$(expr)` per field used ~1302 J, and one `awk` pass with identical output used ~1.0 J, over 1000× less.
+
+    Broken lines go to `customers.rejects.txt` (or the third argument) with their line number and reason, and the job continues. The balance is built with string operations instead of floating point, so large amounts keep their exact cents. Load it with `\copy customers FROM 'customers.csv' WITH (FORMAT csv, HEADER)`.
+verify:
+  static_only: bash script with embedded awk; no python/javascript harness

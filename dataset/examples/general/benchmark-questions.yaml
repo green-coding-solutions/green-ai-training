@@ -1,0 +1,814 @@
+id: conceptual-avif-best-format-001
+category: conceptual
+language: text
+patterns: [modern-image-formats]
+facts: [F-IMGRENDER, F-IMGENC]
+messages:
+  - role: user
+    content: |
+      Is AVIF really the best image format? Everyone on my team says we should just switch everything to AVIF.
+  - role: assistant
+    content: |
+      For photos on the web it is usually the best choice for bytes, but not for every part of the energy bill.
+
+      - **Transfer:** AVIF files are usually the smallest for photos, and fewer bytes over the network is where the saving comes from.
+      - **Decoding is not cheaper.** In Green Metrics Tool browser benchmarks with 50 page loads per format, JPG used ~134 J, WebP ~150 J, AVIF ~159 J and PNG ~181 J of CPU energy. AVIF decoding cost about 19% more than JPG. That benchmark ran on a local network, so it shows the client CPU side only, not the transfer saving.
+      - **Encoding is expensive.** Encoding 50 BMP images took ~89 J as JPG, ~290 J as WebP and ~658 J as AVIF, about 7× JPG.
+
+      So: switch, but encode once at build or upload time, never per request, and keep a fallback:
+
+      ```html
+      <picture>
+        <source srcset="team.avif" type="image/avif">
+        <source srcset="team.webp" type="image/webp">
+        <img src="team.jpg" width="1200" height="800" alt="Our team">
+      </picture>
+      ```
+
+      For icons and logos, SVG beats any raster format.
+verify:
+  static_only: "conceptual answer with an HTML snippet"
+---
+id: estimate-css-vs-js-animation-001
+category: estimate
+language: css
+patterns: [css-animations]
+facts: [F-ANIM]
+messages:
+  - role: user
+    content: |
+      How much more efficient are CSS animations over JS animations? We have a pulsing "live" badge driven by requestAnimationFrame on every page. Is it worth rewriting?
+  - role: assistant
+    content: |
+      In Green Metrics Tool browser benchmarks, a 20-second animation used ~161 J of CPU energy with a JavaScript `requestAnimationFrame` loop that updates styles, and ~145 J with CSS `@keyframes`. That is about 10% less for CSS.
+
+      Where the saving comes from: with `@keyframes` on `transform` and `opacity`, the browser runs the animation itself, often on the compositor. No script runs on every frame.
+
+      ```css
+      .live-badge {
+        animation: pulse 1.2s ease-in-out infinite alternate;
+      }
+
+      @keyframes pulse {
+        from { transform: scale(1);    opacity: 1; }
+        to   { transform: scale(1.15); opacity: 0.6; }
+      }
+      ```
+
+      For a badge that is on every page for the whole visit, the rewrite is small and the saving repeats for every visitor, so yes, it is worth it. Two things to keep in mind:
+
+      - Animate only `transform` and `opacity`. A CSS animation of `width`, `top` or `box-shadow` still triggers layout or paint work on every frame.
+      - The 10% is from one benchmark. Your badge, page and devices differ, so don't scale the number to your traffic. To see your own number, run the page for a fixed time in a Green Metrics Tool usage scenario once with each version and compare.
+verify:
+  static_only: "CSS snippet"
+---
+id: estimate-bash-builtins-vs-loops-001
+category: estimate
+language: bash
+patterns: [bash-builtins]
+facts: [F-BASH-SUBPROC]
+messages:
+  - role: user
+    content: |
+      Do I save energy when using bash builtins vs manual loops with cut and expr? Our scripts are full of `$(echo $line | cut -d' ' -f2)`.
+  - role: assistant
+    content: |
+      Yes, a lot. The cost is not the loop, it is the process starts. Every `$(echo | cut)` or `$(expr)` starts new processes, and that dominates everything else.
+
+      In Green Metrics Tool micro-benchmarks summarizing a 20,000-line access log with identical output:
+
+      - a `while read` loop with `$(echo | cut)` and `$(expr)` per field: ~1302 J and 238 s
+      - the same loop with builtins only (`read -r` field splitting, `$(( ))`, `case`): ~4.3 J, about 300× less
+      - one `awk` pass over the file: ~1.0 J, over 1000× less than the subprocess loop and about 4× less than the builtin loop
+
+      Builtins only:
+
+      ```bash
+      total=0
+      while read -r _ status bytes; do
+          case $status in
+              5??) errors=$(( errors + 1 )) ;;
+          esac
+          total=$(( total + bytes ))
+      done < access.log
+      echo "bytes=$total errors=${errors:-0}"
+      ```
+
+      Or hand the whole file to one tool:
+
+      ```bash
+      awk '$2 ~ /^5/ { e++ } { b += $3 } END { print "bytes=" b, "errors=" e+0 }' access.log
+      ```
+
+      How much you save depends on how many lines your scripts process. Count the command substitutions inside loops: each one is a process start per line. For your own number, run both versions under `time` (wall and CPU time are a good proxy here) or in a Green Metrics Tool usage scenario.
+verify:
+  static_only: "needs access.log; snippets are syntax checked"
+---
+id: conceptual-bash-single-quotes-matter-001
+category: conceptual
+language: text
+patterns: [bash-quoting]
+facts: [F-BASH-QUOTES]
+messages:
+  - role: user
+    content: |
+      single vs double quotes in bash, does that even matter for performance? our linter now wants single quotes for plain strings and the team is annoyed
+  - role: assistant
+    content: |
+      It matters a little, and the linter is right about the habit.
+
+      Bash scans double-quoted text for `$`, backticks and backslashes. Single-quoted text is taken as is. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal in a loop of 1,000,000 iterations used ~314 J with double quotes and ~237 J with single quotes, about 24% less. With 10,000 iterations it was about 14% less.
+
+      What that means in practice:
+
+      - In a script that runs once with a few short strings, the absolute saving is tiny. Nobody should rewrite old scripts for it.
+      - In loops and long literals it adds up, which is why a consistent rule is easier than deciding case by case.
+      - Keep double quotes around variables. That is about correctness (word splitting, globbing), not speed:
+
+      ```bash
+      greeting='Deploy finished'
+      echo "$greeting for $SERVICE"
+      ```
+verify:
+  static_only: "conceptual answer"
+---
+id: conceptual-backup-codec-choice-001
+category: conceptual
+language: text
+patterns: [compress-stored]
+facts: [F-COMPRESS-CODECS]
+messages:
+  - role: user
+    content: |
+      Which compression should we use for our nightly database dumps: gzip, xz or zstd? We keep them 30 days.
+  - role: assistant
+    content: |
+      zstd at its default level. It costs a fraction of the energy of the others, and you compress every night.
+
+      In Green Metrics Tool measurements with default settings on 100 MB of text, compressing used lz4 ~6 J, zstd ~16 J, gzip ~67 J and xz ~458 J. zstd used about 4× less energy than gzip, and xz about 29× more than zstd. Decompressing is cheap for all three: zstd ~5.3 J, gzip ~9.1 J, xz ~11.7 J.
+
+      ```bash
+      pg_dump mydb | zstd -q -o "/backups/mydb-$(date +%F).sql.zst"
+      ```
+
+      One caveat: those figures compare energy, not file size. xz usually produces smaller files. If disk space for 30 days of dumps is your real constraint, compress one dump with both tools and compare the sizes before you decide.
+verify:
+  static_only: "conceptual answer"
+---
+id: conceptual-brotli-api-responses-001
+category: conceptual
+language: text
+patterns: [compress-transmitted]
+facts: [F-COMPRESS]
+messages:
+  - role: user
+    content: |
+      brotli compresses better than gzip. Should our API compress its JSON responses with brotli then?
+  - role: assistant
+    content: |
+      Not at its maximum quality, which is the brotli CLI default (quality 11).
+
+      In Green Metrics Tool measurements, compressing 100 MB of text used ~67 J with gzip and ~3019 J with brotli at quality 11, about 45× gzip. API responses are compressed again for every request, so you would pay that cost on every call.
+
+      Decompressing is cheap either way: brotli ~6.7 J and gzip ~9.1 J for 100 MB. Clients don't suffer from brotli.
+
+      So:
+
+      - **Dynamic JSON responses:** gzip at a moderate level. Lower brotli levels are much cheaper than quality 11, but they were not part of the measurement, so test them before switching.
+      - **Static assets** (JS, CSS, fonts) that are compressed once at build time and served many times: brotli at maximum quality is fine there.
+verify:
+  static_only: "conceptual answer"
+---
+id: conceptual-compress-temp-files-001
+category: conceptual
+language: text
+patterns: [compress-stored, context-tradeoff]
+facts: [F-COMPRESS-BREAKEVEN, F-COMPRESS-CODECS]
+messages:
+  - role: user
+    content: |
+      Our pipeline writes intermediate CSV files that are deleted after about 10 minutes. Should we gzip them to save disk energy?
+  - role: assistant
+    content: |
+      No. For data that lives for minutes, compressing costs more energy than storing it saves.
+
+      Green Coding Solutions estimated the break-even for compressing 100 MB to 30 MB with zstd (~3.2 mWh) against SSD power and embodied carbon: the data has to be kept for about 0.15 days before compression pays off. With xz the break-even was about 7 days. This is an estimate, not a direct measurement, and the measured compression energy was higher than the estimate assumed, so treat these times as lower bounds.
+
+      Ten minutes is far below that. Two cases where it still makes sense:
+
+      - The disk actually runs out of space during the run.
+      - The files go over a slow network to another machine. Then the transfer is the cost, and a fast codec like zstd or lz4 is the right choice.
+verify:
+  static_only: "conceptual answer"
+---
+id: estimate-nginx-gzip-static-001
+category: estimate
+language: nginx
+patterns: [text-compression]
+facts: [F-TEXT-COMPRESS]
+messages:
+  - role: user
+    content: |
+      Our nginx has `gzip on` with comp level 5 for our static React build. Someone said gzip_static is better. How much does that actually save?
+  - role: assistant
+    content: |
+      In Green Metrics Tool measurements, nginx served 2,000 requests for text assets (HTML, CSS, JS, JSON). Client and server CPU energy:
+
+      - no compression: ~7.3 J, 253 MB transferred
+      - precompressed files with `gzip_static`: ~14 J, 25 MB transferred
+      - gzip level 5 on every request: ~54 J, 29 MB transferred
+
+      Compressing on every request cost about 4× the CPU energy of serving precompressed files. Both compressed variants sent about 10× fewer bytes, so keep compression on. Just do the work once at build time:
+
+      ```bash
+      find dist -type f \( -name '*.js' -o -name '*.css' -o -name '*.html' -o -name '*.json' \) -exec gzip -k -9 {} +
+      ```
+
+      ```nginx
+      location / {
+          root /usr/share/nginx/html;
+          gzip_static on;   # serves app.js.gz when the client accepts gzip
+          gzip on;          # fallback for files without a .gz next to them
+      }
+      ```
+
+      The benchmark ran on a local network, where transfer is almost free, so it shows only the CPU side. On real networks the byte saving comes on top. To see your own numbers, run both configurations in a Green Metrics Tool usage scenario with your real build.
+verify:
+  static_only: "nginx config and build command"
+---
+id: conceptual-minify-js-energy-001
+category: conceptual
+language: text
+patterns: [minify-assets]
+facts: [F-MINIFY]
+messages:
+  - role: user
+    content: |
+      Does minifying our JS actually save energy, or is that just for the Lighthouse score?
+  - role: assistant
+    content: |
+      For a small site, mostly bytes, not client energy.
+
+      In Green Metrics Tool browser benchmarks with 50 cold page loads of a small booking page, the unminified JS and CSS sources used ~837 J and an esbuild minified build ~822 J. That is about 2% less, which is within measurement noise. The benchmark ran on a local network, so it could not show the transfer saving.
+
+      Keep minifying anyway. It costs nothing at runtime, it runs once per build, and fewer bytes matter on mobile and slow networks. Just don't expect it to make the browser use measurably less CPU on a small page.
+verify:
+  static_only: "conceptual answer"
+---
+id: conceptual-purgecss-marketing-site-001
+category: conceptual
+language: text
+patterns: [remove-unused-css]
+facts: [F-UNUSED-CSS]
+messages:
+  - role: user
+    content: |
+      we're thinking about adding PurgeCSS to our marketing site build. Is that a meaningful energy win?
+  - role: assistant
+    content: |
+      For client energy, probably not. For bytes, yes.
+
+      In Green Metrics Tool browser benchmarks with 50 cold page loads, a 16 KB stylesheet with mostly unused rules used ~783 J, and the same page with the stylesheet purged and minified to 0.75 KB used ~764 J. That is about 2% less, within measurement noise.
+
+      So the saving is in what goes over the network, which that local benchmark could not show. It grows with the size of your stylesheet: purging a full CSS framework down to the few classes a page uses removes much more than a small hand-written file. It runs once per build, so the cost is small. Add it if your CSS is large, and don't expect a CPU difference in the browser for small files.
+verify:
+  static_only: "conceptual answer"
+---
+id: estimate-web-fonts-vs-system-001
+category: estimate
+language: css
+patterns: [system-fonts-and-deps]
+facts: [F-FONTS]
+messages:
+  - role: user
+    content: |
+      How much energy do custom web fonts cost compared to just using system fonts?
+  - role: assistant
+    content: |
+      In Green Metrics Tool browser benchmarks with 30 cold page loads:
+
+      - six local TTF font files (~4 MB): ~556 J
+      - two Latin-subset WOFF2 files (~55 KB): ~488 J, about 12% less
+      - the system font stack: ~410 J, about 26% less than the TTF set and about 16% less than the WOFF2 subsets
+
+      ```css
+      body {
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      }
+      ```
+
+      If the brand needs its own font, use one or two WOFF2 files subset to the characters you need, not a full set of weights in TTF. These are cold loads with an empty cache, so repeat visitors cost less. For your site, measure one page with both setups in a Green Metrics Tool usage scenario before quoting a number.
+verify:
+  static_only: "CSS snippet"
+---
+id: estimate-paginate-large-table-001
+category: estimate
+language: javascript
+patterns: [dom-size]
+facts: [F-DOM-SIZE]
+messages:
+  - role: user
+    content: |
+      How much would we save by paginating our 10k-row admin table instead of rendering all rows at once?
+  - role: assistant
+    content: |
+      A lot on the client. In Green Metrics Tool browser benchmarks, 30 page loads of a table with 10,000 rows (wrapper elements around every cell, rows appended to the live DOM one by one) used ~1036 J and 72 s. The same data paginated to 100 rows per page, as a plain `<table>` built in a `DocumentFragment`, used ~457 J and 36 s. That is about 56% less, about 2.3× less.
+
+      ```javascript
+      function renderPage(rows, page, pageSize = 100) {
+        const frag = document.createDocumentFragment();
+        for (const row of rows.slice(page * pageSize, (page + 1) * pageSize)) {
+          const tr = document.createElement('tr');
+          for (const value of row) {
+            const td = document.createElement('td');
+            td.textContent = value;
+            tr.appendChild(td);
+          }
+          frag.appendChild(tr);
+        }
+        document.querySelector('#admin tbody').replaceChildren(frag);
+      }
+      ```
+
+      The benchmark changed two things at once: fewer rows per page and fewer elements per row. Your table's markup decides how much of each you get. If you can, paginate on the server too, so the API sends 100 rows instead of 10,000. To measure your page, load it a fixed number of times in a Green Metrics Tool usage scenario with both versions.
+verify:
+  static_only: "browser DOM code"
+---
+id: estimate-docker-slim-base-ci-001
+category: estimate
+language: dockerfile
+patterns: [small-container-images]
+facts: [F-CONTAINER-IMAGE]
+messages:
+  - role: user
+    content: |
+      Is switching from python:3.12 to python:3.12-slim worth it energy-wise? Our CI builds the image on every push.
+  - role: assistant
+    content: |
+      For the build, yes. In Green Metrics Tool measurements of a small Flask app built without cache:
+
+      - `python:3.12` with `build-essential`, `git`, `curl`, `vim` and dev tools installed: ~885 J and 157 s
+      - `python:3.12-slim`, runtime dependencies only, dependency layer before the source, `pip --no-cache-dir`: ~124 J and 25 s, about 7× less
+
+      Serving 2,000 requests afterwards cost the same with both images (~17 J). The saving is in every build, pull and stored copy, so with a build on every push it repeats many times a day.
+
+      ```dockerfile
+      FROM python:3.12-slim
+      WORKDIR /app
+      COPY requirements.txt .
+      RUN pip install --no-cache-dir -r requirements.txt
+      COPY . .
+      CMD ["gunicorn", "-b", "0.0.0.0:8000", "app:app"]
+      ```
+
+      Note that the measured change was more than the base image: dropping the dev tools and putting the dependency layer first are part of the 7×. If a package needs a compiler, install it in a separate build stage instead of going back to the full image. To check your own pipeline, compare the CI job durations before and after; for energy, a Green Metrics Tool usage scenario can run both builds.
+verify:
+  static_only: "Dockerfile"
+---
+id: conceptual-trim-preview-services-001
+category: conceptual
+language: text
+patterns: [minimize-environments]
+facts: [F-PREVIEW-ENV]
+messages:
+  - role: user
+    content: |
+      Our PR preview environments run 3 app replicas, Postgres, Redis and a background worker. If we trim them to 1 replica plus Postgres, how much do we save?
+  - role: assistant
+    content: |
+      Per idle minute, very little. The real saving is in how long the environments exist.
+
+      In Green Metrics Tool measurements, a preview environment idling for 60 seconds used ~269 J of CPU energy with 3 app replicas, Postgres, Redis and a polling worker, and ~262 J with 1 replica and Postgres. That is about 3% less. Machine energy differed by less than 1% (~1330 J vs ~1320 J), because the idle machine's baseline dominates.
+
+      Trimming still helps a bit: fewer services reserve less memory, so more environments fit on fewer machines. But the big lever is removing the hours:
+
+      ```yaml
+      on:
+        pull_request:
+          types: [closed]
+
+      jobs:
+        teardown:
+          runs-on: ubuntu-latest
+          steps:
+            - run: kubectl delete namespace "preview-pr-${{ github.event.pull_request.number }}" --ignore-not-found
+      ```
+
+      Also scale previews to zero at night and on weekends, when nobody opens them.
+verify:
+  static_only: "conceptual answer with a workflow snippet"
+---
+id: estimate-select-star-wide-table-001
+category: estimate
+language: sql
+patterns: [select-columns]
+facts: [F-PG-SELECT, F-PG-COLUMNS]
+messages:
+  - role: user
+    content: |
+      How much does SELECT * actually cost compared to listing the columns? Our products table has about 50 columns, including long HTML descriptions.
+  - role: assistant
+    content: |
+      With large text columns, a lot. In Green Metrics Tool measurements with PostgreSQL 16, rows were read 1,000 times from a 52-column products table with large text columns:
+
+      - 500 rows: `SELECT *` ~95 J, the 10 needed columns ~17 J (about 5.5× less)
+      - 2,500 rows: ~470 J vs ~64 J (about 7× less)
+      - 10,000 rows: ~1869 J vs ~274 J (about 7× less)
+
+      Cost scales with the data each column carries. Reading 2,500 rows 1,000 times took ~13 J for 1 column, ~58 J for 8 columns and ~465 J for all 52. For a join of small columns the gap was smaller, about 2.3× at 200 rows.
+
+      ```sql
+      SELECT id, sku, name, price, stock
+      FROM products
+      WHERE category_id = $1
+      ORDER BY name
+      LIMIT 50;
+      ```
+
+      Your saving depends on how big the skipped columns are. Skipping the HTML descriptions on a listing page is the kind of case where it is largest. To measure your query, compare `EXPLAIN (ANALYZE, BUFFERS)` output, or run both queries in a Green Metrics Tool usage scenario.
+verify:
+  static_only: "PostgreSQL query with a parameter placeholder"
+---
+id: conceptual-copy-for-small-batches-001
+category: conceptual
+language: text
+patterns: [batch-db-writes, context-tradeoff]
+facts: [F-PG-INSERT]
+messages:
+  - role: user
+    content: |
+      I read that COPY is way more efficient than INSERT. Should I switch our endpoint to COPY? Each request writes around 100 rows.
+  - role: assistant
+    content: |
+      Not for 100 rows. COPY's big advantage only shows up with large batches.
+
+      In Green Metrics Tool measurements with PostgreSQL 16 and psycopg 3:
+
+      - **Batches of 5,000 rows:** COPY used about 22× less CPU energy than one `execute()` per row, and about 8× less than `executemany()`.
+      - **Batches of 100 rows:** the loop used ~13 J, `executemany()` ~15 J and COPY ~9.5 J. The per-batch overhead (round trip, commit) dominates, so the differences are small.
+
+      For your endpoint, a single `executemany()` (or a multi-row `INSERT ... VALUES`) in one transaction is simple and good enough. Make sure it is one transaction, not one commit per row. Keep COPY for bulk loads: imports, backfills, nightly ETL with thousands of rows per batch.
+verify:
+  static_only: "conceptual answer"
+---
+id: conceptual-async-three-api-calls-001
+category: conceptual
+language: text
+patterns: [async-concurrent-io]
+facts: [F-HTTP]
+messages:
+  - role: user
+    content: |
+      Is it worth making our script async? It calls 3 APIs one after another and then combines the results.
+  - role: assistant
+    content: |
+      If the 3 calls don't depend on each other, async mostly saves waiting time. The energy difference is small.
+
+      In Green Metrics Tool micro-benchmarks with Python, 10 HTTP requests took ~9.1 J and 3.1 s with sync `urllib` and ~8.4 J and 2.6 s with async `httpx`. That is about 7% less CPU energy and about 17% less wall time.
+
+      ```python
+      import asyncio
+      import httpx
+
+
+      async def fetch_all(urls):
+          async with httpx.AsyncClient(timeout=10) as client:
+              responses = await asyncio.gather(*(client.get(u) for u in urls))
+          return [r.json() for r in responses]
+      ```
+
+      - Worth it if the script runs often or the waiting time matters to someone.
+      - Not worth it if each call needs the previous result. Then the calls stay sequential anyway.
+      - For a script that runs once a day, the extra complexity is the bigger cost.
+verify:
+  static_only: "needs network access"
+---
+id: estimate-torch-no-grad-cpu-001
+category: estimate
+language: python
+patterns: [torch-no-grad]
+facts: [F-NOGRAD]
+messages:
+  - role: user
+    content: |
+      how much does torch.no_grad() save during inference? we run a small classifier on CPU for every uploaded document
+  - role: assistant
+    content: |
+      In Green Metrics Tool micro-benchmarks, 100,000 PyTorch CPU inferences used ~157 J without `torch.no_grad()` and ~135 J with it, about 14% less. It also saves memory, because no autograd graph is kept for a backward pass that never happens.
+
+      ```python
+      model.eval()
+
+      with torch.inference_mode():
+          logits = model(batch)
+      ```
+
+      `torch.inference_mode()` does the same job and also skips some bookkeeping on tensors, so prefer it in pure inference code. It was not part of the measurement.
+
+      For a per-document classifier, this is a one-line change with no downside. Your saving depends on model size and batch size, so don't scale the 14%. To measure, run a fixed number of inferences with and without it under `perf stat` or in a Green Metrics Tool usage scenario.
+verify:
+  static_only: "needs PyTorch and a model"
+---
+id: conceptual-lru-cache-everywhere-001
+category: conceptual
+language: text
+patterns: [memoize, context-tradeoff]
+facts: [F-LRU]
+messages:
+  - role: user
+    content: |
+      Should I just put @lru_cache on all my pure functions to save CPU?
+  - role: assistant
+    content: |
+      No, only on functions that really get the same inputs again and again.
+
+      In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations used ~43 J uncached and ~4.7 J with `@functools.lru_cache`, about 9× less. But that benchmark drew its inputs from only 200 distinct values, so almost every call was a cache hit. With mostly unique inputs, caching only adds overhead: every call hashes the arguments and stores a result that is never used again.
+
+      Good candidates:
+
+      - pure functions with a small set of repeating inputs (config lookups, parsing the same codes, unit conversions)
+      - expensive work per call
+
+      ```python
+      from functools import lru_cache
+
+
+      @lru_cache(maxsize=1024)
+      def tax_rate(country_code: str) -> float:
+          ...
+      ```
+
+      Always set `maxsize`, so the cache cannot grow without limit, and never cache functions whose result depends on time, I/O or mutable arguments.
+verify:
+  static_only: "conceptual answer"
+---
+id: conceptual-try-except-vs-get-001
+category: conceptual
+language: text
+patterns: [avoid-exception-flow]
+facts: [F-EXC]
+messages:
+  - role: user
+    content: |
+      try/except KeyError or dict.get, which one is more efficient in python?
+  - role: assistant
+    content: |
+      It depends on how often the key is missing.
+
+      In Green Metrics Tool micro-benchmarks with 10,000,000 dict lookups and about half of the keys missing, `dict.get(key, default)` used ~67 J and `try/except KeyError` ~76 J, about 12% less with `get`. An `if key in d` check performed like `dict.get`.
+
+      The cost of `try/except` is in raising the exception. When the key is almost always there, `try/except` is cheap and fine.
+
+      ```python
+      # keys are often missing: use get
+      count = counts.get(word, 0)
+
+      # key is expected and a miss is an error: try/except reads well and costs little
+      try:
+          user = users_by_id[user_id]
+      except KeyError:
+          raise UnknownUser(user_id) from None
+      ```
+verify:
+  static_only: "conceptual answer"
+---
+id: estimate-join-vs-plus-equals-001
+category: estimate
+language: python
+patterns: [string-join]
+facts: [F-STRCAT]
+messages:
+  - role: user
+    content: |
+      how much faster / more efficient is "".join() than += when building a big string in python? we build CSV exports line by line
+  - role: assistant
+    content: |
+      In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces used ~469 J with `+=` and ~1.8 J with `"".join()`, roughly 260× less CPU energy. Building it with f-strings in the loop behaved like `+=` (~455 J).
+
+      ```python
+      lines = []
+      for row in rows:
+          lines.append(f"{row.id},{row.name},{row.total}\n")
+      export = "".join(lines)
+      ```
+
+      For CSV exports, writing rows directly to the file with the `csv` module avoids the big string completely, and also handles quoting for you.
+
+      Your saving depends on how many pieces you join and how long they are, so don't scale the benchmark figure. Measure your export with `time` or a Green Metrics Tool usage scenario before and after.
+verify:
+  static_only: "snippet needs rows"
+---
+id: conceptual-match-vs-if-elif-001
+category: conceptual
+language: text
+patterns: [simple-conditions]
+facts: [F-COND]
+messages:
+  - role: user
+    content: |
+      Is Python's match statement more efficient than an if/elif chain? Thinking about rewriting our event router.
+  - role: assistant
+    content: |
+      No. With the same conditions, `match` and `if/elif` differed by about 1% in Green Metrics Tool micro-benchmarks, which is measurement noise. Rewrite for readability if you like, not for energy.
+
+      What made a difference in the same benchmarks was the kind of condition. 10,000,000 classifications used ~46 J with simple equality checks and ~54 J with complex range and modulo conditions, so the simple version used about 16% less.
+
+      For an event router keyed on a type string, a dict lookup keeps the checks simple and is easy to extend:
+
+      ```python
+      HANDLERS = {
+          "order.created": handle_created,
+          "order.paid": handle_paid,
+          "order.cancelled": handle_cancelled,
+      }
+
+
+      def route(event):
+          handler = HANDLERS.get(event["type"])
+          if handler is None:
+              raise ValueError(f"unknown event type {event['type']!r}")
+          return handler(event)
+      ```
+verify:
+  static_only: "conceptual answer"
+---
+id: conceptual-re-compile-needed-001
+category: conceptual
+language: text
+patterns: [regex-precompile]
+facts: [F-REGEX]
+messages:
+  - role: user
+    content: |
+      do I need re.compile() for performance, or does python cache the patterns anyway?
+  - role: assistant
+    content: |
+      Python caches compiled patterns, so `re.compile()` is a small win in the usual case.
+
+      In Green Metrics Tool micro-benchmarks, 1,000,000 matches used ~21 J with inline `re.match(pattern, s)` and ~18 J with a precompiled pattern, about 18% less. The gain is skipping the cache lookup on each call.
+
+      The case that really hurts is a cache miss. Forcing a recompile on every call cost about 200× more per match. That happens when:
+
+      - you build patterns dynamically, e.g. `re.search(rf"\b{word}\b", text)` with many different words
+      - your program uses more distinct patterns than the cache holds (512), so they keep pushing each other out
+
+      ```python
+      import re
+
+      TICKET_RE = re.compile(r"\b[A-Z]{2,5}-\d+\b")
+
+
+      def ticket_ids(text):
+          return TICKET_RE.findall(text)
+      ```
+
+      Compiling at module level is also nicer to read, so it is a good default either way.
+verify:
+  static_only: "conceptual answer"
+---
+id: estimate-numba-quantize-loop-001
+category: estimate
+language: python
+patterns: [vectorize-or-jit]
+facts: [F-NUMBA]
+messages:
+  - role: user
+    content: |
+      Would numba actually help our audio quantization loop? It's a plain python for loop over the samples, files have a few million samples each.
+  - role: assistant
+    content: |
+      Very likely, it is the case JIT is made for. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples used ~40 J in a pure Python loop and ~9.5 J with Numba `@njit`, about 4× less.
+
+      ```python
+      import numpy as np
+      from numba import njit
+
+
+      @njit(cache=True)
+      def quantize(samples, levels):
+          out = np.empty(samples.shape[0], dtype=np.int16)
+          step = 2.0 / (levels - 1)
+          for i in range(samples.shape[0]):
+              out[i] = int(round((samples[i] + 1.0) / step))
+          return out
+      ```
+
+      - The first call compiles the function. `cache=True` stores the result on disk, so later processes don't pay that again.
+      - The input must be a NumPy array, not a Python list.
+      - For a one-off script on a single short file, the compile time can eat the gain.
+
+      Your files and machine differ from the benchmark, so measure: time one file with both versions, or run them in a Green Metrics Tool usage scenario.
+verify:
+  static_only: "needs numba"
+---
+id: conceptual-list-insert-front-001
+category: conceptual
+language: text
+patterns: [deque-or-append]
+facts: [F-LISTINS]
+messages:
+  - role: user
+    content: |
+      is list.insert(0, x) really that bad? I need the newest items first
+  - role: assistant
+    content: |
+      Yes, once the list gets long. Every front insert shifts all existing elements by one place, so building a list this way is O(n²).
+
+      In Green Metrics Tool micro-benchmarks, 1,000,000 `list.insert(0, x)` calls used ~1515 J and 1,000,000 `list.append(x)` calls ~1.2 J, over 1000× difference.
+
+      Two ways to get newest-first:
+
+      ```python
+      # append, then reverse once at the end
+      items = []
+      for event in stream:
+          items.append(event)
+      items.reverse()
+
+      # or a deque, which adds at the front in O(1)
+      from collections import deque
+
+      recent = deque(maxlen=500)
+      for event in stream:
+          recent.appendleft(event)
+      ```
+
+      For a list that stays at a few dozen items, it doesn't matter. Use whatever reads best.
+verify:
+  static_only: "conceptual answer"
+---
+id: conceptual-set-before-single-in-001
+category: conceptual
+language: text
+patterns: [set-membership, context-tradeoff]
+facts: [F-MEMB]
+messages:
+  - role: user
+    content: |
+      I always convert lists to sets before checking `in`. Good habit?
+  - role: assistant
+    content: |
+      Only when you check more than once. Building the set is a full pass over the list plus hashing every element.
+
+      In Green Metrics Tool micro-benchmarks, a single membership test on a 10,000,000-element list used ~6.9 J. Converting the list to a set first and then testing once used ~10.5 J, about 50% more.
+
+      ```python
+      # one lookup: keep the list
+      if order_id in pending_ids:
+          ...
+
+      # many lookups: build the set once, outside the loop
+      blocked = set(blocked_ids)
+      allowed = [o for o in orders if o.customer_id not in blocked]
+      ```
+
+      So the habit is right inside loops and for data you query repeatedly, and wasted work for a single check.
+verify:
+  static_only: "conceptual answer"
+---
+id: conceptual-cache-math-sqrt-local-001
+category: conceptual
+language: text
+patterns: [hoist-invariants]
+facts: [F-ATTR]
+messages:
+  - role: user
+    content: |
+      Is it still worth doing `sqrt = math.sqrt` before a loop, like the old Python performance tips say?
+  - role: assistant
+    content: |
+      It still works, but the gain is small. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local variable before a 10,000,000-iteration loop saved about 4-5%.
+
+      ```python
+      import math
+
+
+      def norms(points):
+          sqrt = math.sqrt
+          return [sqrt(x * x + y * y) for x, y in points]
+      ```
+
+      Worth it in a tight inner loop that runs millions of times and that you have already found to be hot. Not worth it in ordinary code, where the extra name makes the code harder to read for a saving nobody will notice.
+verify:
+  static_only: "conceptual answer"
+---
+id: conceptual-sympy-star-import-energy-001
+category: conceptual
+language: text
+patterns: [keep-star-imports]
+facts: [F-IMPORT]
+messages:
+  - role: user
+    content: |
+      Would replacing `from sympy import *` with `import sympy as sp` in our scripts make them use less energy?
+  - role: assistant
+    content: |
+      No, there is no measurable difference.
+
+      In Green Metrics Tool micro-benchmarks with 1,000 Python process starts, `from sympy import *` used ~3103 J and `import sympy` ~3093 J. For the built-in `posix` module both styles used ~121 J. Python loads the whole module either way. The import style only decides which names end up in your namespace.
+
+      What costs energy is loading a heavy module at all: a start that imported `sympy` used about 3.1 J, about 25× a start that imported only a built-in module (~0.12 J). If these are short-lived scripts that run often, the question to ask is whether they need sympy at all, or only one small function from it.
+
+      So leave the star imports as they are for energy reasons.
+verify:
+  static_only: "conceptual answer"

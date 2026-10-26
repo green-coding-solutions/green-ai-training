@@ -1,0 +1,96 @@
+id: gen-2-00232-generation
+category: generation
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    Hi, I am building the landing page for our app with Flask and Jinja. Marketing writes the feature texts in a YAML file. They use small markup like **bold**, `code` and [link](url). I need a Jinja filter that turns this into HTML. I tried it with replace, but it gets messy. Sometimes the whole rest of the page turns bold and I don't understand why. Can you write a proper version? The landing page is our homepage, so it gets a lot of visits.
+
+    ```python
+    @app.template_filter("inline")
+    def inline(text):
+        while "**" in text:
+            text = text.replace("**", "<strong>", 1)
+            text = text.replace("**", "</strong>", 1)
+        text = text.replace("`", "<code>", 1).replace("`", "</code>", 1)
+        return Markup(text)
+    ```
+
+    In the template I do `{{ feature.body | inline }}` for every feature card.
+- role: assistant
+  content: |
+    Your version has three problems:
+    - A single `**` with no partner opens `<strong>` and never closes it. That is why the rest of the page turns bold.
+    - Only the first `` `code` `` span is converted, and links are not handled.
+    - Nothing is escaped. A `<` or `&` in the text breaks the HTML, and `Markup` tells Jinja to trust it.
+
+    The version below matches complete tokens only and escapes everything else. Unmatched markup stays as plain text.
+
+    ```python
+    import html
+    import re
+    from functools import lru_cache
+
+    _TOKEN = re.compile(r"\*\*(.+?)\*\*|`([^`]+)`|\[([^\]]+)\]\(([^)\s]+)\)")
+    _SAFE_URL = re.compile(r"^(https?://|/|#|mailto:)", re.IGNORECASE)
+
+
+    @lru_cache(maxsize=256)
+    def render_inline(text: str) -> str:
+        """Turn **bold**, `code` and [label](url) into escaped HTML."""
+        out = []
+        pos = 0
+        for m in _TOKEN.finditer(text):
+            out.append(html.escape(text[pos:m.start()]))
+            bold, code, label, url = m.groups()
+            if bold is not None:
+                out.append(f"<strong>{html.escape(bold)}</strong>")
+            elif code is not None:
+                out.append(f"<code>{html.escape(code)}</code>")
+            elif _SAFE_URL.match(url):
+                out.append(f'<a href="{html.escape(url)}">{html.escape(label)}</a>')
+            else:
+                out.append(html.escape(label))  # drop javascript: and other schemes
+            pos = m.end()
+        out.append(html.escape(text[pos:]))
+        return "".join(out)
+    ```
+
+    Register it as a filter. Only the filter wraps the result in `Markup`, so the cached function stays a plain `str -> str` function:
+
+    ```python
+    from markupsafe import Markup
+
+    from .markup import render_inline
+
+
+    @app.template_filter("inline")
+    def inline_filter(text):
+        return Markup(render_inline(text))
+    ```
+
+    Your template stays the same: `{{ feature.body | inline }}`.
+
+    **Green Notes**
+    - **Memoize repeated pure computations** (reduces E): every homepage visit renders the same few feature texts again. With `@lru_cache`, each text is parsed once per worker process. After that, every request is a dictionary lookup. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations with inputs from only 200 distinct values used ~4.7 J with `lru_cache` instead of ~43 J, about 9× less. Your inputs repeat even more, because the YAML holds a small, fixed set of texts.
+    - **Bounded and safe to cache:** `maxsize=256` caps memory. The cache key is the text itself, so when marketing edits a text, the new text gets a new entry and stale HTML is never served.
+    - *Not applied:* don't reuse this cache for user-submitted text such as comments. Those inputs are mostly unique, so the cache would only add overhead.
+verify:
+  green_block: 0
+  test: |-
+    assert render_inline("Deploy **fast**") == "Deploy <strong>fast</strong>"
+    assert render_inline("**a** and **b**") == "<strong>a</strong> and <strong>b</strong>"
+    assert render_inline("Run `pip install x` now") == "Run <code>pip install x</code> now"
+    assert render_inline("See [docs](/docs)") == 'See <a href="/docs">docs</a>'
+    assert render_inline("a < b & **c**") == "a &lt; b &amp; <strong>c</strong>"
+    assert render_inline("**unclosed text") == "**unclosed text"
+    assert "javascript" not in render_inline("[x](javascript:alert(1))")
+    assert "<a" not in render_inline("[x](javascript:alert(1))")
+    before = render_inline.cache_info().hits
+    render_inline("Deploy **fast**")
+    assert render_inline.cache_info().hits == before + 1
+    print("ok")

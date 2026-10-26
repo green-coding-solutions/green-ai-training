@@ -1,0 +1,71 @@
+id: gen-1-00260-generation
+category: generation
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    hello, I need python function for our nginx log rollup. The file have one request per line, 4 fields with space: `epoch status bytes ms`, for example `1729850000 200 5120 37.5`. Some lines is broken (cut by logrotate) and must be skipped. Function should give me back 2 things: sum of log1p(bytes) for every status code, and list of the slow requests (ms >= 500) as tuples (epoch, status, ms). The file is big, around 30 million lines every night, so please make it not slow. Thanks!
+- role: assistant
+  content: |
+    ```python
+    import math
+    from collections import defaultdict
+
+
+    def summarize_log(path, slow_ms=500.0):
+        """Read lines `epoch status bytes ms`. Skip broken lines.
+
+        Returns (log1p(bytes) sum per status, [(epoch, status, ms), ...] for slow requests).
+        """
+        log1p = math.log1p
+        score = defaultdict(float)
+        slow = []
+        add_slow = slow.append
+
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) != 4:
+                    continue
+                try:
+                    epoch = int(parts[0])
+                    size = int(parts[2])
+                    ms = float(parts[3])
+                except ValueError:
+                    continue
+                status = parts[1]
+                score[status] += log1p(size)
+                if ms >= slow_ms:
+                    add_slow((epoch, status, ms))
+
+        return dict(score), slow
+    ```
+
+    **Green Notes**
+    - **Hoist loop-invariant lookups** (reduces E): `math.log1p` and `slow.append` are looked up once before the loop, not 30 million times inside it. This is a small win. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local variable before a 10,000,000-iteration loop saved about 4-5%. It only matters in a loop this hot, so I did not do it anywhere else.
+    - **Streaming read** (reduces M): the file is read line by line, so memory stays flat. Only the slow requests are kept.
+
+    The bigger cost here is the per-line parsing, and that work is needed for your output, so I left it as it is.
+verify:
+  test: |-
+    import os, tempfile, math
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "access.log")
+    with open(p, "w", encoding="utf-8") as fh:
+        fh.write("100 200 0 10\n")
+        fh.write("101 500 99 700.5\n")
+        fh.write("1729850 20\n")
+        fh.write("102 200 abc 5\n")
+        fh.write("103 200 5120 500\n")
+        fh.write("\n")
+    score, slow = summarize_log(p)
+    assert set(score) == {"200", "500"}, score
+    assert abs(score["500"] - math.log1p(99)) < 1e-12
+    assert abs(score["200"] - math.log1p(5120)) < 1e-12
+    assert slow == [(101, "500", 700.5), (103, "200", 500.0)], slow
+    os.remove(p)
+    os.rmdir(d)

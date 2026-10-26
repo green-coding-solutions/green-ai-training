@@ -1,0 +1,145 @@
+id: gen-12764612-00235-refactor
+category: refactor
+language: python
+patterns:
+- memoize
+- simple-conditions
+facts:
+- F-LRU
+- F-COND
+messages:
+- role: user
+  content: |
+    hi, im new with python and ETL. this script add shipping zone and handling class to the order csv from our shop. it run every night and take long time (file is about 2 million lines, but only around 9000 different postcodes). i dont know whats wrong, can you make it better?
+
+    ```python
+    import csv
+
+    ZONE_TABLE = [
+        (1000, 2999, "north"),
+        (3000, 4999, "east"),
+        (5000, 6999, "south"),
+        (7000, 9999, "west"),
+    ]
+
+
+    def zone_for_postcode(postcode):
+        digits = "".join(ch for ch in postcode if ch.isdigit())
+        if len(digits) < 4:
+            return "unknown"
+        prefix = int(digits[:4])
+        for low, high, zone in ZONE_TABLE:
+            if low <= prefix <= high:
+                return zone
+        return "unknown"
+
+
+    def handling_class(code):
+        if code % 10 == 0 and 10 <= code <= 30:
+            return "standard"
+        elif code % 10 == 0 and 40 <= code <= 60:
+            return "express"
+        elif code % 10 == 0 and 70 <= code <= 90:
+            return "freight"
+        else:
+            return "other"
+
+
+    def enrich(src, dst):
+        with open(src, newline="") as fin, open(dst, "w", newline="") as fout:
+            reader = csv.DictReader(fin)
+            writer = csv.DictWriter(fout, fieldnames=reader.fieldnames + ["zone", "handling"])
+            writer.writeheader()
+            for row in reader:
+                row["zone"] = zone_for_postcode(row["postcode"])
+                row["handling"] = handling_class(int(row["service_code"]))
+                writer.writerow(row)
+    ```
+- role: assistant
+  content: |
+    Two small changes. The rest of the script is fine.
+
+    ```python
+    import csv
+    from functools import lru_cache
+
+    ZONE_TABLE = [
+        (1000, 2999, "north"),
+        (3000, 4999, "east"),
+        (5000, 6999, "south"),
+        (7000, 9999, "west"),
+    ]
+
+
+    @lru_cache(maxsize=20_000)
+    def zone_for_postcode(postcode):
+        digits = "".join(ch for ch in postcode if ch.isdigit())
+        if len(digits) < 4:
+            return "unknown"
+        prefix = int(digits[:4])
+        for low, high, zone in ZONE_TABLE:
+            if low <= prefix <= high:
+                return zone
+        return "unknown"
+
+
+    def handling_class(code):
+        if code == 10 or code == 20 or code == 30:
+            return "standard"
+        elif code == 40 or code == 50 or code == 60:
+            return "express"
+        elif code == 70 or code == 80 or code == 90:
+            return "freight"
+        else:
+            return "other"
+
+
+    def enrich(src, dst):
+        with open(src, newline="") as fin, open(dst, "w", newline="") as fout:
+            reader = csv.DictReader(fin)
+            writer = csv.DictWriter(fout, fieldnames=reader.fieldnames + ["zone", "handling"])
+            writer.writeheader()
+            for row in reader:
+                row["zone"] = zone_for_postcode(row["postcode"])
+                row["handling"] = handling_class(int(row["service_code"]))
+                writer.writerow(row)
+    ```
+
+    **Green Notes**
+    - **Memoize a pure function with repeated inputs** (reduces E): `zone_for_postcode` always returns the same zone for the same postcode. With 2 million rows and about 9,000 distinct postcodes, the string cleanup and table scan now run about 9,000 times instead of 2 million times. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over 200 distinct inputs used ~43 J uncached and ~4.7 J with `lru_cache` (about 9× less). Your numbers differ, so measure your own run. `maxsize` keeps memory bounded. The function returns plain strings, so sharing cached results is safe.
+    - **Simple equality conditions** (reduces E): in the same benchmark family, 10,000,000 classifications with simple equality branches used ~46 J, and range-plus-modulo conditions ~54 J (about 16% less). `handling_class` now only compares the code with fixed values. It returns the same result for every input as before.
+
+    *Not applied:* caching on `handling_class`. It is already a few cheap comparisons, so the cache lookup would cost about as much as the work it saves. Caching helps only when inputs repeat a lot and the function does real work. If your postcodes were almost all unique, the cache on `zone_for_postcode` would also give you nothing.
+verify:
+  test: |
+    assert zone_for_postcode("10115") == "north"
+    assert zone_for_postcode("SW1A 1AA") == "unknown"
+    assert zone_for_postcode("99999") == "west"
+    zone_for_postcode("10115")
+    assert zone_for_postcode.cache_info().hits >= 1
+    assert handling_class(40) == "express"
+    assert handling_class(90) == "freight"
+    assert handling_class(15) == "other"
+    assert handling_class(100) == "other"
+    assert handling_class(0) == "other"
+  equivalence:
+    driver: |-
+      import os, tempfile
+      d = tempfile.mkdtemp()
+      src = os.path.join(d, "in.csv")
+      dst = os.path.join(d, "out.csv")
+      rows = [
+          ("1", "10115", "10"), ("2", "SW1A 1AA", "40"), ("3", "30000", "70"),
+          ("4", "55555", "15"), ("5", "10115", "30"), ("6", "99999", "90"),
+          ("7", "12", "0"), ("8", "72000", "100"), ("9", "55555", "60"),
+          ("10", "4999", "20"), ("11", "10115", "-10"),
+      ]
+      with open(src, "w", newline="") as f:
+          f.write("order_id,postcode,service_code\n")
+          for r in rows:
+              f.write(",".join(r) + "\n")
+      enrich(src, dst)
+      with open(dst, newline="") as f:
+          print(f.read())
+      for c in range(-20, 120):
+          print(c, handling_class(c))

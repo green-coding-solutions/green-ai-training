@@ -1,0 +1,110 @@
+id: gen-12764612-00265-multi-turn
+category: multi-turn
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```python
+    import csv
+    import re
+
+    def clean_rows(path, sku_prefix):
+        out = []
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                sku = row["sku"].strip().upper()
+                sku = re.sub("^" + sku_prefix + r"[-_ ]*", "", sku)
+                phone = re.sub(r"[^\d+]", "", row["phone"])
+                if re.match(r"^00", phone):
+                    phone = "+" + phone[2:]
+                email = row["email"].strip().lower()
+                if not re.match(r"^[^@\s]+@[^@\s]+\.[a-z]{2,}$", email):
+                    email = ""
+                out.append({"sku": sku, "phone": phone, "email": email})
+        return out
+    ```
+- role: assistant
+  content: |
+    ```python
+    import csv
+    import re
+
+    _PHONE_JUNK = re.compile(r"[^\d+]")
+    _INTL_ZEROS = re.compile(r"^00")
+    _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[a-z]{2,}$")
+
+    def clean_rows(path, sku_prefix):
+        prefix_re = re.compile("^" + re.escape(sku_prefix) + r"[-_ ]*")
+        out = []
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                sku = prefix_re.sub("", row["sku"].strip().upper())
+                phone = _PHONE_JUNK.sub("", row["phone"])
+                if _INTL_ZEROS.match(phone):
+                    phone = "+" + phone[2:]
+                email = row["email"].strip().lower()
+                if not _EMAIL.match(email):
+                    email = ""
+                out.append({"sku": sku, "phone": phone, "email": email})
+        return out
+    ```
+
+    **Green Notes**
+    - **Compile regex once** (reduces E): the SKU pattern was rebuilt as a string for every row. It is now compiled once per call. The three fixed patterns are module-level constants.
+    - **`re.escape(sku_prefix)`:** a prefix with regex characters such as `.` or `+` could match the wrong SKUs before. The result changes only for such prefixes.
+- role: user
+  content: |
+    hmm bigger diff than i wanted, reviewer will complain. is the module constants part really needed? just want it small
+- role: assistant
+  content: |
+    No. Keep the diff small. The fixed patterns can stay inline, because Python's `re` caches compiled patterns. In Green Metrics Tool micro-benchmarks with 1,000,000 matches, a precompiled pattern used about 18% less CPU energy than inline `re.match`. That is a small win.
+
+    The prefix pattern is the one worth fixing, because it is built from a variable and compiled again on each row's call path. The smaller change:
+
+    ```python
+    import csv
+    import re
+
+    def clean_rows(path, sku_prefix):
+        prefix_re = re.compile("^" + re.escape(sku_prefix) + r"[-_ ]*")
+        out = []
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                sku = prefix_re.sub("", row["sku"].strip().upper())
+                phone = re.sub(r"[^\d+]", "", row["phone"])
+                if re.match(r"^00", phone):
+                    phone = "+" + phone[2:]
+                email = row["email"].strip().lower()
+                if not re.match(r"^[^@\s]+@[^@\s]+\.[a-z]{2,}$", email):
+                    email = ""
+                out.append({"sku": sku, "phone": phone, "email": email})
+        return out
+    ```
+
+    **Green Notes**
+    - **Compile the dynamic pattern once** (reduces E): this is a three-line diff. The inline patterns stay as they are, because their cost is small.
+verify:
+  equivalence:
+    driver: |-
+      import os
+      import tempfile
+
+      content = (
+          "sku,phone,email\n"
+          "sku-1001,0049 170-555 01,Anna@Example.com\n"
+          " SKU_2002 ,+49 (170) 555-02,not an email\n"
+          "other-3003,00 33 1 23 45,bob@x.org\n"
+          "SKU 4004,0044-20-7946,  CAROL@MAIL.CO.UK \n"
+      )
+      with tempfile.TemporaryDirectory() as d:
+          p = os.path.join(d, "drop.csv")
+          with open(p, "w", newline="") as f:
+              f.write(content)
+          for row in clean_rows(p, "SKU"):
+              print(row)

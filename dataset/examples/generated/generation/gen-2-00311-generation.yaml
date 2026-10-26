@@ -1,0 +1,67 @@
+id: gen-2-00311-generation
+category: generation
+language: bash
+patterns:
+- bash-quoting
+- bash-builtins
+facts:
+- F-BASH-QUOTES
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    Bash filter for our log sidecar: `tail -F /var/log/app/app.log | log2ndjson billing prod | <shipper>`.
+    App lines look like `2026-10-25T09:14:03.512Z ERROR billing.invoice Payment failed for "acme" (retry 2)`.
+    Emit one NDJSON object per line with service, env, host, ts, level, component, msg. Stack trace lines (no timestamp)
+    keep the previous event's ts/level/component. Image has bash only, no jq/awk/sed. Just the script, skip the essay.
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # Usage: tail -F app.log | log2ndjson SERVICE ENV
+    # Lines without a timestamp (stack traces) inherit ts/level/component of the previous event.
+    set -euo pipefail
+
+    service=${1:?usage: log2ndjson SERVICE ENV}
+    env_name=${2:?usage: log2ndjson SERVICE ENV}
+
+    # Escapes $1 for a JSON string into REPLY (no subshell).
+    # Control characters other than tab and CR are passed through unchanged.
+    json_escape() {
+        local s=$1
+        s=${s//\\/\\\\}
+        s=${s//\"/\\\"}
+        s=${s//$'\t'/\\t}
+        s=${s//$'\r'/\\r}
+        REPLY=$s
+    }
+
+    json_escape "$service"; svc=$REPLY
+    json_escape "$env_name"; env_j=$REPLY
+    json_escape "${HOSTNAME:-unknown}"; host_j=$REPLY
+    printf -v prefix '{"service":"%s","env":"%s","host":"%s"' "$svc" "$env_j" "$host_j"
+
+    line_re='^([0-9]{4}-[0-9T:.Z+-]+) +([A-Z]+) +([^ ]+) (.*)$'
+    ts='' level='' component=''
+
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ -z $line ]] && continue
+        if [[ $line =~ $line_re ]]; then
+            ts=${BASH_REMATCH[1]}
+            level=${BASH_REMATCH[2]}
+            json_escape "${BASH_REMATCH[3]}"; component=$REPLY
+            msg=${BASH_REMATCH[4]}
+        else
+            msg=$line
+        fi
+        json_escape "$msg"
+        printf '%s,"ts":"%s","level":"%s","component":"%s","msg":"%s"}\n' \
+            "$prefix" "$ts" "$level" "$component" "$REPLY"
+    done
+    ```
+
+    **Green Notes**
+    - **Single quotes for literals** (reduces E): the regex and the JSON format string need no expansion, so they are single-quoted and bash takes them as they are. Double quotes stay only around variables. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal 1,000,000 times used about 24% less CPU energy with single quotes. The saving per line is small, but this filter runs for every log line.
+    - **No process per line** (reduces E): fields come from `=~` and escaping returns via `REPLY`, so the loop never forks. In Green Metrics Tool micro-benchmarks on a 20,000-line log, a builtins-only loop used about 300× less CPU energy than one that ran `$(echo | cut)` and `$(expr)` per field.
+verify:
+  static_only: bash script, reads a live log stream from stdin

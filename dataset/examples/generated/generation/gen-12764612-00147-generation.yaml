@@ -1,0 +1,64 @@
+id: gen-12764612-00147-generation
+category: generation
+language: python
+patterns:
+- simple-conditions
+facts:
+- F-COND
+messages:
+- role: user
+  content: |
+    I'm writing the auth middleware for our FastAPI orders API and need a helper that decides which token scope a request needs, based only on the HTTP method. Requirements:
+
+    - Safe methods (GET, HEAD, OPTIONS) need the "read" scope.
+    - POST, PUT and PATCH need "write".
+    - DELETE needs "admin".
+    - Anything else (TRACE, CONNECT, junk from scanners) returns None, and the middleware will answer 405 itself.
+    - Method names can arrive in any case, e.g. "get" or "Post".
+    - It runs on every single request, so it should be cheap.
+    - Type hints please, Python 3.11.
+- role: assistant
+  content: |
+    ```python
+    _METHOD_SCOPES = {
+        "GET": "read",
+        "HEAD": "read",
+        "OPTIONS": "read",
+        "POST": "write",
+        "PUT": "write",
+        "PATCH": "write",
+        "DELETE": "admin",
+    }
+
+
+    def required_scope(method: str) -> str | None:
+        """Return the token scope needed for an HTTP method, or None if the method is not allowed."""
+        return _METHOD_SCOPES.get(method.upper())
+    ```
+
+    Usage in the middleware:
+
+    ```python
+    scope = required_scope(request.method)
+    if scope is None:
+        return JSONResponse({"detail": "Method not allowed"}, status_code=405)
+    ```
+
+    **Green Notes**
+    - **Simple equality dispatch** (reduces E): one dict lookup replaces a chain of `if method in (...) or ...` guards that runs branch by branch on every request. In Green Metrics Tool micro-benchmarks, simple equality branches used about 16% less CPU energy than complex range and modulo conditions.
+    - The table is built once at import time, not on each call.
+    - Unknown methods return `None` instead of raising, so scanner traffic does not pay for exception handling.
+    - I did not use `match`. It makes no meaningful energy difference compared to `if/elif`, and the dict is shorter.
+verify:
+  test: |-
+    assert required_scope("GET") == "read"
+    assert required_scope("head") == "read"
+    assert required_scope("Options") == "read"
+    assert required_scope("POST") == "write"
+    assert required_scope("put") == "write"
+    assert required_scope("PATCH") == "write"
+    assert required_scope("delete") == "admin"
+    assert required_scope("TRACE") is None
+    assert required_scope("CONNECT") is None
+    assert required_scope("") is None
+    assert required_scope("FOO") is None

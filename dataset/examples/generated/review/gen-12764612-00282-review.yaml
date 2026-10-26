@@ -1,0 +1,126 @@
+id: gen-12764612-00282-review
+category: review
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    hi, im new to python. i wrote this to count requests and 5xx errors per team from our nginx access log (a few GB per day). it works but feels slow and i dont know whats wrong. can you look at it?
+
+    ```python
+    import sys
+
+    OWNERS = {
+        "10.0.1.12": "payments",
+        "10.0.1.15": "payments",
+        "10.0.2.7": "search",
+        "10.0.2.9": "search",
+        "10.0.3.40": "auth",
+        "10.0.4.21": "checkout",
+    }
+
+
+    def owner_for(ip):
+        try:
+            return OWNERS[ip]
+        except KeyError:
+            return "unowned"
+
+
+    def summarize(path):
+        requests = {}
+        errors = {}
+        f = open(path)
+        for line in f:
+            parts = line.split()
+            team = owner_for(parts[0])
+            requests[team] = requests.get(team, 0) + 1
+            if parts[8].startswith("5"):
+                errors[team] = errors.get(team, 0) + 1
+        return requests, errors
+
+
+    def report(path):
+        requests, errors = summarize(path)
+        for team in sorted(requests):
+            print(team, requests[team], errors.get(team, 0))
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (log processing, a few GB per day)
+
+    #### [Bug] One short line stops the whole run
+    - **Where:** `parts[0]` and `parts[8]` in `summarize`
+    - **Issue:** a truncated or blank line has fewer than 9 fields, so `parts[8]` raises `IndexError` and the job dies halfway. Logs that are being rotated often have such lines. The file is also never closed.
+    - **Fix:** skip lines with fewer than 9 fields and open the file with `with`. This changes behavior on purpose: bad lines are now ignored instead of crashing.
+
+    #### [Medium] Exception used for a normal lookup
+    - **Where:** `owner_for`
+    - **Issue:** most client IPs in an access log are not in `OWNERS`, so the `KeyError` path runs for a large share of lines. Raising and catching an exception costs more than a plain lookup. In Green Metrics Tool micro-benchmarks with about half of the dict keys missing, `dict.get(key, default)` used about 12% less CPU energy than `try/except KeyError`. When misses are rare, `try/except` is cheap, so this matters here only because misses are common.
+    - **Fix:** `OWNERS.get(ip, "unowned")`.
+    - **Impact:** E, per line. The gain is modest, not a rewrite-worthy speedup, but the fix is a one-liner and makes the code shorter.
+
+    ```python
+    import sys
+
+    OWNERS = {
+        "10.0.1.12": "payments",
+        "10.0.1.15": "payments",
+        "10.0.2.7": "search",
+        "10.0.2.9": "search",
+        "10.0.3.40": "auth",
+        "10.0.4.21": "checkout",
+    }
+
+
+    def summarize(path):
+        requests = {}
+        errors = {}
+        with open(path) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 9:
+                    continue
+                team = OWNERS.get(parts[0], "unowned")
+                requests[team] = requests.get(team, 0) + 1
+                if parts[8].startswith("5"):
+                    errors[team] = errors.get(team, 0) + 1
+        return requests, errors
+
+
+    def report(path):
+        requests, errors = summarize(path)
+        for team in sorted(requests):
+            print(team, requests[team], errors.get(team, 0))
+    ```
+
+    **Already good:** the counters use `dict.get(key, 0) + 1`, which is the right way to count when the first hit is a miss. The file is read line by line, so memory stays flat for large logs.
+verify:
+  equivalence:
+    driver: |
+      import os, tempfile
+      lines = [
+          '10.0.1.12 - - [01/Oct/2026:10:00:00 +0000] "GET /pay HTTP/1.1" 200 512',
+          '10.0.1.15 - - [01/Oct/2026:10:00:01 +0000] "POST /pay HTTP/1.1" 502 64',
+          '203.0.113.5 - - [01/Oct/2026:10:00:02 +0000] "GET / HTTP/1.1" 200 1024',
+          '203.0.113.6 - - [01/Oct/2026:10:00:03 +0000] "GET /x HTTP/1.1" 500 10',
+          '10.0.2.7 - - [01/Oct/2026:10:00:04 +0000] "GET /s?q=a HTTP/1.1" 200 2048',
+          '198.51.100.9 - - [01/Oct/2026:10:00:05 +0000] "GET /y HTTP/1.1" 404 20',
+          '10.0.3.40 - - [01/Oct/2026:10:00:06 +0000] "POST /login HTTP/1.1" 503 30',
+          '10.0.4.21 - - [01/Oct/2026:10:00:07 +0000] "GET /cart HTTP/1.1" 200 300',
+      ]
+      path = os.path.join(tempfile.mkdtemp(), "access.log")
+      with open(path, "w") as fh:
+          fh.write("\n".join(lines) + "\n")
+      report(path)
+  test: |-
+    import os, tempfile
+    p = os.path.join(tempfile.mkdtemp(), "a.log")
+    with open(p, "w") as fh:
+        fh.write('10.0.1.12 - - [01/Oct/2026:10:00:00 +0000] "GET / HTTP/1.1" 200 10\nbroken line\n\n10.9.9.9 - - [01/Oct/2026:10:00:01 +0000] "GET / HTTP/1.1" 502 5\n')
+    r, e = summarize(p)
+    assert r == {"payments": 1, "unowned": 1}, r
+    assert e == {"unowned": 1}, e

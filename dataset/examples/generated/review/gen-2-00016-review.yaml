@@ -1,0 +1,103 @@
+id: gen-2-00016-review
+category: review
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    Hi, can you review this step from our ETL? It take the raw vibration data from the sensors (each file is like 20-40 milion samples, we get new files every hour) and quantize it to uint8 so the storage is smaller. It run quite long and our pipeline box is at 100% cpu the whole time. Any feedback welcome.
+
+    ```python
+    import glob
+    import os
+
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    SRC_DIR = "/data/raw/vibration"
+    DST_DIR = "/data/compact/vibration"
+    LEVELS = 256
+    SENSOR_RANGE_G = (-16.0, 16.0)
+
+
+    def load_channel(path):
+        table = pq.read_table(path, columns=["ts", "accel_g"])
+        return table.column("ts").to_numpy(), table.column("accel_g").to_numpy()
+
+
+    def quantize(values, lo, hi, levels=LEVELS):
+        out = np.empty(len(values), dtype=np.uint8)
+        span = hi - lo
+        for i in range(len(values)):
+            v = values[i]
+            if v < lo:
+                v = lo
+            elif v > hi:
+                v = hi
+            out[i] = int((v - lo) / span * levels)
+        return out
+
+
+    def process_file(path):
+        ts, accel = load_channel(path)
+        lo, hi = SENSOR_RANGE_G
+        codes = quantize(accel, lo, hi)
+        out = pa.table({"ts": ts, "code": codes})
+        pq.write_table(out, os.path.join(DST_DIR, os.path.basename(path)))
+        return len(codes)
+
+
+    if __name__ == "__main__":
+        total = 0
+        for path in sorted(glob.glob(os.path.join(SRC_DIR, "*.parquet"))):
+            n = process_file(path)
+            total += n
+            print(f"{path}: {n} samples")
+        print("done,", total, "samples")
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline
+
+    #### [Bug] Top of the sensor range overflows `uint8`
+    - **Where:** `quantize`, `out[i] = int((v - lo) / span * levels)`
+    - **Issue:** a value at `hi` (or a value clipped to `hi`) gives `(hi - lo) / span * 256 = 256`, which does not fit in `uint8`. NumPy 2 raises `OverflowError` and stops the file. Older NumPy silently wraps it to `0`, so a saturated sensor gets stored as the minimum reading.
+    - **Fix:** clamp the level to `levels - 1` (see the snippet below).
+
+    #### [High] Pure Python loop over tens of millions of samples
+    - **Where:** the `for i in range(len(values))` loop in `quantize`
+    - **Issue:** every sample goes through the interpreter: indexing, two comparisons, float math, `int()` and a store into a NumPy array. With 20-40 million samples per file every hour, this loop is what keeps the CPU at 100%.
+    - **Fix:** compile the same loop with Numba. The logic stays readable and does the same thing, plus the bug fix:
+
+    ```python
+    import numba
+    import numpy as np
+
+    LEVELS = 256
+
+
+    @numba.njit(cache=True)
+    def quantize(values, lo, hi, levels=LEVELS):
+        n = values.shape[0]
+        out = np.empty(n, dtype=np.uint8)
+        span = hi - lo
+        top = levels - 1
+        for i in range(n):
+            v = values[i]
+            if v < lo:
+                v = lo
+            elif v > hi:
+                v = hi
+            level = int((v - lo) / span * levels)
+            out[i] = min(level, top)
+        return out
+    ```
+
+    - **Impact:** reduces E on every hourly run. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples with Numba `@njit` used about 4× less CPU energy than the same pure Python loop. Your step is the same kind of CPU-bound numeric loop, and it runs on every file.
+    - **Notes:** Numba is a new dependency. The first call compiles the function. `cache=True` stores the compiled code on disk, so the hourly job does not recompile every time it starts. Keep `LEVELS` at 256 or lower, or the codes will not fit in `uint8`.
+verify:
+  static_only: requires numba and pyarrow, not available in stdlib + numpy

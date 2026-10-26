@@ -1,0 +1,92 @@
+id: gen-2-00376-no-change
+category: no-change
+language: python
+patterns:
+- set-membership
+- context-tradeoff
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    I maintain the per-run summary step of our detector analysis. The batch system starts one job per run, so this script runs once per process with a single run number. The good-run list (GRL) is a text file with about 60k run numbers covering several years of data taking.
+
+    A colleague said I should turn `good_runs` into a set "because `in` on a list is O(n)". Before I touch it, here are my requirements:
+
+    - stdlib only. The cluster image has no extra packages.
+    - stdout has to stay byte-identical, because a downstream merger parses it.
+    - `load_good_runs` must keep returning a list in file order. The GRL validation script imports it and checks that the runs are sorted.
+
+    Is the set change worth it here, or is there something else I should optimize?
+
+    ```python
+    import argparse
+    import csv
+    import sys
+    from pathlib import Path
+
+    GRL_PATH = Path("/data/calib/good_runs_2026.txt")
+
+
+    def load_good_runs(path):
+        runs = []
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    runs.append(int(line))
+        return runs
+
+
+    def summarize(events_path):
+        n, e_sum = 0, 0.0
+        with open(events_path, newline="") as f:
+            for row in csv.DictReader(f):
+                n += 1
+                e_sum += float(row["energy_gev"])
+        return n, e_sum
+
+
+    def main(argv=None):
+        p = argparse.ArgumentParser(description="Per-run energy summary")
+        p.add_argument("run", type=int)
+        p.add_argument("events")
+        p.add_argument("--grl", default=GRL_PATH, type=Path)
+        args = p.parse_args(argv)
+
+        good_runs = load_good_runs(args.grl)
+        if args.run not in good_runs:
+            print(f"run {args.run} not in good run list, skipping", file=sys.stderr)
+            return 1
+
+        n, e_sum = summarize(args.events)
+        mean = e_sum / n if n else 0.0
+        print(f"run={args.run} events={n} mean_energy={mean:.3f}")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+- role: assistant
+  content: |
+    Keep the list. The set would not pay off here, and the code is already lean for this job layout.
+
+    - **One lookup per process.** Each job checks one run number once. `run in good_runs` is a single linear scan. Building a set means another full pass over all 60k entries plus hashing each one, just to do that same single lookup. In Green Metrics Tool micro-benchmarks, one membership test on a 10,000,000-element list used ~6.9 J, while converting that list to a set and testing once used ~10.5 J, about 50% more.
+    - **The file read already dominates.** `load_good_runs` touches every line anyway. The scan afterwards is small next to that.
+    - **Your constraints stay intact.** `load_good_runs` still returns the ordered list the validation script expects, and stdout does not change.
+
+    The set becomes the right choice once one process checks many run numbers, for example if you later batch several runs per job. Then build it once and reuse it for all lookups:
+
+    ```python
+    def select_good_runs(runs, good_runs):
+        good = set(good_runs)  # built once, O(1) per lookup afterwards
+        return [r for r in runs if r in good]
+    ```
+
+    This keeps the order of `runs`, and `load_good_runs` can keep returning its list.
+verify:
+  test: |-
+    assert select_good_runs([3, 1, 2, 5], [1, 2, 3]) == [3, 1, 2]
+    assert select_good_runs([], [1, 2]) == []
+    assert select_good_runs([7, 7, 8], [7]) == [7, 7]

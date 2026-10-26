@@ -1,0 +1,114 @@
+id: gen-2-00387-refactor
+category: refactor
+language: python
+patterns:
+- keep-star-imports
+- string-join
+facts:
+- F-IMPORT
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    hi, this is the transform step from our ETL. It take the raw order rows from the shop export and make a TSV for the warehouse load. Runs every night, around 1.5M rows. It work but it is slow and the code is little messy. Can you refactor it and make faster? Output must stay exactly same, the loader is picky.
+
+    ```python
+    from datetime import *
+    from decimal import *
+
+    getcontext().rounding = ROUND_HALF_UP
+
+
+    def parse_ts(raw):
+        # export gives "2024-03-07 14:02:11" in UTC
+        return datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+
+
+    def to_cents(amount):
+        return int((Decimal(amount) * 100).quantize(Decimal("1")))
+
+
+    def build_tsv(rows):
+        out = ""
+        out += "order_id\tcustomer_id\tcreated_at\tamount_cents\tcurrency\n"
+        for row in rows:
+            if row["status"] == "test":
+                continue
+            created = parse_ts(row["created_at"])
+            out += f"{row['order_id']}\t{row['customer_id']}\t{created.isoformat()}\t{to_cents(row['amount'])}\t{row['currency'].upper()}\n"
+        return out
+
+
+    def run(rows, path):
+        with open(path, "w") as f:
+            f.write(build_tsv(rows))
+    ```
+- role: assistant
+  content: |
+    ```python
+    from datetime import *
+    from decimal import *
+
+    getcontext().rounding = ROUND_HALF_UP
+
+    HEADER = "order_id\tcustomer_id\tcreated_at\tamount_cents\tcurrency\n"
+
+
+    def parse_ts(raw):
+        # export gives "2024-03-07 14:02:11" in UTC
+        return datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+
+
+    def to_cents(amount):
+        return int((Decimal(amount) * 100).quantize(Decimal("1")))
+
+
+    def build_tsv(rows):
+        parts = [HEADER]
+        for row in rows:
+            if row["status"] == "test":
+                continue
+            created = parse_ts(row["created_at"])
+            parts.append(
+                f"{row['order_id']}\t{row['customer_id']}\t{created.isoformat()}\t"
+                f"{to_cents(row['amount'])}\t{row['currency'].upper()}\n"
+            )
+        return "".join(parts)
+
+
+    def run(rows, path):
+        with open(path, "w") as f:
+            f.write(build_tsv(rows))
+    ```
+
+    **Green Notes**
+    - **Join strings instead of `+=` in loops** (reduces E): the old code adds about 1.5M f-strings to one growing string. Now each line goes into a list, and one `"".join()` builds the result at the end. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces with `+=` used ~469 J and `"".join()` ~1.8 J. f-strings in a loop behaved like `+=` (~455 J).
+    - **Star imports left as they are:** `from datetime import *` and `from decimal import *` make no measurable energy difference compared to `import datetime` or explicit names. In Green Metrics Tool micro-benchmarks with 1,000 process starts, `from posix import *` and `import posix` both used ~121 J. Changing them would only touch lines without any gain.
+
+    The output is byte-for-byte the same: same header, same skipped `test` rows, same rounding and same line order. The header is now a constant, so it is easier to keep it in sync with the loader.
+verify:
+  test: |
+    rows = [
+        {"order_id": 1, "customer_id": 42, "created_at": "2024-03-07 14:02:11", "amount": "19.995", "currency": "eur", "status": "paid"},
+        {"order_id": 2, "customer_id": 7, "created_at": "2024-03-07 15:00:00", "amount": "5.00", "currency": "usd", "status": "test"},
+        {"order_id": 3, "customer_id": 9, "created_at": "2024-03-08 00:00:01", "amount": "0.004", "currency": "chf", "status": "refunded"},
+    ]
+    out = build_tsv(rows)
+    assert out == (
+        "order_id\tcustomer_id\tcreated_at\tamount_cents\tcurrency\n"
+        "1\t42\t2024-03-07T14:02:11+00:00\t2000\tEUR\n"
+        "3\t9\t2024-03-08T00:00:01+00:00\t0\tCHF\n"
+    )
+    assert build_tsv([]) == "order_id\tcustomer_id\tcreated_at\tamount_cents\tcurrency\n"
+  equivalence:
+    driver: |-
+      rows = [
+          {"order_id": 1, "customer_id": 42, "created_at": "2024-03-07 14:02:11", "amount": "19.995", "currency": "eur", "status": "paid"},
+          {"order_id": 2, "customer_id": 7, "created_at": "2024-03-07 15:00:00", "amount": "5.00", "currency": "usd", "status": "test"},
+          {"order_id": 3, "customer_id": 9, "created_at": "2024-03-08 00:00:01", "amount": "0.004", "currency": "chf", "status": "refunded"},
+          {"order_id": 4, "customer_id": 42, "created_at": "2024-12-31 23:59:59", "amount": "1234.565", "currency": "Gbp", "status": "paid"},
+      ]
+      print(build_tsv(rows), end="")
+      print(repr(build_tsv([])))
+      many = [dict(rows[0], order_id=i) for i in range(2000)]
+      print(len(build_tsv(many)))

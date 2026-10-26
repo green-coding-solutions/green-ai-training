@@ -1,0 +1,101 @@
+id: gen-12764612-00328-refactor
+category: refactor
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    fix this, takes forever on the nightly deploy log
+
+    ```bash
+    #!/bin/bash
+    # summarize deploy log
+    log=${1:-deploy.log}
+
+    if [ ! -r "$log" ]; then
+      echo "cannot read $log" >&2
+      exit 1
+    fi
+
+    ok=0; failed=0; retried=0
+    total_ms=0; max_ms=0; n=0
+
+    while read -r line; do
+      [ -z "$line" ] && continue
+      case "$line" in '#'*) continue ;; esac
+
+      status=$(echo "$line" | cut -d' ' -f4)
+      ms=$(echo "$line" | cut -d' ' -f5 | sed 's/ms$//')
+
+      n=$(expr $n + 1)
+      total_ms=$(expr $total_ms + $ms)
+      if [ "$ms" -gt "$max_ms" ]; then
+        max_ms=$ms
+      fi
+
+      case "$status" in
+        ok)      ok=$(expr $ok + 1) ;;
+        failed)  failed=$(expr $failed + 1) ;;
+        retried) retried=$(expr $retried + 1) ;;
+      esac
+    done < "$log"
+
+    echo "ok: $ok"
+    echo "failed: $failed"
+    echo "retried: $retried"
+    echo "total ms: $total_ms"
+    echo "max ms: $max_ms"
+    if [ "$n" -gt 0 ]; then
+      echo "avg ms: $(expr $total_ms / $n)"
+    else
+      echo "avg ms: 0"
+    fi
+    ```
+
+    Lines look like `2025-03-04T10:22:01 web-03 deploy ok 1532ms`
+- role: assistant
+  content: |
+    ```bash
+    #!/bin/bash
+    # summarize deploy log
+    log=${1:-deploy.log}
+
+    if [ ! -r "$log" ]; then
+      echo "cannot read $log" >&2
+      exit 1
+    fi
+
+    awk '
+      NF < 5 || /^#/ { next }
+      {
+        n++
+        ms = $5
+        sub(/ms$/, "", ms)
+        ms += 0
+        total += ms
+        if (ms > max) max = ms
+        if ($4 == "ok") ok++
+        else if ($4 == "failed") failed++
+        else if ($4 == "retried") retried++
+      }
+      END {
+        printf "ok: %d\n", ok
+        printf "failed: %d\n", failed
+        printf "retried: %d\n", retried
+        printf "total ms: %d\n", total
+        printf "max ms: %d\n", max
+        printf "avg ms: %d\n", n ? total / n : 0
+      }
+    ' "$log"
+    ```
+
+    **Green Notes**
+    - **One `awk` pass instead of subprocesses per line** (reduces E): the old loop started several processes for every log line (`echo`, `cut`, `sed`, `expr`). Process starts dominate the cost of shell loops, not the arithmetic. In Green Metrics Tool micro-benchmarks of a similar job (summarizing a 20,000-line access log, identical output), the loop with `$(echo | cut)` and `$(expr)` used ~1302 J and 238 s. One `awk` pass used ~1.0 J and 0.21 s, over 1000× less. The log size here is different, so measure your own run with `time` or `perf stat`.
+    - **No command substitution in the loop**: the counters and the sum now live inside `awk`, so nothing is forked per line.
+
+    The output is the same for well-formed lines. One difference: lines with fewer than five fields are now skipped. Before, they made `expr` print an error. If you want to keep a pure-bash version, `read -r ts host action status ms` with `$(( ))` and `case` would also remove the forks, but it is still slower than `awk`.
+verify:
+  static_only: bash script reading a log file; no bash verifier available

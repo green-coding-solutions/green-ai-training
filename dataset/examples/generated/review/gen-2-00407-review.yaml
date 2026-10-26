@@ -1,0 +1,169 @@
+id: gen-2-00407-review
+category: review
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    Can you review our Argo CD ApplicationSet for PR preview environments? Context and requirements:
+
+    - Shop storefront, about 15 PRs open at a time, a PR usually lives 3-5 days.
+    - Only QA and the designers use the previews, on weekdays between 8:00 and 18:00.
+    - Redis (sessions) and the worker (order emails) must stay, or the checkout flow can't be tested.
+    - Previews must stay "one click": open the PR, get a URL. No manual steps for developers.
+    - Production is deployed from a different repo, don't touch that.
+
+    Our cluster bill went up since we introduced this and I'd like to know if something in here is wrong or wasteful.
+
+    ```yaml
+    apiVersion: argoproj.io/v1alpha1
+    kind: ApplicationSet
+    metadata:
+      name: shop-previews
+      namespace: argocd
+    spec:
+      goTemplate: true
+      goTemplateOptions: ["missingkey=error"]
+      syncPolicy:
+        preserveResourcesOnDeletion: true
+      generators:
+        - pullRequest:
+            github:
+              owner: acme-shop
+              repo: storefront
+              tokenRef:
+                secretName: github-token
+                key: token
+            requeueAfterSeconds: 120
+      template:
+        metadata:
+          name: 'shop-pr-{{.number}}'
+        spec:
+          project: previews
+          source:
+            repoURL: https://github.com/acme-shop/storefront.git
+            targetRevision: '{{.head_sha}}'
+            path: deploy/chart
+            helm:
+              values: |
+                image:
+                  tag: '{{.head_sha}}'
+                replicaCount: 3
+                autoscaling:
+                  enabled: true
+                  minReplicas: 3
+                  maxReplicas: 6
+                worker:
+                  enabled: true
+                  replicas: 2
+                redis:
+                  enabled: true
+                postgresql:
+                  enabled: true
+                  auth:
+                    password: preview123
+                ingress:
+                  host: 'pr-{{.number}}.preview.acme-shop.example'
+          destination:
+            server: https://kubernetes.default.svc
+            namespace: 'shop-pr-{{.number}}'
+          syncPolicy:
+            automated:
+              prune: true
+              selfHeal: true
+            syncOptions:
+              - CreateNamespace=true
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (per-PR preview environments)
+
+    #### [Security] Hard-coded database password
+    - **Where:** `postgresql.auth.password: preview123`
+    - **Issue:** the password is in git and the same in every preview. The previews have a public ingress host, so anyone who knows the pattern can guess the credentials.
+    - **Fix:** use a secret instead of a literal, for example `auth.existingSecret` pointing to a per-namespace secret created by your secret operator. The exact key depends on your chart.
+
+    #### [High] Environments can outlive their PR
+    - **Where:** `spec.syncPolicy.preserveResourcesOnDeletion: true`
+    - **Issue:** when a PR is merged or closed, the generator stops producing its Application. With this flag, the Application is removed but the workloads, Postgres and Redis stay running in `shop-pr-<number>`. These orphans are most likely what pushed your bill up, because nobody sees them in Argo CD anymore.
+    - **Fix:** remove the flag and add the Argo CD resources finalizer to the generated Application, so deleting it also deletes its resources. After the next merge, check with `kubectl get ns` that nothing is left over.
+    - **Impact:** reduces E and M for every closed PR. Idle services cost little per minute, but an environment that runs for weeks after the merge adds up. Removing environments that should not exist is the biggest lever here.
+
+    #### [Medium] Preview sized like production
+    - **Where:** `replicaCount: 3`, `autoscaling.minReplicas: 3`, `worker.replicas: 2`
+    - **Issue:** previews are used by a few testers. Three app replicas, an autoscaler with a floor of three and two workers reserve CPU and memory that nobody uses. With 15 open PRs this is 45 app pods.
+    - **Fix:** one app replica, autoscaling off, one worker. Keep Redis and Postgres, as you need them.
+    - **Impact:** reduces M (reserved memory, fewer nodes). The CPU effect while idle is small: in Green Metrics Tool micro-benchmarks, an idle environment with 3 app replicas, Postgres, Redis and a polling worker used about 3% more CPU energy than one with 1 replica and Postgres. Machine energy differed by less than 1%. So the gain is mostly in smaller node pools, not in watts per minute.
+
+    #### [Medium] Nothing runs on a schedule
+    - **Where:** the whole template, there is no off-hours handling
+    - **Issue:** your testers work 8:00-18:00 on weekdays, but every preview runs 24/7. That is about 100 hours a week of idle time per environment.
+    - **Fix:** add a scheduled job, for example a CronJob or KEDA cron scaler, that scales preview deployments to 0 in the evening and back up in the morning. Argo CD needs `ignoreDifferences` on `/spec/replicas` for this, otherwise `selfHeal` scales them back up. This keeps the one-click flow, only the first request after the night waits a bit.
+    - **Impact:** reduces M, and E only slightly. Scaling to zero removes whole hours of reserved capacity.
+
+    Fixed ApplicationSet (the scheduled scale-down is not included, it depends on your cluster tooling):
+
+    ```yaml
+    apiVersion: argoproj.io/v1alpha1
+    kind: ApplicationSet
+    metadata:
+      name: shop-previews
+      namespace: argocd
+    spec:
+      goTemplate: true
+      goTemplateOptions: ["missingkey=error"]
+      generators:
+        - pullRequest:
+            github:
+              owner: acme-shop
+              repo: storefront
+              tokenRef:
+                secretName: github-token
+                key: token
+            requeueAfterSeconds: 120
+      template:
+        metadata:
+          name: 'shop-pr-{{.number}}'
+          finalizers:
+            - resources-finalizer.argocd.argoproj.io
+        spec:
+          project: previews
+          source:
+            repoURL: https://github.com/acme-shop/storefront.git
+            targetRevision: '{{.head_sha}}'
+            path: deploy/chart
+            helm:
+              values: |
+                image:
+                  tag: '{{.head_sha}}'
+                replicaCount: 1
+                autoscaling:
+                  enabled: false
+                worker:
+                  enabled: true
+                  replicas: 1
+                redis:
+                  enabled: true
+                postgresql:
+                  enabled: true
+                  auth:
+                    existingSecret: shop-preview-db
+                ingress:
+                  host: 'pr-{{.number}}.preview.acme-shop.example'
+          destination:
+            server: https://kubernetes.default.svc
+            namespace: 'shop-pr-{{.number}}'
+          syncPolicy:
+            automated:
+              prune: true
+              selfHeal: true
+            syncOptions:
+              - CreateNamespace=true
+    ```
+
+    **Already good:** previews are created from the PR commit (`head_sha`), they live in their own namespace, and the `previews` project keeps them apart from production.
+verify:
+  static_only: YAML manifest for Argo CD, no runnable code in the sandbox

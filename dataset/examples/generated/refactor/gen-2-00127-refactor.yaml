@@ -1,0 +1,117 @@
+id: gen-2-00127-refactor
+category: refactor
+language: python
+patterns:
+- memoize
+- vectorize-or-jit
+facts:
+- F-LRU
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    Nightly job over the previous day's nginx logs, about 40M lines. It takes way too long. Optimize it, but show me only what changes, not the whole file again.
+
+    ```python
+    import re
+    import sys
+    from collections import Counter
+
+    import numpy as np
+
+    LINE_RE = re.compile(
+        r'(?P<ip>\S+) \S+ \S+ \[(?P<ts>[^\]]+)\] "(?P<method>\S+) (?P<path>\S+) [^"]*" '
+        r'(?P<status>\d{3}) (?P<bytes>\d+|-) "[^"]*" "(?P<ua>[^"]*)" (?P<rt>[\d.]+)'
+    )
+
+    BOT_RE = re.compile(r"bot|crawl|spider|slurp|curl|python-requests|Go-http-client", re.I)
+    MOBILE_RE = re.compile(r"Mobile|Android|iPhone|iPad", re.I)
+    BROWSER_RES = [
+        ("edge", re.compile(r"Edg/(\d+)")),
+        ("chrome", re.compile(r"Chrome/(\d+)")),
+        ("firefox", re.compile(r"Firefox/(\d+)")),
+        ("safari", re.compile(r"Version/(\d+).*Safari/")),
+    ]
+
+    # latency buckets in ms, same as our Prometheus histogram
+    EDGES = [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000]
+
+
+    def classify_agent(ua):
+        if BOT_RE.search(ua):
+            return ("bot", "other", "bot")
+        device = "mobile" if MOBILE_RE.search(ua) else "desktop"
+        for name, rx in BROWSER_RES:
+            m = rx.search(ua)
+            if m:
+                return (device, name, m.group(1))
+        return (device, "other", "")
+
+
+    def bucket_counts(latencies_ms, edges):
+        counts = np.zeros(len(edges) + 1, dtype=np.int64)
+        for i in range(len(latencies_ms)):
+            v = latencies_ms[i]
+            j = 0
+            while j < len(edges) and v > edges[j]:
+                j += 1
+            counts[j] += 1
+        return counts
+
+
+    def summarize(path):
+        agents = Counter()
+        latencies = []
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                m = LINE_RE.match(line)
+                if not m:
+                    continue
+                device, browser, major = classify_agent(m["ua"])
+                agents[(device, browser, major)] += 1
+                latencies.append(float(m["rt"]) * 1000.0)
+        lat = np.asarray(latencies, dtype=np.float64)
+        return agents, bucket_counts(lat, np.asarray(EDGES, dtype=np.float64))
+
+
+    if __name__ == "__main__":
+        agents, counts = summarize(sys.argv[1])
+        for key, n in agents.most_common(20):
+            print(*key, n, sep="\t")
+        labels = [f"<= {e} ms" for e in EDGES] + [f"> {EDGES[-1]} ms"]
+        for label, n in zip(labels, counts):
+            print(f"{label:>12}  {n}")
+    ```
+- role: assistant
+  content: |
+    Imports:
+
+    ```python
+    import re
+    import sys
+    from collections import Counter
+    from functools import lru_cache
+
+    import numpy as np
+    from numba import njit
+    ```
+
+    Two decorators. Both function bodies stay as they are:
+
+    ```python
+    @lru_cache(maxsize=8192)
+    def classify_agent(ua):
+        ...  # body unchanged
+
+
+    @njit(cache=True)
+    def bucket_counts(latencies_ms, edges):
+        ...  # body unchanged
+    ```
+
+    **Green Notes**
+    - **Memoize `classify_agent`** (reduces E): each line runs up to six regex searches on the user agent. But a day of traffic has only a small set of distinct UA strings, so most of the 40M calls repeat work that was already done. In Green Metrics Tool micro-benchmarks, 1,000,000 calls with inputs drawn from 200 distinct values used ~43 J uncached and ~4.7 J with `lru_cache`, about 9× less. `maxsize` caps memory when bots send random UAs. The function returns immutable tuples, so it is safe to hand out cached results. Check the hit rate with `classify_agent.cache_info()` after one run.
+    - **`@njit` on `bucket_counts`** (reduces E): this is a CPU-bound numeric loop over every request, with an inner loop over the bucket edges. That is the case Numba compiles to machine code. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples used ~40 J in a pure Python loop and ~9.5 J with `@njit`, about 4× less. The function already takes float64 numpy arrays, which is what `njit` needs. With `cache=True` the compiled code is saved next to the module, so the nightly run doesn't compile it again each time.
+    - The output is identical. New dependency: `numba`.
+verify:
+  static_only: needs numba; the answer shows only the changed lines, as the user asked

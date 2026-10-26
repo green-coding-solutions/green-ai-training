@@ -1,0 +1,98 @@
+id: gen-12764612-00013-no-change
+category: no-change
+language: python
+patterns:
+- memoize
+- context-tradeoff
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    We have a nightly ETL job that loads order lines from a CSV export of our shop system (about 800k lines per night) and writes only the new ones to a staging file. Requirements: it must run on the small batch VM with 512 MB RAM, finish before 02:00, and not write lines that we already loaded in earlier runs.
+
+    My plan is to put `@lru_cache(maxsize=None)` on `row_fingerprint`, because it is called for every line and it hashes strings. Is that the right move? Here is the code:
+
+    ```python
+    import csv
+    import hashlib
+    import sys
+
+    FIELDS = ("order_id", "line_no", "sku", "qty", "unit_price")
+
+
+    def row_fingerprint(order_id, line_no, sku, qty, unit_price):
+        raw = f"{order_id}|{line_no}|{sku}|{qty}|{unit_price}"
+        return hashlib.blake2b(raw.encode(), digest_size=16).hexdigest()
+
+
+    def load_seen(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return {line.strip() for line in fh}
+        except FileNotFoundError:
+            return set()
+
+
+    def run(src, dst, seen_path):
+        seen = load_seen(seen_path)
+        new_keys = []
+        with open(src, newline="", encoding="utf-8") as fin, \
+             open(dst, "w", newline="", encoding="utf-8") as fout:
+            reader = csv.DictReader(fin)
+            writer = csv.DictWriter(fout, fieldnames=reader.fieldnames)
+            writer.writeheader()
+            for row in reader:
+                key = row_fingerprint(*(row[f] for f in FIELDS))
+                if key in seen:
+                    continue
+                seen.add(key)
+                new_keys.append(key)
+                writer.writerow(row)
+        with open(seen_path, "a", encoding="utf-8") as fh:
+            fh.writelines(k + "\n" for k in new_keys)
+
+
+    if __name__ == "__main__":
+        run(*sys.argv[1:4])
+    ```
+- role: assistant
+  content: |
+    No, don't add `lru_cache` here. It would make the job slower and use more memory.
+
+    A cache only helps when the same arguments come in again. Your fingerprint includes `order_id` and `line_no`, so every line in the file has a different key. Every call is a miss. You would pay for hashing the arguments, building the cache entry and storing it, and never get a hit. With `maxsize=None` the cache also keeps one entry per line, so memory grows with the file on a 512 MB VM. With a small `maxsize` it just evicts entries that are never reused.
+
+    In Green Metrics Tool micro-benchmarks, `lru_cache` cut the energy of 1,000,000 calls from about 43 J to about 4.7 J (about 9× less). That benchmark used only 200 distinct inputs. Your case is the opposite.
+
+    The rest of the code is already in good shape:
+    - `seen` is a set, so the repeated "already loaded?" check is O(1) per line.
+    - The file is streamed row by row, so memory stays flat.
+    - The new keys are appended to the seen file once, at the end.
+
+    If you want to be sure for your real data, count hits on a sample before changing anything:
+
+    ```python
+    from functools import lru_cache
+
+
+    def hit_ratio(rows, func):
+        cached = lru_cache(maxsize=None)(func)
+        for row in rows:
+            cached(*row)
+        info = cached.cache_info()
+        return info.hits / (info.hits + info.misses)
+    ```
+
+    Feed it the tuples of `FIELDS` from a few thousand lines. If the ratio is near zero, as I expect, leave the function as it is. Memoize only a function whose inputs really repeat, for example a lookup keyed by country code, and give it a bounded `maxsize`.
+verify:
+  test: |-
+    import hashlib
+
+    def row_fingerprint(order_id, line_no, sku, qty, unit_price):
+        raw = f"{order_id}|{line_no}|{sku}|{qty}|{unit_price}"
+        return hashlib.blake2b(raw.encode(), digest_size=16).hexdigest()
+
+    unique_rows = [(i, 1, "A", 1, "1.0") for i in range(100)]
+    assert hit_ratio(unique_rows, row_fingerprint) == 0
+    repeated_rows = [(1, 1, "A", 1, "1.0")] * 10
+    assert hit_ratio(repeated_rows, row_fingerprint) == 0.9

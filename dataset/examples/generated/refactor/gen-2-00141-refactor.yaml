@@ -1,0 +1,149 @@
+id: gen-2-00141-refactor
+category: refactor
+language: python
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+messages:
+- role: user
+  content: |
+    hi, this is the funtion for the wishlist page in our shop. it get called every time a customer open his wishlist. products table have like 45 columns, with long description, the html for product page, specs json and so on. can you clean it up and make it more fast? the output must stay same, the frontend use it.
+
+    ```python
+    import sqlite3
+
+    DB_PATH = "shop.db"
+    PLACEHOLDER_IMG = "/static/img/no-image.png"
+
+
+    def get_db():
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+
+    def format_price(cents, currency="EUR"):
+        return f"{cents / 100:.2f} {currency}"
+
+
+    def load_wishlist(conn, customer_id):
+        rows = conn.execute(
+            """
+            SELECT w.added_at, p.*
+            FROM wishlist_items w
+            JOIN products p ON p.id = w.product_id
+            WHERE w.customer_id = ?
+              AND p.is_active = 1
+            ORDER BY w.added_at DESC
+            """,
+            (customer_id,),
+        ).fetchall()
+
+        items = []
+        for r in rows:
+            if r["sale_price_cents"] is not None:
+                price = r["sale_price_cents"]
+            else:
+                price = r["price_cents"]
+            items.append({
+                "product_id": r["id"],
+                "name": r["name"],
+                "url": "/p/" + r["slug"],
+                "image": r["thumb_url"] or PLACEHOLDER_IMG,
+                "price": format_price(price, r["currency"]),
+                "on_sale": r["sale_price_cents"] is not None,
+                "in_stock": r["stock_qty"] > 0,
+                "added_at": r["added_at"],
+            })
+        return items
+    ```
+- role: assistant
+  content: |
+    ```python
+    import sqlite3
+
+    DB_PATH = "shop.db"
+    PLACEHOLDER_IMG = "/static/img/no-image.png"
+
+
+    def get_db():
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+
+    def format_price(cents, currency="EUR"):
+        return f"{cents / 100:.2f} {currency}"
+
+
+    def load_wishlist(conn, customer_id):
+        rows = conn.execute(
+            """
+            SELECT w.added_at,
+                   p.id, p.name, p.slug, p.thumb_url,
+                   p.price_cents, p.sale_price_cents, p.currency, p.stock_qty
+            FROM wishlist_items w
+            JOIN products p ON p.id = w.product_id
+            WHERE w.customer_id = ?
+              AND p.is_active = 1
+            ORDER BY w.added_at DESC
+            """,
+            (customer_id,),
+        ).fetchall()
+
+        items = []
+        for r in rows:
+            sale = r["sale_price_cents"]
+            price = sale if sale is not None else r["price_cents"]
+            items.append({
+                "product_id": r["id"],
+                "name": r["name"],
+                "url": "/p/" + r["slug"],
+                "image": r["thumb_url"] or PLACEHOLDER_IMG,
+                "price": format_price(price, r["currency"]),
+                "on_sale": sale is not None,
+                "in_stock": r["stock_qty"] > 0,
+                "added_at": r["added_at"],
+            })
+        return items
+    ```
+
+    **Green Notes**
+    - **Select only the needed columns** (reduces E and M): `p.*` loaded every product column, including the long description, the page HTML and the specs JSON, on every wishlist view. The page never uses those columns. Now the query reads only the columns the response uses. In Green Metrics Tool micro-benchmarks on PostgreSQL, reading 500 rows 1,000 times from a 52-column products table with large text columns used ~95 J with `SELECT *` and ~17 J with the 10 needed columns (about 5.5× less). The saving grows with the size of the columns you skip. Wishlists are short, so each call saves only a little, but it adds up because the query runs on every page view.
+    - `is_active` stays in the `WHERE` clause. A column only needs to be in the select list if Python reads it.
+    - The output is the same: same keys, values and order. If the frontend later needs another field, add that column to the list. Don't go back to `p.*`.
+verify:
+  test: |
+    import inspect
+    assert "p.*" not in inspect.getsource(load_wishlist)
+  equivalence:
+    driver: |-
+      conn = sqlite3.connect(":memory:")
+      conn.row_factory = sqlite3.Row
+      conn.executescript("""
+      CREATE TABLE products (
+          id INTEGER PRIMARY KEY, sku TEXT, name TEXT, slug TEXT, description TEXT,
+          page_html TEXT, specs_json TEXT, thumb_url TEXT, price_cents INTEGER,
+          sale_price_cents INTEGER, currency TEXT, stock_qty INTEGER, is_active INTEGER
+      );
+      CREATE TABLE wishlist_items (
+          id INTEGER PRIMARY KEY, customer_id INTEGER, product_id INTEGER, added_at TEXT
+      );
+      """)
+      products = [
+          (1, "SKU-1", "Trail Shoe", "trail-shoe", "x" * 5000, "<p>" * 1000, '{"size": 42}', "/img/1.jpg", 8999, None, "EUR", 4, 1),
+          (2, "SKU-2", "Rain Jacket", "rain-jacket", "y" * 5000, "", "{}", None, 12900, 9900, "EUR", 0, 1),
+          (3, "SKU-3", "Old Cap", "old-cap", "z", "", "{}", "/img/3.jpg", 1500, None, "EUR", 10, 0),
+          (4, "SKU-4", "Wool Socks", "wool-socks", "w" * 200, "", "{}", "", 1299, 0, "CHF", 25, 1),
+      ]
+      conn.executemany("INSERT INTO products VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", products)
+      conn.executemany("INSERT INTO wishlist_items VALUES (?,?,?,?)", [
+          (1, 7, 1, "2026-10-01T10:00:00"),
+          (2, 7, 2, "2026-10-03T09:30:00"),
+          (3, 7, 3, "2026-10-02T12:00:00"),
+          (4, 7, 4, "2026-09-28T08:15:00"),
+          (5, 8, 1, "2026-10-05T18:00:00"),
+      ])
+      for cid in (7, 8, 9):
+          print(cid, load_wishlist(conn, cid))

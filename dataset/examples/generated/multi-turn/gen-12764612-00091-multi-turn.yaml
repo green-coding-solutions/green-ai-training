@@ -1,0 +1,79 @@
+id: gen-12764612-00091-multi-turn
+category: multi-turn
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    hello, this is my script for the restock list of our webshop. stock.csv have around 60000 lines (sku,name,qty,reorder_level,supplier) and it run very slow, almost 1 hour. can you make it better pls?
+
+    ```bash
+    #!/bin/bash
+    # restock report
+    count=0
+    while read line; do
+      sku=$(echo $line | cut -d, -f1)
+      qty=$(echo $line | cut -d, -f3)
+      min=$(echo $line | cut -d, -f4)
+      sup=$(echo $line | cut -d, -f5)
+      if [ $qty -lt $min ]; then
+        need=$(expr $min - $qty)
+        echo "$sku $sup order $need"
+        count=$(expr $count + 1)
+      fi
+    done < stock.csv
+    echo "items to reorder: $count"
+    ```
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+
+    count=0
+    while IFS=, read -r sku _ qty min sup; do
+        if (( qty < min )); then
+            echo "$sku $sup order $(( min - qty ))"
+            count=$(( count + 1 ))
+        fi
+    done < stock.csv
+    echo "items to reorder: $count"
+    ```
+
+    **Green Notes**
+    - **Builtins instead of subprocesses in the loop** (reduces E): the old loop started about 9 processes per line (`echo`, `cut` ×4, `expr` ×2, plus the pipes). With 60,000 lines that is over half a million process starts. `read` with `IFS=,` splits the fields, and `$(( ))` does the maths, so no process is started per line. In Green Metrics Tool micro-benchmarks on a 20,000-line log, a loop with about 10 processes per line used ~1302 J and 238 s. The same loop with builtins only used ~4.3 J and 0.72 s, about 300× less.
+
+    The output is the same. `read -r` also keeps backslashes in the data. As before, `qty` and `reorder_level` must be plain whole numbers, and the name column must not contain commas.
+- role: user
+  content: |
+    ok thx, much faster. but my colleague say awk is even more faster, why you not use awk? and also I want the list sorted by supplier, so I can send the mail to each supplier
+- role: assistant
+  content: |
+    Good point, awk is the better tool here. The sorting is also easy with it.
+
+    ```bash
+    #!/usr/bin/env bash
+
+    awk -F, '
+        $3 + 0 < $4 + 0 {
+            n++
+            print $1, $5, "order", $4 - $3 | "LC_ALL=C sort -k2,2 -k1,1"
+        }
+        END {
+            close("LC_ALL=C sort -k2,2 -k1,1")
+            print "items to reorder: " n + 0
+        }
+    ' stock.csv
+    ```
+
+    **Green Notes**
+    - **One `awk` pass over the file** (reduces E): all the work happens in a single process, and `sort` is the only other one. In the same Green Metrics Tool micro-benchmark (a 20,000-line log, not your file), one `awk` pass used ~1.0 J, about 4× less than the builtin loop. Your stock file is a different job, so measure it with `time` if you want to know.
+
+    Changes in behavior:
+    - The lines are sorted by supplier, then by SKU. `LC_ALL=C` makes the order the same on every machine.
+    - The `close(...)` call makes sure the sorted list is printed before the count line.
+    - Supplier names with spaces, like `Acme Corp`, would break the sort key. If you have them, tell me and I will change it.
+verify:
+  static_only: bash script reading a local stock.csv, no fixture available, output goes through sort

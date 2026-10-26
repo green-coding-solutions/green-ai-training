@@ -1,0 +1,95 @@
+id: gen-12764612-00292-refactor
+category: refactor
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    ```nginx
+    server {
+        listen 80;
+        server_name sims.physlab.example.org;
+        root /srv/sim-reports;
+
+        gzip on;
+        gzip_comp_level 9;
+        gzip_min_length 0;
+        gzip_vary on;
+        gzip_proxied any;
+        gzip_types text/plain text/css text/csv application/json application/javascript
+                   image/svg+xml image/png application/zip;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location /runs/ {
+            alias /srv/sim-reports/runs/;
+            autoindex on;
+        }
+
+        location /api/ {
+            proxy_pass http://127.0.0.1:8050;
+            proxy_set_header Host $host;
+        }
+    }
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```nginx
+    server {
+        listen 80;
+        server_name sims.physlab.example.org;
+        root /srv/sim-reports;
+
+        # serve name.ext.gz when it exists and the client accepts gzip
+        gzip_static on;
+
+        # fallback for dynamic responses (/api/) and files without a .gz
+        gzip on;
+        gzip_comp_level 5;
+        gzip_min_length 256;
+        gzip_vary on;
+        gzip_proxied any;
+        gzip_types text/plain text/css text/csv application/json application/javascript
+                   image/svg+xml;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location /runs/ {
+            alias /srv/sim-reports/runs/;
+            autoindex on;
+        }
+
+        location /api/ {
+            proxy_pass http://127.0.0.1:8050;
+            proxy_set_header Host $host;
+        }
+    }
+    ```
+
+    Compress the static files once, when a run is published (for example at the end of your report job):
+
+    ```bash
+    find /srv/sim-reports -type f \
+        \( -name '*.html' -o -name '*.css' -o -name '*.js' -o -name '*.json' \
+           -o -name '*.csv' -o -name '*.txt' -o -name '*.svg' \) \
+        -exec gzip -9 -k -f {} +
+    ```
+
+    **Green Notes**
+    - **Precompressed static files** (reduces E): before, every request for a CSV, JSON or HTML file was compressed again at level 9. Now nginx sends the `.gz` file that was made once. In Green Metrics Tool micro-benchmarks of nginx serving 2,000 text requests, compressing with gzip level 5 on every request used about 4× the CPU energy of serving precompressed files (~54 J vs ~14 J). The bytes sent were about 10× fewer than with no compression in both cases. Your level 9 costs more CPU per request than the level 5 in that test.
+    - **Moderate level only for dynamic responses** (reduces E): `/api/` output cannot be precompressed, so `gzip on` stays, at level 5. A higher level on every response spends CPU for little extra size gain.
+    - **No PNG or ZIP in `gzip_types`** (reduces E): these formats are already compressed, so nginx would spend CPU and gain nothing. Dropping them does not change what is served.
+    - **`gzip_min_length 256`** (reduces E): tiny responses are no longer compressed.
+
+    Rerun the `find` command after each new run is published, or the old `.gz` file will be served for a changed file. Keep the original files next to the `.gz` files: clients without gzip support still get them. On a fast local network, compression mostly adds CPU work (clients also have to decompress), so the real benefit is fewer bytes for users on slower links.
+verify:
+  static_only: nginx configuration, cannot be run with the stdlib test harness

@@ -1,0 +1,54 @@
+id: gen-12764612-00275-estimate
+category: estimate
+language: html
+patterns:
+- modern-image-formats
+facts:
+- F-IMGRENDER
+- F-IMGENC
+messages:
+- role: user
+  content: |
+    We run a REST API for a property listing site (FastAPI + Postgres). Listings have 8-20 JPG photos each, stored on disk, and the API returns the URLs in the JSON. The frontend renders them with plain `<img>` tags.
+
+    My plan: add an endpoint `/photos/{id}.webp` that opens the stored JPG with Pillow, converts it to WebP and returns it. Then the frontend template points to that endpoint. I don't want to touch the upload flow right now.
+
+    Requirements:
+    - Photos must still work in old browsers.
+    - I need to tell my manager how much energy this saves per month for the sustainability report. Please give me a number in kWh, we have about 300k photo requests per month.
+
+    Can you estimate it?
+- role: assistant
+  content: |
+    I can't give you a kWh figure. Any number would be invented, because it depends on your photo sizes, your cache setup, and how many visitors are on mobile or Wi-Fi. I can tell you the direction, and the plan as written probably goes the wrong way.
+
+    **Why converting per request is a problem**
+
+    Encoding is the expensive part. In Green Metrics Tool micro-benchmarks, encoding 50 BMP images used ~89 J as JPG, ~290 J as WebP and ~658 J as AVIF. AVIF encoding cost about 7× JPG. Your endpoint would pay that cost again on every request. At 300k requests per month, this server-side cost can easily cancel the byte savings. Without a cache in front, it is the same work repeated for the same photos.
+
+    On the client side, the decode cost is similar between formats. In 50 page loads in a headful browser, JPG used ~134 J, WebP ~150 J and AVIF ~159 J. The gain from WebP or AVIF is mainly fewer transferred bytes, and those benchmarks ran on a local network where transfer was almost free. So they don't show that gain.
+
+    **What to do instead**
+
+    Encode once, when the photo is uploaded (or in a one-time batch job for the existing photos), and store the variants next to the JPG. The frontend serves them with a fallback, which also covers old browsers:
+
+    ```html
+    <picture>
+      <source srcset="/photos/1234.webp" type="image/webp">
+      <img src="/photos/1234.jpg" alt="Living room with a large window" width="1200" height="800">
+    </picture>
+    ```
+
+    - WebP is a good default here. AVIF encoding is much more expensive, so use it only if the extra byte saving matters to you.
+    - Old browsers ignore the `<source>` and load the JPG.
+    - The one-time batch job over existing photos is a cost you pay once. After that, serving files is cheap.
+
+    **How to get a number for your report**
+
+    1. Run a Green Metrics Tool usage scenario that loads one listing page with the JPG version and one with the `<picture>` version. Compare the energy.
+    2. Measure the one-time encode job separately, with `perf stat` or RAPL as a CPU-time proxy.
+    3. Check the real transferred bytes per page in your access logs. That tells you the network side.
+
+    I would report the measured per-page difference with the conditions, not a monthly extrapolation.
+verify:
+  static_only: HTML snippet, no executable code

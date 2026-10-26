@@ -1,0 +1,120 @@
+id: gen-1-00174-generation
+category: generation
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    ```python
+    #!/usr/bin/env python3
+    """renamer: apply regex rename rules to every file name under a directory.
+
+    Rules file: one rule per line, `pattern => replacement`. Blank lines and
+    lines starting with # are ignored. Rules are applied in order to the file
+    name only (not the path). Replacement can use \1 style groups.
+
+    Usage: renamer.py RULES ROOT [--dry-run]
+    """
+    import argparse
+    import os
+    import sys
+
+
+    def load_rules(path):
+        ...
+
+
+    def new_name(name, rules):
+        ...
+
+
+    def main():
+        ...
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    ?
+- role: assistant
+  content: |-
+    ```python
+    #!/usr/bin/env python3
+    """renamer: apply regex rename rules to every file name under a directory.
+
+    Rules file: one rule per line, `pattern => replacement`. Blank lines and
+    lines starting with # are ignored. Rules are applied in order to the file
+    name only (not the path). Replacement can use \\1 style groups.
+
+    Usage: renamer.py RULES ROOT [--dry-run]
+    """
+    import argparse
+    import os
+    import re
+    import sys
+
+
+    def load_rules(path):
+        rules = []
+        with open(path, encoding="utf-8") as f:
+            for lineno, line in enumerate(f, 1):
+                line = line.rstrip("\n")
+                if not line.strip() or line.lstrip().startswith("#"):
+                    continue
+                pattern, sep, repl = line.partition(" => ")
+                if not sep:
+                    sys.exit(f"{path}:{lineno}: expected 'pattern => replacement'")
+                try:
+                    rules.append((re.compile(pattern), repl))
+                except re.error as e:
+                    sys.exit(f"{path}:{lineno}: bad pattern: {e}")
+        return rules
+
+
+    def new_name(name, rules):
+        for rx, repl in rules:
+            name = rx.sub(repl, name)
+        return name
+
+
+    def main():
+        ap = argparse.ArgumentParser(description="Rename files with regex rules.")
+        ap.add_argument("rules", help="rules file")
+        ap.add_argument("root", help="directory to walk")
+        ap.add_argument("--dry-run", action="store_true", help="only print changes")
+        args = ap.parse_args()
+
+        rules = load_rules(args.rules)
+        renamed = 0
+        for dirpath, _dirs, files in os.walk(args.root):
+            for name in files:
+                target = new_name(name, rules)
+                if target == name:
+                    continue
+                src = os.path.join(dirpath, name)
+                dst = os.path.join(dirpath, target)
+                if os.path.exists(dst):
+                    print(f"skip (target exists): {src} -> {target}", file=sys.stderr)
+                    continue
+                print(f"{src} -> {target}")
+                if not args.dry_run:
+                    os.rename(src, dst)
+                renamed += 1
+
+        suffix = "would be renamed" if args.dry_run else "renamed"
+        print(f"{renamed} file(s) {suffix}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    The tool never overwrites an existing file. It skips that name and warns on stderr.
+
+    **Green Notes**
+    - **Compile regex once, outside the loop** (reduces E): `load_rules` compiles each pattern one time, and `new_name` reuses the compiled objects for every file. The rules come from a file, so they are built at runtime. A call like `re.sub(pattern, ...)` per file would look up the pattern in Python's internal cache each time. In Green Metrics Tool micro-benchmarks with 1,000,000 matches, a precompiled pattern used about 18% less CPU energy than inline `re.match` (~18 J vs ~21 J), because `re` caches compiled patterns. The win is small with a few rules. It grows if a rules file holds more than 512 patterns, since the cache then thrashes and patterns get recompiled.
+    - **Bad rules fail early**: a broken pattern stops the run with its line number before any file is touched, instead of failing halfway through a rename.

@@ -1,0 +1,138 @@
+id: gen-2-00013-multi-turn
+category: multi-turn
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    ```python
+    import sys
+    import json
+    import torch
+    import torch.nn as nn
+
+    from tokenizer import encode_line  # str -> list[int], padded/truncated to max_len
+
+    MAX_LEN = 256
+    BATCH = 512
+    THRESHOLD = 0.8
+
+
+    class LineScorer(nn.Module):
+        def __init__(self, vocab=257, dim=64):
+            super().__init__()
+            self.emb = nn.Embedding(vocab, dim)
+            self.conv = nn.Conv1d(dim, dim, kernel_size=5, padding=2)
+            self.drop = nn.Dropout(0.1)
+            self.head = nn.Linear(dim, 1)
+
+        def forward(self, x):
+            h = self.emb(x).transpose(1, 2)
+            h = torch.relu(self.conv(h)).max(dim=2).values
+            return torch.sigmoid(self.head(self.drop(h))).squeeze(1)
+
+
+    def load_model(path):
+        model = LineScorer()
+        model.load_state_dict(torch.load(path, map_location="cpu"))
+        return model
+
+
+    def score_file(model, path):
+        flagged = []
+        batch, lines = [], []
+        with open(path, errors="replace") as f:
+            for lineno, raw in enumerate(f, 1):
+                line = raw.rstrip("\n")
+                batch.append(encode_line(line, MAX_LEN))
+                lines.append((lineno, line))
+                if len(batch) == BATCH:
+                    flagged += _score_batch(model, batch, lines)
+                    batch, lines = [], []
+        if batch:
+            flagged += _score_batch(model, batch, lines)
+        return flagged
+
+
+    def _score_batch(model, batch, lines):
+        x = torch.tensor(batch, dtype=torch.long)
+        scores = model(x)
+        out = []
+        for (lineno, text), s in zip(lines, scores.tolist()):
+            if s > THRESHOLD:
+                out.append({"line": lineno, "score": round(s, 3), "text": text})
+        return out
+
+
+    if __name__ == "__main__":
+        model = load_model("models/line_scorer.pt")
+        for path in sys.argv[1:]:
+            for hit in score_file(model, path):
+                print(json.dumps({"file": path, **hit}))
+    ```
+
+    ?
+- role: assistant
+  content: |
+    I see two problems in the scoring path. The model never goes into eval mode, and every batch builds an autograd graph that nothing uses. Here are the changed parts. The rest of the file stays the same.
+
+    ```python
+    def load_model(path):
+        model = LineScorer()
+        model.load_state_dict(torch.load(path, map_location="cpu"))
+        model.eval()  # dropout off for scoring
+        return model
+
+
+    @torch.no_grad()
+    def _score_batch(model, batch, lines):
+        x = torch.tensor(batch, dtype=torch.long)
+        scores = model(x)
+        out = []
+        for (lineno, text), s in zip(lines, scores.tolist()):
+            if s > THRESHOLD:
+                out.append({"line": lineno, "score": round(s, 3), "text": text})
+        return out
+    ```
+
+    **Green Notes**
+    - **Bug fixed, missing `model.eval()`:** the model was still in training mode, so `Dropout(0.1)` was active. The same line could get a different score on every run, and lines near the threshold were flagged at random.
+    - **`torch.no_grad()` for inference** (reduces E and M): without it, autograd records every operation and keeps the activations of each 512-line batch for a backward pass that never happens. In Green Metrics Tool micro-benchmarks, 100,000 PyTorch CPU inferences used ~135 J with `no_grad` and ~157 J without, about 14% less. Here it applies to every batch of every log file.
+- role: user
+  content: |
+    wait we need grads. explain.py loads the same model with load_model() and does backward() on the flagged lines for the char heatmap
+- role: assistant
+  content: |
+    That still works. `@torch.no_grad()` only applies while `_score_batch` is running. Outside that function autograd is on as usual, so the forward and `backward()` in explain.py behave the same as before.
+
+    Two things to know:
+
+    - **`load_model()` now returns the model in eval mode.** That is what you want for the heatmap too. With dropout on, the gradients were noisy and changed from run to run. `backward()` works the same in eval mode.
+    - **If explain.py might ever be called from inside a `no_grad` block** (say, from a future batch job), make its forward pass explicit:
+
+    ```python
+    def scores_with_grad(model, texts):
+        x = torch.tensor([encode_line(t, MAX_LEN) for t in texts], dtype=torch.long)
+        with torch.enable_grad():
+            return model(x)  # graph only for the flagged lines
+    ```
+
+    This keeps the expensive part (the graph) limited to the few flagged lines. The bulk scoring of every line doesn't build one.
+- role: user
+  content: |
+    ok but is no_grad really needed now that we have eval()? feels like 2 lines doing the same thing
+- role: assistant
+  content: |
+    They do different things:
+
+    - **`model.eval()`** changes how some layers behave: dropout turns off, and batch norm would use its running stats. It does not turn off autograd.
+    - **`torch.no_grad()`** stops autograd from recording the graph and holding on to activations. It does not touch dropout.
+
+    You can check it in one line: after `model.eval()`, `model(x).requires_grad` is still `True`.
+
+    If you only want one of them, keep `eval()`, because the scores depend on it. `no_grad` doesn't change the scores, it only removes the wasted graph work on every batch. That's why I'd keep both.
+verify:
+  static_only: needs torch and the project's tokenizer module; no model file available

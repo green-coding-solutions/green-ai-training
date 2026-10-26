@@ -1,0 +1,124 @@
+id: gen-2-00211-review
+category: review
+language: bash
+patterns:
+- compress-transmitted
+- bash-builtins
+facts:
+- F-COMPRESS-CODECS
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    review this pls. cron every 10 min on the etl box, each csv is ~50k meter readings
+
+    ```bash
+    #!/usr/bin/env bash
+    # push new meter readings to billing (cron */10)
+    set -e
+
+    SRC_DIR=/data/etl/meters/incoming
+    OUT_DIR=/data/etl/meters/outgoing
+    ENDPOINT="https://ingest.billing-partner.example/v2/readings"
+    TOKEN=$(cat /etc/etl/billing.token)
+
+    for f in "$SRC_DIR"/*.csv; do
+        [ -e "$f" ] || continue
+        batch=$(basename "$f" .csv)
+        out="$OUT_DIR/$batch.tsv"
+        : > "$out"
+        while read line; do
+            meter=$(echo "$line" | cut -d, -f1)
+            ts=$(echo "$line" | cut -d, -f2)
+            wh=$(echo "$line" | cut -d, -f3)
+            kwh=$(expr "$wh" / 1000)
+            printf '%s\t%s\t%s\n' "$meter" "$ts" "$kwh" >> "$out"
+        done < "$f"
+        xz -9 -k "$out"
+        curl -s -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/x-xz" \
+            --data-binary @"$out.xz" "$ENDPOINT" && rm "$f" "$out" "$out.xz"
+    done
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (cron, every 10 minutes)
+
+    #### [Bug] Failed uploads delete the source data
+    - **Where:** `curl -s ... && rm "$f" "$out" "$out.xz"`
+    - **Issue:** without `--fail`, curl exits 0 on HTTP 4xx and 5xx responses. So when the partner rejects a batch, the script treats it as a success and deletes the CSV. `-s` also hides the error message.
+    - **Fix:** use `curl -sS --fail ...` and delete the files only when curl succeeds.
+
+    #### [Bug] One failed upload blocks every later run
+    - **Where:** `xz -9 -k "$out"`
+    - **Issue:** after a failed upload, `$out.xz` stays on disk. On the next run, xz refuses to overwrite it and exits non-zero. `set -e` then stops the script. No batch ships until someone deletes the file by hand.
+    - **Fix:** write the compressed stream with a redirect (`... | zstd -q -c > "$out"`). A redirect overwrites the old file.
+
+    #### [High] About ten process starts per CSV line
+    - **Where:** the `while read` loop
+    - **Issue:** each line runs three `$(echo | cut)` and one `$(expr)`. That starts around ten processes per line, and `>>` reopens the output file every time. With ~50k lines per file every 10 minutes, process starts take up almost the whole run time. In Green Metrics Tool micro-benchmarks, a 20,000-line log summary that ran `$(echo | cut)` and `$(expr)` per field used ~1302 J. One `awk` pass with the same output used ~1.0 J, over 1000× less.
+    - **Fix:** one awk pass per file:
+      ```bash
+      awk -F, -v OFS='\t' '{ print $1, $2, int($3 / 1000) }' "$f"
+      ```
+    - **Impact:** E, for every line on every run. awk also keeps a last line that has no trailing newline. The old loop silently dropped that line.
+
+    #### [Medium] `xz -9` for data that is compressed once and then deleted
+    - **Where:** `xz -9 -k "$out"`
+    - **Issue:** each batch is compressed once, sent once, then deleted. A fast codec is the right choice for that. In Green Metrics Tool benchmarks on 100 MB of text with default settings, xz used ~458 J, gzip ~67 J and zstd ~16 J, so xz cost about 29× zstd. `-9` is slower than xz's default level. These figures compare energy only. xz makes smaller files, but that matters on slow links, not for a few MB per batch.
+    - **Fix:** use `zstd` at its default level if the partner API accepts it. If they only take gzip, `gzip -c` at its default level is still much cheaper than xz.
+    - **Impact:** E on the ETL box every run. Slightly more bytes on the network.
+
+    ```bash
+    #!/usr/bin/env bash
+    # push new meter readings to billing (cron */10)
+    set -eo pipefail
+
+    SRC_DIR=/data/etl/meters/incoming
+    OUT_DIR=/data/etl/meters/outgoing
+    ENDPOINT='https://ingest.billing-partner.example/v2/readings'
+    TOKEN=$(cat /etc/etl/billing.token)
+
+    for f in "$SRC_DIR"/*.csv; do
+        [ -e "$f" ] || continue
+        batch=$(basename "$f" .csv)
+        out="$OUT_DIR/$batch.tsv.zst"
+        awk -F, -v OFS='\t' '{ print $1, $2, int($3 / 1000) }' "$f" | zstd -q -c > "$out"
+        if curl -sS --fail -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H 'Content-Type: application/zstd' \
+            --data-binary @"$out" "$ENDPOINT"; then
+            rm -- "$f" "$out"
+        fi
+    done
+    ```
+
+    One difference in behavior: when a Wh value is not a number (for example a trailing `\r` from a Windows export), `expr` failed and stopped the run. awk turns `\r` and other trailing junk into the plain number, and a value that is not a number at all becomes 0. Add a check in awk if bad rows should stop the batch.
+verify:
+  lang: bash
+  setup: |
+    d="$(mktemp -d)"
+    cd "$d"
+    printf '%s\n' \
+      'MTR-0001,2026-10-24T08:00:00Z,15342' \
+      'MTR-0002,2026-10-24T08:00:00Z,999' \
+      'MTR-0003,2026-10-24T08:00:00Z,1000' \
+      'MTR-0104,2026-10-24T08:10:00Z,123456789' \
+      'MTR-0105,2026-10-24T08:10:00Z,0' > in.csv
+  original_code: |
+    f=in.csv
+    out=orig.tsv
+    : > "$out"
+    while read line; do
+        meter=$(echo "$line" | cut -d, -f1)
+        ts=$(echo "$line" | cut -d, -f2)
+        wh=$(echo "$line" | cut -d, -f3)
+        kwh=$(expr "$wh" / 1000)
+        printf '%s\t%s\t%s\n' "$meter" "$ts" "$kwh" >> "$out"
+    done < "$f"
+    cat "$out"
+  green_code: |
+    awk -F, -v OFS='\t' '{ print $1, $2, int($3 / 1000) }' in.csv
+  equivalence:
+    driver: 'true'

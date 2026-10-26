@@ -1,0 +1,110 @@
+id: gen-2-00161-review
+category: review
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    quick review? deploys our landing page previews
+
+    ```yaml
+    name: landing-preview
+    on:
+      push:
+        branches-ignore: [main]
+
+    jobs:
+      deploy:
+        runs-on: ubuntu-latest
+        env:
+          NS: lp-${{ github.ref_name }}
+          IMAGE: ghcr.io/acme/landing:${{ github.sha }}
+        steps:
+          - uses: actions/checkout@v4
+          - uses: docker/login-action@v3
+            with:
+              registry: ghcr.io
+              username: ${{ github.actor }}
+              password: ${{ secrets.GITHUB_TOKEN }}
+          - name: build & push
+            run: |
+              docker build -t "$IMAGE" .
+              docker push "$IMAGE"
+          - uses: azure/setup-kubectl@v4
+          - name: kubeconfig
+            run: |
+              mkdir -p ~/.kube
+              echo "${{ secrets.PREVIEW_KUBECONFIG }}" > ~/.kube/config
+          - name: deploy
+            run: |
+              kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+              # web (next.js), cms (strapi), postgres, redis, og-image worker
+              kubectl -n "$NS" apply -f k8s/preview/
+              kubectl -n "$NS" set image deploy/web web="$IMAGE"
+              kubectl -n "$NS" scale deploy/web --replicas=3
+              echo "Preview: https://$NS.preview.acme.dev"
+    ```
+- role: assistant
+  content: |
+    **Workload:** CI/CD and infrastructure (landing page preview environments)
+
+    #### [Bug] Namespace name breaks for most branch names
+    - **Where:** `NS: lp-${{ github.ref_name }}`
+    - **Issue:** Kubernetes namespace names allow only lowercase letters, digits and `-`, up to 63 characters. A branch like `feature/new-hero` or `Fix_Footer` gives an invalid name, so `kubectl create namespace` fails and the job fails.
+    - **Fix:** name the namespace after the PR number, `lp-pr-${{ github.event.pull_request.number }}`. The workflow below does this.
+
+    #### [High] Previews are never torn down
+    - **Where:** the whole workflow. It only deploys and never deletes anything.
+    - **Issue:** every branch keeps five services running after it is merged or abandoned, until someone deletes the namespace by hand. The cost of a preview comes mostly from the hours it exists, not from how big it is.
+    - **Fix:** run on pull request events and delete the namespace when the PR closes:
+      ```yaml
+      on:
+        pull_request:
+          types: [opened, synchronize, reopened, ready_for_review, closed]
+
+      concurrency: preview-${{ github.event.pull_request.number }}
+
+      jobs:
+        deploy:
+          if: github.event.action != 'closed' && !github.event.pull_request.draft
+          runs-on: ubuntu-latest
+          env:
+            NS: lp-pr-${{ github.event.pull_request.number }}
+            IMAGE: ghcr.io/acme/landing:${{ github.sha }}
+          steps:
+            # ... same steps as before ...
+
+        teardown:
+          if: github.event.action == 'closed'
+          runs-on: ubuntu-latest
+          env:
+            NS: lp-pr-${{ github.event.pull_request.number }}
+          steps:
+            - uses: azure/setup-kubectl@v4
+            - name: kubeconfig
+              run: |
+                mkdir -p ~/.kube
+                echo "${{ secrets.PREVIEW_KUBECONFIG }}" > ~/.kube/config
+            - run: kubectl delete namespace "$NS" --ignore-not-found
+      ```
+      Also add a scheduled job that scales previews to zero in the evening, e.g. `kubectl -n "$ns" scale deploy,statefulset --all --replicas=0` for every `lp-pr-*` namespace. Scale up again on the next push or on request.
+    - **Impact:** E and M. All the idle hours of merged and abandoned branches go away, and the nodes they hold are freed.
+
+    #### [Medium] A preview for every pushed branch
+    - **Where:** `on: push`, `branches-ignore: [main]`
+    - **Issue:** WIP branches, dependency bot branches and branches without a PR each get a full stack that nobody opens.
+    - **Fix:** the trigger above already deploys only for open PRs, and the `!github.event.pull_request.draft` condition skips drafts. If you want even fewer, deploy only for PRs with a `preview` label (add `labeled` to the types and check `contains(github.event.pull_request.labels.*.name, 'preview')`).
+    - **Impact:** E and M, fewer environments exist in the first place.
+
+    #### [Low] 3 web replicas, Redis and a worker per preview
+    - **Where:** `scale deploy/web --replicas=3`, the services in `k8s/preview/`
+    - **Issue:** a landing page preview gets a few clicks from reviewers. In Green Metrics Tool measurements, an idle preview with 3 app replicas, Postgres, Redis and a polling worker used ~269 J of CPU energy over 60 seconds. One with 1 replica and Postgres used ~262 J, about 3% less. So the extra services add little energy per minute, but each one reserves memory and limits how many previews fit on a node.
+    - **Fix:** drop the `scale` line and set `replicas: 1` in the manifest. Start the og-image worker and Redis only if the preview needs them.
+    - **Impact:** M, more previews per node.
+
+    **Already good:** images are tagged by commit SHA, and `create namespace --dry-run | apply` is idempotent, so re-runs are safe.
+verify:
+  static_only: GitHub Actions workflow that needs a Kubernetes cluster and registry credentials

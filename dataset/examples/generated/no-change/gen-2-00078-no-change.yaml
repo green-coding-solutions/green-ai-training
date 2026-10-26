@@ -1,0 +1,59 @@
+id: gen-2-00078-no-change
+category: no-change
+language: bash
+patterns:
+- bash-builtins
+- context-tradeoff
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    hi, i made this script for our webshop. cron runs it every hour and it checks the inventory export (about 3000 products) and writes a list of products that are low or out of stock. it works fine.
+
+    but my colleague looked at it and said "bash loops with $( ) are super slow, you should rewrite it in awk". i dont really understand what is wrong with it?? i have $( ) in there two times. do i need to rewrite it?
+
+    ```bash
+    #!/usr/bin/env bash
+    # low-stock report for the shop, cron runs it every hour
+    set -euo pipefail
+
+    file=${1:-/srv/shop/export/inventory.csv}
+    outdir=/srv/shop/reports
+    stamp=$(date '+%Y-%m-%d %H:%M')
+    outfile="$outdir/low-stock-$(date +%F).txt"
+
+    checked=0
+    low=0
+    out_of_stock=0
+
+    {
+      read -r _   # skip header: sku,qty,reorder_level,name
+      while IFS=, read -r sku qty reorder name; do
+        [[ $qty =~ ^[0-9]+$ && $reorder =~ ^[0-9]+$ ]] || continue
+        checked=$((checked + 1))
+        if (( qty == 0 )); then
+          out_of_stock=$((out_of_stock + 1))
+          printf '%s\tOUT\t%s\n' "$sku" "$name"
+        elif (( qty < reorder )); then
+          low=$((low + 1))
+          printf '%s\tLOW (%d/%d)\t%s\n' "$sku" "$qty" "$reorder" "$name"
+        fi
+      done
+    } < "$file" > "$outfile"
+
+    printf '%s checked=%d low=%d out=%d\n' "$stamp" "$checked" "$low" "$out_of_stock" >> "$outdir/low-stock.log"
+    ```
+- role: assistant
+  content: |
+    Nothing is wrong with it. You don't need to rewrite it. Your colleague is describing a real problem, but your script doesn't have it.
+
+    - **Your `$( )` calls run once, not once per line.** Both `date` calls are outside the loop, so each run starts two processes, whether the file has 3,000 lines or 300,000. The slow pattern is command substitution *inside* the loop, like `qty=$(echo "$line" | cut -d, -f2)`. That starts new processes for every line.
+    - **The loop uses only builtins.** `IFS=, read -r` splits the fields, `(( ))` and `$(( ))` do the math, `[[ =~ ]]` checks the input, and `printf` writes the output. None of these start a process.
+    - **For scale:** in Green Metrics Tool micro-benchmarks on a 20,000-line access log, a loop that ran `$(echo | cut)` and `$(expr)` for every field used ~1302 J. The same loop with builtins only used ~4.3 J, about 300× less. Your script is already the cheap version.
+
+    **Why I wouldn't switch to awk here:** in the same benchmark, one `awk` pass used about 4× less than the builtin loop. That is the next step for big files. But at about 3,000 lines per hour, the absolute difference is small. A script you understand and can maintain is worth more here. Consider awk if the export grows to hundreds of thousands of lines or the job runs much more often. You can check the cost yourself with `time ./low-stock.sh`.
+
+    One small detail that you already handle well: putting `name` last in `read` means product names that contain commas still end up whole in `$name`.
+verify:
+  static_only: bash script that reads a cron-generated inventory export; no change proposed

@@ -1,0 +1,112 @@
+id: gen-2-00012-generation
+category: generation
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    ```python
+    # api/search.py
+    from flask import Blueprint, jsonify, request
+
+    from .db import search_tickets
+
+    bp = Blueprint("search", __name__)
+
+    FILTER_FIELDS = {"status", "assignee", "tag", "priority"}
+
+
+    def parse_query(q: str) -> dict:
+        """Split a search box string into filters and free text.
+
+        'status:open tag:billing "refund failed" -spam printer'
+        -> {"filters": {"status": ["open"], "tag": ["billing"]},
+            "phrases": ["refund failed"],
+            "exclude": ["spam"],
+            "terms": ["printer"]}
+
+        Unknown fields (foo:bar) are treated as plain terms.
+        Field names are case-insensitive, values keep their case.
+        """
+        raise NotImplementedError
+
+
+    @bp.get("/api/tickets/search")
+    def search():
+        q = request.args.get("q", "")
+        if len(q) > 500:
+            return jsonify(error="query too long"), 400
+        parsed = parse_query(q)
+        return jsonify(results=search_tickets(**parsed))
+    ```
+
+    ?
+- role: assistant
+  content: |
+    Here is `parse_query`. It replaces the stub. The rest of the module stays the same.
+
+    ```python
+    import re
+
+    FILTER_FIELDS = {"status", "assignee", "tag", "priority"}
+
+    # Compiled once at import time and reused by every request.
+    _TOKEN_RE = re.compile(
+        r'"(?P<phrase>[^"]*)"'                   # "exact phrase"
+        r'|(?P<field>[A-Za-z_]+):(?P<value>\S+)'  # field:value
+        r'|(?P<word>\S+)'                         # word or -word
+    )
+
+
+    def parse_query(q: str) -> dict:
+        filters, phrases, exclude, terms = {}, [], [], []
+        for m in _TOKEN_RE.finditer(q):
+            phrase = m.group("phrase")
+            if phrase is not None:
+                if phrase.strip():
+                    phrases.append(phrase.strip())
+            elif m.group("field") is not None:
+                field = m.group("field").lower()
+                if field in FILTER_FIELDS:
+                    filters.setdefault(field, []).append(m.group("value"))
+                else:
+                    terms.append(m.group(0))
+            else:
+                word = m.group("word")
+                if word.startswith("-") and len(word) > 1:
+                    exclude.append(word[1:])
+                else:
+                    terms.append(word)
+        return {"filters": filters, "phrases": phrases, "exclude": exclude, "terms": terms}
+    ```
+
+    Edge cases: empty quotes `""` are ignored. A quote with no closing match is not a phrase, so `"refund failed` becomes the terms `"refund` and `failed`. `-status:closed` becomes the excluded word `status:closed`.
+
+    **Green Notes**
+    - **Compile regex once, outside the request path** (reduces E): the pattern is compiled at import, so each request only runs the matcher. The gain is small, because Python's `re` already caches compiled patterns. In Green Metrics Tool micro-benchmarks, 1,000,000 matches used ~21 J with inline `re.match` and ~18 J with a precompiled pattern, about 18% less.
+    - **One static pattern, not one built from data** (reduces E): the field names are checked against `FILTER_FIELDS` after matching. They are never joined into the pattern. Patterns built per call can miss the cache and get recompiled. In the same benchmarks, forcing a recompile on every call cost about 200× more per match.
+verify:
+  test: |-
+    assert parse_query('status:open tag:billing "refund failed" -spam printer') == {
+        "filters": {"status": ["open"], "tag": ["billing"]},
+        "phrases": ["refund failed"],
+        "exclude": ["spam"],
+        "terms": ["printer"],
+    }
+    assert parse_query("Status:Open foo:bar") == {
+        "filters": {"status": ["Open"]},
+        "phrases": [],
+        "exclude": [],
+        "terms": ["foo:bar"],
+    }
+    r = parse_query('tag:a tag:b -x - ""')
+    assert r["filters"] == {"tag": ["a", "b"]}
+    assert r["exclude"] == ["x"]
+    assert r["terms"] == ["-"]
+    assert r["phrases"] == []
+    assert parse_query("") == {"filters": {}, "phrases": [], "exclude": [], "terms": []}
+    assert parse_query('"refund failed')["terms"] == ['"refund', "failed"]
+    assert parse_query("-status:closed")["exclude"] == ["status:closed"]

@@ -1,0 +1,142 @@
+id: gen-2-00361-estimate
+category: estimate
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import csv
+    import json
+    import logging
+    import urllib.request
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    # Platform team wants a number before we touch this:
+    # how many kWh per year would we save if fetch_all() went async?
+    # Runs hourly from cron on the shared ETL VM.
+
+    STATIONS_URL = "https://opendata.example-city.org/api/v2/stations/{id}/latest"
+    STATION_IDS = [
+        "AQ-001", "AQ-002", "AQ-004", "AQ-007", "AQ-009", "AQ-011",
+        "AQ-012", "AQ-015", "AQ-018", "AQ-021", "AQ-022", "AQ-025",
+        "AQ-027", "AQ-030", "AQ-031", "AQ-034", "AQ-036", "AQ-040",
+        "AQ-041", "AQ-043", "AQ-047", "AQ-050", "AQ-052", "AQ-055",
+    ]
+    OUT_DIR = Path("/srv/etl/airquality")
+    TIMEOUT = 10
+    FIELDS = ["station", "ts", "pm25", "pm10", "no2"]
+
+    log = logging.getLogger("aq_ingest")
+
+
+    def fetch_station(station_id):
+        url = STATIONS_URL.format(id=station_id)
+        with urllib.request.urlopen(url, timeout=TIMEOUT) as resp:
+            return json.load(resp)
+
+
+    def fetch_all():
+        results = {}
+        for sid in STATION_IDS:
+            try:
+                results[sid] = fetch_station(sid)
+            except Exception as exc:
+                log.warning("station %s failed: %s", sid, exc)
+        return results
+
+
+    def normalize(sid, payload):
+        m = payload.get("measurements", {})
+        return {
+            "station": sid,
+            "ts": payload.get("timestamp"),
+            "pm25": m.get("pm25"),
+            "pm10": m.get("pm10"),
+            "no2": m.get("no2"),
+        }
+
+
+    def write_csv(rows):
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H")
+        path = OUT_DIR / f"aq_{stamp}.csv"
+        with path.open("w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=FIELDS)
+            w.writeheader()
+            w.writerows(rows)
+        return path
+
+
+    def main():
+        logging.basicConfig(level=logging.INFO)
+        data = fetch_all()
+        rows = [normalize(sid, p) for sid, p in data.items()]
+        path = write_csv(rows)
+        log.info("wrote %d rows to %s", len(rows), path)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    I can't give you a reliable kWh figure. It depends on your VM, the API latency and what else runs on that machine. What I can give you is the measured direction and a way to get your own number.
+
+    **What was measured.** In Green Metrics Tool micro-benchmarks, 10 HTTP requests took ~9.1 J and 3.1 s with sync `urllib`, and ~8.4 J and 2.6 s with async `httpx`. That is about 7% less CPU energy and about 17% less wall time. With small request counts like this, async mostly saves time, not energy.
+
+    **Why it is similar for your job.**
+    - `fetch_all()` makes 24 requests one after another. Most of that time the CPU waits for the network and does little work.
+    - Async overlaps those waits, so the run finishes sooner. Parsing JSON, normalizing and writing the CSV stay the same work.
+    - The ETL VM is shared and always on. A shorter run does not switch it off, so the machine-level saving is smaller than the wall-time saving.
+
+    So the honest answer for the platform team: expect clearly faster runs and a small CPU energy change. The change is still small and low-risk, so it is fine to do if faster runs help you:
+
+    ```python
+    import asyncio
+
+    import httpx
+
+
+    async def fetch_station(client, station_id):
+        resp = await client.get(STATIONS_URL.format(id=station_id))
+        resp.raise_for_status()  # urlopen also raises on 4xx/5xx
+        return resp.json()
+
+
+    async def fetch_all():
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            payloads = await asyncio.gather(
+                *(fetch_station(client, sid) for sid in STATION_IDS),
+                return_exceptions=True,
+            )
+        results = {}
+        for sid, payload in zip(STATION_IDS, payloads):
+            if isinstance(payload, Exception):
+                log.warning("station %s failed: %s", sid, payload)
+            else:
+                results[sid] = payload
+        return results
+
+
+    def main():
+        logging.basicConfig(level=logging.INFO)
+        data = asyncio.run(fetch_all())
+        rows = [normalize(sid, p) for sid, p in data.items()]
+        path = write_csv(rows)
+        log.info("wrote %d rows to %s", len(rows), path)
+    ```
+
+    Behavior stays the same. Rows keep the `STATION_IDS` order, and failed stations are still logged and skipped. All 24 requests now go out at once. Check that the open data API does not rate-limit that.
+
+    **How to get your number:**
+    - Best: a Green Metrics Tool usage scenario that runs one ingest cycle. Run it once with each version, ideally against a local stub of the API so network latency doesn't vary between runs.
+    - Quick proxy on the VM: `perf stat -e power/energy-pkg/ python aq_ingest.py` (needs RAPL access), or `/usr/bin/time -v` for CPU time and wall time. Repeat each version several times and compare the medians.
+    - The yearly figure is your measured per-run difference times your runs per year. Don't scale the benchmark numbers above to your job.
+verify:
+  static_only: needs network access and the httpx package

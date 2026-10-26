@@ -1,0 +1,198 @@
+id: gen-2-00084-refactor
+category: refactor
+language: python
+patterns:
+- memoize
+- select-columns
+facts:
+- F-LRU
+- F-PG-SELECT
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import argparse
+    import csv
+    import sqlite3
+    import sys
+    from collections import defaultdict
+
+    # builds(id, project, branch, sha, runner_label, started_at, duration_s,
+    #        status, log_tail, junit_xml, env_json)  -- filled by the webhook receiver
+
+    # cents per runner-minute for 2 cores
+    BASE_RATES = {"linux": 0.8, "windows": 1.6, "macos": 8.0}
+    ARCH_FACTOR = {"x64": 1.0, "arm64": 0.85}
+    GPU_SURCHARGE = 7.0
+
+
+    def runner_rate(label):
+        """'linux-arm64-8core-gpu' -> cents per minute"""
+        parts = label.strip().lower().split("-")
+        os_name = parts[0]
+        arch = "x64"
+        cores = 2
+        gpu = False
+        for part in parts[1:]:
+            if part in ARCH_FACTOR:
+                arch = part
+            elif part.endswith("core") and part[:-4].isdigit():
+                cores = int(part[:-4])
+            elif part == "gpu":
+                gpu = True
+        rate = BASE_RATES[os_name] * ARCH_FACTOR[arch] * cores / 2
+        if gpu:
+            rate += GPU_SURCHARGE
+        return rate
+
+
+    def costs_by_project(conn, month):
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM builds WHERE started_at LIKE ? ORDER BY id",
+            (month + "%",),
+        )
+        costs = defaultdict(float)
+        minutes = defaultdict(float)
+        for row in rows:
+            mins = row["duration_s"] / 60
+            costs[row["project"]] += runner_rate(row["runner_label"]) * mins
+            minutes[row["project"]] += mins
+        return costs, minutes
+
+
+    def main():
+        parser = argparse.ArgumentParser(description="Monthly CI runner chargeback")
+        parser.add_argument("db")
+        parser.add_argument("month", help="YYYY-MM")
+        args = parser.parse_args()
+
+        conn = sqlite3.connect(args.db)
+        costs, minutes = costs_by_project(conn, args.month)
+        writer = csv.writer(sys.stdout)
+        writer.writerow(["project", "minutes", "cost_eur"])
+        for project in sorted(costs):
+            writer.writerow([project, round(minutes[project], 1), round(costs[project] / 100, 2)])
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    ```python
+    import argparse
+    import csv
+    import sqlite3
+    import sys
+    from collections import defaultdict
+    from functools import lru_cache
+
+    # builds(id, project, branch, sha, runner_label, started_at, duration_s,
+    #        status, log_tail, junit_xml, env_json)  -- filled by the webhook receiver
+
+    # cents per runner-minute for 2 cores
+    BASE_RATES = {"linux": 0.8, "windows": 1.6, "macos": 8.0}
+    ARCH_FACTOR = {"x64": 1.0, "arm64": 0.85}
+    GPU_SURCHARGE = 7.0
+
+
+    @lru_cache(maxsize=256)
+    def runner_rate(label):
+        """'linux-arm64-8core-gpu' -> cents per minute"""
+        parts = label.strip().lower().split("-")
+        os_name = parts[0]
+        arch = "x64"
+        cores = 2
+        gpu = False
+        for part in parts[1:]:
+            if part in ARCH_FACTOR:
+                arch = part
+            elif part.endswith("core") and part[:-4].isdigit():
+                cores = int(part[:-4])
+            elif part == "gpu":
+                gpu = True
+        rate = BASE_RATES[os_name] * ARCH_FACTOR[arch] * cores / 2
+        if gpu:
+            rate += GPU_SURCHARGE
+        return rate
+
+
+    def costs_by_project(conn, month):
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT project, runner_label, duration_s FROM builds "
+            "WHERE started_at LIKE ? ORDER BY id",
+            (month + "%",),
+        )
+        costs = defaultdict(float)
+        minutes = defaultdict(float)
+        for row in rows:
+            mins = row["duration_s"] / 60
+            costs[row["project"]] += runner_rate(row["runner_label"]) * mins
+            minutes[row["project"]] += mins
+        return costs, minutes
+
+
+    def main():
+        parser = argparse.ArgumentParser(description="Monthly CI runner chargeback")
+        parser.add_argument("db")
+        parser.add_argument("month", help="YYYY-MM")
+        args = parser.parse_args()
+
+        conn = sqlite3.connect(args.db)
+        costs, minutes = costs_by_project(conn, args.month)
+        writer = csv.writer(sys.stdout)
+        writer.writerow(["project", "minutes", "cost_eur"])
+        for project in sorted(costs):
+            writer.writerow([project, round(minutes[project], 1), round(costs[project] / 100, 2)])
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **Select only the needed columns** (reduces E): the loop uses three columns. `SELECT *` also read `log_tail`, `junit_xml` and `env_json` for every build of the month, and those text columns are likely most of each row. In Green Metrics Tool micro-benchmarks on PostgreSQL, reading 2,500 rows 1,000 times from a 52-column table with large text columns used about 7× less CPU energy with the 10 needed columns than with `SELECT *`. The saving grows with the size of the columns you skip.
+    - **Memoize `runner_rate`** (reduces E): it runs once per build, but you only have a handful of distinct runner labels. Now each label is parsed once per run. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations with inputs from only 200 distinct values used about 9× less CPU energy with `lru_cache`. This only pays off because labels repeat. `maxsize` keeps the cache bounded if the label set grows.
+
+    The CSV output is identical. Unknown labels still raise `KeyError`, because exceptions are not cached. The cache assumes the rate tables don't change while the process runs. If a test patches them, call `runner_rate.cache_clear()`.
+verify:
+  module: true
+  test: |
+    import sqlite3
+    assert hasattr(runner_rate, "cache_info")
+    assert runner_rate("linux-x64") == 0.8
+    assert abs(runner_rate("linux-arm64-8core-gpu") - (0.8 * 0.85 * 4 + 7.0)) < 1e-9
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE builds (id INTEGER PRIMARY KEY, project TEXT, runner_label TEXT, started_at TEXT, duration_s INTEGER, log_tail TEXT)")
+    conn.execute("INSERT INTO builds VALUES (1, 'api', 'linux-x64', '2026-09-01T10:00:00', 120, 'log')")
+    seen = []
+    conn.set_trace_callback(seen.append)
+    costs, minutes = costs_by_project(conn, "2026-09")
+    assert "*" not in seen[0]
+    assert costs["api"] == 1.6 and minutes["api"] == 2.0
+  equivalence:
+    driver: |-
+      conn = sqlite3.connect(":memory:")
+      conn.execute(
+          "CREATE TABLE builds (id INTEGER PRIMARY KEY, project TEXT, branch TEXT, sha TEXT, "
+          "runner_label TEXT, started_at TEXT, duration_s INTEGER, status TEXT, "
+          "log_tail TEXT, junit_xml TEXT, env_json TEXT)"
+      )
+      labels = ["linux-x64", "linux-arm64-8core", "windows-x64-4core", "macos-arm64", "Linux-x64-16core-gpu"]
+      projects = ["api", "web", "infra"]
+      for i in range(300):
+          conn.execute(
+              "INSERT INTO builds (project, branch, sha, runner_label, started_at, duration_s, "
+              "status, log_tail, junit_xml, env_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
+              (projects[i % 3], "main", "%040x" % i, labels[i % 5],
+               "2026-0%d-%02dT10:00:00" % (8 + i % 2, 1 + i % 28),
+               30 + (i * 37) % 900, "success", "x" * 2000, "<testsuite/>", "{}"),
+          )
+      costs, minutes = costs_by_project(conn, "2026-09")
+      for p in sorted(costs):
+          print(p, round(minutes[p], 4), round(costs[p], 4))
+      print(runner_rate("macos-arm64"), runner_rate("windows-x64-4core"))

@@ -1,0 +1,67 @@
+id: gen-12764612-00243-generation
+category: generation
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    hi, I am new to python and not sure I do this right. we have a small gateway (raspberry pi) in a greenhouse. 40 sensor boards send raw 12-bit ADC numbers (0 to 4095) over serial, one reading per second each. the sensors are NTC thermistors (10k, beta 3950) in a voltage divider with a 10k resistor, thermistor on the bottom. I need a function that turns the raw number into celsius. my first try uses math.log and feels heavy for the pi, is there a better way to write it?
+- role: assistant
+  content: |
+    A 12-bit reading can only be one of 4096 values, so each conversion needs to be computed once. After that it comes from a cache.
+
+    ```python
+    import math
+    from functools import lru_cache
+
+    ADC_MAX = 4095       # 12-bit ADC
+    R_FIXED = 10_000.0   # divider resistor, ohms
+    R_NOMINAL = 10_000.0 # thermistor resistance at 25 C
+    T_NOMINAL = 298.15   # 25 C in kelvin
+    BETA = 3950.0
+
+
+    @lru_cache(maxsize=ADC_MAX + 1)
+    def raw_to_celsius(raw: int) -> float:
+        """Convert a raw 12-bit ADC reading to degrees Celsius."""
+        if not 0 < raw < ADC_MAX:
+            raise ValueError(f"raw value {raw} out of range, sensor may be disconnected")
+        # thermistor is on the bottom of the divider
+        resistance = R_FIXED * raw / (ADC_MAX - raw)
+        inv_kelvin = 1.0 / T_NOMINAL + math.log(resistance / R_NOMINAL) / BETA
+        return 1.0 / inv_kelvin - 273.15
+
+
+    if __name__ == "__main__":
+        for raw in (1500, 2048, 2600):
+            print(raw, round(raw_to_celsius(raw), 2))
+    ```
+
+    Call it with an `int`, for example `raw_to_celsius(int(line))`. Readings of exactly 0 or 4095 mean a shorted or disconnected sensor, so they raise an error instead of dividing by zero. Errors are not cached.
+
+    **Green Notes**
+    - **Memoize repeated pure computations** (reduces E): the result depends only on `raw`, and there are at most 4096 inputs, so the cache stays small and nearly every call after the first few minutes is a hit. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over 200 distinct inputs used ~43 J uncached and ~4.7 J with `lru_cache`, about 9× less.
+
+    *Not applied:* a hand-made lookup table. `lru_cache` fills itself and the formula stays in one place.
+
+    This only helps because the inputs repeat. If you later average several readings into a float and convert that, almost every value is new, and the cache would just add overhead. In that case remove the decorator.
+verify:
+  module: true
+  test: |-
+    assert abs(raw_to_celsius(2048) - 25.0) < 0.2
+    assert raw_to_celsius(1500) > raw_to_celsius(2600)
+    raw_to_celsius.cache_clear()
+    a = raw_to_celsius(2048)
+    b = raw_to_celsius(2048)
+    assert a == b
+    assert raw_to_celsius.cache_info().hits == 1
+    for bad in (0, 4095):
+        try:
+            raw_to_celsius(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError")

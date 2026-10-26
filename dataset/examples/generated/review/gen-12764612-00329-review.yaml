@@ -1,0 +1,116 @@
+id: gen-12764612-00329-review
+category: review
+language: python
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    ```python
+    import re
+    import psycopg
+
+    LINE_RE = re.compile(
+        r'(\S+) \S+ \S+ \[([^\]]+)\] "(\S+) (\S+) [^"]*" (\d{3}) (\d+|-)'
+    )
+
+    def load_access_log(path, dsn):
+        conn = psycopg.connect(dsn)
+        cur = conn.cursor()
+        bad = 0
+        with open(path) as f:
+            for line in f:
+                m = LINE_RE.match(line)
+                if not m:
+                    bad += 1
+                    continue
+                ip, ts, method, url, status, size = m.groups()
+                size = 0 if size == '-' else int(size)
+                cur.execute(
+                    f"INSERT INTO access_log (ip, ts, method, url, status, bytes) "
+                    f"VALUES ('{ip}', to_timestamp('{ts}', 'DD/Mon/YYYY:HH24:MI:SS TZHTZM'), "
+                    f"'{method}', '{url}', {status}, {size})"
+                )
+                conn.commit()
+        print(f"done, {bad} unparsable lines skipped")
+
+    if __name__ == "__main__":
+        import sys
+        load_access_log(sys.argv[1], sys.argv[2])
+    ```
+
+    ?
+- role: assistant
+  content: |
+    **Workload:** data pipeline (log loading)
+
+    #### [Security] SQL injection through the log content
+    - **Where:** the f-string passed to `cur.execute(...)`
+    - **Issue:** `url` and `method` come from client requests. A request path containing a `'` breaks the statement. A crafted one can run its own SQL. Log files are untrusted input.
+    - **Fix:** never build SQL from values. Pass them as parameters, or stream them through `COPY` as shown below.
+
+    #### [High] One INSERT and one commit per row
+    - **Where:** the `cur.execute(...)` and `conn.commit()` inside the `for line in f` loop
+    - **Issue:** every log line costs one statement round trip and one commit. A log file with millions of lines means millions of both. Per-row overhead dominates the work.
+    - **Fix:** parse in Python, collect rows, and write each batch of a few thousand rows with one `COPY ... FROM STDIN` and one commit.
+    - **Impact:** reduces E and run time for every line loaded. In Green Metrics Tool micro-benchmarks, inserting 500,000 rows in batches of 5,000 rows took ~384 J and 60 s with one `execute()` per row. `COPY` took ~17 J and 3.1 s, about 22× less. The gap is small for batches of only ~100 rows, but a log file gives you big batches.
+
+    ```python
+    import re
+    import sys
+    from datetime import datetime
+
+    import psycopg
+
+    LINE_RE = re.compile(
+        r'(\S+) \S+ \S+ \[([^\]]+)\] "(\S+) (\S+) [^"]*" (\d{3}) (\d+|-)'
+    )
+    TS_FORMAT = "%d/%b/%Y:%H:%M:%S %z"
+    COPY_SQL = "COPY access_log (ip, ts, method, url, status, bytes) FROM STDIN"
+    BATCH_SIZE = 5000
+
+    def write_batch(conn, rows):
+        with conn.cursor() as cur, cur.copy(COPY_SQL) as copy:
+            for row in rows:
+                copy.write_row(row)
+        conn.commit()
+
+    def load_access_log(path, dsn):
+        bad = 0
+        rows = []
+        with psycopg.connect(dsn) as conn, open(path) as f:
+            for line in f:
+                m = LINE_RE.match(line)
+                if not m:
+                    bad += 1
+                    continue
+                ip, ts, method, url, status, size = m.groups()
+                rows.append((
+                    ip,
+                    datetime.strptime(ts, TS_FORMAT),
+                    method,
+                    url,
+                    int(status),
+                    0 if size == '-' else int(size),
+                ))
+                if len(rows) >= BATCH_SIZE:
+                    write_batch(conn, rows)
+                    rows.clear()
+            if rows:
+                write_batch(conn, rows)
+        print(f"done, {bad} unparsable lines skipped")
+
+    if __name__ == "__main__":
+        load_access_log(sys.argv[1], sys.argv[2])
+    ```
+
+    Behavior notes:
+    - Commits now happen per 5,000 rows. If the job fails midway, you keep the batches already committed, not every row up to the failure.
+    - `COPY` is not an upsert. A duplicate key stops the batch. If you re-run on the same file, add a unique key and load into a staging table first.
+    - The connection is now closed by the `with` block. The old code never closed it.
+
+    **Already good:** the file is read line by line, so memory stays flat. Unparsable lines are skipped and counted.
+verify:
+  static_only: needs a running PostgreSQL server and psycopg

@@ -1,0 +1,276 @@
+id: gen-2-00328-generation
+category: generation
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    hi, we sell a log search product (our UI + ClickHouse + a ingest worker). sales team want a demo enviroment on our k8s cluster (1.29) for customer calls. they only use it monday-friday in office hours, Berlin time, aprox 8 to 18.
+
+    Images:
+    - registry.example.com/logsearch-ui:2.4 (port 8080, needs CLICKHOUSE_URL and CLICKHOUSE_PASSWORD)
+    - registry.example.com/logsearch-ingest:2.4 (generates fake nginx + app logs and write them to clickhouse, needs same env vars)
+    - clickhouse/clickhouse-server:24.8
+
+    the demo data should not be lost between days. password for clickhouse is in existing secret `clickhouse-auth` (key `password`). ingress we do ourself, just need the services. namespace `logsearch-demo`. can you write the manifests?
+- role: assistant
+  content: |
+    Here are the manifests. They include two CronJobs that put the demo to sleep in the evening and wake it up before office hours.
+
+    ```yaml
+    apiVersion: v1
+    kind: Namespace
+    metadata:
+      name: logsearch-demo
+    ---
+    apiVersion: apps/v1
+    kind: StatefulSet
+    metadata:
+      name: clickhouse
+      namespace: logsearch-demo
+    spec:
+      serviceName: clickhouse
+      replicas: 1
+      selector:
+        matchLabels:
+          app: clickhouse
+      template:
+        metadata:
+          labels:
+            app: clickhouse
+        spec:
+          containers:
+            - name: clickhouse
+              image: clickhouse/clickhouse-server:24.8
+              ports:
+                - name: http
+                  containerPort: 8123
+                - name: native
+                  containerPort: 9000
+              env:
+                - name: CLICKHOUSE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: clickhouse-auth
+                      key: password
+              resources:
+                requests:
+                  cpu: 250m
+                  memory: 1Gi
+                limits:
+                  memory: 2Gi
+              volumeMounts:
+                - name: data
+                  mountPath: /var/lib/clickhouse
+      volumeClaimTemplates:
+        - metadata:
+            name: data
+          spec:
+            accessModes: [ReadWriteOnce]
+            resources:
+              requests:
+                storage: 10Gi
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: clickhouse
+      namespace: logsearch-demo
+    spec:
+      selector:
+        app: clickhouse
+      ports:
+        - name: http
+          port: 8123
+        - name: native
+          port: 9000
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: logsearch-ingest
+      namespace: logsearch-demo
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: logsearch-ingest
+      template:
+        metadata:
+          labels:
+            app: logsearch-ingest
+        spec:
+          containers:
+            - name: ingest
+              image: registry.example.com/logsearch-ingest:2.4
+              env:
+                - name: CLICKHOUSE_URL
+                  value: http://clickhouse:8123
+                - name: CLICKHOUSE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: clickhouse-auth
+                      key: password
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  memory: 256Mi
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: logsearch-ui
+      namespace: logsearch-demo
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: logsearch-ui
+      template:
+        metadata:
+          labels:
+            app: logsearch-ui
+        spec:
+          containers:
+            - name: ui
+              image: registry.example.com/logsearch-ui:2.4
+              ports:
+                - containerPort: 8080
+              env:
+                - name: CLICKHOUSE_URL
+                  value: http://clickhouse:8123
+                - name: CLICKHOUSE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: clickhouse-auth
+                      key: password
+              readinessProbe:
+                tcpSocket:
+                  port: 8080
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  memory: 512Mi
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: logsearch-ui
+      namespace: logsearch-demo
+    spec:
+      selector:
+        app: logsearch-ui
+      ports:
+        - name: http
+          port: 80
+          targetPort: 8080
+    ---
+    # Sleep / wake schedule (Mon-Fri 07:30-19:00 Berlin time)
+    apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: demo-scaler
+      namespace: logsearch-demo
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: Role
+    metadata:
+      name: demo-scaler
+      namespace: logsearch-demo
+    rules:
+      - apiGroups: [apps]
+        resources: [deployments, statefulsets]
+        verbs: [get, list]
+      - apiGroups: [apps]
+        resources: [deployments/scale, statefulsets/scale]
+        verbs: [get, update, patch]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata:
+      name: demo-scaler
+      namespace: logsearch-demo
+    subjects:
+      - kind: ServiceAccount
+        name: demo-scaler
+        namespace: logsearch-demo
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: Role
+      name: demo-scaler
+    ---
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata:
+      name: demo-sleep
+      namespace: logsearch-demo
+    spec:
+      schedule: "0 19 * * 1-5"
+      timeZone: Europe/Berlin
+      concurrencyPolicy: Forbid
+      jobTemplate:
+        spec:
+          backoffLimit: 2
+          template:
+            spec:
+              serviceAccountName: demo-scaler
+              restartPolicy: OnFailure
+              containers:
+                - name: kubectl
+                  image: bitnami/kubectl:latest  # pin a tag close to your cluster version
+                  args:
+                    - --namespace=logsearch-demo
+                    - scale
+                    - deployment,statefulset
+                    - --all
+                    - --replicas=0
+    ---
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata:
+      name: demo-wake
+      namespace: logsearch-demo
+    spec:
+      schedule: "30 7 * * 1-5"
+      timeZone: Europe/Berlin
+      concurrencyPolicy: Forbid
+      jobTemplate:
+        spec:
+          backoffLimit: 2
+          template:
+            spec:
+              serviceAccountName: demo-scaler
+              restartPolicy: OnFailure
+              containers:
+                - name: kubectl
+                  image: bitnami/kubectl:latest  # pin a tag close to your cluster version
+                  args:
+                    - --namespace=logsearch-demo
+                    - scale
+                    - deployment,statefulset
+                    - --all
+                    - --replicas=1
+    ```
+
+    For a late customer call, sales can wake it up by hand:
+
+    ```bash
+    kubectl -n logsearch-demo scale deployment,statefulset --all --replicas=1
+    ```
+
+    **Green Notes**
+    - **Scale to zero outside office hours** (reduces E and M): the demo runs about 58 of 168 hours a week instead of all of them. Friday's sleep job lasts until Monday's wake job, so weekends are covered too. In Green Metrics Tool measurements of an idle preview environment, extra services added only about 3% CPU energy. The idle baseline dominates, so the real saving is the hours the environment does not run.
+    - **One replica per component** (reduces M): a demo has no high-availability need. Fewer pods reserve less memory and node capacity.
+    - **ClickHouse data on a PVC**: the volume stays when the StatefulSet scales to 0, so the demo data is still there the next morning. The ingest worker also stops at night, so the data does not grow while nobody uses it.
+    - The freed capacity only turns into fewer running machines if your cluster autoscaler can remove nodes, or if other workloads use it.
+
+    `timeZone` in CronJobs needs Kubernetes 1.27 or newer, so 1.29 is fine. The wake job sets every workload to 1 replica. If you later give a component more replicas, change the wake job to scale it by name.
+verify:
+  static_only: Kubernetes manifests, need a cluster to apply

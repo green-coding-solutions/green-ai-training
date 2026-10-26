@@ -1,0 +1,135 @@
+id: gen-1-00269-review
+category: review
+language: javascript
+patterns:
+- dom-size
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    Can you review this? It's the stock overview for our warehouse staff in the shop backend. Requirements: show all products with SKU, name, shelf location, quantity and reorder level, highlight rows where quantity is at or below the reorder level, and let people filter by typing. We have about 9,000 products now and the page gets slow when the data arrives, and typing in the filter field lags. Product names come from supplier feeds. I'd like feedback on anything that is wrong, not only speed.
+
+    ```javascript
+    // stock.js
+    async function loadStock() {
+      const res = await fetch('/api/stock');
+      const items = await res.json(); // [{sku, name, location, qty, reorderAt}]
+      const root = document.getElementById('stock-list');
+      root.innerHTML = '';
+
+      items.forEach(function (item) {
+        const row = document.createElement('div');
+        row.className = 'stock-row';
+        if (item.qty <= item.reorderAt) {
+          row.classList.add('low');
+        }
+        row.innerHTML =
+          '<div class="cell"><span class="sku">' + item.sku + '</span></div>' +
+          '<div class="cell"><span class="name">' + item.name + '</span></div>' +
+          '<div class="cell"><span class="loc">' + item.location + '</span></div>' +
+          '<div class="cell"><span class="qty">' + item.qty + '</span></div>' +
+          '<div class="cell"><span class="reorder">' + item.reorderAt + '</span></div>';
+        root.appendChild(row);
+      });
+
+      document.getElementById('stock-count').textContent = items.length + ' products';
+    }
+
+    document.getElementById('stock-filter').addEventListener('input', function (e) {
+      const q = e.target.value.toLowerCase();
+      document.querySelectorAll('.stock-row').forEach(function (row) {
+        row.style.display = row.textContent.toLowerCase().includes(q) ? '' : 'none';
+      });
+    });
+
+    loadStock();
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (internal admin page, client-side rendering)
+
+    #### [Security] Supplier data is inserted as HTML
+    - **Where:** the `row.innerHTML = ...` string
+    - **Issue:** `sku`, `name` and `location` are put into markup unescaped. A product name from a supplier feed that contains `<img onerror=...>` runs script in the admin session of whoever opens the page.
+    - **Fix:** set values with `textContent` (see the rewrite below). It never parses markup.
+
+    #### [Bug] Failed requests break the page without a message
+    - **Where:** `fetch('/api/stock')` followed directly by `res.json()`
+    - **Issue:** on a 500 or a 401 the body is usually an error object, so `items.forEach` throws and the staff sees an empty list with no explanation.
+    - **Fix:** check `res.ok` and show an error line.
+
+    #### [High] All rows are in the DOM, built one by one
+    - **Where:** `items.forEach(...)` with `root.appendChild(row)`, and the `querySelectorAll('.stock-row')` filter
+    - **Issue:** about 9,000 rows, each with a row element, wrapper `div`s and `span`s, are appended to the live document one at a time. The browser has to lay out and keep all of them, and the filter touches every row on every keystroke, which is why typing lags. In Green Metrics Tool micro-benchmarks, 30 page loads of a 10,000-row table built from 14 elements per row used ~1036 J. The same data paginated to 100 rows per page as a plain `<table>` built in a `DocumentFragment` used ~457 J, about 56% less. Nobody reads 9,000 rows at once, so staff lose nothing.
+    - **Fix:** keep the data in an array, filter the array, and render only one page of 100 rows as plain `<tr>`/`<td>`:
+      ```javascript
+      // stock.js
+      const PAGE_SIZE = 100;
+      let items = [];
+      let filtered = [];
+      let page = 0;
+
+      async function loadStock() {
+        const res = await fetch('/api/stock');
+        if (!res.ok) {
+          document.getElementById('stock-count').textContent = 'Could not load stock (' + res.status + ')';
+          return;
+        }
+        items = await res.json(); // [{sku, name, location, qty, reorderAt}]
+        applyFilter();
+      }
+
+      function applyFilter() {
+        const q = document.getElementById('stock-filter').value.trim().toLowerCase();
+        filtered = q
+          ? items.filter(function (i) {
+              return i.sku.toLowerCase().includes(q) ||
+                     i.name.toLowerCase().includes(q) ||
+                     i.location.toLowerCase().includes(q);
+            })
+          : items;
+        page = 0;
+        render();
+      }
+
+      function render() {
+        const frag = document.createDocumentFragment();
+        const start = page * PAGE_SIZE;
+        for (const item of filtered.slice(start, start + PAGE_SIZE)) {
+          const tr = document.createElement('tr');
+          if (item.qty <= item.reorderAt) {
+            tr.className = 'low';
+          }
+          for (const value of [item.sku, item.name, item.location, item.qty, item.reorderAt]) {
+            const td = document.createElement('td');
+            td.textContent = value;
+            tr.appendChild(td);
+          }
+          frag.appendChild(tr);
+        }
+        document.getElementById('stock-body').replaceChildren(frag);
+
+        const pages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+        document.getElementById('stock-count').textContent =
+          filtered.length + ' products, page ' + (page + 1) + ' of ' + pages;
+        document.getElementById('prev').disabled = page === 0;
+        document.getElementById('next').disabled = page >= pages - 1;
+      }
+
+      document.getElementById('stock-filter').addEventListener('input', applyFilter);
+      document.getElementById('prev').addEventListener('click', function () { page--; render(); });
+      document.getElementById('next').addEventListener('click', function () { page++; render(); });
+
+      loadStock();
+      ```
+      The page needs `<table><thead>…</thead><tbody id="stock-body"></tbody></table>` plus two buttons with the ids `prev` and `next`, and your `.low` style can stay as it is.
+    - **Impact:** E and M on the client. The DOM holds at most 100 rows instead of thousands, so load and typing stay fast. The filter now searches all products, not only the rows on screen.
+
+    #### Behavior changes to know about
+    - The filter matches SKU, name and location. Before, it also matched the quantity numbers, because it searched the whole row text.
+    - A new filter always goes back to page 1.
+
+    **Already good:** the low-stock rule `qty <= reorderAt` is simple and clear, and the data is fetched once instead of on every filter change.
+verify:
+  static_only: needs a browser DOM and the /api/stock endpoint

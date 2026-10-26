@@ -1,0 +1,102 @@
+id: gen-1-00021-review
+category: review
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import logging
+    import requests
+
+    log = logging.getLogger("vat")
+
+    VIES_URL = "https://vat-check.shop-internal.example/v1/check"
+
+
+    def validate_vat_ids(customers):
+        """Check the VAT ID of every B2B customer before invoices are created."""
+        results = {}
+        for c in customers:
+            try:
+                r = requests.get(
+                    VIES_URL,
+                    params={"country": c["country"], "vat": c["vat_id"]},
+                )
+                data = r.json()
+                results[c["id"]] = data.get("valid", False)
+            except:
+                results[c["id"]] = False
+        log.info("checked %d customers", len(results))
+        return results
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (batch job before invoicing)
+
+    #### [Bug] Failed checks are stored as "invalid VAT ID"
+    - **Where:** the bare `except:` and `results[c["id"]] = False`
+    - **Issue:** a timeout, a 500 or broken JSON becomes `False`, the same as a real "not valid" answer. Customers with a good VAT ID can then be invoiced with VAT. The bare `except:` also catches `KeyboardInterrupt` and hides the reason.
+    - **Fix:** catch only HTTP and JSON errors, log them, and return `None` for "could not check". Let the caller retry those later.
+
+    #### [Bug] No timeout on `requests.get`
+    - **Where:** the `requests.get(...)` call
+    - **Issue:** `requests` waits forever by default. One hung connection stalls the whole run.
+    - **Fix:** set a timeout (10 s below). Also call `raise_for_status()` so error pages are not parsed as answers.
+
+    #### [Medium] One request at a time
+    - **Where:** the `for c in customers` loop
+    - **Issue:** each check waits for the previous one. The run takes N × the latency of the service, and the process sits idle for almost all of that time. The checks are independent, so they can overlap.
+    - **Fix:** use `httpx.AsyncClient` with `asyncio.gather` and a semaphore to cap parallel requests. The public function stays synchronous.
+    - **Impact:** cuts wall time and the time the job holds the machine (E, M). In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. For small request counts the gain is mostly wall time. It grows with the number of customers. If you only checked a handful of IDs, the sync loop would be fine.
+
+    ```python
+    import asyncio
+    import logging
+
+    import httpx
+
+    log = logging.getLogger("vat")
+
+    VIES_URL = "https://vat-check.shop-internal.example/v1/check"
+    MAX_PARALLEL = 10
+
+
+    async def _check(client, sem, c):
+        async with sem:
+            try:
+                r = await client.get(
+                    VIES_URL,
+                    params={"country": c["country"], "vat": c["vat_id"]},
+                )
+                r.raise_for_status()
+                return c["id"], r.json().get("valid", False)
+            except (httpx.HTTPError, ValueError) as exc:
+                log.warning("VAT check failed for customer %s: %s", c["id"], exc)
+                return c["id"], None  # None = could not check
+
+
+    async def _validate_all(customers):
+        sem = asyncio.Semaphore(MAX_PARALLEL)
+        async with httpx.AsyncClient(timeout=10) as client:
+            pairs = await asyncio.gather(*(_check(client, sem, c) for c in customers))
+        return dict(pairs)
+
+
+    def validate_vat_ids(customers):
+        """Check the VAT ID of every B2B customer before invoices are created."""
+        results = asyncio.run(_validate_all(customers))
+        log.info("checked %d customers", len(results))
+        return results
+    ```
+
+    `asyncio.run` cannot be called from inside a running event loop. If this runs in an async app, call `_validate_all` directly. Check that the service allows 10 parallel requests, and lower `MAX_PARALLEL` if it does not.
+
+    **Already good:** one function with a clear job, and the result is a plain dict keyed by customer id.
+verify:
+  static_only: needs a live HTTP service and httpx

@@ -1,0 +1,89 @@
+id: gen-1-00173-review
+category: review
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import torch
+    import torch.nn as nn
+
+
+    class UpsellNet(nn.Module):
+        def __init__(self, n_features=24):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(n_features, 64),
+                nn.BatchNorm1d(64),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(64, 1),
+                nn.Sigmoid(),
+            )
+
+        def forward(self, x):
+            return self.net(x)
+
+
+    model = UpsellNet()
+    model.load_state_dict(torch.load("models/upsell.pt", map_location="cpu"))
+
+
+    def rank_upsells(cart_vec, candidates, top_k=3):
+        """cart_vec: 12 floats. candidates: list of (sku, 12 floats)."""
+        feats = torch.tensor(
+            [cart_vec + f for _, f in candidates], dtype=torch.float32
+        )
+        scores = model(feats).squeeze(1)
+        order = torch.argsort(scores, descending=True)[:top_k]
+        return [(candidates[i][0], float(scores[i])) for i in order]
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (one call per cart view, CPU inference)
+
+    #### [Bug] Model runs in training mode
+    - **Where:** `model = UpsellNet()` after `load_state_dict`, never `model.eval()`
+    - **Issue:** a new module starts in training mode. `Dropout` randomly zeroes inputs, so the same cart can get different rankings on each call. `BatchNorm1d` uses the statistics of the current batch and also updates its running statistics on every request. With a single candidate it raises an error ("expected more than 1 value per channel").
+    - **Fix:** call `model.eval()` once after loading the weights.
+
+    #### [High] Autograd graph built for every request
+    - **Where:** `scores = model(feats).squeeze(1)`
+    - **Issue:** outside `torch.no_grad()`, PyTorch records the graph for a backward pass that never happens. This is extra work and memory on every call.
+    - **Fix:** wrap the forward pass in `torch.no_grad()`. `torch.inference_mode()` also works.
+    - **Impact:** reduces E and M per request. In Green Metrics Tool micro-benchmarks of 100,000 PyTorch CPU inferences, `torch.no_grad()` used ~135 J against ~157 J without it, about 14% less. The saving is modest per call but applies to every cart view.
+
+    ```python
+    model = UpsellNet()
+    model.load_state_dict(torch.load("models/upsell.pt", map_location="cpu"))
+    model.eval()
+
+
+    def rank_upsells(cart_vec, candidates, top_k=3):
+        """cart_vec: 12 floats. candidates: list of (sku, 12 floats)."""
+        if not candidates:
+            return []
+        feats = torch.tensor(
+            [cart_vec + f for _, f in candidates], dtype=torch.float32
+        )
+        with torch.no_grad():
+            scores = model(feats).squeeze(1)
+        order = torch.argsort(scores, descending=True)[:top_k]
+        return [(candidates[i][0], float(scores[i])) for i in order]
+    ```
+
+    Scores will change slightly after the fix. That is expected, because they were noisy before.
+
+    #### [Low] Empty candidate list
+    - **Where:** `torch.tensor([...])` with no candidates
+    - **Issue:** an empty list gives a tensor of the wrong shape, and the model call fails. The guard in the snippet returns `[]` instead.
+
+    **Already good:** the model is loaded once at import, not per request. Features are built in one batch, not one forward pass per candidate.
+verify:
+  static_only: needs torch, which is not available in the stdlib + numpy test environment

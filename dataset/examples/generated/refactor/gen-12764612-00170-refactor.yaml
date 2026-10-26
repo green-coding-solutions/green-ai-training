@@ -1,0 +1,76 @@
+id: gen-12764612-00170-refactor
+category: refactor
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    Hello, we have a script on our game server what move the rotated logs to archive folder. It run every 2 hours from cron and the CPU is high when it run. Can you make it better please? I think the bzip2 is the problem but I am not sure
+
+    ```bash
+    #!/bin/bash
+    # archive rotated gameserver logs
+
+    LOG_DIR="/var/log/gamesrv"
+    ARCHIVE_DIR="/srv/archive/gamesrv"
+    KEEP_DAYS=21
+
+    mkdir -p "$ARCHIVE_DIR"
+
+    for f in "$LOG_DIR"/*.log.1; do
+      [ -e "$f" ] || continue
+      name=$(basename "$f" .log.1)
+      stamp=$(date +%Y%m%d-%H%M)
+      out="$ARCHIVE_DIR/$name-$stamp.log.bz2"
+
+      bzip2 -9 -c "$f" > "$out"
+      if bzip2 -t "$out"; then
+        rm -f "$f"
+      else
+        echo "compress failed for $f" >&2
+      fi
+    done
+
+    find "$ARCHIVE_DIR" -name "*.log.bz2" -mtime +"$KEEP_DAYS" -delete
+    ```
+- role: assistant
+  content: |
+    You are right, `bzip2 -9` is the expensive part. It runs on every rotated log, every 2 hours. I switched to `zstd` and fixed one small bug.
+
+    ```bash
+    #!/bin/bash
+    # archive rotated gameserver logs
+
+    LOG_DIR="/var/log/gamesrv"
+    ARCHIVE_DIR="/srv/archive/gamesrv"
+    KEEP_DAYS=21
+
+    mkdir -p "$ARCHIVE_DIR"
+
+    for f in "$LOG_DIR"/*.log.1; do
+      [ -e "$f" ] || continue
+      name=$(basename "$f" .log.1)
+      stamp=$(date +%Y%m%d-%H%M)
+      out="$ARCHIVE_DIR/$name-$stamp.log.zst"
+
+      if zstd -q -c "$f" > "$out.tmp" && zstd -q -t "$out.tmp" && mv "$out.tmp" "$out"; then
+        rm -f "$f"
+      else
+        echo "compress failed for $f" >&2
+        rm -f "$out.tmp"
+      fi
+    done
+
+    find "$ARCHIVE_DIR" \( -name '*.log.bz2' -o -name '*.log.zst' \) -mtime +"$KEEP_DAYS" -delete
+    ```
+
+    **Green Notes**
+    - **Fast codec for data compressed often** (reduces E): this job compresses new logs all day, so the cost of the codec repeats every run. In Green Metrics Tool micro-benchmarks on 100 MB of English text, compressing used ~106 J with bzip2 and ~16 J with zstd at its default level. Reading the archives later is cheaper too: decompressing used ~52 J with bzip2 and ~5.3 J with zstd. Of the common codecs, bzip2 is the slow one to decompress.
+    - **Energy only, not size:** that benchmark compared energy, not file size. bzip2 may give smaller files than default zstd. If disk space gets tight, raise the zstd level step by step and check the size and CPU time on your own logs.
+    - **Bug fixed:** before, a failed or interrupted compress left a broken `.bz2` file in the archive. Now zstd writes to a `.tmp` file, tests it, and only then renames it, so the archive only has complete files.
+    - **Behavior changes:** new archives end in `.zst`, so use `zstdcat` or `zstd -dc` instead of `bzcat` when you read them. The `zstd` package must be installed on the server. The cleanup `find` deletes both `.bz2` and `.zst`, so your old archives still expire after 21 days. They are not recompressed.
+verify:
+  static_only: needs bzip2 and zstd binaries plus cron-style log directories; shell script operates on system paths

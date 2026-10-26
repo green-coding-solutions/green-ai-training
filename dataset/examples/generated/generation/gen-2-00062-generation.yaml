@@ -1,0 +1,163 @@
+id: gen-2-00062-generation
+category: generation
+language: javascript
+patterns:
+- dom-size
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    Hi, I'm new to frontend. On our shop's product page we show the customer reviews under the product. This is my code:
+
+    ```javascript
+    fetch('/api/products/' + productId + '/reviews')
+      .then(r => r.json())
+      .then(reviews => {
+        reviews.forEach(r => {
+          document.getElementById('reviews').innerHTML += `
+            <div class="review">
+              <div class="review-top">
+                <div class="stars">${r.rating}</div>
+                <div class="author"><span>${r.author}</span></div>
+                <div class="date"><span>${r.date}</span></div>
+              </div>
+              <div class="review-body"><p>${r.text}</p></div>
+            </div>`;
+        });
+      });
+    ```
+
+    For most products it's ok. But our best seller (a coffee machine) has around 9000 reviews, and the page freezes for many seconds. Sometimes Chrome says "page unresponsive". I don't know what's wrong. Is it the API? Can you write the reviews part properly? We use plain JS, no framework. The API returns an array of {author, rating, date, text}, rating is 1-5.
+- role: assistant
+  content: |
+    The API is fine. The problem is the rendering. Every `innerHTML +=` makes the browser serialize and re-parse the whole list again, 9,000 times. In the end the page holds about 81,000 elements for reviews nobody scrolls through. The version below shows 20 reviews per page, builds each page off-screen, and inserts it in one step.
+
+    ```html
+    <section id="reviews" class="reviews">
+      <h2>Customer reviews</h2>
+      <ol class="review-list"></ol>
+      <nav class="review-pager">
+        <button type="button" class="review-prev">Previous</button>
+        <span class="review-status" aria-live="polite"></span>
+        <button type="button" class="review-next">Next</button>
+      </nav>
+    </section>
+    <script src="/js/reviews.js" defer></script>
+    ```
+
+    ```javascript
+    const PAGE_SIZE = 20;
+
+    function getPage(items, page, pageSize = PAGE_SIZE) {
+      const pageCount = Math.max(1, Math.ceil(items.length / pageSize));
+      const current = Math.min(Math.max(1, page), pageCount);
+      const start = (current - 1) * pageSize;
+      return { items: items.slice(start, start + pageSize), page: current, pageCount };
+    }
+
+    function renderReviewPage(container, reviews, page) {
+      const { items, page: current, pageCount } = getPage(reviews, page);
+      const fragment = document.createDocumentFragment();
+
+      for (const r of items) {
+        const stars = Math.max(0, Math.min(5, Math.round(Number(r.rating) || 0)));
+        const li = document.createElement('li');
+        li.className = 'review';
+        const head = document.createElement('p');
+        head.className = 'review-head';
+        head.textContent = `${'★'.repeat(stars)}${'☆'.repeat(5 - stars)} ${r.author} · ${r.date}`;
+        const body = document.createElement('p');
+        body.textContent = r.text;
+        li.append(head, body);
+        fragment.append(li);
+      }
+
+      container.querySelector('.review-list').replaceChildren(fragment);
+      container.querySelector('.review-status').textContent =
+        `Page ${current} of ${pageCount} (${reviews.length} reviews)`;
+      container.querySelector('.review-prev').disabled = current === 1;
+      container.querySelector('.review-next').disabled = current === pageCount;
+      return current;
+    }
+
+    async function setupReviews(container, productId) {
+      const res = await fetch(`/api/products/${encodeURIComponent(productId)}/reviews`);
+      if (!res.ok) throw new Error(`Could not load reviews: ${res.status}`);
+      const reviews = await res.json();
+
+      let page = renderReviewPage(container, reviews, 1);
+      container.querySelector('.review-prev').addEventListener('click', () => {
+        page = renderReviewPage(container, reviews, page - 1);
+      });
+      container.querySelector('.review-next').addEventListener('click', () => {
+        page = renderReviewPage(container, reviews, page + 1);
+      });
+    }
+
+    // usage on the product page:
+    // setupReviews(document.getElementById('reviews'), productId);
+    ```
+
+    Your old code also had a security bug. Review text, author name and date went straight into `innerHTML`, so a customer could post a review containing `<img src=x onerror=...>` and run script on your shop page. The new code uses `textContent`, so the text is always shown as plain text.
+
+    **Green Notes**
+    - **Paginate long lists** (reduces E): the page holds 20 reviews instead of 9,000, so layout and style work stay small no matter how many reviews a product gets. In Green Metrics Tool browser benchmarks, a 10,000-row table paginated to 100 rows per page and built in a `DocumentFragment` used about 56% less CPU energy over 30 page loads than rendering all rows at once.
+    - **Build off-DOM, insert once** (reduces E): each page is built in a `DocumentFragment` and inserted with one `replaceChildren` call. The old code re-parsed the whole list once for every review.
+    - **Fewer wrapper elements** (reduces E, M): each review now has 3 elements instead of 9. Style `.review-head` with CSS instead of adding nested `div`s.
+verify:
+  test: |-
+    function check(cond, msg) { if (!cond) throw new Error(msg); }
+
+    class FakeEl {
+      constructor(tag) { this.tag = tag; this.children = []; this.textContent = ''; this.className = ''; this.disabled = false; this.isFragment = false; }
+      append(...c) { this.children.push(...c); }
+      replaceChildren(...c) {
+        this.children = [];
+        for (const x of c) {
+          if (x.isFragment) this.children.push(...x.children); else this.children.push(x);
+        }
+      }
+    }
+    globalThis.document = {
+      createElement: (t) => new FakeEl(t),
+      createDocumentFragment: () => { const f = new FakeEl('#fragment'); f.isFragment = true; return f; },
+    };
+    const parts = {
+      '.review-list': new FakeEl('ol'),
+      '.review-status': new FakeEl('span'),
+      '.review-prev': new FakeEl('button'),
+      '.review-next': new FakeEl('button'),
+    };
+    const fakeContainer = { querySelector: (s) => parts[s] };
+
+    const sample = Array.from({ length: 45 }, (_, i) => ({
+      author: `u${i}`, rating: (i % 5) + 1, date: '2026-01-01', text: `t${i}`,
+    }));
+
+    let p = getPage(sample, 3);
+    check(p.items.length === 5 && p.page === 3 && p.pageCount === 3, 'page 3');
+    check(getPage(sample, 99).page === 3, 'clamp high');
+    check(getPage(sample, 0).page === 1, 'clamp low');
+    const empty = getPage([], 1);
+    check(empty.pageCount === 1 && empty.items.length === 0, 'empty');
+
+    check(renderReviewPage(fakeContainer, sample, 2) === 2, 'render returns page');
+    check(parts['.review-list'].children.length === 20, 'twenty per page');
+    const first = parts['.review-list'].children[0];
+    check(first.children.length === 2, 'two children per review');
+    check(first.children[0].textContent === '★☆☆☆☆ u20 · 2026-01-01', 'header: ' + first.children[0].textContent);
+    check(first.children[1].textContent === 't20', 'body');
+    check(parts['.review-status'].textContent === 'Page 2 of 3 (45 reviews)', 'status');
+    check(parts['.review-prev'].disabled === false && parts['.review-next'].disabled === false, 'buttons page 2');
+
+    check(renderReviewPage(fakeContainer, sample, 3) === 3, 'page 3 render');
+    check(parts['.review-list'].children.length === 5, 'last page size');
+    check(parts['.review-next'].disabled === true, 'next disabled on last');
+
+    const xss = [{ author: '<b>x</b>', rating: 9, date: 'd', text: '<img src=x onerror=alert(1)>' }];
+    renderReviewPage(fakeContainer, xss, 1);
+    const xr = parts['.review-list'].children[0];
+    check(xr.children[1].textContent === '<img src=x onerror=alert(1)>', 'text kept as plain text');
+    check(xr.children[0].textContent.startsWith('★★★★★ '), 'rating clamped');
+    check(parts['.review-prev'].disabled === true && parts['.review-next'].disabled === true, 'single page buttons');

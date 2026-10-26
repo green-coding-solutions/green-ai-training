@@ -1,0 +1,91 @@
+id: gen-2-00022-generation
+category: generation
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    ```python
+    import math
+    import socket
+    import struct
+
+    NUM_CLASSES = 4
+    SCORE_THRESHOLD = 0.4
+    NPU_SOCK = "/run/npu/infer.sock"
+
+
+    def _recv_exact(s, size):
+        buf = bytearray()
+        while len(buf) < size:
+            chunk = s.recv(size - len(buf))
+            if not chunk:
+                raise ConnectionError("npu socket closed")
+            buf += chunk
+        return bytes(buf)
+
+
+    def infer(frame: bytes) -> list[float]:
+        with socket.socket(socket.AF_UNIX) as s:
+            s.connect(NPU_SOCK)
+            s.sendall(struct.pack("<I", len(frame)) + frame)
+            (n,) = struct.unpack("<I", _recv_exact(s, 4))
+            return list(struct.unpack(f"<{n}f", _recv_exact(s, n * 4)))
+
+
+    def decode_scores(logits, threshold=SCORE_THRESHOLD):
+        # sigmoid every logit, keep (idx, score) with score >= threshold
+        # runs every frame on the gateway (~100k logits), no numpy in this image
+        # TODO
+        ...
+
+
+    def detections(frame):
+        hits = decode_scores(infer(frame))
+        return [(i // NUM_CLASSES, i % NUM_CLASSES, s) for i, s in hits]
+    ```
+
+    ?
+- role: assistant
+  content: |
+    Here is `decode_scores`. It returns hits in logit order, so `detections` works as it is.
+
+    ```python
+    import math
+
+
+    def decode_scores(logits, threshold=0.4):
+        """Sigmoid every logit, return [(idx, score)] with score >= threshold."""
+        exp = math.exp  # hoisted: one lookup per call, not one per logit
+        hits = []
+        for i, x in enumerate(logits):
+            if x >= 0.0:
+                score = 1.0 / (1.0 + exp(-x))
+            else:
+                e = exp(x)
+                score = e / (1.0 + e)
+            if score >= threshold:
+                hits.append((i, score))
+        return hits
+    ```
+
+    **Green Notes**
+    - **Hoist loop-invariant attribute lookups** (reduces E): `exp = math.exp` runs once per call. Without it, every logit pays for a global lookup plus an attribute lookup. The gain is small. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local variable before a 10,000,000-iteration loop saved about 4-5%. It is still worth doing here because this loop runs over every logit of every frame.
+
+    The two-branch sigmoid is for correctness, not speed. `1 / (1 + exp(-x))` raises `OverflowError` once a logit drops below about -709. The branch for negative `x` only calls `exp` on values ≤ 0, so it never overflows.
+verify:
+  test: |-
+    r = decode_scores([0.0, 2.0, -2.0, -1000.0, 1000.0], threshold=0.5)
+    assert [i for i, _ in r] == [0, 1, 4]
+    assert abs(r[0][1] - 0.5) < 1e-12
+    assert abs(r[1][1] - 1.0 / (1.0 + math.exp(-2.0))) < 1e-12
+    assert r[2][1] == 1.0
+    assert decode_scores([], 0.4) == []
+    r = decode_scores([-3.0, -0.5], 0.3)
+    assert [i for i, _ in r] == [1]
+    assert abs(r[0][1] - 1.0 / (1.0 + math.exp(0.5))) < 1e-12
+    assert decode_scores([-3.0, -0.5], 0.4) == []
+    print("ok")

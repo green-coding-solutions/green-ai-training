@@ -1,0 +1,58 @@
+id: gen-1-00166-generation
+category: generation
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    hi, i am new to bash and not sure how to do this right. our api writes a log file, every line looks like this:
+
+    2024-05-12T14:03:22Z GET /api/items 200 123ms
+
+    (time, method, path, status, duration). the file can have a few hundred thousand lines. i want a script that shows for every hour how many requests there were and how many were slow (1000 ms or more). my boss wants it as a small table. i tried to read it line by line but i think i am doing something wrong because it feels slow
+- role: assistant
+  content: |
+    Don't read the file line by line in bash. One `awk` call can count everything in a single pass.
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    log=${1:?usage: hourly_requests.sh LOGFILE [SLOW_MS]}
+    slow_ms=${2:-1000}
+
+    printf '%-13s %9s %6s\n' 'HOUR' 'REQUESTS' 'SLOW'
+
+    awk -v slow="$slow_ms" '
+      {
+        hour = substr($1, 1, 13)      # 2024-05-12T14
+        ms = $5
+        sub(/ms$/, "", ms)            # "123ms" -> "123"
+        total[hour]++
+        if (ms + 0 >= slow) slow_count[hour]++
+      }
+      END {
+        for (h in total)
+          printf "%-13s %9d %6d\n", h, total[h], slow_count[h] + 0
+      }
+    ' "$log" | sort
+    ```
+
+    Run it like this:
+
+    ```bash
+    ./hourly_requests.sh api.log          # slow = 1000 ms or more
+    ./hourly_requests.sh api.log 500      # slow = 500 ms or more
+    ```
+
+    A line with a duration that is not a number counts as 0 ms, so it is never slow.
+
+    **Green Notes**
+    - **One `awk` pass instead of a shell loop** (reduces E): the file is read once and all counting happens inside one process. A `while read` loop that calls `$(echo "$line" | cut ...)` for each field starts several new processes per line, and starting processes is what costs the energy. In Green Metrics Tool micro-benchmarks on a 20,000-line log summary with identical output, such a loop used ~1302 J and 238 s, and one `awk` pass used ~1.0 J and 0.21 s.
+    - **`sort` only sees the result lines** (reduces E): `awk` prints one line per hour, so `sort` handles a few dozen lines, not the whole log.
+    - If you ever need a per-line loop in bash, use `read -r` with field splitting and `$(( ))` for the math. Both are builtins and start no processes. For a whole-file summary like this one, `awk` is still the better tool.
+verify:
+  static_only: bash script that needs a log file input; awk/sort pipeline not run by the verifier

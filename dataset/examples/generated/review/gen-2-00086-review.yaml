@@ -1,0 +1,135 @@
+id: gen-2-00086-review
+category: review
+language: html
+patterns:
+- dom-size
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    Hi, this is the page where our fraud analysts look at the results from the nightly scoring of our fraud model. Every night there are around 10-15k transactions. When they open it the browser hangs for many seconds, and when they type in the min score field it become even more slow and the table look strange (same rows many times?). Can you review pls?
+
+    ```html
+    <!doctype html>
+    <html>
+    <head>
+    <meta charset="utf-8">
+    <title>Fraud scores – nightly batch</title>
+    <style>
+      .cell { padding: 2px 6px; }
+      .high { color: #b00020; font-weight: bold; }
+    </style>
+    </head>
+    <body>
+    <h1>Fraud model v3 – nightly scoring</h1>
+    <label>Min score <input id="min" type="number" step="0.05" value="0"></label>
+    <span id="count"></span>
+    <table id="tx">
+      <thead><tr><th>Tx ID</th><th>Merchant</th><th>Amount</th><th>Country</th><th>Score</th><th>Top feature</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <script>
+    let rows = [];
+
+    function render() {
+      const min = parseFloat(document.getElementById('min').value) || 0;
+      const tbody = document.querySelector('#tx tbody');
+      const shown = rows.filter(r => r.score >= min);
+      for (const r of shown) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td><div class="cell"><span>${r.tx_id}</span></div></td>
+          <td><div class="cell"><span>${r.merchant}</span></div></td>
+          <td><div class="cell"><span>${r.amount.toFixed(2)} ${r.currency}</span></div></td>
+          <td><div class="cell"><span>${r.country}</span></div></td>
+          <td><div class="cell"><span class="${r.score > 0.8 ? 'high' : ''}">${r.score.toFixed(3)}</span></div></td>
+          <td><div class="cell"><span>${r.top_feature}</span></div></td>`;
+        tbody.appendChild(tr);
+      }
+      document.getElementById('count').textContent = shown.length + ' transactions';
+    }
+
+    fetch('/api/batches/latest/predictions')
+      .then(res => res.json())
+      .then(data => {
+        rows = data.predictions.sort((a, b) => b.score - a.score);
+        render();
+      });
+
+    document.getElementById('min').addEventListener('input', render);
+    </script>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (internal analyst page for batch ML inference results)
+
+    #### [Security] Transaction data inserted as HTML
+    - **Where:** `tr.innerHTML = ...` in `render()`
+    - **Issue:** `merchant` and `top_feature` come from transaction data. A fraudster can choose a merchant name like `<img src=x onerror=...>`, and it runs as script in your analysts' browsers.
+    - **Fix:** build cells with `textContent` instead of `innerHTML`. The snippet below does this.
+
+    #### [Bug] Rows are duplicated on every filter change
+    - **Where:** `render()`, `tbody.appendChild(tr)`
+    - **Issue:** the `tbody` is never cleared. Each keystroke in the min score field appends the filtered rows again below the old ones. This is the "same rows many times" you see, and the table grows with every input event.
+    - **Fix:** replace the `tbody` content instead of appending: `tbody.replaceChildren(frag)`.
+
+    #### [High] Up to 15k rows rendered at once, with wrappers in every cell, appended one by one
+    - **Where:** `render()` and the `.cell` markup
+    - **Issue:** every row goes into the live DOM separately, and every cell is a `td` plus a `div` plus a `span`. With 10-15k transactions the browser builds and lays out a huge tree on load, and again on every keystroke. In Green Metrics Tool page-load benchmarks, a 10,000-row table with 14 elements per row, appended to the live DOM one by one, used ~1036 J over 30 loads. The same data paginated to 100 rows per page as a plain `<table>` built in a `DocumentFragment` used ~457 J, about 56% less.
+    - **Fix:** show 100 rows per page, drop the wrappers, build the page in a fragment:
+      ```html
+      <style>
+        #tx td { padding: 2px 6px; }
+        .high { color: #b00020; font-weight: bold; }
+      </style>
+      <button id="prev">Prev</button> <button id="next">Next</button>
+      ```
+      ```javascript
+      const PAGE_SIZE = 100;
+      let rows = [];
+      let page = 0;
+
+      function cell(text, className) {
+        const td = document.createElement('td');
+        td.textContent = text;
+        if (className) td.className = className;
+        return td;
+      }
+
+      function render() {
+        const min = parseFloat(document.getElementById('min').value) || 0;
+        const shown = rows.filter(r => r.score >= min);
+        const pages = Math.max(1, Math.ceil(shown.length / PAGE_SIZE));
+        page = Math.min(page, pages - 1);
+
+        const frag = document.createDocumentFragment();
+        for (const r of shown.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)) {
+          const tr = document.createElement('tr');
+          tr.append(
+            cell(r.tx_id),
+            cell(r.merchant),
+            cell(`${r.amount.toFixed(2)} ${r.currency}`),
+            cell(r.country),
+            cell(r.score.toFixed(3), r.score > 0.8 ? 'high' : ''),
+            cell(r.top_feature)
+          );
+          frag.appendChild(tr);
+        }
+        document.querySelector('#tx tbody').replaceChildren(frag);
+        document.getElementById('count').textContent =
+          `${shown.length} transactions, page ${page + 1} of ${pages}`;
+      }
+
+      document.getElementById('min').addEventListener('input', () => { page = 0; render(); });
+      document.getElementById('prev').addEventListener('click', () => { if (page > 0) { page--; render(); } });
+      document.getElementById('next').addEventListener('click', () => { page++; render(); });
+      ```
+      Keep your `fetch` block as it is. The rows stay sorted by score, so page 1 shows the riskiest transactions first.
+    - **Impact:** E and memory on the client. The page loads quickly, and each keystroke rebuilds only 100 plain rows instead of the whole batch. This also fixes the two findings above.
+
+    **Already good:** the data is sorted once after the fetch, and filtering runs in memory without new requests.
+verify:
+  static_only: HTML page that fetches predictions from an internal API; browser-only DOM code

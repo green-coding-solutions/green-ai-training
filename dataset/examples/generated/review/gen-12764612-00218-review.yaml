@@ -1,0 +1,111 @@
+id: gen-12764612-00218-review
+category: review
+language: html
+patterns:
+- modern-image-formats
+- dom-size
+facts:
+- F-DOM-SIZE
+- F-IMGRENDER
+- F-IMGENC
+messages:
+- role: user
+  content: |
+    Review this, diff only please. It's the report page our `corekit` CLI writes after each sync. About 10k core samples, each with a photo that the CLI exports as PNG.
+
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <title>Core sample report</title>
+    <link rel="stylesheet" href="report.css">
+    </head>
+    <body>
+    <h1>Core sample report</h1>
+    <div id="wrap"><table id="samples"><tbody></tbody></table></div>
+    <script>
+    fetch('samples.json').then(r => r.json()).then(samples => {
+      const tbody = document.querySelector('#samples tbody');
+      samples.forEach(s => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td><div class="cell"><span class="id">${s.id}</span></div></td>
+          <td><div class="cell"><span>${s.site}</span></div></td>
+          <td><div class="cell"><span>${s.depth_m} m</span></div></td>
+          <td><div class="cell"><img src="photos/${s.id}.png" width="160" height="120" alt="Core ${s.id}"></div></td>
+          <td><div class="cell"><span>${s.notes}</span></div></td>`;
+        tbody.appendChild(tr);
+      });
+    });
+    </script>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (static report, opened by many people after each sync)
+
+    #### [Security] Data from `samples.json` is written with `innerHTML`
+    - **Where:** `tr.innerHTML = ...` with `${s.site}`, `${s.notes}`, `${s.id}`
+    - **Issue:** free-text fields like `notes` are inserted as HTML. A note containing `<img onerror=...>` runs script for everyone who opens the report.
+    - **Fix:** set values with `textContent` (included in the diff below).
+
+    #### [High] 10,000 rows in the live DOM, with wrappers around every cell
+    - **Where:** the `forEach` that appends one `<tr>` at a time
+    - **Issue:** each row creates a `div` and a `span` per cell, and the browser keeps all of it alive. It also loads 10k PNGs.
+    - **Fix:** show 100 rows per page, plain `<td>` cells, rows built in a `DocumentFragment`.
+    - **Impact:** reduces client E and M on every page open. In Green Metrics Tool browser micro-benchmarks, a 10,000-row table with wrappers around every cell used about 56% less CPU energy when paginated to 100 rows per page as a plain table built in a fragment.
+
+    #### [Medium] Photos exported as PNG
+    - **Where:** `photos/${s.id}.png`, written by the CLI
+    - **Issue:** PNG is lossless and large for photographs. In the same micro-benchmarks, 50 page loads cost about 181 J with PNG and about 134 J with JPG, and JPG also encoded far cheaper than PNG.
+    - **Fix:** export JPEG once in the CLI. Keep PNG only if you need lossless pixels for analysis. I would not use AVIF here: it encodes at about 7× the cost of JPG, and its savings are fewer bytes, not less decode work.
+    - **Impact:** reduces E in the CLI and in each browser, and reduces transferred bytes.
+
+    ```diff
+    -<div id="wrap"><table id="samples"><tbody></tbody></table></div>
+    +<table id="samples"><tbody></tbody></table>
+    +<button id="prev">Prev</button> <span id="pos"></span> <button id="next">Next</button>
+     <script>
+    +const PAGE = 100;
+     fetch('samples.json').then(r => r.json()).then(samples => {
+       const tbody = document.querySelector('#samples tbody');
+    -  samples.forEach(s => {
+    -    const tr = document.createElement('tr');
+    -    tr.innerHTML = `...`;
+    -    tbody.appendChild(tr);
+    -  });
+    +  const pages = Math.ceil(samples.length / PAGE);
+    +  let page = 0;
+    +  const td = node => {
+    +    const c = document.createElement('td');
+    +    c.append(node);
+    +    return c;
+    +  };
+    +  const render = () => {
+    +    const frag = document.createDocumentFragment();
+    +    for (const s of samples.slice(page * PAGE, (page + 1) * PAGE)) {
+    +      const img = new Image(160, 120);
+    +      img.src = `photos/${encodeURIComponent(s.id)}.jpg`;
+    +      img.alt = `Core ${s.id}`;
+    +      const tr = document.createElement('tr');
+    +      tr.append(td(s.id), td(s.site), td(`${s.depth_m} m`), td(img), td(s.notes));
+    +      frag.appendChild(tr);
+    +    }
+    +    tbody.replaceChildren(frag);
+    +    document.getElementById('pos').textContent = `${page + 1} / ${pages}`;
+    +  };
+    +  document.getElementById('prev').onclick = () => { if (page > 0) { page--; render(); } };
+    +  document.getElementById('next').onclick = () => { if (page < pages - 1) { page++; render(); } };
+    +  render();
+     });
+     </script>
+    ```
+
+    **Behavior change:** the page shows 100 samples at a time. If people use browser search across all samples, add a filter box that works on `samples` before `render()`.
+
+    **Green Notes**
+    - If you need the `.id` and `.cell` styles, move them to the `td` rules in `report.css`.
+verify:
+  static_only: HTML page that needs a browser, a fetch of samples.json and image files

@@ -1,0 +1,99 @@
+id: gen-1-00064-generation
+category: generation
+language: python
+patterns:
+- simple-conditions
+facts:
+- F-COND
+messages:
+- role: user
+  content: |
+    I need a small Python CLI script for our payroll team. Requirements:
+
+    - Input: a CSV file path as the only argument. Columns are `employee`, `clock_in` (ISO timestamp like `2024-03-05T22:15:00`) and `minutes` (paid minutes of that shift entry).
+    - Each entry belongs to a shift, decided only by the hour of `clock_in`:
+      - night: 22:00 to 05:59
+      - morning: 06:00 to 13:59
+      - afternoon: 14:00 to 21:59
+    - Output: CSV to stdout with `employee,morning,afternoon,night`, total minutes per employee and shift, sorted by employee name.
+    - The yearly export has a few million rows, so it should not be slow.
+    - Standard library only, please.
+- role: assistant
+  content: |
+    ```python
+    #!/usr/bin/env python3
+    """Sum paid minutes per employee and shift from a time-clock CSV."""
+    import argparse
+    import csv
+    import sys
+    from collections import defaultdict
+    from datetime import datetime
+
+    SHIFTS = ("morning", "afternoon", "night")
+
+
+    def _shift_for_hour(hour):
+        if hour >= 22 or hour < 6:
+            return "night"
+        if hour < 14:
+            return "morning"
+        return "afternoon"
+
+
+    # The range logic runs once per hour of the day at startup, not once per row.
+    SHIFT_BY_HOUR = tuple(_shift_for_hour(h) for h in range(24))
+
+
+    def summarize(rows):
+        totals = defaultdict(lambda: dict.fromkeys(SHIFTS, 0))
+        for row in rows:
+            hour = datetime.fromisoformat(row["clock_in"]).hour
+            totals[row["employee"]][SHIFT_BY_HOUR[hour]] += int(row["minutes"])
+        return totals
+
+
+    def main(argv=None):
+        parser = argparse.ArgumentParser(description="Paid minutes per employee and shift.")
+        parser.add_argument("csv_file", help="time-clock export (employee, clock_in, minutes)")
+        args = parser.parse_args(argv)
+
+        with open(args.csv_file, newline="") as f:
+            totals = summarize(csv.DictReader(f))
+
+        writer = csv.writer(sys.stdout)
+        writer.writerow(["employee", *SHIFTS])
+        for employee in sorted(totals):
+            writer.writerow([employee, *(totals[employee][s] for s in SHIFTS)])
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+
+    A shift entry that runs past a boundary counts fully for the shift where it started, because only `clock_in` decides.
+
+    **Green Notes**
+    - **Simple per-row classification** (reduces E): the night rule is a wrap-around range with an `or`, which is the kind of guard chain that costs more on every row. Here it is evaluated 24 times at startup. Each row then does one tuple index and one dict update. In Green Metrics Tool micro-benchmarks over 10,000,000 classifications, simple equality branches used about 16% less CPU energy than complex range and modulo conditions.
+    - **Single pass with `csv.DictReader`:** rows are streamed and summed as they are read, so memory stays flat even for a multi-million-row export.
+
+    *Not applied:* `match` instead of `if` — with the same conditions there is no measurable energy difference, so the plain `if` helper stays.
+verify:
+  module: true
+  test: |-
+    assert SHIFT_BY_HOUR[5] == "night"
+    assert SHIFT_BY_HOUR[6] == "morning"
+    assert SHIFT_BY_HOUR[13] == "morning"
+    assert SHIFT_BY_HOUR[14] == "afternoon"
+    assert SHIFT_BY_HOUR[21] == "afternoon"
+    assert SHIFT_BY_HOUR[22] == "night"
+    assert SHIFT_BY_HOUR[0] == "night"
+    rows = [
+        {"employee": "a", "clock_in": "2024-03-05T05:59:00", "minutes": "30"},
+        {"employee": "a", "clock_in": "2024-03-05T06:00:00", "minutes": "40"},
+        {"employee": "a", "clock_in": "2024-03-05T22:00:00", "minutes": "60"},
+        {"employee": "b", "clock_in": "2024-03-06T14:00:00", "minutes": "15"},
+    ]
+    t = summarize(rows)
+    assert t["a"] == {"morning": 40, "afternoon": 0, "night": 90}
+    assert t["b"] == {"morning": 0, "afternoon": 15, "night": 0}

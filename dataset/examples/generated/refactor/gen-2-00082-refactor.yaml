@@ -1,0 +1,173 @@
+id: gen-2-00082-refactor
+category: refactor
+language: javascript
+patterns:
+- dom-size
+- minify-assets
+facts:
+- F-DOM-SIZE
+- F-MINIFY
+messages:
+- role: user
+  content: |
+    ?
+
+    ```javascript
+    // log-viewer.js – job log page on the runner dashboard
+    // TODO(infra): minify before deploy? ticket INFRA-412 says it's "greener"
+
+    const LEVEL_LABEL = { info: 'INFO', warn: 'WARN', error: 'ERR' };
+
+    function formatTs(iso) {
+      const d = new Date(iso);
+      return d.toISOString().slice(11, 23);
+    }
+
+    function renderLine(line) {
+      const row = document.createElement('div');
+      row.className = 'log-row lvl-' + line.level;
+
+      const gutter = document.createElement('div');
+      gutter.className = 'gutter';
+      const num = document.createElement('span');
+      num.className = 'line-no';
+      num.textContent = line.n;
+      gutter.appendChild(num);
+
+      const tsWrap = document.createElement('div');
+      tsWrap.className = 'ts';
+      const time = document.createElement('time');
+      time.dateTime = line.ts;
+      time.textContent = formatTs(line.ts);
+      tsWrap.appendChild(time);
+
+      const body = document.createElement('div');
+      body.className = 'body';
+      const badge = document.createElement('span');
+      badge.className = 'badge';
+      badge.textContent = LEVEL_LABEL[line.level] || line.level;
+      const text = document.createElement('span');
+      text.className = 'text';
+      text.innerHTML = line.text;
+      body.appendChild(badge);
+      body.appendChild(text);
+
+      row.appendChild(gutter);
+      row.appendChild(tsWrap);
+      row.appendChild(body);
+      return row;
+    }
+
+    async function loadLog(jobId) {
+      const res = await fetch(`/api/jobs/${jobId}/log`);
+      const lines = await res.json();
+      const container = document.getElementById('log');
+      container.innerHTML = '';
+      for (const line of lines) {
+        container.appendChild(renderLine(line));
+      }
+      document.getElementById('line-count').textContent = `${lines.length} lines`;
+    }
+
+    const jobId = new URLSearchParams(location.search).get('job');
+    loadLog(jobId);
+    ```
+- role: assistant
+  content: |
+    ```javascript
+    // log-viewer.js – job log page on the runner dashboard
+    const PAGE_SIZE = 200;
+    const LEVEL_LABEL = { info: 'INFO', warn: 'WARN', error: 'ERR' };
+
+    let lines = [];
+    let page = 0;
+
+    const container = document.getElementById('log');
+    const lineCount = document.getElementById('line-count');
+    const table = document.createElement('table');
+    table.className = 'log';
+    const tbody = table.createTBody();
+
+    const prevBtn = button('‹ Prev', () => goTo(page - 1));
+    const nextBtn = button('Next ›', () => goTo(page + 1));
+    const errBtn = button('First error', () => {
+      const i = lines.findIndex((l) => l.level === 'error');
+      if (i >= 0) goTo(Math.floor(i / PAGE_SIZE));
+    });
+    const pageInfo = document.createElement('span');
+    const pager = document.createElement('nav');
+    pager.className = 'pager';
+    pager.append(prevBtn, pageInfo, nextBtn, errBtn);
+    container.replaceChildren(pager, table);
+
+    function button(label, onClick) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = label;
+      b.addEventListener('click', onClick);
+      return b;
+    }
+
+    function formatTs(iso) {
+      return new Date(iso).toISOString().slice(11, 23);
+    }
+
+    function renderPage() {
+      const start = page * PAGE_SIZE;
+      const frag = document.createDocumentFragment();
+      for (const line of lines.slice(start, start + PAGE_SIZE)) {
+        const tr = document.createElement('tr');
+        tr.className = 'lvl-' + line.level;
+        const no = tr.insertCell();
+        no.className = 'line-no';
+        no.textContent = line.n;
+        const ts = tr.insertCell();
+        ts.className = 'ts';
+        ts.title = line.ts;
+        ts.textContent = formatTs(line.ts);
+        const badge = tr.insertCell();
+        badge.className = 'badge';
+        badge.textContent = LEVEL_LABEL[line.level] || line.level;
+        const text = tr.insertCell();
+        text.className = 'text';
+        text.textContent = line.text;
+        frag.appendChild(tr);
+      }
+      tbody.replaceChildren(frag);
+
+      const pages = Math.max(1, Math.ceil(lines.length / PAGE_SIZE));
+      pageInfo.textContent = `Page ${page + 1} / ${pages}`;
+      prevBtn.disabled = page === 0;
+      nextBtn.disabled = page >= pages - 1;
+    }
+
+    function goTo(p) {
+      const pages = Math.max(1, Math.ceil(lines.length / PAGE_SIZE));
+      page = Math.min(Math.max(p, 0), pages - 1);
+      renderPage();
+      container.scrollIntoView();
+    }
+
+    async function loadLog(jobId) {
+      const res = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/log`);
+      if (!res.ok) {
+        lineCount.textContent = `Could not load log (HTTP ${res.status})`;
+        return;
+      }
+      lines = await res.json();
+      page = 0;
+      errBtn.hidden = !lines.some((l) => l.level === 'error');
+      lineCount.textContent = `${lines.length} lines`;
+      renderPage();
+    }
+
+    loadLog(new URLSearchParams(location.search).get('job'));
+    ```
+
+    **Green Notes**
+    - **Paginate and flatten the rows** (reduces E): the old code built eight elements for every log line and appended each line to the live DOM on its own. A long build log became a huge DOM. Now one page of 200 lines is rendered as a plain `<table>` with five elements per line, and the page is inserted once from a `DocumentFragment`. In Green Metrics Tool page-load benchmarks, a 10,000-row table with 14 elements per row appended one by one used about 56% less CPU energy when paginated to 100 rows per page and built in a `DocumentFragment`.
+    - **Minification (the TODO):** I removed the TODO. For a file this small, minifying saves bytes on the network, not CPU. In Green Metrics Tool page-load benchmarks, a minified build of a small page used about 2% less client energy, which is within measurement noise. Add it if your build step already runs a bundler, but it is low priority.
+    - **Security fix:** `text.innerHTML = line.text` rendered build output as HTML. A log line like `<img src=x onerror=...>` from a test or a dependency would run script on the dashboard. It now uses `textContent`. The job id is now URL-encoded, and a failed request shows an error instead of throwing on `res.json()`.
+    - **Behavior changes:** the browser's Ctrl+F only searches the current page. The "First error" button jumps to the first `error` line. The `lvl-*` class is still on each row, but the `.log-row`, `.gutter` and `.body` wrappers are gone, so update the CSS selectors to `table.log tr` / `td.*`.
+verify:
+  static_only: needs a browser DOM and fetch against the runner dashboard API

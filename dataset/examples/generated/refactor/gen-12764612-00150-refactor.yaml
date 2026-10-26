@@ -1,0 +1,111 @@
+id: gen-12764612-00150-refactor
+category: refactor
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import os
+    import sys
+
+    CATEGORIES = {
+        ".py": "code", ".js": "code", ".sh": "code",
+        ".md": "docs", ".txt": "docs", ".rst": "docs",
+        ".png": "image", ".jpg": "image", ".svg": "image",
+        ".csv": "data", ".json": "data",
+    }
+
+    def categorize(name):
+        ext = os.path.splitext(name)[1].lower()
+        try:
+            return CATEGORIES[ext]
+        except KeyError:
+            return "other"
+
+    def summarize(root):
+        counts = {}
+        for dirpath, dirnames, filenames in os.walk(root):
+            for name in filenames:
+                cat = categorize(name)
+                try:
+                    counts[cat] += 1
+                except KeyError:
+                    counts[cat] = 1
+        return counts
+
+    def main():
+        root = sys.argv[1] if len(sys.argv) > 1 else "."
+        for cat, n in sorted(summarize(root).items()):
+            print(f"{cat:8} {n}")
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    ```python
+    import os
+    import sys
+
+    CATEGORIES = {
+        ".py": "code", ".js": "code", ".sh": "code",
+        ".md": "docs", ".txt": "docs", ".rst": "docs",
+        ".png": "image", ".jpg": "image", ".svg": "image",
+        ".csv": "data", ".json": "data",
+    }
+
+    def categorize(name):
+        ext = os.path.splitext(name)[1].lower()
+        return CATEGORIES.get(ext, "other")
+
+    def summarize(root):
+        counts = {}
+        for dirpath, dirnames, filenames in os.walk(root):
+            for name in filenames:
+                cat = categorize(name)
+                try:
+                    counts[cat] += 1
+                except KeyError:
+                    counts[cat] = 1
+        return counts
+
+    def main():
+        root = sys.argv[1] if len(sys.argv) > 1 else "."
+        for cat, n in sorted(summarize(root).items()):
+            print(f"{cat:8} {n}")
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **`dict.get` instead of `try/except KeyError` in `categorize`** (reduces E): in a source tree, many files have unknown or no extensions (`.lock`, `.yml`, `Makefile`). Each of those raised and caught a `KeyError`. In Green Metrics Tool micro-benchmarks with about half of the keys missing, 10,000,000 lookups used about 12% less CPU energy with `dict.get(key, default)` (~67 J) than with `try/except KeyError` (~76 J). The result is the same.
+    - *Not applied:* the `counts[cat] += 1` block stays as it is. It only misses once per category, so it raises a handful of times for the whole walk. When misses are rare, `try/except` is cheap, because the cost is in raising.
+verify:
+  module: true
+  test: |
+    assert categorize("a.PY") == "code"
+    assert categorize("Makefile") == "other"
+    assert categorize("x.lock") == "other"
+    import tempfile, os as _os
+    d = tempfile.mkdtemp()
+    for n in ["a.py", "b.md", "c.lock", "Makefile", "d.PNG", "e.py"]:
+        open(_os.path.join(d, n), "w").close()
+    assert summarize(d) == {"code": 2, "docs": 1, "other": 2, "image": 1}
+  equivalence:
+    driver: |-
+      import tempfile, os as _os
+      d = tempfile.mkdtemp()
+      _os.makedirs(_os.path.join(d, "sub"))
+      for n in ["a.py", "b.md", "c.lock", "Makefile", "d.PNG", "e.py", "sub/f.json", "sub/g.yml", "sub/h"]:
+          open(_os.path.join(d, n), "w").close()
+      for n in ["a.PY", "x", "y.csv", "z.tar.gz", ".bashrc"]:
+          print(n, categorize(n))
+      for k, v in sorted(summarize(d).items()):
+          print(k, v)

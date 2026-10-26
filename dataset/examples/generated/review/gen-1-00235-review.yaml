@@ -1,0 +1,126 @@
+id: gen-1-00235-review
+category: review
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    hi, i wrote this for our webshop to work out the shipping cost for every order in the daily export. it works and the numbers are right, but it feels slow when the order file is big. i dont know what is wrong with it, can you take a look?
+
+    ```python
+    import csv
+
+    ZONE_FILE = "shipping_zones.csv"   # columns: prefix,zone
+    RATES = {"A": 4.90, "B": 7.50, "C": 12.00, "default": 9.90}
+
+
+    def get_zone(postcode):
+        best_prefix = ""
+        best_zone = "default"
+        with open(ZONE_FILE, newline="") as f:
+            for row in csv.DictReader(f):
+                prefix = row["prefix"]
+                if postcode.startswith(prefix) and len(prefix) > len(best_prefix):
+                    best_prefix = prefix
+                    best_zone = row["zone"]
+        return best_zone
+
+
+    def shipping_cost(postcode, weight_kg):
+        rate = RATES[get_zone(postcode)]
+        extra = max(0, weight_kg - 2) * 1.2
+        return round(rate + extra, 2)
+
+
+    def main():
+        total = 0
+        with open("orders.csv", newline="") as f:
+            for row in csv.DictReader(f):
+                cost = shipping_cost(row["postcode"], float(row["weight_kg"]))
+                total += cost
+                print(row["order_id"], cost)
+        print("Total shipping:", round(total, 2))
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (daily batch over the order export)
+
+    #### [High] The zone file is opened and parsed again for every order
+    - **Where:** `get_zone`, called from `shipping_cost` for each row of `orders.csv`
+    - **Issue:** the zone table does not change during the run, and the same postcode usually appears in many orders. Still, each order opens `shipping_zones.csv`, parses it and scans every row. That is repeated work with the same input and the same answer. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over 200 distinct inputs used ~43 J uncached and ~4.7 J with `functools.lru_cache`, about 9× less. Your function also does file I/O on every call, so the saving comes from skipping that.
+    - **Fix:** read the zone table once, and cache the result per postcode. The function stays pure: same postcode in, same zone out. The cache is bounded, so memory stays small. The table is returned as a tuple, so no caller can change it by accident.
+
+    ```python
+    import csv
+    from functools import lru_cache
+
+    ZONE_FILE = "shipping_zones.csv"   # columns: prefix,zone
+    RATES = {"A": 4.90, "B": 7.50, "C": 12.00, "default": 9.90}
+
+
+    @lru_cache(maxsize=1)
+    def load_zones():
+        with open(ZONE_FILE, newline="") as f:
+            return tuple((row["prefix"], row["zone"]) for row in csv.DictReader(f))
+
+
+    @lru_cache(maxsize=4096)
+    def get_zone(postcode):
+        best_prefix = ""
+        best_zone = "default"
+        for prefix, zone in load_zones():
+            if postcode.startswith(prefix) and len(prefix) > len(best_prefix):
+                best_prefix = prefix
+                best_zone = zone
+        return best_zone
+
+
+    def shipping_cost(postcode, weight_kg):
+        rate = RATES[get_zone(postcode)]
+        extra = max(0, weight_kg - 2) * 1.2
+        return round(rate + extra, 2)
+
+
+    def main():
+        total = 0
+        with open("orders.csv", newline="") as f:
+            for row in csv.DictReader(f):
+                cost = shipping_cost(row["postcode"], float(row["weight_kg"]))
+                total += cost
+                print(row["order_id"], cost)
+        print("Total shipping:", round(total, 2))
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+    - **Impact:** E (CPU) and disk reads, per order row. The output is identical. Work per order drops from "open file, parse, scan all prefixes" to a cache lookup for postcodes you have already seen.
+
+    #### [Low] The cache goes stale in a long-running process
+    - **Where:** `load_zones` and `get_zone`
+    - **Issue:** as a script that exits after the export, this is fine. If you later reuse these functions in a web app or worker that stays up, they will keep the old zone table until restart.
+    - **Fix:** call `load_zones.cache_clear()` and `get_zone.cache_clear()` after you update `shipping_zones.csv`.
+
+    **Already good:** the CSV files are streamed row by row, so memory stays flat for big exports. Rounding happens once per order.
+verify:
+  module: true
+  test: |-
+    import os, tempfile
+    os.chdir(tempfile.mkdtemp())
+    with open("shipping_zones.csv", "w") as f:
+        f.write("prefix,zone\nSW,A\nSW1,B\nM,C\n")
+    assert get_zone("SW1A1AA") == "B"
+    assert get_zone("SW9") == "A"
+    assert get_zone("M1") == "C"
+    assert get_zone("ZZ") == "default"
+    assert get_zone("SW1A1AA") == "B"
+    assert get_zone.cache_info().hits >= 1
+    assert load_zones.cache_info().currsize == 1
+    assert shipping_cost("M1", 3) == 13.2

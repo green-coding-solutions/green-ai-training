@@ -1,0 +1,98 @@
+id: gen-12764612-00327-review
+category: review
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    hello, can you look at my script please. it is for our REST API, it read the access log and tell me how many request are slow, and the top 5 slow endpoints. I run it from cron every 10 minutes and the log have about 40k lines now. Sometimes the next cron start before the last one is finish, I dont understand why. Log line look like this:
+
+    `2026-10-20T10:15:03 GET /api/orders 200 342`
+
+    ```bash
+    #!/bin/bash
+    # slow request report for myapi
+    LOG=/var/log/myapi/access.log
+    LIMIT=500
+    count=0
+    slow=0
+    errors=0
+    sum=0
+    rm -f /tmp/slow_paths.txt
+
+    while read line; do
+        path=$(echo $line | cut -d' ' -f3)
+        status=$(echo $line | cut -d' ' -f4)
+        ms=$(echo $line | cut -d' ' -f5)
+        count=$(expr $count + 1)
+        sum=$(expr $sum + $ms)
+        if [ $status = "500" ]; then
+            errors=$(expr $errors + 1)
+        fi
+        if [ $ms -gt $LIMIT ]; then
+            slow=$(expr $slow + 1)
+            echo "$path" >> /tmp/slow_paths.txt
+        fi
+    done < $LOG
+
+    echo "Requests: $count"
+    echo "Slow (>${LIMIT}ms): $slow"
+    echo "Server errors: $errors"
+    echo "Average: $(expr $sum / $count) ms"
+    echo "Top slow endpoints:"
+    sort /tmp/slow_paths.txt | uniq -c | sort -rn | head -5
+    ```
+- role: assistant
+  content: |-
+    **Workload:** script (cron job every 10 minutes, 40k log lines)
+
+    #### [Bug] Crash on an empty or rotated log
+    - **Where:** `expr $sum / $count`
+    - **Issue:** if the log is empty (for example right after rotation), `count` is 0 and `expr` fails with a division by zero. Also, a blank or broken line leaves `ms` empty, and then `[ $ms -gt $LIMIT ]` and `expr $sum + $ms` print errors.
+    - **Fix:** the version below skips lines with fewer than 5 fields and only prints the average when there are requests.
+
+    #### [Security] Fixed file name in `/tmp`
+    - **Where:** `/tmp/slow_paths.txt`
+    - **Issue:** any local user can create this name first, for example as a symlink to another file. Your script then writes into that file. Two overlapping cron runs also write into the same file and mix their results.
+    - **Fix:** don't use a temp file at all (see below). If you need one, use `mktemp`.
+
+    #### [High] Many process starts for every log line
+    - **Where:** the `while read` loop
+    - **Issue:** every line runs three `echo | cut` pipelines and two `expr` calls, and one more `expr` for each slow or failed request. That is millions of process starts per run, and it is why a run can take longer than 10 minutes and overlap with the next one. Starting processes costs far more than the arithmetic. In Green Metrics Tool micro-benchmarks summarizing a 20,000-line log, a loop with `$(echo | cut)` and `$(expr)` per field used ~1302 J and 238 s. One `awk` pass over the file used ~1.0 J and 0.21 s, over 1000× less.
+    - **Fix:** one `awk` pass reads the file once and does all counting:
+      ```bash
+      #!/bin/bash
+      # slow request report for myapi
+      LOG=/var/log/myapi/access.log
+      LIMIT=500
+
+      awk -v limit="$LIMIT" '
+          NF < 5 { next }
+          {
+              count++
+              sum += $5
+              if ($4 == 500) errors++
+              if ($5 > limit) {
+                  slow++
+                  print $3 | "sort | uniq -c | sort -rn | head -5"
+              }
+          }
+          END {
+              print "Requests: " count + 0
+              print "Slow (>" limit "ms): " slow + 0
+              print "Server errors: " errors + 0
+              if (count > 0) print "Average: " int(sum / count) " ms"
+              print "Top slow endpoints:"
+              fflush()
+              close("sort | uniq -c | sort -rn | head -5")
+          }
+      ' "$LOG"
+      ```
+    - **Impact:** E, and also run time: the job should finish in well under a second for 40k lines, so runs no longer overlap. Output has the same lines as before. Differences: malformed lines are skipped instead of causing errors, and the average line is left out when the log is empty.
+
+    #### [Low] Unquoted variables and `read` without `-r`
+    - **Where:** `echo $line`, `< $LOG`, `while read line`
+    - **Issue:** unquoted `$line` is split and can glob, and `read` without `-r` eats backslashes. The `awk` version doesn't have these problems. If you keep a shell loop elsewhere, use `while read -r a b path status ms` so no field needs a subprocess, and `$(( ))` for the arithmetic.

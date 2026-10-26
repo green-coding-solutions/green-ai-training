@@ -1,0 +1,96 @@
+id: gen-2-00053-review
+category: review
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    hi, I am new to linux admin stuff. We have an orders REST API, and this script runs every hour from cron. My senior said "compress everything to save disk", so I used xz with the highest setting. But the disk on the server still gets full. Also every hour the CPU stays high for a long time and the API gets slow. I don't understand what is wrong, can you look?
+
+    ```bash
+    #!/bin/bash
+    # runs every hour from cron (0 * * * *)
+    LOG_DIR=/var/log/orders-api
+    CACHE_DIR=/var/cache/orders-api/exports
+    ARCHIVE=/srv/archive/orders-api
+
+    mkdir -p $ARCHIVE
+
+    # 1. rotate access log
+    ts=$(date +%Y%m%d-%H)
+    mv $LOG_DIR/access.log $LOG_DIR/access-$ts.log
+    kill -USR1 $(cat /run/orders-api.pid)
+
+    # 2. compress rotated logs and move them to the archive
+    for f in $LOG_DIR/access-*.log; do
+        xz -9e $f
+        mv $f.xz $ARCHIVE/
+    done
+
+    # 3. CSV files the API writes for GET /reports/export downloads
+    #    (cleanup.sh deletes *.csv in there after 15 min)
+    for f in $CACHE_DIR/*.csv; do
+        xz -9e -k $f
+    done
+
+    # 4. keep 90 days of logs
+    find $ARCHIVE -name "*.xz" -mtime +90 -exec rm {} \;
+
+    echo "done $(date)"
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (hourly cron on an API server)
+
+    #### [Bug] Compressed export copies are never deleted
+    - **Where:** step 3, `xz -9e -k` on `$CACHE_DIR/*.csv`
+    - **Issue:** `-k` keeps the CSV and also writes a `.csv.xz` next to it. `cleanup.sh` deletes only `*.csv`, so every `.csv.xz` stays there forever. This is probably why your disk keeps filling up.
+    - **Fix:** remove step 3 (see the next finding). Then delete the copies that are already there, once:
+      ```bash
+      find /var/cache/orders-api/exports -name '*.csv.xz' -delete
+      ```
+
+    #### [High] Exports that live 15 minutes get compressed
+    - **Where:** step 3
+    - **Issue:** nothing reads the `.xz` copies. The API serves the CSV, and the CSV is deleted 15 minutes later. Compression costs CPU, and it only pays off if the smaller file is stored long enough. A Green Coding Solutions estimate puts that break-even at about 0.15 days for zstd and about 7 days for xz, and both are lower bounds. 15 minutes is far below either one.
+    - **Fix:** delete step 3 completely. Short-lived files should stay uncompressed.
+    - **Impact:** E. No more compression work for exports, every hour, and it grows with export traffic.
+
+    #### [High] Hourly logs compressed with `xz -9e`
+    - **Where:** step 2
+    - **Issue:** logs are compressed every hour, so the codec runs all the time. In Green Metrics Tool measurements that compressed 100 MB of English text with default settings, zstd used ~16 J and xz ~458 J, about 29× more. `-9e` is the slowest xz setting, so it costs even more than the measured default. Together with step 3, this is probably most of your hourly CPU spike.
+    - **Fix:** use zstd at its default level. `--rm` deletes the log only if compression worked. With the old `xz` + `mv`, the `mv` ran even after a failure. `nullglob` stops the loop from running on the literal `access-*.log` when no log matches. I also quoted the variables:
+      ```bash
+      #!/bin/bash
+      # runs every hour from cron (0 * * * *)
+      shopt -s nullglob
+
+      LOG_DIR=/var/log/orders-api
+      ARCHIVE=/srv/archive/orders-api
+
+      mkdir -p "$ARCHIVE"
+
+      # 1. rotate access log
+      ts=$(date +%Y%m%d-%H)
+      mv "$LOG_DIR/access.log" "$LOG_DIR/access-$ts.log"
+      kill -USR1 "$(cat /run/orders-api.pid)"
+
+      # 2. compress rotated logs into the archive (source removed only on success)
+      for f in "$LOG_DIR"/access-*.log; do
+          zstd -q --rm "$f" -o "$ARCHIVE/${f##*/}.zst"
+      done
+
+      # 3. keep 90 days of logs (the old .xz files expire too)
+      find "$ARCHIVE" \( -name '*.xz' -o -name '*.zst' \) -mtime +90 -delete
+
+      echo "done $(date)"
+      ```
+    - **Impact:** E, every hour. One caveat: the measurement compares energy, not file size, and `xz -9e` makes smaller files. Logs you keep for 90 days are worth compressing with either codec. If disk space is really tight, try a higher zstd level on one real log and compare size and time. New archives end in `.zst`, so read them with `zstdcat` instead of `xzcat`. Install the `zstd` package if the server doesn't have it yet.
+
+    **Already good:** the hourly rotation and the 90-day retention are a sensible setup. Old logs get compressed and also expire.
+verify:
+  static_only: needs zstd, a running API process and the log directories; the script is syntax checked only

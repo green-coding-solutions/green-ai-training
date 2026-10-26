@@ -1,0 +1,121 @@
+id: gen-2-00023-refactor
+category: refactor
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    We run a small log viewer for the ops team. nginx 1.24 serves the dashboard (static Vue build in /srv/logview/dist), proxies /api/ to our log search service, and lists the daily exports that logrotate writes to /var/log/exports (all of them are .log.gz).
+
+    After an incident, the whole team opens the dashboard at once and CPU on the nginx box jumps. Can you clean up the config? Requirements:
+    - responses must stay compressed, some people use it over VPN from home
+    - our scripts download exports with plain `curl` (no `--compressed`), so this must keep working
+    - search results are dynamic JSON and can be big
+    - we can add a step to the build script, but the config should stay readable
+
+    ```nginx
+    server {
+        listen 443 ssl http2;
+        server_name logs.internal.example.com;
+
+        ssl_certificate     /etc/nginx/tls/logs.crt;
+        ssl_certificate_key /etc/nginx/tls/logs.key;
+
+        access_log /var/log/nginx/logview.access.log;
+
+        gzip on;
+        gzip_comp_level 9;
+        gzip_min_length 256;
+        gzip_proxied any;
+        gzip_vary on;
+        gzip_types text/plain text/css application/javascript application/json
+                   image/svg+xml application/gzip application/octet-stream;
+
+        root /srv/logview/dist;
+
+        location / {
+            try_files $uri /index.html;
+        }
+
+        location /assets/ {
+            add_header Cache-Control "public, max-age=2592000, immutable";
+        }
+
+        location /api/ {
+            proxy_pass http://127.0.0.1:8081/;
+            proxy_set_header Host $host;
+            proxy_read_timeout 60s;
+        }
+
+        location /exports/ {
+            alias /var/log/exports/;
+            autoindex on;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    ```nginx
+    server {
+        listen 443 ssl http2;
+        server_name logs.internal.example.com;
+
+        ssl_certificate     /etc/nginx/tls/logs.crt;
+        ssl_certificate_key /etc/nginx/tls/logs.key;
+
+        access_log /var/log/nginx/logview.access.log;
+
+        root /srv/logview/dist;
+
+        # dashboard files: send the .gz copies made at build time
+        gzip_static on;
+
+        # dynamic responses (API JSON): compressed per request, moderate level
+        gzip on;
+        gzip_comp_level 5;
+        gzip_min_length 256;
+        gzip_proxied any;
+        gzip_vary on;
+        gzip_types text/plain text/css application/javascript application/json image/svg+xml;
+
+        location / {
+            try_files $uri /index.html;
+        }
+
+        location /assets/ {
+            add_header Cache-Control "public, max-age=2592000, immutable";
+        }
+
+        location /api/ {
+            proxy_pass http://127.0.0.1:8081/;
+            proxy_set_header Host $host;
+            proxy_read_timeout 60s;
+        }
+
+        # exports are already .gz: sent as they are
+        location /exports/ {
+            alias /var/log/exports/;
+            autoindex on;
+        }
+    }
+    ```
+
+    Add this to the build script, after the dashboard build:
+
+    ```bash
+    find /srv/logview/dist -type f \
+      \( -name '*.html' -o -name '*.js' -o -name '*.css' -o -name '*.json' -o -name '*.svg' \) \
+      -exec gzip -k -f -9 {} +
+    ```
+
+    **Green Notes**
+    - **Precompress the dashboard at build time** (reduces E): when the whole team opens the dashboard at once, nginx compressed the same JS and CSS again for every visitor, at the highest level. Now each file is compressed once per deploy, and nginx just sends the `.gz` file. In Green Metrics Tool benchmarks with nginx serving 2,000 requests for text assets, gzip level 5 on every request used ~54 J of client and server CPU energy, while precompressed files with `gzip_static` used ~14 J, about 4× less. Both sent about 10× fewer bytes than no compression, so remote users on the VPN still get small responses.
+    - **Moderate level for the API** (reduces E): search results change with every request, so they have to be compressed live. Level 9 uses the most CPU per response and makes the output only slightly smaller. Level 5 is a common middle ground. The high level is fine in the build step, because that runs only once per deploy.
+    - **No compression for the exports** (reduces E): `application/gzip` and `application/octet-stream` in `gzip_types` made nginx gzip the `.log.gz` archives a second time on every browser download. That costs CPU and saves no bytes, so both types are removed.
+
+    Behavior: plain `curl` sends no `Accept-Encoding`, so it gets the original files. That is why `gzip -k` keeps them next to the `.gz` copies. Export downloads are byte-for-byte the same as before. Run the `find` step on every build: `gzip_static` prefers the `.gz` file, so a stale copy would be served in place of a newer original. Check that your nginx build has the module with `nginx -V 2>&1 | grep -o with-http_gzip_static_module` (most distro packages include it).
+verify:
+  static_only: nginx config and build step, needs a running nginx

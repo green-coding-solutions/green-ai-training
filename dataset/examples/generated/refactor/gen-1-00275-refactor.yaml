@@ -1,0 +1,63 @@
+id: gen-1-00275-refactor
+category: refactor
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    hi, im new to python and not sure whats wrong. this is the step before our wake word model, it evens out the volume of a recording. we run it on a few hundred recordings every night, each is about 30 minutes at 16kHz, and the whole thing takes hours. the model itself is fast, so i think its this part? how can i make it better
+
+    ```python
+    import numpy as np
+
+
+    def normalize_audio(samples, decay=0.999, target=0.5):
+        out = np.zeros(len(samples), dtype=np.float32)
+        env = 1e-6
+        for i in range(len(samples)):
+            x = float(samples[i])
+            env = max(abs(x), env * decay, 1e-6)
+            out[i] = x * target / env
+        return out
+
+
+    def prepare_batch(recordings):
+        return [normalize_audio(r) for r in recordings]
+    ```
+- role: assistant
+  content: |
+    Yes, this loop is the likely cause. It runs in plain Python over about 29 million samples per recording. Each step depends on the previous `env` value, so it can't be turned into one simple numpy expression. This is the case where JIT compiling the loop fits.
+
+    ```python
+    import numpy as np
+    from numba import njit
+
+
+    @njit(cache=True)
+    def _normalize(samples, decay, target):
+        out = np.zeros(len(samples), dtype=np.float32)
+        env = 1e-6
+        for i in range(len(samples)):
+            x = float(samples[i])
+            env = max(abs(x), env * decay, 1e-6)
+            out[i] = x * target / env
+        return out
+
+
+    def normalize_audio(samples, decay=0.999, target=0.5):
+        return _normalize(np.ascontiguousarray(samples, dtype=np.float32), decay, target)
+
+
+    def prepare_batch(recordings):
+        return [normalize_audio(r) for r in recordings]
+    ```
+
+    **Green Notes**
+    - **JIT-compile hot numeric loops** (reduces E): `@njit` compiles the loop to machine code, so the per-sample work no longer goes through the Python interpreter. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples in a pure Python loop used about 40 J, and the same loop with Numba `@njit` about 9.5 J (about 4× less). Your loop has more work per sample, so treat that as a rough guide, not a forecast. To check on your data, time one recording before and after with `time` or `perf stat`.
+
+    The output is the same as before. `cache=True` stores the compiled code on disk, so the compile cost is paid on the first run only, not on every nightly start. Numba is not worth it for very short clips or a one-off script, because the compile time would be larger than the loop. For hundreds of 30-minute files every night, it is.
+verify:
+  static_only: uses numba, which is not in the stdlib + numpy test environment

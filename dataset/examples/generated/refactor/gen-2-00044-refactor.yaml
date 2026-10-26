@@ -1,0 +1,97 @@
+id: gen-2-00044-refactor
+category: refactor
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    nginx in front of our model server + the playground UI. fix this
+
+    ```nginx
+    server {
+        listen 80;
+        server_name playground.internal;
+
+        root /srv/playground/dist;
+        index index.html;
+
+        gzip on;
+        gzip_comp_level 9;
+        gzip_proxied any;
+        gzip_types text/html text/css application/javascript application/json image/png image/jpeg image/svg+xml;
+
+        location / {
+            try_files $uri $uri/ /index.html;
+        }
+
+        location /assets/ {
+            expires 30d;
+            add_header Cache-Control "public, immutable";
+        }
+
+        location /v1/ {
+            proxy_pass http://127.0.0.1:8000;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_read_timeout 120s;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    ```nginx
+    server {
+        listen 80;
+        server_name playground.internal;
+
+        root /srv/playground/dist;
+        index index.html;
+
+        # static UI files: serve the .gz files made at build time
+        gzip_static on;
+
+        # dynamic inference responses: compress on the fly at a moderate level
+        gzip on;
+        gzip_comp_level 5;
+        gzip_proxied any;
+        gzip_types text/css application/javascript application/json image/svg+xml;
+
+        location / {
+            try_files $uri $uri/ /index.html;
+        }
+
+        location /assets/ {
+            expires 30d;
+            add_header Cache-Control "public, immutable";
+        }
+
+        location /v1/ {
+            proxy_pass http://127.0.0.1:8000;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_read_timeout 120s;
+        }
+    }
+    ```
+
+    Add this to the UI build, after the bundler runs, so the `.gz` files are made next to the originals:
+
+    ```bash
+    find /srv/playground/dist -type f \
+      \( -name '*.html' -o -name '*.js' -o -name '*.css' -o -name '*.json' -o -name '*.svg' \) \
+      -exec gzip -9 -k -f {} +
+    ```
+
+    **Green Notes**
+    - **Precompress static assets** (reduces E): before, nginx gzipped every JS, CSS and HTML file again on every request at level 9. Now each file is compressed once per build and served as is. In Green Metrics Tool measurements of nginx serving 2,000 requests for text assets, gzip level 5 on every request cost about 4× the CPU energy of serving precompressed files. Both sent about 10× fewer bytes than no compression. Level 9 costs more CPU per request than the measured level 5.
+    - **Moderate level for dynamic responses** (reduces E): the `/v1/` JSON responses can't be precompressed, so they are still gzipped per request. Level 5 instead of 9 keeps most of the byte saving for less CPU work.
+    - **No gzip for JPEG/PNG** (reduces E): these formats are already compressed, so gzip only burned CPU on them. SVG stays in the list because it is text.
+
+    Notes:
+    - `text/html` is always compressed when `gzip on` is set. Listing it in `gzip_types` only triggered a "duplicate MIME type" warning.
+    - Run the `gzip -k` step in every build. Otherwise nginx serves stale `.gz` files after a deploy. Files without a `.gz` next to them still get compressed on the fly, so nothing breaks if one is missing.
+verify:
+  static_only: nginx config, needs nginx and a built UI directory

@@ -1,0 +1,99 @@
+id: gen-1-00127-review
+category: review
+language: sql
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    Can you review the query below? It's the feature loader for our fraud scoring model. A worker runs it every minute, loads the payments that have no score yet, builds the feature vector and writes the score back by payment id.
+
+    Context:
+    - Postgres 16
+    - `payments` has about 45 columns, including `raw_request` (jsonb, a few KB per row), `device_fingerprint` (text) and `customer_note` (text)
+    - `customers` has about 20 columns
+    - The model only uses: `amount_cents`, `currency`, `merchant_category`, `ip_country`, `card_country`, `attempt_count`, the hour of `created_at`, and from the customer `signup_date` and `chargeback_count`
+
+    Requirements: same rows, oldest payment first, and I don't want to rewrite the scoring code beyond what is needed.
+
+    ```sql
+    SELECT *
+    FROM payments p
+    JOIN customers c ON c.id = p.customer_id
+    WHERE p.fraud_score IS NULL
+      AND p.status = 'pending'
+    ORDER BY p.created_at
+    LIMIT 1000;
+    ```
+- role: assistant
+  content: |
+    **Workload:** AI/ML (feature loading for inference)
+
+    #### [Bug] `SELECT *` over a join returns duplicate column names
+    - **Where:** `SELECT *` with `JOIN customers c`
+    - **Issue:** both tables have `id` and `created_at`. Most drivers turn a row into a dict, and then the later column wins. `row["id"]` becomes the customer id, not the payment id, so scores can be written back to the wrong rows (or to none). The hour of `created_at` can come from the customer's creation time too.
+    - **Fix:** name the columns and alias the payment id, as shown below.
+
+    #### [High] Reads wide columns the model never uses
+    - **Where:** `SELECT *`
+    - **Issue:** every run pulls all columns of 1000 rows, including `raw_request`, `device_fingerprint`, `customer_note` and the unused customer columns. The model needs 9 values plus the id. The large columns are read, sent over the connection and parsed in the worker for nothing.
+    - **Fix:** select only the needed columns.
+    - **Impact:** reduces E and network per run, and it repeats every minute. In Green Metrics Tool micro-benchmarks on a 52-column table with large text columns, naming the 10 needed columns used about 5.5× to 7× less CPU energy than `SELECT *` (500 to 10,000 rows). The saving grows with the size of the skipped columns, so your `raw_request` column matters most.
+
+    ```sql
+    SELECT p.id AS payment_id,
+           p.amount_cents,
+           p.currency,
+           p.merchant_category,
+           p.ip_country,
+           p.card_country,
+           p.attempt_count,
+           p.created_at,
+           c.signup_date,
+           c.chargeback_count
+    FROM payments p
+    JOIN customers c ON c.id = p.customer_id
+    WHERE p.fraud_score IS NULL
+      AND p.status = 'pending'
+    ORDER BY p.created_at
+    LIMIT 1000;
+    ```
+
+    The rows and their order are the same. One code change is needed: read `payment_id` instead of `id` when you write the score back.
+
+    **Already good:** the batch is bounded by `LIMIT` and ordered, so each run has a predictable size.
+verify:
+  sql:
+    setup: |
+      CREATE TABLE customers (
+        id INTEGER PRIMARY KEY,
+        email TEXT,
+        signup_date TEXT,
+        chargeback_count INTEGER,
+        created_at TEXT
+      );
+      CREATE TABLE payments (
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER,
+        amount_cents INTEGER,
+        currency TEXT,
+        merchant_category TEXT,
+        ip_country TEXT,
+        card_country TEXT,
+        attempt_count INTEGER,
+        status TEXT,
+        fraud_score REAL,
+        created_at TEXT,
+        raw_request TEXT,
+        device_fingerprint TEXT,
+        customer_note TEXT
+      );
+      INSERT INTO customers VALUES (1, 'a@example.com', '2024-01-10', 0, '2024-01-10 08:00:00');
+      INSERT INTO customers VALUES (2, 'b@example.com', '2025-06-02', 2, '2025-06-02 09:30:00');
+      INSERT INTO payments VALUES (101, 1, 4999, 'EUR', 'books', 'DE', 'DE', 1, 'pending', NULL, '2026-10-01 10:00:00', '{"ua":"x"}', 'fp1', 'note');
+      INSERT INTO payments VALUES (102, 2, 129900, 'EUR', 'electronics', 'RO', 'DE', 3, 'pending', NULL, '2026-10-01 09:00:00', '{"ua":"y"}', 'fp2', '');
+      INSERT INTO payments VALUES (103, 2, 500, 'USD', 'games', 'US', 'US', 1, 'settled', 0.02, '2026-10-01 08:00:00', '{"ua":"z"}', 'fp3', '');
+    compare: false

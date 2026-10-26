@@ -1,0 +1,181 @@
+id: gen-2-00171-review
+category: review
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    Can you review our drift-correction module? It runs on the magnetometer data after every acquisition run: 64 channels, around 4 million samples per channel. It fits a random-walk Kalman filter and then an RTS smoother, and we subtract the smoothed baseline. The forward pass finishes in a few seconds per channel. The smoother takes so long that the post-processing queue backs up.
+
+    Requirements:
+    - stdlib only. This gets vendored into the acquisition software and those boxes have no numpy.
+    - keep the public functions and return types (plain lists, time order).
+    - don't change the filter model. Dropouts in the data are NaN and must stay NaN in the output.
+    - please check the math too, a colleague wrote the smoother from a textbook.
+
+    ```python
+    """Scalar random-walk Kalman filter + RTS smoother for baseline drift.
+
+    Used by drift_correct.py on every channel of a run.
+    """
+    import math
+    from typing import NamedTuple, Sequence
+
+
+    class SmoothResult(NamedTuple):
+        mean: list
+        var: list
+
+
+    def kalman_filter(z: Sequence[float], q: float, r: float):
+        """Forward pass. Returns filtered and one-step predicted mean/variance."""
+        n = len(z)
+        x_f, P_f, x_p, P_p = [], [], [], []
+        x, P = z[0], r
+        for k in range(n):
+            if k > 0:
+                P = P + q
+            x_p.append(x)
+            P_p.append(P)
+            if not math.isnan(z[k]):
+                K = P / (P + r)
+                x = x + K * (z[k] - x)
+                P = (1.0 - K) * P
+            x_f.append(x)
+            P_f.append(P)
+        return x_f, P_f, x_p, P_p
+
+
+    def rts_smooth(z: Sequence[float], q: float, r: float) -> SmoothResult:
+        """Rauch-Tung-Striebel backward pass over the filtered estimates."""
+        x_f, P_f, x_p, P_p = kalman_filter(z, q, r)
+        n = len(z)
+        xs = [x_f[-1]]
+        Ps = [P_f[-1]]
+        for k in range(n - 2, -1, -1):
+            C = P_f[k] / P_p[k]
+            xs.insert(0, x_f[k] + C * (xs[0] - x_p[k + 1]))
+            Ps.insert(0, P_f[k] + C * C * (Ps[0] - P_p[k + 1]))
+        return SmoothResult(xs, Ps)
+
+
+    def detrend_channel(samples: Sequence[float], q: float = 1e-6, r: float = 0.25) -> list:
+        """Subtract the smoothed baseline. NaN dropouts stay NaN."""
+        baseline = rts_smooth(samples, q, r).mean
+        return [s if math.isnan(s) else s - b for s, b in zip(samples, baseline)]
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (offline smoothing, 64 channels × millions of samples per run)
+
+    #### [Bug] Smoother gain uses the wrong predicted variance
+    - **Where:** `rts_smooth`, `C = P_f[k] / P_p[k]`
+    - **Issue:** the RTS gain is `P_{k|k} / P_{k+1|k}`. It has to divide by the prediction for step `k+1`, the same step whose mean `x_p[k + 1]` you use on the next line. With `P_p[k]` the gain is too large and every smoothed mean and variance is off.
+    - **Fix:** `C = P_f[k] / P_p[k + 1]`. Smoothed values will change. That is the fix, not a regression.
+
+    #### [Bug] A NaN first sample makes the whole channel NaN
+    - **Where:** `kalman_filter`, `x, P = z[0], r`
+    - **Issue:** if a channel starts with a dropout, `x` starts as NaN. Every update afterwards is NaN too, so the whole channel turns into NaN. An empty series also fails here with an unclear `IndexError`.
+    - **Fix:** start from the first finite sample, and raise a clear `ValueError` if there is none. When `z[0]` is finite, nothing changes.
+
+    #### [High] Front insertion makes the backward pass quadratic
+    - **Where:** `rts_smooth`, `xs.insert(0, ...)` and `Ps.insert(0, ...)`
+    - **Issue:** each `insert(0, x)` shifts every element already in the list. Over the backward pass that is O(n²) work, twice per step. At millions of samples per channel, this is where the smoother's time goes. The forward pass only appends, so it stays fast.
+    - **Fix:** `append` while walking backward, read the latest value with `[-1]`, and reverse each list once at the end. The math is unchanged and the lists come back in time order. A `deque.appendleft` would also work, but you need plain lists back anyway.
+    - **Impact:** E, O(n²) → O(n) for the backward pass. In Green Metrics Tool micro-benchmarks, 1,000,000 `list.insert(0, x)` calls used ~1515 J and 1,000,000 `append` calls used ~1.2 J, a difference of over 1000×.
+
+    ```python
+    """Scalar random-walk Kalman filter + RTS smoother for baseline drift.
+
+    Used by drift_correct.py on every channel of a run.
+    """
+    import math
+    from typing import NamedTuple, Sequence
+
+
+    class SmoothResult(NamedTuple):
+        mean: list
+        var: list
+
+
+    def kalman_filter(z: Sequence[float], q: float, r: float):
+        """Forward pass. Returns filtered and one-step predicted mean/variance."""
+        n = len(z)
+        x_f, P_f, x_p, P_p = [], [], [], []
+        x = next((v for v in z if not math.isnan(v)), None)
+        if x is None:
+            raise ValueError("series has no finite samples")
+        P = r
+        for k in range(n):
+            if k > 0:
+                P = P + q
+            x_p.append(x)
+            P_p.append(P)
+            if not math.isnan(z[k]):
+                K = P / (P + r)
+                x = x + K * (z[k] - x)
+                P = (1.0 - K) * P
+            x_f.append(x)
+            P_f.append(P)
+        return x_f, P_f, x_p, P_p
+
+
+    def rts_smooth(z: Sequence[float], q: float, r: float) -> SmoothResult:
+        """Rauch-Tung-Striebel backward pass over the filtered estimates."""
+        x_f, P_f, x_p, P_p = kalman_filter(z, q, r)
+        n = len(z)
+        xs = [x_f[-1]]
+        Ps = [P_f[-1]]
+        for k in range(n - 2, -1, -1):
+            C = P_f[k] / P_p[k + 1]
+            xs.append(x_f[k] + C * (xs[-1] - x_p[k + 1]))
+            Ps.append(P_f[k] + C * C * (Ps[-1] - P_p[k + 1]))
+        xs.reverse()
+        Ps.reverse()
+        return SmoothResult(xs, Ps)
+
+
+    def detrend_channel(samples: Sequence[float], q: float = 1e-6, r: float = 0.25) -> list:
+        """Subtract the smoothed baseline. NaN dropouts stay NaN."""
+        baseline = rts_smooth(samples, q, r).mean
+        return [s if math.isnan(s) else s - b for s, b in zip(samples, baseline)]
+    ```
+
+    **Already good:** the forward pass builds its lists with `append`. Dropouts skip the update step, which is the correct way to handle missing measurements. `detrend_channel` keeps NaN samples as NaN.
+verify:
+  test: |-
+    import math, random
+    random.seed(1)
+    z = [math.sin(i / 50) + random.gauss(0, 0.5) for i in range(2000)]
+    z[100:120] = [float("nan")] * 20
+    q, r = 1e-3, 0.25
+    x_f, P_f, x_p, P_p = kalman_filter(z, q, r)
+    n = len(z)
+    ref_x = [0.0] * n
+    ref_P = [0.0] * n
+    ref_x[-1] = x_f[-1]
+    ref_P[-1] = P_f[-1]
+    for k in range(n - 2, -1, -1):
+        C = P_f[k] / P_p[k + 1]
+        ref_x[k] = x_f[k] + C * (ref_x[k + 1] - x_p[k + 1])
+        ref_P[k] = P_f[k] + C * C * (ref_P[k + 1] - P_p[k + 1])
+    res = rts_smooth(z, q, r)
+    assert isinstance(res.mean, list) and isinstance(res.var, list)
+    assert res.mean == ref_x and res.var == ref_P
+    assert all(s <= f + 1e-12 for s, f in zip(res.var, P_f))
+    z2 = [float("nan")] * 5 + [1.0] * 50
+    res2 = rts_smooth(z2, q, r)
+    assert not any(math.isnan(v) for v in res2.mean)
+    assert all(v == 1.0 for v in res2.mean)
+    try:
+        rts_smooth([float("nan")] * 3, q, r)
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+    out = detrend_channel(z, q, r)
+    assert len(out) == len(z)
+    assert all(math.isnan(out[i]) for i in range(100, 120))
+    assert not math.isnan(out[0])

@@ -1,0 +1,93 @@
+id: gen-2-00098-generation
+category: generation
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    Hi, i need a python function for our nightly ETL. We must send customer balances to an old bank system and they only accept fixed-width file, no csv. Every line is one customer:
+
+    - customer_id: 10 chars, left padded with zeros
+    - name: 30 chars, padded with spaces, cut if longer
+    - country: 2 chars, uppercase
+    - balance: sign (+ or -) and 11 digits in cents, zero padded
+
+    At the end one trailer line "TRL" + record count with 9 digits, padded to same length like the other lines. Line ending must be CRLF (windows). Function get the records (list of dicts from our postgres query, balance is Decimal) and give back one string, because the upload lib take the whole content at once. Its around 2 mio customers each night so it should not be to slow.
+- role: assistant
+  content: |
+    ```python
+    from decimal import Decimal, ROUND_HALF_UP
+
+    ID_LEN, NAME_LEN, COUNTRY_LEN, DIGITS_LEN = 10, 30, 2, 11
+    RECORD_LEN = ID_LEN + NAME_LEN + COUNTRY_LEN + 1 + DIGITS_LEN
+    CENT = Decimal("1")
+
+
+    def _format_record(rec):
+        cust_id = str(rec["customer_id"])
+        if len(cust_id) > ID_LEN:
+            raise ValueError(f"customer_id too long: {cust_id}")
+
+        # line breaks inside a name would break the fixed-width layout
+        name = rec["name"].replace("\r", " ").replace("\n", " ")[:NAME_LEN]
+        country = rec["country"].upper()[:COUNTRY_LEN]
+
+        cents = int((Decimal(str(rec["balance"])) * 100).quantize(CENT, rounding=ROUND_HALF_UP))
+        sign = "-" if cents < 0 else "+"
+        digits = str(abs(cents))
+        if len(digits) > DIGITS_LEN:
+            raise ValueError(f"balance too large for customer {cust_id}: {rec['balance']}")
+
+        return (
+            f"{cust_id:0>{ID_LEN}}"
+            f"{name:<{NAME_LEN}}"
+            f"{country:<{COUNTRY_LEN}}"
+            f"{sign}{digits:0>{DIGITS_LEN}}"
+        )
+
+
+    def to_fixed_width(records):
+        """Build the bank file: one fixed-width line per customer plus a trailer, CRLF line endings."""
+        lines = [_format_record(rec) for rec in records]
+        lines.append(f"TRL{len(lines):09d}".ljust(RECORD_LEN))
+        return "\r\n".join(lines) + "\r\n"
+    ```
+
+    Before you upload, encode with the charset the bank expects, for example `content.encode("latin-1", errors="replace")`. Padding counts characters, so the lines only stay fixed-width in bytes with a single-byte charset. Balances are rounded half up to whole cents. An ID or balance that does not fit raises `ValueError` instead of writing a broken line.
+
+    **Green Notes**
+    - **Join strings instead of `+=`** (reduces E): the file is made from one short line per customer, so the lines go into a list and are joined once at the end. Growing one big string with `+=` can copy it again and again. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces with `+=` used ~469 J and `"".join()` ~1.8 J, roughly 260× less. Appending f-strings in a loop behaved like `+=` (~455 J). The f-string inside `_format_record` is fine, because it builds only one short line.
+verify:
+  test: |-
+    from decimal import Decimal
+
+    out = to_fixed_width([
+        {"customer_id": 42, "name": "Müller GmbH", "country": "de", "balance": Decimal("1234.565")},
+        {"customer_id": 7, "name": "A" * 40, "country": "AT", "balance": "-0.5"},
+        {"customer_id": 1234567890, "name": "Line\nBreak", "country": "fr", "balance": Decimal("0")},
+    ])
+    assert out.endswith("\r\n")
+    lines = out.split("\r\n")[:-1]
+    assert len(lines) == 4
+    assert all(len(l) == RECORD_LEN == 54 for l in lines)
+    assert lines[0] == "0000000042" + "Müller GmbH".ljust(30) + "DE" + "+00000123457"
+    assert lines[1] == "0000000007" + "A" * 30 + "AT" + "-00000000050"
+    assert lines[2] == "1234567890" + "Line Break".ljust(30) + "FR" + "+00000000000"
+    assert lines[3] == "TRL000000003".ljust(54)
+
+    assert to_fixed_width([]) == "TRL000000000".ljust(54) + "\r\n"
+    assert to_fixed_width(iter([])) == "TRL000000000".ljust(54) + "\r\n"
+
+    for bad in (
+        {"customer_id": 12345678901, "name": "x", "country": "DE", "balance": Decimal("1")},
+        {"customer_id": 1, "name": "x", "country": "DE", "balance": Decimal("1000000000")},
+    ):
+        try:
+            to_fixed_width([bad])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError")

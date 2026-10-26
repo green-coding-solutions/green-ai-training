@@ -1,0 +1,51 @@
+id: gen-12764612-00298-generation
+category: generation
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    bash script for cron: pack yesterday's batch scoring csvs from /data/scoring/out (scores-YYYY-MM-DD-*.csv) into /archive/scoring, delete archives after 90 days
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    SRC=/data/scoring/out
+    DEST=/archive/scoring
+    KEEP_DAYS=90
+
+    day=$(date -d yesterday +%F)
+    out="$DEST/scores-$day.tar.zst"
+
+    mkdir -p "$DEST"
+    cd "$SRC"
+
+    shopt -s nullglob
+    files=(scores-"$day"-*.csv)
+    if (( ${#files[@]} == 0 )); then
+      echo "no scoring files for $day"
+      exit 0
+    fi
+
+    tar -cf - -- "${files[@]}" | zstd -q -f -o "$out.tmp"
+    zstd -q -t "$out.tmp"
+    mv "$out.tmp" "$out"
+
+    find "$DEST" -maxdepth 1 -name 'scores-*.tar.zst' -mtime +"$KEEP_DAYS" -delete
+    ```
+
+    The source CSVs are left in place. The archive is written to a temp name, tested, then renamed, so a failed run never leaves a broken `.tar.zst` behind.
+
+    **Green Notes**
+    - **Fast codec for data that is compressed every night** (reduces E): `zstd` at its default level. In Green Metrics Tool micro-benchmarks on 100 MB of text, compressing used ~16 J with zstd, ~67 J with gzip and ~458 J with xz. That is about 4× less than gzip, and xz used about 29× more than zstd. These figures compare energy only, not file size, so xz or brotli would give smaller files.
+    - **Compression is worth it here** (reduces M): the archives live for 90 days. A Green Coding Solutions estimate (not a direct measurement) puts the storage break-even for zstd at about 0.15 days, so CSV text kept for months easily pays it back.
+
+    *Not applied:* xz or brotli at high levels. They only make sense for static data that is compressed once and kept or served for a long time.
+verify:
+  static_only: needs /data and /archive paths, GNU date, tar and zstd; cron script

@@ -1,0 +1,91 @@
+id: gen-2-00115-generation
+category: generation
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    write a small path router for our api. routes like /users/{id}/orders/{order_id}, give me back handler + params
+- role: assistant
+  content: |
+    Each route template becomes a regex once, when you register it. `match()` returns `(handler, params)`, or `None` when no route fits.
+
+    ```python
+    import re
+    from typing import Callable, Optional
+
+    _PARAM = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+    class Router:
+        def __init__(self) -> None:
+            self._routes: list[tuple[str, re.Pattern[str], Callable]] = []
+
+        def add(self, method: str, template: str, handler: Callable) -> None:
+            """Register a route like '/users/{id}/orders/{order_id}'."""
+            parts = []
+            pos = 0
+            for m in _PARAM.finditer(template):
+                parts.append(re.escape(template[pos:m.start()]))
+                parts.append(f"(?P<{m.group(1)}>[^/]+)")
+                pos = m.end()
+            parts.append(re.escape(template[pos:]))
+            # Compiled once here. A duplicate param name raises re.error at startup.
+            pattern = re.compile("".join(parts))
+            self._routes.append((method.upper(), pattern, handler))
+
+        def match(self, method: str, path: str) -> Optional[tuple[Callable, dict[str, str]]]:
+            method = method.upper()
+            for route_method, pattern, handler in self._routes:
+                if route_method != method:
+                    continue
+                m = pattern.fullmatch(path)
+                if m:
+                    return handler, m.groupdict()
+            return None
+    ```
+
+    Usage:
+
+    ```python
+    router = Router()
+    router.add("GET", "/users/{id}/orders/{order_id}", get_order)
+
+    found = router.match("GET", "/users/42/orders/a-7")
+    # (get_order, {"id": "42", "order_id": "a-7"})
+    ```
+
+    Routes are checked in registration order, and the first match wins. Params are strings. Convert them in the handler. A trailing slash (`/users/42/`) does not match.
+
+    **Green Notes**
+    - **Compile regex once, at registration** (reduces E): each request only runs `fullmatch` on ready patterns. Building the regex string and compiling it never happen per request. Python's `re` keeps its own cache, so precompiling a fixed pattern is only a small win. In Green Metrics Tool micro-benchmarks, a precompiled pattern used about 18% less CPU energy than inline `re.match`. A forced recompile on every call cost about 200× more per match.
+verify:
+  green_block: 0
+  test: |-
+    def get_order(): pass
+    def list_users(): pass
+    def get_file(): pass
+
+    r = Router()
+    r.add("GET", "/users", list_users)
+    r.add("get", "/users/{id}/orders/{order_id}", get_order)
+    r.add("GET", "/files/{name}.json", get_file)
+
+    assert r.match("GET", "/users") == (list_users, {})
+    assert r.match("get", "/users/42/orders/a-7") == (get_order, {"id": "42", "order_id": "a-7"})
+    assert r.match("POST", "/users/42/orders/7") is None
+    assert r.match("GET", "/users/42/orders") is None
+    assert r.match("GET", "/users/4/2/orders/7") is None
+    assert r.match("GET", "/users/42/") is None
+    assert r.match("GET", "/files/report.json") == (get_file, {"name": "report"})
+    assert r.match("GET", "/files/reportXjson") is None
+
+    import re as _re
+    try:
+        r.add("GET", "/a/{x}/b/{x}", get_file)
+        raise AssertionError("duplicate param should fail")
+    except _re.error:
+        pass

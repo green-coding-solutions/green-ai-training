@@ -1,0 +1,106 @@
+id: gen-12764612-00203-review
+category: review
+language: bash
+patterns:
+- compress-stored
+- bash-quoting
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    hi, i wrote this script for our nightly export of the shop tables (about 40 tables in tables.txt, the archive is kept for a year because of accounting). it works on my machine but i am not sure if i did everything right. can you look at it?
+
+    ```bash
+    #!/bin/bash
+    # nightly export of shop tables, validate, archive
+    OUT="/data/exports"
+    ARCHIVE="/data/archive"
+    DAY=$(date +%F)
+    mkdir -p "$OUT/$DAY" "$ARCHIVE"
+
+    echo "Starting nightly export"
+    for t in $(cat tables.txt); do
+        echo "Exporting table $t"
+        psql -d shop -c "\copy $t to '$OUT/$DAY/$t.csv' csv header"
+        gzip -9 "$OUT/$DAY/$t.csv"
+        if ! zcat "$OUT/$DAY/$t.csv.gz" | python3 validate.py "$t"; then
+            echo "Validation failed, stopping the export"
+            exit 1
+        fi
+    done
+
+    tar -cf - "$OUT/$DAY" | xz -9e > "$ARCHIVE/$DAY.tar.xz"
+
+    echo "Cleaning old exports"
+    find "$OUT" -mindepth 1 -maxdepth 1 -mtime +1 -exec rm -rf {} +
+    echo "Archive written: $ARCHIVE/$DAY.tar.xz"
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly batch)
+
+    #### [Bug] Old exports are deleted even if the archive failed
+    - **Where:** `tar ... | xz ... > file`, then `find ... -exec rm -rf`
+    - **Issue:** the script never checks if the archive step worked. In a pipe, only the exit code of the last command counts, so a failing `tar` goes unnoticed. The cleanup then runs anyway and deletes the older raw exports. A broken archive could be the only copy left. Also, `psql` errors are not checked.
+    - **Fix:** use `set -o pipefail`, write to a temp file, and only move it into place and clean up if everything worked (see the full script below).
+
+    #### [Medium] `xz -9e` for a nightly job
+    - **Where:** `xz -9e`
+    - **Issue:** you compress every night, so the cost of the codec repeats every night. Keeping the archive for a year does justify compressing it. But in Green Metrics Tool micro-benchmarks on English text, xz at its default level used about 29× more CPU energy than zstd at its default level. These facts compare energy only, not file size. xz usually makes smaller files. If disk space is the main concern, keep xz and drop to the default level.
+    - **Fix:** `zstd` (default level) for the archive.
+    - **Impact:** E on every run, and the saving repeats nightly. The archive is still compressed, so the storage benefit stays.
+
+    #### [Medium] Files are compressed, then decompressed right away
+    - **Where:** `gzip -9 ...` followed by `zcat ... | python3 validate.py`
+    - **Issue:** each CSV is compressed and read back a few seconds later. Data that is only kept for seconds gains nothing from compression, and you pay for both steps. The `.gz` files then also go into the tar, where the second compression can't shrink them further.
+    - **Fix:** validate the plain CSV and compress once, in the final archive step.
+    - **Impact:** E, one compress and one decompress less per table per night.
+
+    #### [Low] Double quotes on text that needs no expansion
+    - **Where:** `OUT="/data/exports"`, `ARCHIVE=...`, `echo "Starting nightly export"`, `echo "Validation failed, stopping the export"`, `echo "Cleaning old exports"`
+    - **Issue:** bash scans double-quoted text for `$`, backticks and backslashes. Single quotes are taken as they are. In Green Metrics Tool micro-benchmarks, a loop with a 6,200-character literal used about 24% less CPU energy with single quotes. Your strings are short and run once, so the real saving here is tiny. It is still a good habit.
+    - **Fix:** single quotes for these. Keep double quotes where a variable must expand, like `"Exporting table $t"` and `"$OUT/$DAY"`.
+    - **Impact:** E, negligible in this script.
+
+    Here is the script with these changes:
+
+    ```bash
+    #!/bin/bash
+    # nightly export of shop tables, validate, archive
+    set -o pipefail
+    OUT='/data/exports'
+    ARCHIVE='/data/archive'
+    DAY=$(date +%F)
+    mkdir -p "$OUT/$DAY" "$ARCHIVE"
+
+    echo 'Starting nightly export'
+    for t in $(cat tables.txt); do
+        echo "Exporting table $t"
+        psql -d shop -c "\copy $t to '$OUT/$DAY/$t.csv' csv header" || exit 1
+        if ! python3 validate.py "$t" < "$OUT/$DAY/$t.csv"; then
+            echo 'Validation failed, stopping the export'
+            exit 1
+        fi
+    done
+
+    tmp="$ARCHIVE/$DAY.tar.zst.tmp"
+    if ! tar -C "$OUT" -cf - "$DAY" | zstd > "$tmp"; then
+        echo 'Archive failed, keeping the old exports'
+        rm -f "$tmp"
+        exit 1
+    fi
+    mv "$tmp" "$ARCHIVE/$DAY.tar.zst"
+
+    echo 'Cleaning old exports'
+    find "$OUT" -mindepth 1 -maxdepth 1 -mtime +1 -exec rm -rf {} +
+    echo "Archive written: $ARCHIVE/$DAY.tar.zst"
+    ```
+
+    Two behavior changes: the archive is now `.tar.zst` (restore with `zstd -dc file | tar -x`), and its paths start with the date folder instead of `data/exports/<date>`.
+
+    **Already good:** the variables in paths are quoted, and `mkdir -p` makes reruns safe.
+verify:
+  static_only: needs a PostgreSQL database, psql, zstd and validate.py; script is not runnable in the sandbox

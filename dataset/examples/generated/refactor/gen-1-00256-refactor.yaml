@@ -1,0 +1,123 @@
+id: gen-1-00256-refactor
+category: refactor
+language: python
+patterns:
+- memoize
+- hoist-invariants
+facts:
+- F-LRU
+- F-ATTR
+messages:
+- role: user
+  content: |
+    hello, we have gateway on raspberry pi who read 200 temperature sensors (NTC thermistor, 12 bit ADC) every second and send alarm if too hot or too cold. the cpu is always busy and the fan is loud. can you optimize this please? i think the math is the slow part but i am not sure
+
+    ```python
+    import math
+
+
+    class ThermistorBank:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+        def adc_to_celsius(self, raw):
+            # voltage divider, 12 bit ADC
+            r = self.cfg.series_resistor * raw / (4095 - raw)
+            ln_r = math.log(r)
+            inv_t = (self.cfg.sh_a
+                     + self.cfg.sh_b * ln_r
+                     + self.cfg.sh_c * ln_r ** 3)
+            return 1.0 / inv_t - 273.15 + self.cfg.offset
+
+        def process_batch(self, readings):
+            out = []
+            for ch, raw in readings:
+                t = self.adc_to_celsius(raw)
+                if t < self.cfg.alarm_low or t > self.cfg.alarm_high:
+                    out.append((ch, round(t, 2), True))
+                else:
+                    out.append((ch, round(t, 2), False))
+            return out
+    ```
+- role: assistant
+  content: |
+    ```python
+    import math
+    from functools import lru_cache
+
+
+    class ThermistorBank:
+        def __init__(self, cfg):
+            self.cfg = cfg
+            self._rs = cfg.series_resistor
+            self._a = cfg.sh_a
+            self._b = cfg.sh_b
+            self._c = cfg.sh_c
+            self._offset = cfg.offset
+            # a 12 bit ADC has at most 4096 different raw values
+            self.adc_to_celsius = lru_cache(maxsize=4096)(self._convert)
+
+        def _convert(self, raw):
+            # voltage divider, 12 bit ADC
+            r = self._rs * raw / (4095 - raw)
+            ln_r = math.log(r)
+            inv_t = self._a + self._b * ln_r + self._c * ln_r ** 3
+            return 1.0 / inv_t - 273.15 + self._offset
+
+        def process_batch(self, readings):
+            convert = self.adc_to_celsius
+            low = self.cfg.alarm_low
+            high = self.cfg.alarm_high
+            out = []
+            append = out.append
+            for ch, raw in readings:
+                t = convert(raw)
+                append((ch, round(t, 2), t < low or t > high))
+            return out
+    ```
+
+    **Green Notes**
+    - **Memoize repeated pure computations** (reduces E): `adc_to_celsius` depends only on the raw value, and room temperatures give the same raw values again and again. Now `log` and the polynomial run once per distinct value. The cache is bounded to 4096 entries, the number of possible 12-bit values. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over 200 distinct inputs used ~43 J without `lru_cache` and ~4.7 J with it, about 9× less. This only helps because inputs repeat. If your readings were mostly unique, the cache would add overhead.
+    - **Hoist loop-invariant lookups** (reduces E, small): `self.cfg.alarm_low`, `alarm_high` and the method lookup are now read once per batch, not once per sensor. The coefficients are copied to plain attributes once in `__init__`. This is only a few percent at best. In the same micro-benchmarks, caching `math.sqrt` in a local before a 10,000,000-iteration loop saved about 4-5%. The cache is the real change.
+
+    The results are the same as before. The two alarm branches became one boolean expression.
+
+    Two things to know:
+    - The cache and the copied coefficients are fixed when the object is created. If you change `cfg` while the gateway runs (new offset after calibration), create a new `ThermistorBank` or call `adc_to_celsius.cache_clear()` after copying the new values.
+    - `raw = 0` or `raw = 4095` still raises, as before (`ValueError` and `ZeroDivisionError`). Errors are not cached. A broken or unplugged sensor will give these values, so catch them in the caller if you do not already.
+verify:
+  equivalence:
+    driver: |
+      import random
+      from types import SimpleNamespace
+
+      cfg = SimpleNamespace(
+          series_resistor=10000.0,
+          sh_a=1.009249522e-03,
+          sh_b=2.378405444e-04,
+          sh_c=2.019202697e-07,
+          offset=-0.35,
+          alarm_low=5.0,
+          alarm_high=60.0,
+      )
+      rng = random.Random(42)
+      bank = ThermistorBank(cfg)
+      for _ in range(5):
+          readings = [(ch, rng.choice([300, 1500, 2048, 2050, 2051, 3900, 4090, rng.randint(1, 4094)]))
+                      for ch in range(200)]
+          res = bank.process_batch(readings)
+          print(sum(1 for _, _, alarm in res if alarm), res[:5], res[-1])
+  test: |-
+    from types import SimpleNamespace
+    cfg = SimpleNamespace(series_resistor=10000.0, sh_a=1.009249522e-03, sh_b=2.378405444e-04,
+                          sh_c=2.019202697e-07, offset=0.0, alarm_low=5.0, alarm_high=60.0)
+    b = ThermistorBank(cfg)
+    out = b.process_batch([(i, 2048) for i in range(50)])
+    assert len(out) == 50
+    assert b.adc_to_celsius.cache_info().hits == 49
+    assert all(isinstance(a, bool) for _, _, a in out)
+    try:
+        b.adc_to_celsius(4095)
+        assert False
+    except ZeroDivisionError:
+        pass

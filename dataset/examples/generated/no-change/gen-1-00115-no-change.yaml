@@ -1,0 +1,46 @@
+id: gen-1-00115-no-change
+category: no-change
+language: bash
+patterns:
+- bash-builtins
+- context-tradeoff
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    hi, I'm new to bash and I wrote this for our CI. It runs after every build, reads the build log and checks if our 3 test sites are up. It works but a coworker said "you should use builtins, not external commands, its slow". I dont know what is wrong with it. Can you tell me what to fix?
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    LOG="${1:?usage: $0 build.log}"
+
+    errors=$(grep -c 'ERROR' "$LOG" || true)
+    warnings=$(grep -c 'WARN' "$LOG" || true)
+
+    echo "errors: $errors"
+    echo "warnings: $warnings"
+
+    echo "top failing steps:"
+    grep 'ERROR' "$LOG" | awk '{print $3}' | sort | uniq -c | sort -rn | head -5
+
+    for env in staging qa demo; do
+      code=$(curl -s -o /dev/null -w '%{http_code}' "https://$env.example.com/health")
+      echo "$env: $code"
+    done
+    ```
+- role: assistant
+  content: |
+    Nothing is wrong with it. I would not change it.
+
+    The advice about builtins is right for one case: a loop that starts several processes for every input line, like `$(echo "$line" | cut ...)` or `$(expr ...)`. In Green Metrics Tool micro-benchmarks on a 20,000-line log, that style used about 300× more CPU energy than the same loop with builtins only. Your script does not do that:
+
+    - **The log is read by whole-file tools.** `grep -c`, then one `grep | awk | sort | uniq | sort | head` pipeline. That is a fixed number of process starts, no matter how long the log is. `awk` and `grep` are the right tools for this job. Rewriting them as a `while read` loop with builtins would be more code and not cheaper.
+    - **The only loop has 3 rounds.** Each round runs `curl`. The HTTP check is the work itself, and no builtin can replace it. The 3 process starts are noise next to the network wait.
+    - **Quoting is already good.** Literals use single quotes, and variables like `"$LOG"` keep double quotes. Keep it that way.
+
+    If you want to improve it, an idea for later: if the log gets very large, you could count errors, warnings and step names in one `awk` pass. For a normal build log, that would not change much, so I would leave it.
+verify:
+  static_only: needs curl and a build log with external HTTP endpoints

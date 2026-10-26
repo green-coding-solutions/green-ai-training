@@ -1,0 +1,120 @@
+id: gen-2-00044-generation
+category: generation
+language: python
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    ```python
+    # gateway/uplink_sink.py
+    import json
+    import logging
+    import time
+    from dataclasses import dataclass
+    from datetime import datetime
+
+    import psycopg
+
+    log = logging.getLogger("uplink_sink")
+
+    # ~3000 cold-chain loggers on LoRaWAN, one uplink per minute each
+    FLUSH_EVERY_S = 30
+
+    # CREATE TABLE sensor_readings (
+    #   dev_eui       text        NOT NULL,
+    #   received_at   timestamptz NOT NULL,
+    #   temperature_c real,
+    #   humidity_pct  real,
+    #   battery_mv    integer,
+    #   rssi          integer     NOT NULL
+    # );
+
+
+    @dataclass
+    class Reading:
+        dev_eui: str
+        received_at: datetime
+        temperature_c: float | None
+        humidity_pct: float | None
+        battery_mv: int | None
+        rssi: int
+
+
+    def decode_uplink(msg: dict) -> Reading:
+        up = msg["uplink_message"]
+        payload = up["decoded_payload"]
+        return Reading(
+            dev_eui=msg["end_device_ids"]["dev_eui"].lower(),
+            received_at=datetime.fromisoformat(msg["received_at"].replace("Z", "+00:00")),
+            temperature_c=payload.get("temperature"),
+            humidity_pct=payload.get("humidity"),
+            battery_mv=payload.get("battery_mv"),
+            rssi=up["rx_metadata"][0]["rssi"],
+        )
+
+
+    def store_readings(conn: psycopg.Connection, readings: list[Reading]) -> int:
+        """Write one buffer to sensor_readings. Returns number of rows written."""
+        # TODO
+        ...
+
+
+    def run(mqtt_queue, dsn: str) -> None:
+        buffer: list[Reading] = []
+        last_flush = time.monotonic()
+        with psycopg.connect(dsn) as conn:
+            while True:
+                msg = mqtt_queue.get()
+                try:
+                    buffer.append(decode_uplink(json.loads(msg)))
+                except (ValueError, KeyError, IndexError) as e:
+                    log.warning("bad uplink: %s", e)
+                if buffer and time.monotonic() - last_flush >= FLUSH_EVERY_S:
+                    n = store_readings(conn, buffer)
+                    log.info("flushed %d readings", n)
+                    buffer.clear()
+                    last_flush = time.monotonic()
+    ```
+
+    ?
+- role: assistant
+  content: |
+    Here is `store_readings`. It writes the whole buffer with one `COPY` in one transaction:
+
+    ```python
+    COPY_SQL = (
+        "COPY sensor_readings "
+        "(dev_eui, received_at, temperature_c, humidity_pct, battery_mv, rssi) "
+        "FROM STDIN"
+    )
+
+
+    def store_readings(conn: psycopg.Connection, readings: list[Reading]) -> int:
+        """Write one buffer to sensor_readings. Returns number of rows written."""
+        if not readings:
+            return 0
+        with conn.transaction():
+            with conn.cursor() as cur, cur.copy(COPY_SQL) as copy:
+                for r in readings:
+                    copy.write_row((
+                        r.dev_eui,
+                        r.received_at,
+                        r.temperature_c,
+                        r.humidity_pct,
+                        r.battery_mv,
+                        r.rssi,
+                    ))
+        return len(readings)
+    ```
+
+    `write_row` turns `None` into `NULL`, and the timezone-aware `received_at` maps to `timestamptz`. You don't need to escape anything by hand.
+
+    **Green Notes**
+    - **Batch database writes** (reduces E): each flush is one `COPY` stream and one commit. One `INSERT` per reading would cost a round trip per reading. Your buffer collects every logger's uplinks over the flush interval, so a flush holds many rows, and that is the case where `COPY` pays off. In Green Metrics Tool micro-benchmarks that inserted 500,000 rows in batches of 5,000, `COPY` used ~17 J against ~384 J for one `execute()` per row, about 22× less. With 1,000-row batches it was still about 5× less than the loop. With batches of only 100 rows the differences were small, so keep the time-based buffer and don't flush per message.
+
+    One behavior to be aware of: `COPY` is all-or-nothing. If one row is rejected, for example a `NOT NULL` violation, the whole flush rolls back, the exception leaves `run()`, and the buffer is not cleared. `decode_uplink` already guarantees `dev_eui`, `received_at` and `rssi`, so this should only happen on schema changes or a lost connection.
+verify:
+  static_only: needs a running PostgreSQL server and the psycopg package

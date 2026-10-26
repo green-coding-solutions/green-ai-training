@@ -1,0 +1,95 @@
+id: gen-1-00139-refactor
+category: refactor
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    fix this, too slow on the big scans
+
+    ```python
+    import argparse
+
+    import numpy as np
+
+
+    def posterize(img, levels):
+        h, w = img.shape
+        out = np.zeros((h, w), dtype=np.uint8)
+        step = 255.0 / (levels - 1)
+        for y in range(h):
+            for x in range(w):
+                v = float(img[y, x])
+                if v < 0.0:
+                    v = 0.0
+                elif v > 1.0:
+                    v = 1.0
+                q = int(v * (levels - 1) + 0.5)
+                out[y, x] = int(round(q * step))
+        return out
+
+
+    def main():
+        p = argparse.ArgumentParser()
+        p.add_argument("src")
+        p.add_argument("dst")
+        p.add_argument("--levels", type=int, default=16)
+        args = p.parse_args()
+        img = np.load(args.src)
+        np.save(args.dst, posterize(img, args.levels))
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    ```python
+    import argparse
+
+    import numpy as np
+    from numba import njit
+
+
+    @njit(cache=True)
+    def posterize(img, levels):
+        h, w = img.shape
+        out = np.zeros((h, w), dtype=np.uint8)
+        step = 255.0 / (levels - 1)
+        for y in range(h):
+            for x in range(w):
+                v = img[y, x]
+                if v < 0.0:
+                    v = 0.0
+                elif v > 1.0:
+                    v = 1.0
+                q = int(v * (levels - 1) + 0.5)
+                out[y, x] = int(np.rint(q * step))
+        return out
+
+
+    def main():
+        p = argparse.ArgumentParser()
+        p.add_argument("src")
+        p.add_argument("dst")
+        p.add_argument("--levels", type=int, default=16)
+        args = p.parse_args()
+        img = np.load(args.src).astype(np.float64)
+        np.save(args.dst, posterize(img, args.levels))
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **JIT-compile the hot numeric loop** (reduces E): this is a plain Python loop over every pixel, and it is pure number work. That is the case Numba is made for. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples in a pure Python loop used about 4× less CPU energy with Numba `@njit`.
+    - **`cache=True`** (reduces E): the compile step runs on the first call. Since this is a CLI that starts a new process each time, the cache saves the compile cost on later runs.
+    - The input is converted to `float64` once in `main`, so Numba compiles one clean typed version. `np.rint` rounds half to even, like Python's `round`, so the output is the same as before. `levels` must still be at least 2.
+
+    *Not applied:* Numba for small images. If most of your files are small, the compile cost can be larger than the loop. Then the plain version is fine.
+verify:
+  static_only: needs numba, which is not in the stdlib + numpy test environment

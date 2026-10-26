@@ -1,0 +1,62 @@
+id: gen-12764612-00378-no-change
+category: no-change
+language: python
+patterns:
+- string-join
+- context-tradeoff
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    hi, i am new to python and i write the software for a small gateway that talks to some modbus sensors. i added a debug log of every frame we send and receive. a friend told me strings in python are slow and i should be careful. is something wrong in my code? i dont know what to look for
+
+    ```python
+    import time
+
+    def hex_dump(frame: bytes) -> str:
+        return " ".join(f"{b:02x}" for b in frame)
+
+    def log_frame(direction, frame, log):
+        ts = time.strftime("%H:%M:%S")
+        log.write(f"{ts} {direction} len={len(frame)} {hex_dump(frame)}\n")
+
+    def poll_sensor(port, address, log):
+        request = bytes([address, 0x03, 0x00, 0x00, 0x00, 0x02])
+        log_frame("TX", request, log)
+        port.write(request)
+        response = port.read(9)
+        log_frame("RX", response, log)
+        return response
+    ```
+- role: assistant
+  content: |
+    Nothing is wrong here. This code is already in the efficient form.
+
+    - **`hex_dump` uses `" ".join(...)`.** It builds the text from all pieces in one step. The slow pattern your friend means is `text += piece` inside a loop.
+    - **The f-string in `log_frame` is a single expression.** It runs once per frame and is not repeated in a loop, so it is fine.
+    - **Frames are tiny.** A Modbus frame is a few bytes, so each log line is short.
+
+    For scale: in Green Metrics Tool micro-benchmarks, building one string from 1,000,000 pieces used about 469 J with `+=` and about 1.8 J with `"".join()`, roughly 260× less. That gap needs a huge number of pieces. You already use the `join` form, so you do not need to change anything.
+
+    Keep the same shape if you add a longer dump later, for example 16 bytes per row. Collect the rows in a list and join them once at the end:
+
+    ```python
+    def hex_rows(frame: bytes, width: int = 16) -> str:
+        rows = []
+        for offset in range(0, len(frame), width):
+            chunk = frame[offset:offset + width]
+            rows.append(f"{offset:04x}  " + " ".join(f"{b:02x}" for b in chunk))
+        return "\n".join(rows)
+    ```
+
+    Do not use `out += row` in that loop. If the gateway ever feels slow, measure first (for example with `cProfile`) before changing string code.
+verify:
+  test: |-
+    expected = (
+        "0000  00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f\n"
+        "0010  10 11 12 13"
+    )
+    assert hex_rows(bytes(range(20))) == expected
+    assert hex_rows(b"") == ""
+    assert hex_rows(b"\x01\x03", width=16) == "0000  01 03"

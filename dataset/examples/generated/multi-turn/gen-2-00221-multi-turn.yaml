@@ -1,0 +1,284 @@
+id: gen-2-00221-multi-turn
+category: multi-turn
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    hi, we replay one day of our api gateway log (~25M request) to choose the rate limit for the public endpoint. the sweep take more then 40 min on the analysis box, profiler say almost all is in simulate_bucket. how can i make it faster? later we want try much more configs
+
+    ```python
+    import numpy as np
+
+
+    def load_gateway_log(path):
+        # columns: ts_ms, client_id, status, bytes
+        data = np.loadtxt(path, delimiter=",", skiprows=1, dtype=np.int64)
+        order = np.argsort(data[:, 0], kind="stable")
+        return data[order]
+
+
+    def simulate_bucket(ts_ms, rate_per_s, burst):
+        """Replay requests through one global token bucket.
+        Returns array with 1 = allowed, 0 = throttled."""
+        allowed = np.zeros(len(ts_ms), dtype=np.int8)
+        tokens = float(burst)
+        last = ts_ms[0]
+        for i in range(len(ts_ms)):
+            now = ts_ms[i]
+            tokens = min(burst, tokens + (now - last) / 1000.0 * rate_per_s)
+            last = now
+            if tokens >= 1.0:
+                tokens -= 1.0
+                allowed[i] = 1
+        return allowed
+
+
+    def sweep(ts_ms, rates, bursts):
+        results = []
+        for r in rates:
+            for b in bursts:
+                allowed = simulate_bucket(ts_ms, r, b)
+                throttled = len(allowed) - int(allowed.sum())
+                results.append((r, b, throttled, throttled / len(allowed)))
+        return results
+
+
+    if __name__ == "__main__":
+        import sys
+        log = load_gateway_log(sys.argv[1])
+        rates = [50, 100, 200, 400]
+        bursts = [10, 50, 100, 500]
+        for r, b, n, frac in sweep(log[:, 0], rates, bursts):
+            print(f"rate={r:>4}/s burst={b:>4}  throttled={n:>9}  ({frac:.4f})")
+    ```
+- role: assistant
+  content: |
+    The time goes into the Python loop that runs once per request. The token bucket carries state from one request to the next, so numpy can't vectorize it cleanly. Compiling the loop with Numba is the simple fix:
+
+    ```python
+    import numpy as np
+    from numba import njit
+
+
+    def load_gateway_log(path):
+        # columns: ts_ms, client_id, status, bytes
+        data = np.loadtxt(path, delimiter=",", skiprows=1, dtype=np.int64)
+        order = np.argsort(data[:, 0], kind="stable")
+        return data[order]
+
+
+    @njit(cache=True)
+    def simulate_bucket(ts_ms, rate_per_s, burst):
+        """Replay requests through one global token bucket.
+        Returns array with 1 = allowed, 0 = throttled."""
+        allowed = np.zeros(len(ts_ms), dtype=np.int8)
+        cap = float(burst)
+        tokens = cap
+        last = ts_ms[0]
+        for i in range(len(ts_ms)):
+            now = ts_ms[i]
+            tokens = min(cap, tokens + (now - last) / 1000.0 * rate_per_s)
+            last = now
+            if tokens >= 1.0:
+                tokens -= 1.0
+                allowed[i] = 1
+        return allowed
+
+
+    def sweep(ts_ms, rates, bursts):
+        results = []
+        for r in rates:
+            for b in bursts:
+                allowed = simulate_bucket(ts_ms, r, b)
+                throttled = len(allowed) - int(allowed.sum())
+                results.append((r, b, throttled, throttled / len(allowed)))
+        return results
+
+
+    if __name__ == "__main__":
+        import sys
+        log = load_gateway_log(sys.argv[1])
+        rates = [50, 100, 200, 400]
+        bursts = [10, 50, 100, 500]
+        for r, b, n, frac in sweep(log[:, 0], rates, bursts):
+            print(f"rate={r:>4}/s burst={b:>4}  throttled={n:>9}  ({frac:.4f})")
+    ```
+
+    **Green Notes**
+    - **JIT-compile the hot loop (Numba)** (reduces E): `simulate_bucket` is a CPU-bound numeric loop. It runs over every request once for each rate/burst pair, and the work grows with each config you add. In Green Metrics Tool micro-benchmarks, a numeric loop over 10,000,000 samples used ~40 J in pure Python and ~9.5 J with `@njit`, about 4× less.
+    - **`cache=True`**: the first call compiles the function once and saves the result to disk. Later runs skip that step.
+    - The arithmetic and its order are unchanged, so throttle counts stay the same. `cap = float(burst)` only keeps the types consistent for Numba.
+- role: user
+  content: |
+    thanks, on my laptop it is much faster now. but problem: ops guy say no numba in the cron image, they dont want llvmlite there because image is shared with other jobs. can same file work with and without numba? and dont make it complicate pls, my collegue need to read it too
+- role: assistant
+  content: |
+    Yes. Make the import optional. Without Numba, `njit` turns into a decorator that does nothing, and the same function runs as plain Python:
+
+    ```python
+    import numpy as np
+
+    try:
+        from numba import njit
+    except ImportError:
+        # No numba installed (e.g. the cron image): run as plain Python.
+        def njit(**kwargs):
+            return lambda func: func
+
+
+    def load_gateway_log(path):
+        # columns: ts_ms, client_id, status, bytes
+        data = np.loadtxt(path, delimiter=",", skiprows=1, dtype=np.int64)
+        order = np.argsort(data[:, 0], kind="stable")
+        return data[order]
+
+
+    @njit(cache=True)
+    def simulate_bucket(ts_ms, rate_per_s, burst):
+        """Replay requests through one global token bucket.
+        Returns array with 1 = allowed, 0 = throttled."""
+        allowed = np.zeros(len(ts_ms), dtype=np.int8)
+        cap = float(burst)
+        tokens = cap
+        last = ts_ms[0]
+        for i in range(len(ts_ms)):
+            now = ts_ms[i]
+            tokens = min(cap, tokens + (now - last) / 1000.0 * rate_per_s)
+            last = now
+            if tokens >= 1.0:
+                tokens -= 1.0
+                allowed[i] = 1
+        return allowed
+
+
+    def sweep(ts_ms, rates, bursts):
+        results = []
+        for r in rates:
+            for b in bursts:
+                allowed = simulate_bucket(ts_ms, r, b)
+                throttled = len(allowed) - int(allowed.sum())
+                results.append((r, b, throttled, throttled / len(allowed)))
+        return results
+
+
+    if __name__ == "__main__":
+        import sys
+        log = load_gateway_log(sys.argv[1])
+        rates = [50, 100, 200, 400]
+        bursts = [10, 50, 100, 500]
+        for r, b, n, frac in sweep(log[:, 0], rates, bursts):
+            print(f"rate={r:>4}/s burst={b:>4}  throttled={n:>9}  ({frac:.4f})")
+    ```
+
+    Both ways give the same results. On your laptop the sweep uses the compiled loop. In the cron image it runs at the old speed. If the cron run gets too slow once you add more configs, a separate image with Numba just for this job would get the speed back.
+verify:
+  module: true
+  original_code: |
+    import numpy as np
+
+
+    def load_gateway_log(path):
+        # columns: ts_ms, client_id, status, bytes
+        data = np.loadtxt(path, delimiter=",", skiprows=1, dtype=np.int64)
+        order = np.argsort(data[:, 0], kind="stable")
+        return data[order]
+
+
+    def simulate_bucket(ts_ms, rate_per_s, burst):
+        """Replay requests through one global token bucket.
+        Returns array with 1 = allowed, 0 = throttled."""
+        allowed = np.zeros(len(ts_ms), dtype=np.int8)
+        tokens = float(burst)
+        last = ts_ms[0]
+        for i in range(len(ts_ms)):
+            now = ts_ms[i]
+            tokens = min(burst, tokens + (now - last) / 1000.0 * rate_per_s)
+            last = now
+            if tokens >= 1.0:
+                tokens -= 1.0
+                allowed[i] = 1
+        return allowed
+
+
+    def sweep(ts_ms, rates, bursts):
+        results = []
+        for r in rates:
+            for b in bursts:
+                allowed = simulate_bucket(ts_ms, r, b)
+                throttled = len(allowed) - int(allowed.sum())
+                results.append((r, b, throttled, throttled / len(allowed)))
+        return results
+
+
+    if __name__ == "__main__":
+        import sys
+        log = load_gateway_log(sys.argv[1])
+        rates = [50, 100, 200, 400]
+        bursts = [10, 50, 100, 500]
+        for r, b, n, frac in sweep(log[:, 0], rates, bursts):
+            print(f"rate={r:>4}/s burst={b:>4}  throttled={n:>9}  ({frac:.4f})")
+  green_code: |
+    import numpy as np
+
+    try:
+        from numba import njit
+    except ImportError:
+        # No numba installed (e.g. the cron image): run as plain Python.
+        def njit(**kwargs):
+            return lambda func: func
+
+
+    def load_gateway_log(path):
+        # columns: ts_ms, client_id, status, bytes
+        data = np.loadtxt(path, delimiter=",", skiprows=1, dtype=np.int64)
+        order = np.argsort(data[:, 0], kind="stable")
+        return data[order]
+
+
+    @njit(cache=True)
+    def simulate_bucket(ts_ms, rate_per_s, burst):
+        """Replay requests through one global token bucket.
+        Returns array with 1 = allowed, 0 = throttled."""
+        allowed = np.zeros(len(ts_ms), dtype=np.int8)
+        cap = float(burst)
+        tokens = cap
+        last = ts_ms[0]
+        for i in range(len(ts_ms)):
+            now = ts_ms[i]
+            tokens = min(cap, tokens + (now - last) / 1000.0 * rate_per_s)
+            last = now
+            if tokens >= 1.0:
+                tokens -= 1.0
+                allowed[i] = 1
+        return allowed
+
+
+    def sweep(ts_ms, rates, bursts):
+        results = []
+        for r in rates:
+            for b in bursts:
+                allowed = simulate_bucket(ts_ms, r, b)
+                throttled = len(allowed) - int(allowed.sum())
+                results.append((r, b, throttled, throttled / len(allowed)))
+        return results
+
+
+    if __name__ == "__main__":
+        import sys
+        log = load_gateway_log(sys.argv[1])
+        rates = [50, 100, 200, 400]
+        bursts = [10, 50, 100, 500]
+        for r, b, n, frac in sweep(log[:, 0], rates, bursts):
+            print(f"rate={r:>4}/s burst={b:>4}  throttled={n:>9}  ({frac:.4f})")
+  equivalence:
+    driver: |-
+      import numpy as np
+      rng = np.random.default_rng(7)
+      gaps = rng.exponential(8.0, size=20000).astype(np.int64)
+      ts = np.cumsum(gaps) + 1700000000000
+      for r, b, n, frac in sweep(ts, [50, 100, 200], [5, 20, 100]):
+          print(r, b, n, f"{frac:.10f}")

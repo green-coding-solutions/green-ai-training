@@ -1,0 +1,93 @@
+id: gen-12764612-00261-refactor
+category: refactor
+language: python
+patterns:
+- deque-or-append
+- hoist-invariants
+facts:
+- F-LISTINS
+- F-ATTR
+messages:
+- role: user
+  content: |
+    We run a chat model behind an internal API. This class builds the prompt for each request from the conversation history. Requirements for the cleanup:
+    - same prompt text as today, byte for byte
+    - keep the class name and the `build(system_prompt, turns)` signature, other code calls it
+    - newest turns win when the history does not fit the token budget, but the prompt must stay in chronological order
+    - no new dependencies
+
+    Some conversations have a few thousand turns because support agents keep them open for weeks. Can you make it faster and cleaner?
+
+    ```python
+    class PromptBuilder:
+        def __init__(self, tokenizer, config):
+            self.tokenizer = tokenizer
+            self.config = config
+
+        def build(self, system_prompt, turns):
+            budget = self.config.max_context_tokens - self.config.reserved_for_reply
+            used = len(self.tokenizer.encode(system_prompt))
+            selected = []
+            for turn in reversed(turns):
+                text = turn["role"] + ": " + turn["content"]
+                n = len(self.tokenizer.encode(text))
+                if used + n > budget:
+                    break
+                selected.insert(0, text)
+                used += n
+            return "\n".join([system_prompt] + selected)
+    ```
+- role: assistant
+  content: |
+    ```python
+    class PromptBuilder:
+        def __init__(self, tokenizer, config):
+            self.tokenizer = tokenizer
+            self.config = config
+
+        def build(self, system_prompt, turns):
+            encode = self.tokenizer.encode
+            budget = self.config.max_context_tokens - self.config.reserved_for_reply
+            used = len(encode(system_prompt))
+            selected = []
+            for turn in reversed(turns):
+                text = f"{turn['role']}: {turn['content']}"
+                n = len(encode(text))
+                if used + n > budget:
+                    break
+                selected.append(text)
+                used += n
+            selected.reverse()
+            return "\n".join([system_prompt] + selected)
+    ```
+
+    **Green Notes**
+    - **Append, then reverse once** (reduces E): `selected.insert(0, text)` shifts every item already in the list, so the loop does quadratic work for long histories. Now each turn is appended and the list is reversed one time at the end. The prompt text and its chronological order are the same. In Green Metrics Tool micro-benchmarks, 1,000,000 front inserts used ~1515 J of CPU energy and 1,000,000 appends used ~1.2 J. Your prompts only hold as many turns as fit the budget, so the real gap is far smaller than in that test. It still grows with the number of turns kept. `collections.deque` with `appendleft` would also work, but you need a list for `"\n".join` anyway, so reverse is simpler.
+    - **Local `encode`** (reduces E): the method is looked up once per request, not twice per turn. In Green Metrics Tool micro-benchmarks, caching a lookup before a 10,000,000-iteration loop saved only about 4-5%. Expect a small gain here. The tokenizer call itself costs much more than the lookup.
+
+    The f-string gives the same text as the `+` concatenation, so the output is identical.
+verify:
+  module: false
+  equivalence:
+    driver: |-
+      class Tok:
+          def encode(self, s):
+              return s.split()
+
+      class Cfg:
+          max_context_tokens = 40
+          reserved_for_reply = 10
+
+      turns = [
+          {"role": "user" if i % 2 == 0 else "assistant", "content": " ".join(f"w{i}_{j}" for j in range(1 + i % 5))}
+          for i in range(60)
+      ]
+      b = PromptBuilder(Tok(), Cfg())
+      print(b.build("You are a helpful agent.", turns))
+      print("---")
+      print(b.build("You are a helpful agent.", turns[:3]))
+      print("---")
+      print(b.build("You are a helpful agent.", []))
+      print("---")
+      Cfg.reserved_for_reply = 38
+      print(b.build("You are a helpful agent.", turns))

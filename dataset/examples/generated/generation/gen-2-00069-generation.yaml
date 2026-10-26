@@ -1,0 +1,102 @@
+id: gen-2-00069-generation
+category: generation
+language: html
+patterns:
+- remove-unused-css
+facts:
+- F-UNUSED-CSS
+messages:
+- role: user
+  content: |
+    Need /www/status.html for the gateway web UI (lighttpd on the box, files live on a small flash partition, most units are on LTE). Shows hostname, firmware, uptime, LTE RSSI and a table of the Modbus slaves. Data comes from GET /api/status:
+
+    ```json
+    {"hostname": "gw-0412", "firmware": "3.8.1", "uptime_s": 734512, "lte_rssi_dbm": -79,
+     "slaves": [{"id": 1, "name": "boiler-meter", "last_poll": 1792745001, "state": "ok"},
+                {"id": 7, "name": "pump-vfd", "last_poll": null, "state": "timeout"}]}
+    ```
+
+    Other pages link the full /css/bootstrap.min.css, use it if handy. Just the file.
+- role: assistant
+  content: |
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Gateway status</title>
+    <style>
+      body { font: 14px/1.4 sans-serif; margin: 1rem; color: #222; }
+      h1 { font-size: 1.25rem; margin: 0 0 1rem; }
+      dl { display: grid; grid-template-columns: max-content 1fr; gap: .25rem 1rem; margin: 0 0 1.5rem; }
+      dt { font-weight: 600; }
+      dd { margin: 0; }
+      table { border-collapse: collapse; }
+      th, td { text-align: left; padding: .35rem .75rem; border-bottom: 1px solid #ddd; }
+      .ok { color: #1a7f37; }
+      .err, #msg { color: #c62828; }
+    </style>
+    </head>
+    <body>
+    <h1>Gateway status</h1>
+    <p id="msg" hidden></p>
+    <dl>
+      <dt>Hostname</dt><dd id="hostname">-</dd>
+      <dt>Firmware</dt><dd id="firmware">-</dd>
+      <dt>Uptime</dt><dd id="uptime">-</dd>
+      <dt>LTE RSSI</dt><dd id="rssi">-</dd>
+    </dl>
+    <table>
+      <thead><tr><th>ID</th><th>Name</th><th>Last poll</th><th>State</th></tr></thead>
+      <tbody id="slaves"></tbody>
+    </table>
+    <script>
+    function fmtUptime(s) {
+      const d = Math.floor(s / 86400);
+      const h = Math.floor(s % 86400 / 3600);
+      const m = Math.floor(s % 3600 / 60);
+      return (d ? d + 'd ' : '') + h + 'h ' + m + 'm';
+    }
+
+    function cell(tr, text, cls) {
+      const td = tr.insertCell();
+      td.textContent = text;
+      if (cls) td.className = cls;
+    }
+
+    fetch('/api/status')
+      .then(r => {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then(s => {
+        document.getElementById('hostname').textContent = s.hostname;
+        document.getElementById('firmware').textContent = s.firmware;
+        document.getElementById('uptime').textContent = fmtUptime(s.uptime_s);
+        document.getElementById('rssi').textContent = s.lte_rssi_dbm + ' dBm';
+        const tbody = document.getElementById('slaves');
+        for (const x of s.slaves) {
+          const tr = tbody.insertRow();
+          cell(tr, x.id);
+          cell(tr, x.name);
+          cell(tr, x.last_poll ? new Date(x.last_poll * 1000).toLocaleString() : 'never');
+          cell(tr, x.state, x.state === 'ok' ? 'ok' : 'err');
+        }
+      })
+      .catch(e => {
+        const msg = document.getElementById('msg');
+        msg.textContent = 'Could not load status: ' + e.message;
+        msg.hidden = false;
+      });
+    </script>
+    </body>
+    </html>
+    ```
+
+    **Green Notes**
+    - **Only the CSS this page uses, inline** (reduces network): the page skips the full Bootstrap build, so it has one less request and only a few small rules travel over LTE. In Green Metrics Tool page-load tests, a 16 KB stylesheet with mostly unused rules and its purged 0.75 KB version differed by about 2% in client CPU energy, which is within noise. The gain here is bytes on the link, not CPU.
+
+    Slave names are set with `textContent`, so a name from the device config can't inject markup.
+verify:
+  static_only: HTML page that fetches /api/status from the gateway, needs a browser and the device API

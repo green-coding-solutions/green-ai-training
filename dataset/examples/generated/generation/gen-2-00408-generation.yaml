@@ -1,0 +1,63 @@
+id: gen-2-00408-generation
+category: generation
+language: sql
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    Hi, I'm a PhD student in astronomy and I have almost no experience with databases. Our group has photometry from a survey: one CSV with about 400k measurements of variable stars. It looks like this:
+
+    ```text
+    star_id,mjd,filter,mag,mag_err
+    V0012,59001.2314,g,14.882,0.011
+    V0012,59001.2391,r,14.401,0.009
+    V0047,59001.2455,g,16.120,0.024
+    ```
+
+    I want to put it in a Postgres table so I can query light curves per star. I tried to write an INSERT for every line, but it feels wrong for so many rows. Can you give me the SQL to create the table and load the file? I'm not sure what I should do.
+- role: assistant
+  content: |
+    Your feeling is right. For a file this size, load it in one bulk step, not one `INSERT` per line.
+
+    Create the table:
+
+    ```sql
+    CREATE TABLE photometry (
+        star_id  text             NOT NULL,
+        mjd      double precision NOT NULL,
+        filter   char(1)          NOT NULL,
+        mag      real             NOT NULL,
+        mag_err  real,
+        PRIMARY KEY (star_id, mjd, filter)
+    );
+    ```
+
+    Then load the file in `psql`. The command must be on one line:
+
+    ```sql
+    \copy photometry (star_id, mjd, filter, mag, mag_err) FROM 'photometry.csv' WITH (FORMAT csv, HEADER true)
+    ```
+
+    Check the result:
+
+    ```sql
+    SELECT count(*) FROM photometry;
+
+    SELECT mjd, mag
+    FROM photometry
+    WHERE star_id = 'V0012' AND filter = 'g'
+    ORDER BY mjd;
+    ```
+
+    **Green Notes**
+    - **Bulk load with `COPY` instead of one `INSERT` per row** (reduces E): the file is streamed to the server in one operation. 400k single `INSERT`s would mean 400k statements and round trips. In Green Metrics Tool micro-benchmarks with PostgreSQL (500,000 rows in batches of 5,000), COPY used about 22× less CPU energy than one `execute()` per row.
+    - **One transaction:** `\copy` is a single statement. If a line is bad, nothing is loaded and you can fix the file and run it again. The table is never half-filled.
+    - The primary key makes duplicate measurements fail the load, so loading the same file twice by mistake will not double your data. It also gives you a fast lookup per star and filter.
+
+    For a handful of rows, a plain `INSERT` is fine. COPY pays off with many rows.
+verify:
+  static_only: uses the psql \copy meta-command and PostgreSQL, not runnable in SQLite

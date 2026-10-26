@@ -1,0 +1,71 @@
+id: gen-2-00372-generation
+category: generation
+language: python
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    Need `sweep_points(conn, sweep_id)` in our MD run catalog module, for the phase diagram notebook. Per run: run id, temperature, pressure, final energy, converged flag. A sweep is ~3k runs, and the notebook re-pulls on every cell rerun. Diff only.
+
+    ```python
+    """Access layer for the MD run catalog (psycopg 3, Postgres 16)."""
+    from psycopg.rows import dict_row
+
+    # md_runs (34 columns), the relevant ones:
+    #   run_id bigint pk, sweep_id int, created_at timestamptz,
+    #   temperature_k double precision, pressure_bar double precision,
+    #   timestep_fs double precision, n_steps int,
+    #   final_energy_kj double precision, converged boolean,
+    #   force_field text, host text, wall_seconds double precision,
+    #   input_deck text            -- ~40 KB per run
+    #   stdout_log text            -- often several MB
+    #   trajectory_summary jsonb   -- per-frame stats, large
+
+
+    def fetch_run(conn, run_id):
+        """Full record for the run detail view."""
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM md_runs WHERE run_id = %s", (run_id,))
+            return cur.fetchone()
+
+
+    def list_sweeps(conn, since):
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT sweep_id FROM md_runs "
+                "WHERE created_at >= %s ORDER BY sweep_id",
+                (since,),
+            )
+            return [row[0] for row in cur.fetchall()]
+    ```
+- role: assistant
+  content: |
+    Add to the module:
+
+    ```python
+    def sweep_points(conn, sweep_id):
+        """Phase-diagram points for one sweep, ordered by run_id."""
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT run_id, temperature_k, pressure_bar,
+                       final_energy_kj, converged
+                FROM md_runs
+                WHERE sweep_id = %s
+                ORDER BY run_id
+                """,
+                (sweep_id,),
+            )
+            return cur.fetchall()
+    ```
+
+    **Green Notes**
+    - **Select only the needed columns** (reduces E, network): `SELECT *` would ship `input_deck`, `stdout_log` and `trajectory_summary` for every run on every cell rerun. Those columns are almost all of each row's bytes, and the plot needs none of them. In Green Metrics Tool micro-benchmarks on a 52-column table with large text columns, reading 2,500 rows 1,000 times used ~470 J with `SELECT *` and ~64 J with the 10 needed columns, about 7× less. The saving grows with the size of the skipped columns.
+    - `fetch_run` can keep `SELECT *`. It reads one row, and the detail view uses the full record.
+verify:
+  static_only: needs psycopg 3 and a running PostgreSQL server

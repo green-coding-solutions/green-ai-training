@@ -1,0 +1,53 @@
+id: gen-2-00194-generation
+category: generation
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    py func: last 50 signups from signups.jsonl (we append to it, oldest first), newest first, for the "just joined" ticker on the landing page
+- role: assistant
+  content: |
+    ```python
+    import json
+    from collections import deque
+
+
+    def recent_signups(path, limit=50):
+        """Return the newest `limit` signups from an append-only JSONL file, newest first."""
+        last = deque(maxlen=limit)
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    last.append(line)
+        return [json.loads(line) for line in reversed(last)]
+    ```
+
+    Usage in the ticker view:
+
+    ```python
+    items = recent_signups("signups.jsonl")
+    ```
+
+    **Green Notes**
+    - **Append to a bounded deque, reverse once** (reduces E): the file is oldest first, so a quick version would call `list.insert(0, entry)` for every line. Each front insert shifts the whole list, so the work grows quadratically as the file grows. `deque(maxlen=limit)` appends in O(1) and drops the oldest entry automatically. The result is reversed once at the end. In Green Metrics Tool micro-benchmarks, 1,000,000 `list.insert(0, x)` calls used over 1000× the CPU energy of 1,000,000 `append` calls.
+    - **Bounded memory** (reduces M): only the last `limit` lines are kept, not the whole signup history.
+verify:
+  green_block: 0
+  test: |-
+    import json, os, tempfile
+    fd, p = tempfile.mkstemp(suffix=".jsonl")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        for i in range(120):
+            f.write(json.dumps({"id": i, "city": "Berlin"}) + "\n")
+        f.write("\n")
+    r = recent_signups(p, limit=50)
+    assert [x["id"] for x in r] == list(range(119, 69, -1))
+    assert len(r) == 50
+    assert recent_signups(p, limit=0) == []
+    assert [x["id"] for x in recent_signups(p, limit=500)] == list(range(119, -1, -1))
+    os.remove(p)

@@ -1,0 +1,121 @@
+id: gen-2-00176-generation
+category: generation
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    hi, my team lead asked me to set up test environments for pull requests in our ingestion pipeline repo. We already use Argo CD for prod (one Application that points at `deploy/chart` with `values-prod.yaml`). He said "just use an ApplicationSet with the PR generator", but I never did that and the docs confuse me a bit. Reviewers want to run the pipeline against a sample file before they approve.
+
+    My plan was to copy the prod values. This is `deploy/chart/values-prod.yaml`:
+
+    ```yaml
+    ingestApi:
+      replicaCount: 3
+      resources:
+        requests:
+          cpu: "1"
+          memory: 2Gi
+    transformWorker:
+      replicaCount: 4
+      resources:
+        requests:
+          cpu: "2"
+          memory: 4Gi
+    postgres:
+      persistence:
+        enabled: true
+        size: 200Gi
+    redis:
+      enabled: true      # dedup of incoming events
+    metabase:
+      enabled: true      # dashboards for the analysts
+    ```
+
+    Repo is `northwind-data/ingest-pipeline` on GitHub (private, there is a secret `github-token` with key `token` in the `argocd` namespace). Is this the right approach? Before this we had one shared staging env, but it ran for months and nobody knew if anyone still used it, so I'm not sure what we did wrong there.
+- role: assistant
+  content: |
+    Yes, an ApplicationSet with the pull request generator is the right tool. Don't copy the prod values, though. Use a small preview values file, and let Argo CD delete each environment when its PR closes.
+
+    `deploy/argocd/ingest-previews.yaml` (apply it once to the `argocd` namespace):
+
+    ```yaml
+    apiVersion: argoproj.io/v1alpha1
+    kind: ApplicationSet
+    metadata:
+      name: ingest-pr-previews
+      namespace: argocd
+    spec:
+      goTemplate: true
+      goTemplateOptions: ["missingkey=error"]
+      generators:
+        - pullRequest:
+            github:
+              owner: northwind-data
+              repo: ingest-pipeline
+              tokenRef:
+                secretName: github-token
+                key: token
+              labels:
+                - preview          # only PRs with this label get an environment
+      template:
+        metadata:
+          name: 'ingest-pr-{{.number}}'
+          finalizers:
+            - resources-finalizer.argocd.argoproj.io   # delete the deployed resources with the app
+        spec:
+          project: default
+          source:
+            repoURL: https://github.com/northwind-data/ingest-pipeline.git
+            targetRevision: '{{.head_sha}}'
+            path: deploy/chart
+            helm:
+              valueFiles:
+                - values-preview.yaml
+          destination:
+            server: https://kubernetes.default.svc
+            namespace: 'ingest-pr-{{.number}}'
+          syncPolicy:
+            automated:
+              prune: true
+              selfHeal: true
+            syncOptions:
+              - CreateNamespace=true
+    ```
+
+    `deploy/chart/values-preview.yaml`:
+
+    ```yaml
+    ingestApi:
+      replicaCount: 1
+      resources:
+        requests:
+          cpu: 250m        # enough for a sample file, raise if pods get throttled
+          memory: 512Mi
+    transformWorker:
+      replicaCount: 1
+      resources:
+        requests:
+          cpu: 500m
+          memory: 1Gi
+    postgres:
+      persistence:
+        enabled: false     # data is gone on pod restart, reviewers reload the sample file
+    redis:
+      enabled: true        # the pipeline needs it for dedup
+    metabase:
+      enabled: false       # reviewers check the tables, not the dashboards
+    ```
+
+    How it works: when someone adds the `preview` label, Argo CD creates `ingest-pr-<number>` and deploys the PR's head commit. When the PR is merged or closed, or the label is removed, the Application is deleted, and the finalizer removes everything it deployed. Argo CD leaves the empty namespace behind. An empty namespace costs nothing, but you can clean them up from time to time with `kubectl delete ns ingest-pr-<number>`.
+
+    **Green Notes**
+    - **Environment exists only while the PR is open** (reduces E, M): this fixes your old staging problem. In a Green Metrics Tool measurement of an idle preview environment, a full stack used only about 3% more CPU energy per minute than a trimmed one. The real cost is the hours an unused environment keeps running, and deleting it on merge or close removes those hours.
+    - **Opt-in label** (reduces E, M): PRs that only touch docs or CI don't start a stack. If every PR really needs one, remove the `labels` filter.
+    - **1 replica each, small requests, no Metabase, no persistent volume** (reduces M): each preview reserves a fraction of what prod does, so the cluster needs fewer nodes, and no 200Gi disk per PR is left behind after cleanup.
+    - *Not applied:* scale-to-zero at night. These environments last as long as a review, so add a night schedule only if PRs stay open for weeks.
+verify:
+  static_only: Argo CD ApplicationSet and Helm values, needs a Kubernetes cluster with Argo CD and GitHub access

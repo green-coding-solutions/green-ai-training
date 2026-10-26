@@ -1,0 +1,141 @@
+id: gen-2-00057-review
+category: review
+language: javascript
+patterns:
+- minify-assets
+facts:
+- F-MINIFY
+messages:
+- role: user
+  content: |
+    Hi! We built `logscope`, a small web UI for searching our aggregated logs. The backend is a separate service. The UI is just static files behind nginx on the internal network. About 20 people on the on-call rotation use it, mostly over VPN. Before we tag 1.0 I'd like a review of the build script and the two JS files that touch log data.
+
+    Requirements / questions:
+    1. The build has to stay zero-dependency (plain Node 20, no `npm install` in CI) unless there is a real reason.
+    2. My team lead wants us to add PurgeCSS + minification "because it's greener". `dist/app.css` is ~290 KB right now (full bootstrap.css, we use maybe 20 classes), `app.js` is ~60 KB. Is it worth it?
+    3. If anything else is broken, tell me.
+
+    ```javascript
+    // build.mjs - bundles the logscope UI into dist/
+    import { readFile, writeFile, mkdir, copyFile } from 'node:fs/promises';
+    import { createHash } from 'node:crypto';
+    import path from 'node:path';
+
+    const SRC = 'ui';
+    const OUT = 'dist';
+    const jsFiles = ['vendor/dayjs.min.js', 'api.js', 'filters.js', 'viewer.js', 'main.js'];
+    const cssFiles = ['vendor/bootstrap.css', 'theme.css'];
+
+    const hash = (buf) => createHash('sha256').update(buf).digest('hex').slice(0, 8);
+
+    async function concat(files) {
+      const parts = [];
+      for (const f of files) parts.push(await readFile(path.join(SRC, f), 'utf8'));
+      return parts.join('\n');
+    }
+
+    async function main() {
+      await mkdir(OUT, { recursive: true });
+      const js = await concat(jsFiles);
+      const css = await concat(cssFiles);
+      const jsName = `app.${hash(js)}.js`;
+      const cssName = `app.${hash(css)}.css`;
+      await writeFile(path.join(OUT, jsName), js);
+      await writeFile(path.join(OUT, cssName), css);
+
+      let html = await readFile(path.join(SRC, 'index.html'), 'utf8');
+      html = html.replace('%JS%', jsName).replace('%CSS%', cssName);
+      await writeFile(path.join(OUT, 'index.html'), html);
+      await copyFile(path.join(SRC, 'favicon.ico'), path.join(OUT, 'favicon.ico'));
+      console.log(`built ${jsName} (${js.length} bytes), ${cssName} (${css.length} bytes)`);
+    }
+
+    main();
+    ```
+
+    ```javascript
+    // api.js
+    async function searchLogs(query, since) {
+      const res = await fetch('/api/search?q=' + query + '&since=' + since);
+      if (!res.ok) throw new Error(`search failed: ${res.status}`);
+      return res.json();
+    }
+    ```
+
+    ```javascript
+    // viewer.js
+    const MAX_LINES = 500;
+
+    function levelClass(level) {
+      return { ERROR: 'text-danger', WARN: 'text-warning', INFO: 'text-body', DEBUG: 'text-muted' }[level] || 'text-body';
+    }
+
+    function renderEntries(tbody, entries) {
+      const rows = entries.slice(-MAX_LINES).map(e =>
+        `<tr class="${levelClass(e.level)}">
+           <td class="font-monospace small">${dayjs(e.ts).format('HH:mm:ss.SSS')}</td>
+           <td><span class="badge bg-secondary">${e.service}</span></td>
+           <td class="font-monospace">${e.message}</td>
+         </tr>`
+      );
+      tbody.innerHTML = rows.join('');
+    }
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (internal log search UI, static files)
+
+    #### [Security] Log content is inserted as raw HTML
+    - **Where:** `viewer.js`, `renderEntries()`, `${e.service}` and `${e.message}` inside `innerHTML`
+    - **Issue:** log messages contain whatever clients send, such as paths, user agents and form values. A logged request with `<img src=x onerror=...>` runs script in the browser of the person on call, with their session for `/api`.
+    - **Fix:** escape every log value before it goes into the template:
+      ```javascript
+      const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+
+      function esc(value) {
+        return String(value).replace(/[&<>"']/g, ch => HTML_ESCAPES[ch]);
+      }
+
+      function renderEntries(tbody, entries) {
+        const rows = entries.slice(-MAX_LINES).map(e =>
+          `<tr class="${levelClass(e.level)}">
+             <td class="font-monospace small">${dayjs(e.ts).format('HH:mm:ss.SSS')}</td>
+             <td><span class="badge bg-secondary">${esc(e.service)}</span></td>
+             <td class="font-monospace">${esc(e.message)}</td>
+           </tr>`
+        );
+        tbody.innerHTML = rows.join('');
+      }
+      ```
+
+    #### [Bug] Search query is not URL-encoded
+    - **Where:** `api.js`, `searchLogs()`
+    - **Issue:** a query with `&` is split into extra parameters, `+` arrives as a space, and `#` cuts off the rest of the URL, including `since`. Queries like `path:/a#b` or `user:a+b` return wrong results.
+    - **Fix:**
+      ```javascript
+      const params = new URLSearchParams({ q: query, since: String(since) });
+      const res = await fetch(`/api/search?${params}`);
+      ```
+
+    #### [Low] Assets are shipped unminified
+    - **Where:** `build.mjs`, `cssFiles = ['vendor/bootstrap.css', ...]` and the concatenated `js`, both written as is
+    - **Issue:** about "greener": in Green Metrics Tool measurements of a small booking page, a minified JS and CSS build used about 2% less client CPU energy than the unminified sources over 50 cold loads, which is within noise. The clear gain is fewer bytes over the VPN, not client CPU. Part of your 60 KB of JS is `dayjs.min.js`, which is already minified. Purging unused Bootstrap rules also only saves bytes.
+    - **Fix,** cheapest first:
+      1. Zero dependencies: use `bootstrap.min.css` from the same Bootstrap release instead of `bootstrap.css`. It has the same rules, without comments and whitespace.
+      2. Only if you accept a dev dependency, add PurgeCSS. Give it `ui/*.js` as content, not only `index.html`. Classes like `text-danger` and `badge` appear only in `viewer.js`, so an HTML-only scan would remove them.
+      3. If you ever add esbuild, minify the concatenated JS:
+         ```javascript
+         import { transform } from 'esbuild';
+         const js = (await transform(await concat(jsFiles), { loader: 'js', minify: true })).code;
+         ```
+         Without a `format` option, esbuild keeps top-level names. The globals that your files share (`searchLogs`, `renderEntries`) keep working.
+    - **Impact:** network, fewer bytes on every cold load. With about 20 users, the total is small.
+
+    **Recommendation:** fix the escaping and the URL encoding before 1.0. Switch to `bootstrap.min.css` now, because it costs nothing. PurgeCSS and esbuild are optional and only save bytes, so with your zero-dependency rule I would skip them.
+verify:
+  green_block: 0
+  test: |-
+    const out = esc(`<img src=x onerror="alert('x')">&`);
+    if (out !== '&lt;img src=x onerror=&quot;alert(&#39;x&#39;)&quot;&gt;&amp;') throw new Error('bad escape: ' + out);
+    if (esc(42) !== '42') throw new Error('number not stringified');
+    if (esc('plain text') !== 'plain text') throw new Error('plain text changed');

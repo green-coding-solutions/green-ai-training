@@ -1,0 +1,155 @@
+id: gen-2-00095-review
+category: review
+language: python
+sql_dialect: postgres
+patterns:
+- select-columns
+- regex-precompile
+facts:
+- F-PG-SELECT
+- F-REGEX
+messages:
+- role: user
+  content: |
+    Please review our incremental product feed export before we ship it next week. Setup and requirements:
+
+    - Postgres 16, psycopg 3. Cron runs it every 15 minutes and writes a CSV for Google Shopping and idealo.
+    - Usually a few hundred products change per run. After the nightly price import it is 30-40k.
+    - `products` has about 45 columns, including `description`, `long_html`, `specs` (jsonb) and `seo_text`. `brands` is small (id, name, slug, logo_url, created_at, updated_at).
+    - Rank the findings by severity, correctness first.
+    - A colleague says we must `re.compile` the GTIN check or it will be slow. Is that true?
+
+    ```sql
+    -- queries/feed_changed_products.sql
+    SELECT *, b.name AS brand_name
+    FROM products p
+    JOIN brands b ON b.id = p.brand_id
+    WHERE p.updated_at > %(since)s
+      AND p.status = 'active'
+    ORDER BY p.updated_at;
+    ```
+
+    ```python
+    import csv
+    import re
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    from psycopg.rows import dict_row
+
+    QUERY = Path("queries/feed_changed_products.sql").read_text()
+    FEED_COLUMNS = ["id", "title", "brand", "gtin", "price", "currency", "availability", "link"]
+
+
+    def export_changed(conn, state, out_path):
+        since = state.get("last_run", datetime(1970, 1, 1, tzinfo=timezone.utc))
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(QUERY, {"since": since})
+            rows = cur.fetchall()
+
+        skipped = 0
+        with open(out_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(FEED_COLUMNS)
+            for r in rows:
+                gtin = (r["gtin"] or "").strip()
+                if not re.match(r"^\d{8}(\d{4,6})?$", gtin):  # GTIN-8/12/13/14
+                    skipped += 1
+                    continue
+                w.writerow([
+                    r["id"],
+                    r["name"],
+                    r["brand_name"],
+                    gtin,
+                    f"{r['price_cents'] / 100:.2f}",
+                    r["currency"],
+                    "in_stock" if r["stock"] > 0 else "out_of_stock",
+                    f"https://shop.example.com/p/{r['slug']}",
+                ])
+
+        state["last_run"] = datetime.now(timezone.utc)
+        return len(rows) - skipped
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (incremental feed export)
+
+    #### [Bug] `SELECT *` over the join overwrites product fields with brand fields
+    - **Where:** `SELECT *, b.name AS brand_name` together with `dict_row`
+    - **Issue:** `*` returns `id`, `name`, `created_at` and `updated_at` twice, once from `products` and once from `brands`. `dict_row` keeps the last value for a repeated key, so `r["id"]` is the brand id and `r["name"]` is the brand name. Every feed row gets the wrong product id and title.
+    - **Fix:** name the columns and alias them (see the query below).
+
+    #### [Bug] The watermark can skip changed products
+    - **Where:** `state["last_run"] = datetime.now(timezone.utc)` at the end
+    - **Issue:** a product updated after the query ran but before this line has `updated_at < last_run`. The next run never picks it up. This is most likely during the nightly import.
+    - **Fix:** use the newest `updated_at` you actually read. Rows are ordered by it, so that is the last row. If no rows came back, keep the old watermark. If writers hold long transactions, start the window a minute earlier. A product that shows up twice in the feed does no harm.
+
+    #### [High] The query reads all large text columns for 8 feed fields
+    - **Where:** `SELECT *` in `feed_changed_products.sql`
+    - **Issue:** every run reads `description`, `long_html`, `specs` and `seo_text` for each changed product. Postgres has to load and send them, and Python decodes them into dicts, only for the CSV to use 8 small fields.
+    - **Fix:**
+      ```sql
+      SELECT p.id, p.name AS title, b.name AS brand, p.gtin,
+             p.price_cents, p.currency, p.stock, p.slug, p.updated_at
+      FROM products p
+      JOIN brands b ON b.id = p.brand_id
+      WHERE p.updated_at > %(since)s
+        AND p.status = 'active'
+      ORDER BY p.updated_at;
+      ```
+    - **Impact:** E on the database and in the client, every run, worst after the price import. In Green Metrics Tool micro-benchmarks on a 52-column products table with large text columns, naming the 10 needed columns used about 5.5× to 7× less CPU energy than `SELECT *`. The saving grows with the size of the columns you skip.
+
+    #### [Low] Precompiling the GTIN regex
+    - **Where:** `re.match(r"^\d{8}(\d{4,6})?$", gtin)` in the loop
+    - **Issue:** your colleague is mostly wrong. Python's `re` caches compiled patterns, so a constant pattern is not compiled again for each row. In Green Metrics Tool micro-benchmarks over 1,000,000 matches, a precompiled pattern used about 18% less CPU energy than inline `re.match`. With at most tens of thousands of rows per run, you won't notice it. Precompiling matters a lot when patterns are built dynamically, which is not the case here.
+    - **Fix:** a module-level `GTIN_RE = re.compile(...)` is still worth doing, because it names the pattern and keeps it in one place.
+
+    Fixed Python, to use with the query above:
+
+    ```python
+    import csv
+    import re
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    from psycopg.rows import dict_row
+
+    QUERY = Path("queries/feed_changed_products.sql").read_text()
+    FEED_COLUMNS = ["id", "title", "brand", "gtin", "price", "currency", "availability", "link"]
+    GTIN_RE = re.compile(r"^\d{8}(\d{4,6})?$")  # GTIN-8/12/13/14
+
+
+    def export_changed(conn, state, out_path):
+        since = state.get("last_run", datetime(1970, 1, 1, tzinfo=timezone.utc))
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(QUERY, {"since": since})
+            rows = cur.fetchall()
+
+        skipped = 0
+        with open(out_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(FEED_COLUMNS)
+            for r in rows:
+                gtin = (r["gtin"] or "").strip()
+                if not GTIN_RE.match(gtin):
+                    skipped += 1
+                    continue
+                w.writerow([
+                    r["id"],
+                    r["title"],
+                    r["brand"],
+                    gtin,
+                    f"{r['price_cents'] / 100:.2f}",
+                    r["currency"],
+                    "in_stock" if r["stock"] > 0 else "out_of_stock",
+                    f"https://shop.example.com/p/{r['slug']}",
+                ])
+
+        if rows:
+            state["last_run"] = rows[-1]["updated_at"]  # rows are ordered by updated_at
+        return len(rows) - skipped
+    ```
+
+    **Already good:** the query is parameterized, and it filters on `updated_at` so each run reads only changed products.
+verify:
+  static_only: PostgreSQL 16 query with psycopg placeholders, Python code needs psycopg and a live database

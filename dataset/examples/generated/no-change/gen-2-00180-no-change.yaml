@@ -1,0 +1,88 @@
+id: gen-2-00180-no-change
+category: no-change
+language: python
+patterns:
+- memoize
+- context-tradeoff
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    add lru_cache to decode_frame, it runs for every mqtt message
+
+    ```python
+    import json
+    import logging
+    import queue
+    import struct
+
+    log = logging.getLogger("gateway")
+
+    # sensor_id, unix ts, temp*100, humidity*100, battery mV, seq counter
+    FRAME = struct.Struct("<HIhhHB")
+    readings = queue.Queue(maxsize=10_000)
+
+
+    def load_calibration(path):
+        with open(path) as f:
+            return {int(k): tuple(v) for k, v in json.load(f).items()}
+
+
+    CALIBRATION = load_calibration("/etc/gateway/calibration.json")
+
+
+    def crc8(data: bytes) -> int:
+        crc = 0
+        for b in data:
+            crc ^= b
+            for _ in range(8):
+                crc = ((crc << 1) ^ 0x07) & 0xFF if crc & 0x80 else (crc << 1) & 0xFF
+        return crc
+
+
+    def decode_frame(payload: bytes) -> dict:
+        if len(payload) != FRAME.size + 1:
+            raise ValueError(f"bad frame length {len(payload)}")
+        body, checksum = payload[:-1], payload[-1]
+        if crc8(body) != checksum:
+            raise ValueError("crc mismatch")
+        sensor_id, ts, temp_raw, hum_raw, battery_mv, seq = FRAME.unpack(body)
+        offset, gain = CALIBRATION.get(sensor_id, (0.0, 1.0))
+        return {
+            "sensor_id": sensor_id,
+            "ts": ts,
+            "seq": seq,
+            "temp_c": round(temp_raw / 100.0 * gain + offset, 2),
+            "humidity": hum_raw / 100.0,
+            "battery_v": battery_mv / 1000.0,
+        }
+
+
+    def on_message(client, userdata, msg):
+        try:
+            reading = decode_frame(msg.payload)
+        except ValueError as e:
+            log.warning("dropped frame from %s: %s", msg.topic, e)
+            return
+        readings.put(reading)
+    ```
+- role: assistant
+  content: |
+    I wouldn't add it here. A cache only helps when the same input comes back, and your inputs almost never repeat. Every frame has its own timestamp and sequence counter, so each `payload` is different from the ones before it.
+
+    With `@lru_cache` on `decode_frame`:
+    - **Almost no hits.** Every call still hashes the payload, misses, decodes, stores the result and evicts an old entry. That is more work per message than you do now.
+    - **Memory on the gateway.** The default `maxsize=128` gives constant eviction churn. `maxsize=None` would keep every frame forever and grow without bound.
+    - **Shared mutable results.** On a hit, the cache returns the *same* dict object. If any consumer of `readings` changes a reading (adds a field, converts units), the cached copy changes too. That is a subtle bug.
+
+    In Green Metrics Tool micro-benchmarks, `lru_cache` used about 9× less CPU energy than recomputing. But that only worked because the inputs came from 200 distinct values. With mostly unique inputs, caching only adds overhead. Your MQTT stream is the unique-input case.
+
+    The function is already fine as it is:
+    - The `struct.Struct` is built once at import, not on every message.
+    - Calibration is loaded once at startup, and each frame does a single dict lookup with a default.
+    - Bad frames are rejected early (length check, then CRC) before any unpacking.
+
+    If you want to confirm this on your own traffic, wrap it as `lru_cache(maxsize=1024)(decode_frame)`, replay a captured batch of payloads and print `cache_info()`. You should see close to zero hits. If the gateway CPU really is busy, profile `on_message` with `cProfile` before you change anything.
+verify:
+  static_only: 'no-change answer: the user''s code is left as it is and the answer contains no code block to run'

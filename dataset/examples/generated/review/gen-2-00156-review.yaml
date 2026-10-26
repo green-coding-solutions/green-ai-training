@@ -1,0 +1,100 @@
+id: gen-2-00156-review
+category: review
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    hexview.py, crawls on our firmware images (tens of MB). fix this
+
+    ```python
+    #!/usr/bin/env python3
+    """hexview: canonical hex + ASCII dump of a file (like hexdump -C)."""
+    import argparse
+    import sys
+
+
+    def dump(data, offset=0, width=16):
+        out = ""
+        for pos in range(0, len(data), width):
+            chunk = data[pos:pos + width]
+            line = f"{offset + pos:08x}  "
+            for i, b in enumerate(chunk):
+                line += f"{b:02x} "
+                if i == 7:
+                    line += " "
+            line = line.ljust(10 + width * 3 + 1)
+            text = ""
+            for b in chunk:
+                if 32 <= b <= 127:
+                    text += chr(b)
+                else:
+                    text += "."
+            line += f" |{text}|"
+            out += line + "\n"
+        return out
+
+
+    def main():
+        p = argparse.ArgumentParser(description="hex + ASCII dump")
+        p.add_argument("file")
+        p.add_argument("-s", "--skip", type=int, default=0, help="start offset in bytes")
+        p.add_argument("-n", "--length", type=int, help="number of bytes to dump")
+        args = p.parse_args()
+
+        with open(args.file, "rb") as f:
+            f.seek(args.skip)
+            data = f.read(-1 if args.length is None else args.length)
+
+        sys.stdout.write(dump(data, offset=args.skip))
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (CLI tool, work grows with file size)
+
+    #### [Bug] DEL byte is printed raw
+    - **Where:** `dump`, `if 32 <= b <= 127`
+    - **Issue:** `0x7f` (DEL) is a control character, but the check treats it as printable. It goes straight to the terminal instead of showing as `.` like `hexdump -C` does.
+    - **Fix:** use `32 <= b < 127`.
+
+    #### [High] Output built with `+=` per byte and per line
+    - **Where:** `dump`: `line += f"{b:02x} "`, `text += chr(b)`, `out += line + "\n"`
+    - **Issue:** every byte of the file does two string concatenations, and every line is appended to `out`, which keeps growing until it holds the whole dump. Each `+=` can copy the string built so far. Using an f-string in the `+=` doesn't help.
+    - **Fix:** let `bytes.hex(" ")` format each half line in C, build the ASCII column with one `join`, collect lines in a list and join once at the end (code below).
+    - **Impact:** E. You now get one `hex()` call per half line and one final `join`, so the work stays linear in file size. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces with `+=` used ~469 J and `"".join()` ~1.8 J, roughly 260× less. f-strings in a loop (~455 J) behaved like `+=`. The output is byte-for-byte the same, except for the DEL fix. `bytes.hex(sep)` needs Python 3.8+.
+
+    ```python
+    def dump(data, offset=0, width=16):
+        lines = []
+        for pos in range(0, len(data), width):
+            chunk = data[pos:pos + width]
+            left = chunk[:8].hex(" ")
+            right = chunk[8:].hex(" ")
+            hex_part = f"{left}  {right}" if right else left
+            text = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+            lines.append(f"{offset + pos:08x}  {hex_part:<49} |{text}|\n")
+        return "".join(lines)
+    ```
+
+    **Already good:** the file is opened in binary mode, and `--skip` uses `seek` instead of reading and slicing the whole file.
+verify:
+  module: true
+  green_block: 0
+  equivalence:
+    driver: |
+      data = bytes((i * 37 + 11) % 127 for i in range(1000))
+      print(dump(data), end="")
+      print(repr(dump(data[:8], offset=0x100)))
+      print(repr(dump(data[:9])))
+      print(repr(dump(data[:16], offset=4096)))
+      print(repr(dump(b"")))
+  test: |-
+    assert dump(b"\x7f") == "00000000  7f" + " " * 47 + " |.|\n"
+    assert dump(b"AB") == "00000000  41 42" + " " * 44 + " |AB|\n"

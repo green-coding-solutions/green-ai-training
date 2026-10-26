@@ -1,0 +1,93 @@
+id: gen-12764612-00184-multi-turn
+category: multi-turn
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    ```python
+    import csv
+
+    def load_discontinued(path):
+        with open(path) as f:
+            return [line.strip() for line in f if line.strip()]
+
+    def split_orders(orders_path, discontinued_path):
+        discontinued = load_discontinued(discontinued_path)
+        ok, rejected = [], []
+        with open(orders_path, newline="") as f:
+            for row in csv.DictReader(f):
+                if row["sku"] in discontinued:
+                    rejected.append(row)
+                else:
+                    ok.append(row)
+        return ok, rejected
+    ```
+
+    ?
+- role: assistant
+  content: |
+    The slow part is `row["sku"] in discontinued`. `discontinued` is a list, so every order row scans it from the start. With a long discontinued list and many order rows, that is O(rows × skus). Load it as a set once and each check is O(1):
+
+    ```python
+    import csv
+
+    def load_discontinued(path):
+        with open(path) as f:
+            return {line.strip() for line in f if line.strip()}
+
+    def split_orders(orders_path, discontinued_path):
+        discontinued = load_discontinued(discontinued_path)
+        ok, rejected = [], []
+        with open(orders_path, newline="") as f:
+            for row in csv.DictReader(f):
+                if row["sku"] in discontinued:
+                    rejected.append(row)
+                else:
+                    ok.append(row)
+        return ok, rejected
+    ```
+
+    **Green Notes**
+    - **Set for repeated membership tests** (reduces E): the set is built once and then looked up once per order row. This replaces a linear scan per row with a hash lookup.
+    - The output is the same. `ok` and `rejected` keep the order of the CSV rows. The set only drops duplicate SKUs in the discontinued file, which does not change any result.
+- role: user
+  content: |
+    ok thx. now i also need a tiny cli for support: `python check.py SKU123` tells if that one sku is discontinued. can i just reuse load_discontinued?
+- role: assistant
+  content: |
+    You can, but not the set version. For one lookup, building a set costs more than it saves. In Green Metrics Tool micro-benchmarks, one membership test on a 10,000,000-element list used less energy than converting that list to a set and testing once. The set version used about 50% more. A set only pays off when you look up many times.
+
+    For the CLI, read the file once and stop at the first match:
+
+    ```python
+    import sys
+
+    def is_discontinued(path, sku):
+        with open(path) as f:
+            return any(sku and line.strip() == sku for line in f)
+
+    if __name__ == "__main__":
+        path, sku = sys.argv[1], sys.argv[2]
+        print("discontinued" if is_discontinued(path, sku) else "active")
+    ```
+
+    **Green Notes**
+    - **Set for repeated lookups only** (reduces E): this CLI makes a single lookup per run, so the plain scan is cheaper than building a set. It also needs no list in memory and stops at the first hit.
+    - Keep the set version of `load_discontinued` for the order import, where it is checked once per row.
+verify:
+  module: true
+  green_block: 0
+  test: |-
+    import os, tempfile
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "disc.txt")
+    with open(p, "w") as f:
+        f.write("A1\n\n  B2  \nC3\n")
+    assert is_discontinued(p, "A1") is True
+    assert is_discontinued(p, "B2") is True
+    assert is_discontinued(p, "Z9") is False
+    assert is_discontinued(p, "") is False

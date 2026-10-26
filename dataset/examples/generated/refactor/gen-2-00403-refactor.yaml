@@ -1,0 +1,159 @@
+id: gen-2-00403-refactor
+category: refactor
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    #!/usr/bin/env python3
+    """Split build artifacts into content-defined chunks for the CI cache.
+
+    Only chunks the cache hasn't seen get uploaded, so a one-line change in
+    the app doesn't re-upload the whole 600 MB bundle.
+    """
+    import hashlib
+    import json
+    import random
+    import sys
+    from pathlib import Path
+
+    MIN_CHUNK = 2 * 1024
+    AVG_MASK = (1 << 13) - 1      # ~8 KiB average
+    MAX_CHUNK = 64 * 1024
+
+    _rng = random.Random(0x5EED)
+    GEAR = [_rng.getrandbits(32) for _ in range(256)]
+
+
+    def chunk_boundaries(data: bytes) -> list[int]:
+        cuts = []
+        start = 0
+        h = 0
+        for i, b in enumerate(data):
+            h = ((h << 1) + GEAR[b]) & 0xFFFFFFFF
+            size = i - start + 1
+            if size < MIN_CHUNK:
+                continue
+            if (h & AVG_MASK) == 0 or size >= MAX_CHUNK:
+                cuts.append(i + 1)
+                start = i + 1
+                h = 0
+        if start < len(data):
+            cuts.append(len(data))
+        return cuts
+
+
+    def build_manifest(path: Path) -> dict:
+        data = path.read_bytes()
+        chunks = []
+        start = 0
+        for end in chunk_boundaries(data):
+            digest = hashlib.sha256(data[start:end]).hexdigest()
+            chunks.append({"offset": start, "size": end - start, "sha256": digest})
+            start = end
+        return {"file": path.name, "size": len(data), "chunks": chunks}
+
+
+    def main(argv):
+        out = Path(argv[1])
+        manifests = [build_manifest(Path(p)) for p in argv[2:]]
+        out.write_text(json.dumps(manifests, indent=2))
+        total = sum(len(m["chunks"]) for m in manifests)
+        print(f"{len(manifests)} files, {total} chunks -> {out}")
+
+
+    if __name__ == "__main__":
+        main(sys.argv)
+    ```
+- role: assistant
+  content: |
+    ```python
+    #!/usr/bin/env python3
+    """Split build artifacts into content-defined chunks for the CI cache.
+
+    Only chunks the cache hasn't seen get uploaded, so a one-line change in
+    the app doesn't re-upload the whole 600 MB bundle.
+    """
+    import hashlib
+    import json
+    import random
+    import sys
+    from pathlib import Path
+
+    import numpy as np
+    from numba import njit
+
+    MIN_CHUNK = 2 * 1024
+    AVG_MASK = (1 << 13) - 1      # ~8 KiB average
+    MAX_CHUNK = 64 * 1024
+
+    _rng = random.Random(0x5EED)
+    GEAR = np.array([_rng.getrandbits(32) for _ in range(256)], dtype=np.int64)
+
+
+    @njit(cache=True)
+    def _cut_points(buf, gear, min_chunk, avg_mask, max_chunk):
+        # Every chunk except the last has at least min_chunk bytes.
+        cuts = np.empty(buf.size // min_chunk + 1, dtype=np.int64)
+        n = 0
+        start = 0
+        h = 0
+        for i in range(buf.size):
+            h = ((h << 1) + gear[buf[i]]) & 0xFFFFFFFF
+            size = i - start + 1
+            if size < min_chunk:
+                continue
+            if (h & avg_mask) == 0 or size >= max_chunk:
+                cuts[n] = i + 1
+                n += 1
+                start = i + 1
+                h = 0
+        if start < buf.size:
+            cuts[n] = buf.size
+            n += 1
+        return cuts[:n]
+
+
+    def chunk_boundaries(data: bytes) -> list[int]:
+        buf = np.frombuffer(data, dtype=np.uint8)
+        return _cut_points(buf, GEAR, MIN_CHUNK, AVG_MASK, MAX_CHUNK).tolist()
+
+
+    def build_manifest(path: Path) -> dict:
+        data = path.read_bytes()
+        chunks = []
+        start = 0
+        for end in chunk_boundaries(data):
+            digest = hashlib.sha256(data[start:end]).hexdigest()
+            chunks.append({"offset": start, "size": end - start, "sha256": digest})
+            start = end
+        return {"file": path.name, "size": len(data), "chunks": chunks}
+
+
+    def main(argv):
+        out = Path(argv[1])
+        manifests = [build_manifest(Path(p)) for p in argv[2:]]
+        out.write_text(json.dumps(manifests, indent=2))
+        total = sum(len(m["chunks"]) for m in manifests)
+        print(f"{len(manifests)} files, {total} chunks -> {out}")
+
+
+    if __name__ == "__main__":
+        main(sys.argv)
+    ```
+
+    **Green Notes**
+    - **JIT-compile the hot numeric loop** (reduces E): `chunk_boundaries` runs one interpreted iteration per byte. For a large bundle that means hundreds of millions of iterations on every CI run. With `@njit` the same loop runs as machine code. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples used ~40 J in a pure Python loop and ~9.5 J with Numba `@njit`, about 4× less.
+    - **Why Numba and not NumPy:** every cut resets the hash, so each step depends on the one before. That does not map cleanly to array operations. A compiled loop keeps the logic readable.
+
+    The output is identical. The gear table comes from the same seeded RNG, and the arithmetic is the same: `int64` with the explicit `& 0xFFFFFFFF` mask. Chunk boundaries and manifests do not change, so existing cache entries stay valid.
+
+    You need `numba` and `numpy` in the CI image. The loop compiles on the first call in each job. `cache=True` only skips that step if `__pycache__` survives between jobs. Either way, the compile is small compared to a pass over hundreds of MB.
+verify:
+  static_only: answer code needs numba, which is not in stdlib + numpy

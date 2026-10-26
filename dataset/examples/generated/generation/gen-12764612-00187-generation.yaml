@@ -1,0 +1,59 @@
+id: gen-12764612-00187-generation
+category: generation
+language: python
+patterns:
+- simple-conditions
+facts:
+- F-COND
+messages:
+- role: user
+  content: |
+    ```python
+    def modbus_exception_action(code: int) -> str:
+        """Map a Modbus exception code from a meter to what the poller should do.
+
+        1, 2, 3   -> "skip"       (our request is wrong, asking again won't help)
+        5, 6      -> "retry"      (device is busy, try again next cycle)
+        10, 11    -> "reconnect"  (gateway path problem, reopen the TCP link)
+        4, 8      -> "alarm"      (device fault, tell ops)
+        anything else -> "skip"
+
+        Called for every failed read: ~200 meters, polled every 2 seconds.
+        """
+        ...
+    ```
+
+    ?
+- role: assistant
+  content: |
+    Here is the body, using plain equality checks only:
+
+    ```python
+    def modbus_exception_action(code: int) -> str:
+        """Map a Modbus exception code from a meter to what the poller should do."""
+        if code == 5 or code == 6:
+            return "retry"
+        if code == 10 or code == 11:
+            return "reconnect"
+        if code == 4 or code == 8:
+            return "alarm"
+        # 1, 2, 3 and every unknown code: our request is wrong or unknown, don't repeat it
+        return "skip"
+    ```
+
+    **Green Notes**
+    - **Simple equality conditions** (reduces E): this runs on every failed read, so it is a hot path. In Green Metrics Tool micro-benchmarks, a classifier with simple equality branches used about 16% less CPU energy than one with range and modulo guards. Avoid things like `1 <= code <= 3` or `code % 2` here.
+    - *Not applied:* `match`. It showed no meaningful energy difference to `if` branches with the same conditions (about 1%, which is noise), so the plain `if` version stays.
+
+    Codes 1, 2 and 3 have no branch of their own: they fall through to `"skip"`, same as unknown codes, as in your spec.
+verify:
+  test: |-
+    expected = {
+        1: "skip", 2: "skip", 3: "skip",
+        4: "alarm", 8: "alarm",
+        5: "retry", 6: "retry",
+        10: "reconnect", 11: "reconnect",
+        0: "skip", 7: "skip", 9: "skip", 12: "skip", 255: "skip", -1: "skip",
+    }
+    for code, action in expected.items():
+        assert modbus_exception_action(code) == action, (code, action)

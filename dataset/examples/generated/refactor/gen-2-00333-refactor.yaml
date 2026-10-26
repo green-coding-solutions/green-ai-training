@@ -1,0 +1,123 @@
+id: gen-2-00333-refactor
+category: refactor
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import time
+
+    # rendered by GET /metrics, Prometheus scrapes every 15s
+    HELP = {
+        "http_requests_total": "Total HTTP requests by route and status.",
+        "http_request_duration_seconds": "Request latency histogram.",
+        "db_pool_in_use": "Connections currently checked out.",
+    }
+
+    TYPES = {
+        "http_requests_total": "counter",
+        "http_request_duration_seconds": "histogram",
+        "db_pool_in_use": "gauge",
+    }
+
+
+    def _escape(value):
+        return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+    def _labels(labels):
+        if not labels:
+            return ""
+        parts = [f'{k}="{_escape(v)}"' for k, v in sorted(labels.items())]
+        return "{" + ",".join(parts) + "}"
+
+
+    def render_metrics(samples, include_timestamp=False):
+        """Prometheus text format. samples: metric name -> list of (labels, value)."""
+        body = ""
+        ts = f" {int(time.time() * 1000)}" if include_timestamp else ""
+        for name in sorted(samples):
+            if name in HELP:
+                body += f"# HELP {name} {HELP[name]}\n"
+            body += f"# TYPE {name} {TYPES.get(name, 'untyped')}\n"
+            for labels, value in samples[name]:
+                body += f"{name}{_labels(labels)} {value}{ts}\n"
+        return body
+    ```
+- role: assistant
+  content: |
+    ```python
+    import time
+
+    # rendered by GET /metrics, Prometheus scrapes every 15s
+    HELP = {
+        "http_requests_total": "Total HTTP requests by route and status.",
+        "http_request_duration_seconds": "Request latency histogram.",
+        "db_pool_in_use": "Connections currently checked out.",
+    }
+
+    TYPES = {
+        "http_requests_total": "counter",
+        "http_request_duration_seconds": "histogram",
+        "db_pool_in_use": "gauge",
+    }
+
+
+    def _escape(value):
+        return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+    def _labels(labels):
+        if not labels:
+            return ""
+        parts = [f'{k}="{_escape(v)}"' for k, v in sorted(labels.items())]
+        return "{" + ",".join(parts) + "}"
+
+
+    def render_metrics(samples, include_timestamp=False):
+        """Prometheus text format. samples: metric name -> list of (labels, value)."""
+        lines = []
+        ts = f" {int(time.time() * 1000)}" if include_timestamp else ""
+        for name in sorted(samples):
+            if name in HELP:
+                lines.append(f"# HELP {name} {HELP[name]}\n")
+            lines.append(f"# TYPE {name} {TYPES.get(name, 'untyped')}\n")
+            for labels, value in samples[name]:
+                lines.append(f"{name}{_labels(labels)} {value}{ts}\n")
+        return "".join(lines)
+    ```
+
+    **Green Notes**
+    - **`"".join()` instead of `+=`** (reduces E): `body +=` makes a new, longer string for every sample line. Routes × statuses × histogram buckets quickly add up to thousands of lines, and that happens on every scrape. Now each line goes into a list, and the body is built once at the end. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces with `+=` used ~469 J and `"".join()` used ~1.8 J. f-string concatenation in a loop behaved like `+=` (~455 J). The f-strings that remain are fine, because each one only formats a single short line.
+    - The output is byte for byte the same: same order, same trailing newline, and `""` for empty `samples`.
+    - `_labels` already used `join`, so it stays as it was.
+verify:
+  equivalence:
+    driver: |-
+      samples = {
+          "http_requests_total": [
+              ({"route": "/api/orders", "status": "200"}, 1532),
+              ({"route": "/api/orders", "status": "500"}, 3),
+              ({"route": '/a"b\\c', "status": "404"}, 1),
+          ],
+          "http_request_duration_seconds": [
+              ({"le": le}, i * 10) for i, le in enumerate(["0.05", "0.1", "0.5", "1", "+Inf"])
+          ],
+          "db_pool_in_use": [({}, 4)],
+          "custom_jobs": [({"queue": "mail"}, 2.5)],
+      }
+      print(render_metrics(samples), end="")
+      print(repr(render_metrics({})))
+      big = {
+          "http_requests_total": [
+              ({"route": f"/r/{i}", "status": str(200 + i % 3)}, i) for i in range(3000)
+          ]
+      }
+      out = render_metrics(big)
+      print(len(out), out.count("\n"), repr(out[-60:]))

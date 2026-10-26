@@ -1,0 +1,124 @@
+id: gen-2-00272-no-change
+category: no-change
+language: python
+patterns:
+- set-membership
+- context-tradeoff
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    #!/usr/bin/env python3
+    """Enrollment hook: the gateway's provisioning service runs this once per new device."""
+    import json
+    import sys
+    from pathlib import Path
+
+    REGISTRY = Path("/var/lib/gateway/devices.json")
+
+
+    def load_registry(path):
+        with path.open() as f:
+            data = json.load(f)
+        return data["devices"]
+
+
+    def enroll(device_id, fw_version, path=REGISTRY):
+        devices = load_registry(path)
+        known_ids = [d["id"] for d in devices]
+        # known_ids = set(known_ids)  # faster?
+        if device_id in known_ids:
+            print(f"{device_id}: already enrolled, skipping")
+            return False
+        devices.append({"id": device_id, "fw": fw_version, "status": "pending"})
+        tmp = path.with_suffix(".tmp")
+        with tmp.open("w") as f:
+            json.dump({"devices": devices}, f, indent=2)
+        tmp.replace(path)
+        print(f"{device_id}: enrolled (fw {fw_version})")
+        return True
+
+
+    if __name__ == "__main__":
+        if len(sys.argv) != 3:
+            sys.exit("usage: enroll.py DEVICE_ID FW_VERSION")
+        sys.exit(0 if enroll(sys.argv[1], sys.argv[2]) else 1)
+    ```
+- role: assistant
+  content: |
+    Keep the list. The commented-out `set()` line would make this slower, not faster.
+
+    - **One lookup per run:** each enrollment starts a fresh process, and that process does exactly one `in` check. `set(known_ids)` must hash every ID first, which is O(n) work. That costs more than one linear scan, and the scan can stop early when it finds a match.
+    - **Measured:** in Green Metrics Tool micro-benchmarks, a single membership test on a 10,000,000-element list used ~6.9 J. Converting the list to a set and testing once used ~10.5 J, about 50% more.
+    - **Where the work is:** parsing `devices.json` already touches every entry, and writing the file back touches every entry again. The scan is a small part of each run.
+
+    A set pays off when one process checks many IDs, for example a bulk import that enrolls a whole batch of devices. In that case, build the set once before the loop and look up in it.
+
+    Here is the code as it is, with the dead comment removed:
+
+    ```python
+    #!/usr/bin/env python3
+    """Enrollment hook: the gateway's provisioning service runs this once per new device."""
+    import json
+    import sys
+    from pathlib import Path
+
+    REGISTRY = Path("/var/lib/gateway/devices.json")
+
+
+    def load_registry(path):
+        with path.open() as f:
+            data = json.load(f)
+        return data["devices"]
+
+
+    def enroll(device_id, fw_version, path=REGISTRY):
+        devices = load_registry(path)
+        known_ids = [d["id"] for d in devices]
+        if device_id in known_ids:
+            print(f"{device_id}: already enrolled, skipping")
+            return False
+        devices.append({"id": device_id, "fw": fw_version, "status": "pending"})
+        tmp = path.with_suffix(".tmp")
+        with tmp.open("w") as f:
+            json.dump({"devices": devices}, f, indent=2)
+        tmp.replace(path)
+        print(f"{device_id}: enrolled (fw {fw_version})")
+        return True
+
+
+    if __name__ == "__main__":
+        if len(sys.argv) != 3:
+            sys.exit("usage: enroll.py DEVICE_ID FW_VERSION")
+        sys.exit(0 if enroll(sys.argv[1], sys.argv[2]) else 1)
+    ```
+
+    One correctness note: if the provisioning service can run two hooks at the same time, they read and write the file at the same time and one new entry can get lost. They also share the same `.tmp` file. A file lock around `enroll` (for example `fcntl.flock` on a lock file) prevents this.
+verify:
+  module: true
+  test: |
+    import tempfile, json as _json
+    from pathlib import Path as _P
+    _d = tempfile.mkdtemp()
+    _p = _P(_d) / "devices.json"
+    _p.write_text(_json.dumps({"devices": [{"id": "gw-sensor-01", "fw": "1.2.0", "status": "active"}]}))
+    assert enroll("gw-sensor-01", "1.2.0", path=_p) is False
+    assert enroll("gw-sensor-02", "1.3.1", path=_p) is True
+    assert enroll("gw-sensor-02", "1.3.1", path=_p) is False
+    _ids = [d["id"] for d in _json.loads(_p.read_text())["devices"]]
+    assert _ids == ["gw-sensor-01", "gw-sensor-02"]
+  equivalence:
+    driver: |-
+      import tempfile, json as _json
+      from pathlib import Path as _P
+      _d = tempfile.mkdtemp()
+      _p = _P(_d) / "devices.json"
+      _p.write_text(_json.dumps({"devices": [{"id": "dev-%03d" % i, "fw": "1.0.0", "status": "active"} for i in range(50)]}))
+      print(enroll("dev-010", "1.0.0", path=_p))
+      print(enroll("dev-999", "2.1.0", path=_p))
+      print(enroll("dev-999", "2.1.0", path=_p))
+      print(_p.read_text())

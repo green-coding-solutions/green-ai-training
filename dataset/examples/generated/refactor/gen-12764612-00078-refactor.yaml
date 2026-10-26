@@ -1,0 +1,143 @@
+id: gen-12764612-00078-refactor
+category: refactor
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    We run PR preview environments for our orders REST API on one shared Docker host. CI deploys a Compose stack per pull request with `docker compose -p pr-<number> up -d`. The host is getting full. Can you refactor the compose file?
+
+    Requirements:
+    - Reviewers only open the Swagger UI and call a few endpoints by hand. Nobody load tests a preview.
+    - The API uses Redis only as a response cache. It skips the cache and works normally if Redis is not reachable.
+    - The worker only builds the nightly CSV export. Only a few PRs touch that, and those PRs should still be able to run it.
+    - Keep the Postgres seed and the image tag logic as they are.
+    - Compose v2.24 on the host.
+
+    ```yaml
+    name: orders-api-preview
+
+    services:
+      api:
+        image: registry.example.com/orders-api:${PR_TAG}
+        deploy:
+          replicas: 3
+        environment:
+          DATABASE_URL: postgres://orders:orders@db:5432/orders
+          REDIS_URL: redis://redis:6379/0
+          CACHE_TTL: "300"
+          LOG_LEVEL: debug
+        depends_on:
+          - db
+          - redis
+        ports:
+          - "8080"
+
+      worker:
+        image: registry.example.com/orders-api:${PR_TAG}
+        command: ["python", "-m", "orders.worker"]
+        environment:
+          DATABASE_URL: postgres://orders:orders@db:5432/orders
+          REDIS_URL: redis://redis:6379/0
+          POLL_INTERVAL_SECONDS: "5"
+        depends_on:
+          - db
+          - redis
+
+      db:
+        image: postgres:16
+        environment:
+          POSTGRES_USER: orders
+          POSTGRES_PASSWORD: orders
+          POSTGRES_DB: orders
+        volumes:
+          - ./seed/preview.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
+          - pgdata:/var/lib/postgresql/data
+
+      redis:
+        image: redis:7
+
+    volumes:
+      pgdata:
+    ```
+- role: assistant
+  content: |
+    ```yaml
+    name: orders-api-preview
+
+    services:
+      api:
+        image: registry.example.com/orders-api:${PR_TAG}
+        environment:
+          DATABASE_URL: postgres://orders:orders@db:5432/orders
+          REDIS_URL: redis://redis:6379/0
+          CACHE_TTL: "300"
+          LOG_LEVEL: debug
+        depends_on:
+          db:
+            condition: service_started
+          redis:
+            condition: service_started
+            required: false
+        ports:
+          - "8080"
+
+      # start only when needed: docker compose --profile full up -d
+      worker:
+        profiles: [full]
+        image: registry.example.com/orders-api:${PR_TAG}
+        command: ["python", "-m", "orders.worker"]
+        environment:
+          DATABASE_URL: postgres://orders:orders@db:5432/orders
+          REDIS_URL: redis://redis:6379/0
+          POLL_INTERVAL_SECONDS: "5"
+        depends_on:
+          - db
+          - redis
+
+      db:
+        image: postgres:16
+        environment:
+          POSTGRES_USER: orders
+          POSTGRES_PASSWORD: orders
+          POSTGRES_DB: orders
+        volumes:
+          - ./seed/preview.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
+          - pgdata:/var/lib/postgresql/data
+
+      # only part of the "full" preview
+      redis:
+        profiles: [full]
+        image: redis:7
+
+    volumes:
+      pgdata:
+    ```
+
+    The default preview is now one API container and Postgres. A PR that touches the export starts the extra services with `--profile full`. The API ignores Redis when it is not running, because of `required: false`. That matches your note that it works without the cache.
+
+    The saving that matters most is how long a preview lives, so add a teardown to your CI:
+
+    ```yaml
+    on:
+      pull_request:
+        types: [closed]
+
+    jobs:
+      teardown:
+        runs-on: [self-hosted, preview-host]
+        steps:
+          - run: docker compose -p "pr-${{ github.event.number }}" --profile full down --volumes
+    ```
+
+    **Green Notes**
+    - **Fewer replicas and services by default** (reduces E, M): 3 API replicas became 1, and Redis and the worker are opt-in. In Green Metrics Tool micro-benchmarks, an idle preview with 3 app replicas, Postgres, Redis and a polling worker used about 269 J CPU energy per 60 seconds. One replica plus Postgres used about 262 J, only about 3% less. Idle services cost little CPU, so this change mostly frees memory and host capacity.
+    - **Remove environments that are not needed** (reduces E, M): the teardown on PR close matters more than the trimming. A closed PR no longer keeps a stack and a database volume. Machine energy in the same benchmark differed by less than 1%, because the idle host baseline dominates. So fewer running hours is where the saving comes from.
+    - **Optional next step:** run `docker compose -p pr-<n> stop` for all previews at night and start them again on the next push. It removes the idle hours, and the volumes keep their data.
+
+    Behavior changes: the default preview has no response cache, so responses may be slower than in staging. Do not use it for load tests. The nightly export only runs in `full` previews.
+verify:
+  static_only: Docker Compose and GitHub Actions YAML, needs Docker and a CI runner

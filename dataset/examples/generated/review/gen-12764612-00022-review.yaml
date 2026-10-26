@@ -1,0 +1,118 @@
+id: gen-12764612-00022-review
+category: review
+language: html
+patterns:
+- lazy-load-images
+- css-animations
+facts:
+- F-LAZY-IMG
+- F-ANIM
+messages:
+- role: user
+  content: |
+    Please review the landing page of our developer portal. FastAPI serves it as a plain static file at `/`, there is no build step and I want to keep it that way. Requirements: the look must stay the same, it must work in current Chrome, Firefox and Safari, and the "Quick start" section stays on the page. Most visitors are developers who read the top part and then go to the docs.
+
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <title>Parcelo API - Developer Portal</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <link rel="stylesheet" href="/static/portal.css">
+    </head>
+    <body>
+      <header class="topbar">
+        <a href="/" class="logo">Parcelo API</a>
+        <span class="status"><i id="status-dot"></i> <span id="status-text">checking...</span></span>
+      </header>
+
+      <section class="hero">
+        <h1>Ship parcels with one request</h1>
+        <img src="/static/img/hero-dashboard.webp" alt="Parcelo dashboard with live shipments" width="1200" height="640">
+      </section>
+
+      <section id="quickstart">
+        <h2>Quick start</h2>
+        <pre><code>curl https://api.parcelo.example/v1/shipments \
+      -H "Authorization: Bearer REDACTED" \
+      -d '{"to": "10115 Berlin", "weight_g": 850}'</code></pre>
+      </section>
+
+      <section id="guides">
+        <h2>Guides</h2>
+        <div class="grid">
+          <figure><img src="/static/img/guide-labels.webp" alt="Label printing" width="600" height="400"><figcaption>Print labels</figcaption></figure>
+          <figure><img src="/static/img/guide-tracking.webp" alt="Tracking events" width="600" height="400"><figcaption>Track parcels</figcaption></figure>
+          <figure><img src="/static/img/guide-webhooks.webp" alt="Webhook setup" width="600" height="400"><figcaption>Webhooks</figcaption></figure>
+          <figure><img src="/static/img/guide-returns.webp" alt="Returns flow" width="600" height="400"><figcaption>Returns</figcaption></figure>
+          <figure><img src="/static/img/guide-rates.webp" alt="Rate calculator" width="600" height="400"><figcaption>Rates</figcaption></figure>
+          <figure><img src="/static/img/guide-sandbox.webp" alt="Sandbox mode" width="600" height="400"><figcaption>Sandbox</figcaption></figure>
+        </div>
+      </section>
+
+      <script>
+        const dot = document.getElementById('status-dot');
+        const text = document.getElementById('status-text');
+
+        function pulse(t) {
+          const wave = Math.sin(t / 400);
+          dot.style.transform = 'scale(' + (1 + 0.25 * wave) + ')';
+          dot.style.opacity = 0.7 + 0.3 * wave;
+          requestAnimationFrame(pulse);
+        }
+        requestAnimationFrame(pulse);
+
+        fetch('/v1/health')
+          .then(r => r.json())
+          .then(d => { text.textContent = d.ok ? 'All systems operational' : 'Degraded'; })
+          .catch(() => { text.textContent = 'Status unavailable'; });
+      </script>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (static landing page served by the API backend)
+
+    #### [Security] Live-looking API key in the Quick start
+    - **Where:** the `curl` example in `#quickstart`
+    - **Issue:** `sk_live_...` looks like a real secret key. Anyone who opens the page can copy it. If it is real, it is public now.
+    - **Fix:** rotate the key if it is real, and show a placeholder instead:
+      ```html
+      <pre><code>curl https://api.parcelo.example/v1/shipments \
+        -H "Authorization: Bearer $PARCELO_API_KEY" \
+        -d '{"to": "10115 Berlin", "weight_g": 850}'</code></pre>
+      ```
+    - **Impact:** none on energy. It is a secret leak.
+
+    #### [Medium] Guide screenshots load even if nobody scrolls to them
+    - **Where:** the six `<img>` tags in `#guides`
+    - **Issue:** they are far below the fold, but the browser fetches and decodes all of them on every first visit. Your visitors mostly read the top and leave for the docs, so most of that work is wasted.
+    - **Fix:** add `loading="lazy"` to these six images only. Your `width` and `height` attributes are already there, so the layout will not jump when they load. Keep the hero image eager, because it is above the fold and lazy loading would delay it.
+      ```html
+      <img src="/static/img/guide-labels.webp" alt="Label printing" width="600" height="400" loading="lazy">
+      ```
+    - **Impact:** network and client E, only for visits that do not scroll down. In Green Metrics Tool micro-benchmarks, an article with 15 photos used about 12% less client energy when loaded without scrolling, and there was no difference when the visitor scrolled to the end. Browsers that do not know the attribute just load the images as before.
+
+    #### [Medium] Status dot is animated with JavaScript on every frame
+    - **Where:** `pulse()` with `requestAnimationFrame`
+    - **Issue:** the script runs on every frame for as long as the tab is open and writes styles each time. This is a pure visual effect, so CSS can do it without running your JavaScript.
+    - **Fix:** use `@keyframes` on `transform` and `opacity` and remove `pulse()`. The `fetch` part stays as is.
+      ```css
+      #status-dot { animation: pulse 2.5s ease-in-out infinite; }
+
+      @keyframes pulse {
+        0%, 100% { transform: scale(0.95); opacity: 0.4; }
+        50%      { transform: scale(1.25); opacity: 1; }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        #status-dot { animation: none; }
+      }
+      ```
+    - **Impact:** client E on every page view. In Green Metrics Tool micro-benchmarks, a 20-second CSS `@keyframes` animation used about 10% less CPU energy than a `requestAnimationFrame` version with style updates. The easing is slightly different from the sine wave, so the look is close but not pixel-identical. The `prefers-reduced-motion` rule is a small addition for users who turn animations off.
+
+    **Already good:** the hero image is eager, all images have `width` and `height`, and the health check is a single `fetch` instead of a loop.
+verify:
+  static_only: HTML/CSS page review; needs a browser to run, no Python or JavaScript module to import

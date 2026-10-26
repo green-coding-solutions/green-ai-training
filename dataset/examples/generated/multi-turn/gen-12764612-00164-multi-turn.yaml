@@ -1,0 +1,114 @@
+id: gen-12764612-00164-multi-turn
+category: multi-turn
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    hi, i have a raspberry pi as gateway for our greenhouse sensors. it show a small dashboard on the local network (html, js, css) and the sensor data come as json from a python service. when someone open the dashboard the pi cpu go up and fan is loud. i dont know whats wrong, maybe my nginx config?
+
+    ```nginx
+    server {
+        listen 80;
+        server_name _;
+        root /opt/gateway/www;
+        index index.html;
+
+        gzip on;
+        gzip_comp_level 9;
+        gzip_types *;
+        gzip_min_length 0;
+        gzip_proxied any;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location /api/ {
+            proxy_pass http://127.0.0.1:8081;
+            proxy_set_header Host $host;
+        }
+
+        location /snapshots/ {
+            alias /var/lib/gateway/snapshots/;
+            autoindex on;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    Yes, the gzip settings are the likely cause. Every response is compressed on the Pi at the highest level, even files that cannot get smaller.
+
+    ```nginx
+    server {
+        listen 80;
+        server_name _;
+        root /opt/gateway/www;
+        index index.html;
+
+        gzip_static on;
+        gzip on;
+        gzip_comp_level 5;
+        gzip_min_length 1024;
+        gzip_vary on;
+        gzip_proxied any;
+        gzip_types text/css application/javascript application/json image/svg+xml;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location /api/ {
+            proxy_pass http://127.0.0.1:8081;
+            proxy_set_header Host $host;
+        }
+
+        location /snapshots/ {
+            alias /var/lib/gateway/snapshots/;
+            autoindex on;
+        }
+    }
+    ```
+
+    Compress the dashboard files once, after each change:
+
+    ```bash
+    find /opt/gateway/www -type f \( -name '*.html' -o -name '*.css' -o -name '*.js' -o -name '*.svg' \) -exec gzip -k -9 -f {} +
+    ```
+
+    **Green Notes**
+    - **Precompressed static files** (reduces E): the dashboard files are the same for every visitor, so compress them once and let `gzip_static` serve the `.gz` copy. In Green Metrics Tool micro-benchmarks of nginx serving text assets, compressing on every request used about 4× the CPU energy of serving precompressed files. Both sent about 10× fewer bytes than uncompressed files. Compressing once is the right place for the high level.
+    - **Only text types** (reduces E): `gzip_types *` also compressed your JPEG snapshots. They are already compressed, so this only burned CPU. The new list skips them. `gzip_min_length` also skips tiny responses.
+    - **Moderate level for the JSON** (reduces E): the sensor JSON is created live, so it still has to be compressed per request. Level 5 is a good balance for that. The highest level spends the most CPU on every response for usually only a slightly smaller result.
+
+    One thing to watch: if you edit a file and forget to run the `gzip` command, nginx keeps serving the old `.gz` copy.
+- role: user
+  content: |
+    ok but i dont have any build, i just edit index.html with nano directly on the pi. i will 100% forget to run that gzip command. is there something simpler?
+- role: assistant
+  content: |
+    Yes. Then drop `gzip_static` and let nginx compress on the fly. A stale page is a worse problem than some extra CPU.
+
+    ```nginx
+    gzip on;
+    gzip_comp_level 5;
+    gzip_min_length 1024;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_types text/css application/javascript application/json image/svg+xml;
+    ```
+
+    Delete the `.gz` files you may have created already:
+
+    ```bash
+    find /opt/gateway/www -name '*.gz' -delete
+    ```
+
+    You keep the two fixes that need no workflow change: no compression for the JPEG snapshots and no maximum level. The per-request cost from the earlier measurement still applies. But it grows with the number of page loads, and a small dashboard for a few people on the local network is a small load.
+
+    If you later add a deploy step (a script or `scp` from your laptop), put the `gzip` command in it and add `gzip_static on;` back.
+verify:
+  static_only: nginx configuration, cannot be executed in the test harness

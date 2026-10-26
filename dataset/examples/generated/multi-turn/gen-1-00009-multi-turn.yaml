@@ -1,0 +1,79 @@
+id: gen-1-00009-multi-turn
+category: multi-turn
+language: bash
+patterns:
+- bash-quoting
+facts:
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    hello, i need bash script for make landing pages. i have file campaigns.txt, every line is slug|headline, around 3000 lines. for every line it must make out/<slug>/index.html with the headline and one button to /signup?c=<slug>. the css is the same for all pages and it should be inside the html (no extra request). thx
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    list=${1:?usage: make-pages.sh campaigns.txt outdir}
+    out=${2:?usage: make-pages.sh campaigns.txt outdir}
+
+    css='*{box-sizing:border-box}body{margin:0;font-family:system-ui,sans-serif;color:#222}.hero{padding:4rem 1rem;text-align:center;background:#f4f7fb}.hero h1{font-size:2.5rem;margin:0 0 1rem}.cta{display:inline-block;padding:.8rem 1.6rem;background:#0a6cff;color:#fff;border-radius:6px;text-decoration:none}'
+
+    page='<!doctype html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>%s</title>
+    <style>%s</style>
+    </head>
+    <body>
+    <section class="hero">
+    <h1>%s</h1>
+    <a class="cta" href="/signup?c=%s">Start free</a>
+    </section>
+    </body>
+    </html>
+    '
+
+    while IFS='|' read -r slug headline; do
+      [[ -z $slug ]] && continue
+      case $slug in
+        *[!a-z0-9-]*) echo "skip bad slug: $slug" >&2; continue ;;
+      esac
+      headline=${headline//&/&amp;}
+      headline=${headline//</&lt;}
+      headline=${headline//>/&gt;}
+      mkdir -p -- "$out/$slug"
+      printf "$page" "$headline" "$css" "$headline" "$slug" > "$out/$slug/index.html"
+    done < "$list"
+    ```
+
+    **Green Notes**
+    - **Single quotes for literals** (reduces E): the CSS and the HTML template have no `$` or backticks, so they are single-quoted and bash takes them as is. Double quotes are used only where a variable must expand.
+    - **No processes in the loop** (reduces E): splitting the line, escaping the headline and checking the slug use only builtins (`read -r`, `${var//}`, `case`). No `sed`, `echo | cut` or `basename` is started 3000 times.
+
+    The script also skips slugs with unsafe characters, so a bad line can't write outside `outdir`. The headline is HTML-escaped.
+- role: user
+  content: |
+    works, thank you. but now my boss want a comment on top of the css with brand name and the year, brand is in env variable BRAND. also my colleague say single quotes are hard to read and he always use double quotes everywhere, why you use single? it really matter?
+- role: assistant
+  content: |
+    Here is the change. The comment needs `$brand` and the year, so that one string uses double quotes. The CSS stays single-quoted.
+
+    ```bash
+    brand=${BRAND:-Acme}
+    printf -v year '%(%Y)T' -1
+
+    header="/* $brand $year */"
+    css=$header'*{box-sizing:border-box}body{margin:0;font-family:system-ui,sans-serif;color:#222}.hero{padding:4rem 1rem;text-align:center;background:#f4f7fb}.hero h1{font-size:2.5rem;margin:0 0 1rem}.cta{display:inline-block;padding:.8rem 1.6rem;background:#0a6cff;color:#fff;border-radius:6px;text-decoration:none}'
+    ```
+
+    Replace the old `css=...` line with these lines. The rest of the script stays the same. `printf -v` with `%(%Y)T` is a bash builtin, so no `date` process is started.
+
+    Does it matter? For this script, only a little. Bash scans double-quoted text for `$`, backticks and backslashes, and single-quoted text is not scanned. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal 1,000,000 times used about 24% less CPU energy with single quotes. That is a long string in a very hot loop. Here the CSS is assigned once, so the saving is tiny.
+
+    The rule is easy to keep in a team: single quotes by default, double quotes only when something must expand. Always keep double quotes around variables like `"$out/$slug"`.
+verify:
+  static_only: bash script that writes files; no deterministic stdout to compare

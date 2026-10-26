@@ -1,0 +1,58 @@
+id: gen-1-00116-no-change
+category: no-change
+language: python
+patterns:
+- select-columns
+- context-tradeoff
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+messages:
+- role: user
+  content: |
+    Our lint bot flags the `SELECT *` in `extract_rates` as a perf issue (select-columns rule). Diff only please, I don't need the explanation.
+
+    ```python
+    import logging
+    from datetime import datetime, timezone
+
+    import psycopg
+
+    log = logging.getLogger("etl.fx")
+
+    WAREHOUSE_UPSERT = """
+        INSERT INTO dw.fx_rates (id, base_ccy, quote_ccy, rate, source, fetched_at)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (id) DO UPDATE
+        SET rate = EXCLUDED.rate, source = EXCLUDED.source, fetched_at = EXCLUDED.fetched_at
+    """
+
+
+    def extract_rates(src, since):
+        with src.cursor() as cur:
+            cur.execute("SELECT * FROM fx_rates WHERE fetched_at >= %s", (since,))
+            return cur.fetchall()
+
+
+    def load_rates(dw, rows):
+        with dw.cursor() as cur:
+            cur.executemany(WAREHOUSE_UPSERT, rows)
+        dw.commit()
+        log.info("loaded %d fx rates", len(rows))
+
+
+    def run(src_dsn, dw_dsn, since):
+        with psycopg.connect(src_dsn) as src, psycopg.connect(dw_dsn) as dw:
+            rows = extract_rates(src, since)
+            load_rates(dw, rows)
+            return datetime.now(timezone.utc), len(rows)
+    ```
+- role: assistant
+  content: |
+    No diff. Leave it as is.
+
+    `fx_rates` has six narrow columns (ids, currency codes, a number, a source tag, a timestamp), and the upsert uses all six. `SELECT *` skips nothing here, so there is nothing to save. In Green Metrics Tool micro-benchmarks on PostgreSQL, naming 10 of 52 columns used about 5.5× to 7× less CPU energy than `SELECT *`. That table had large text columns, and the saving grows with the size of the columns you skip. Cost scales with the data each column carries, and you skip none.
+
+    The one real risk is schema drift: `executemany` expects exactly six values per row, so a new column on the source table breaks the load with a parameter count error. If you want a guard against that, spell out the six names in the query. That is a robustness choice, not an energy one. Revisit the rule if someone adds a wide text or JSON column to `fx_rates` that the warehouse doesn't need.
+verify:
+  static_only: needs PostgreSQL and psycopg connections to run

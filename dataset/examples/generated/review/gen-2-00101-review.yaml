@@ -1,0 +1,100 @@
+id: gen-2-00101-review
+category: review
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    fix this. review cluster is full again
+
+    ```yaml
+    stages: [build, review]
+
+    variables:
+      CHART: deploy/logstack
+
+    build_image:
+      stage: build
+      image: docker:27
+      services: [docker:27-dind]
+      script:
+        - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+        - docker build -t $CI_REGISTRY_IMAGE/ingest:$CI_COMMIT_SHORT_SHA .
+        - docker push $CI_REGISTRY_IMAGE/ingest:$CI_COMMIT_SHORT_SHA
+
+    deploy_review:
+      stage: review
+      image: alpine/helm:3.15.4
+      rules:
+        - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      script:
+        - helm upgrade --install logs $CHART
+            --namespace review-$CI_COMMIT_REF_SLUG --create-namespace
+            --set ingest.image.tag=$CI_COMMIT_SHORT_SHA
+            --set ingest.replicas=3
+            --set kafka.brokers=3
+            --set opensearch.nodes=3
+            --set opensearch.security.enabled=false
+            --set dashboards.enabled=true
+            --set seed.source=s3://acme-prod-logs/samples/latest/
+            --set ingress.host=$CI_COMMIT_REF_NAME.review.acme-logs.io
+      environment:
+        name: review/$CI_COMMIT_REF_SLUG
+        url: https://$CI_COMMIT_REF_SLUG.review.acme-logs.io
+        auto_stop_in: never
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (log ingestion review environments in CI)
+
+    #### [Bug] Ingress host uses the raw branch name
+    - **Where:** `--set ingress.host=$CI_COMMIT_REF_NAME...`
+    - **Issue:** branches like `feature/parser-fix` produce a host name with a `/`, which is not a valid host. The ingress also does not match the environment URL, which uses the slug.
+    - **Fix:** `--set ingress.host=$CI_COMMIT_REF_SLUG.review.acme-logs.io`
+
+    #### [Security] Production logs in an open OpenSearch on a public URL
+    - **Where:** `seed.source=s3://acme-prod-logs/...` together with `opensearch.security.enabled=false` and a public ingress
+    - **Issue:** anyone who knows or guesses a branch URL can read production log lines. These often contain IPs, user IDs and sometimes tokens.
+    - **Fix:** seed review environments with synthetic or anonymized samples. Also keep the security plugin on, or put the ingress behind your SSO.
+
+    #### [High] Review stacks never stop
+    - **Where:** `auto_stop_in: never`, no `on_stop` job
+    - **Issue:** this is why the cluster fills up. Every branch keeps a full Kafka, OpenSearch and ingest stack running after it is merged. The cost of a review environment comes mostly from the hours it exists.
+    - **Fix:** add a stop job. GitLab runs it when the branch is deleted and after `auto_stop_in`. Deleting the namespace also removes the Kafka and OpenSearch volumes, which `helm uninstall` leaves behind.
+      ```yaml
+      deploy_review:
+        # ...
+        environment:
+          name: review/$CI_COMMIT_REF_SLUG
+          url: https://$CI_COMMIT_REF_SLUG.review.acme-logs.io
+          on_stop: stop_review
+          auto_stop_in: 2 days
+
+      stop_review:
+        stage: review
+        image: alpine/k8s:1.30.4
+        rules:
+          - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+            when: manual
+        allow_failure: true
+        variables:
+          GIT_STRATEGY: none
+        script:
+          - kubectl delete namespace review-$CI_COMMIT_REF_SLUG --ignore-not-found --wait=false
+        environment:
+          name: review/$CI_COMMIT_REF_SLUG
+          action: stop
+      ```
+      Also add a scheduled pipeline that scales the `review-*` namespaces to zero at night.
+    - **Impact:** E and M. The idle hours of merged and forgotten branches go away, and so do their volumes.
+
+    #### [Low] Three-node cluster for every review
+    - **Where:** `ingest.replicas=3`, `kafka.brokers=3`, `opensearch.nodes=3`
+    - **Issue:** a review environment usually has a single reviewer. In Green Metrics Tool measurements, an idle preview environment ran for 60 seconds. With 3 app replicas, Postgres, Redis and a polling worker it used ~269 J of CPU energy. With 1 replica and Postgres it used ~262 J, about 3% less. Idle extra services cost little CPU per minute. But each broker and OpenSearch node reserves heap and disk, so fewer reviews fit on the cluster.
+    - **Fix:** use a `values-review.yaml` with one replica, one broker and one single-node OpenSearch. Only enable dashboards on the branches that need them.
+    - **Impact:** M, more reviews per node.
+verify:
+  static_only: GitLab CI config, needs a runner and a Kubernetes cluster

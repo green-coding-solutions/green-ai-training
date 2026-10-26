@@ -1,0 +1,117 @@
+id: gen-12764612-00155-refactor
+category: refactor
+language: python
+patterns:
+- async-concurrent-io
+- memoize
+facts:
+- F-HTTP
+- F-LRU
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import json
+    import re
+    import sys
+    import urllib.request
+    from collections import Counter
+
+    LINE_RE = re.compile(r'^(\S+) \S+ \S+ \[[^\]]+\] "(\S+) (\S+)[^"]*" (\d{3}) (\d+|-)')
+
+
+    def lookup_country(ip):
+        url = f"https://ipapi.example.com/json/{ip}"
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            return json.load(resp).get("country_code", "??")
+
+
+    def summarize(path):
+        hits = Counter()
+        errors = Counter()
+        with open(path) as f:
+            for line in f:
+                m = LINE_RE.match(line)
+                if not m:
+                    continue
+                ip, method, url, status, size = m.groups()
+                country = lookup_country(ip)
+                hits[country] += 1
+                if status.startswith("5"):
+                    errors[country] += 1
+        return hits, errors
+
+
+    if __name__ == "__main__":
+        hits, errors = summarize(sys.argv[1])
+        for country, n in hits.most_common(10):
+            print(f"{country}\t{n}\t{errors[country]}")
+    ```
+- role: assistant
+  content: |
+    ```python
+    import asyncio
+    import re
+    import sys
+    from collections import Counter
+
+    import httpx
+
+    LINE_RE = re.compile(r'^(\S+) \S+ \S+ \[[^\]]+\] "(\S+) (\S+)[^"]*" (\d{3}) (\d+|-)')
+    MAX_CONCURRENT = 20
+
+
+    async def lookup_country(client, sem, ip):
+        async with sem:
+            resp = await client.get(f"https://ipapi.example.com/json/{ip}")
+            resp.raise_for_status()
+            return ip, resp.json().get("country_code", "??")
+
+
+    async def summarize_async(path):
+        hits_by_ip = Counter()
+        errors_by_ip = Counter()
+        with open(path) as f:
+            for line in f:
+                m = LINE_RE.match(line)
+                if not m:
+                    continue
+                ip, status = m.group(1), m.group(4)
+                hits_by_ip[ip] += 1
+                if status.startswith("5"):
+                    errors_by_ip[ip] += 1
+
+        sem = asyncio.Semaphore(MAX_CONCURRENT)
+        async with httpx.AsyncClient(timeout=5) as client:
+            pairs = await asyncio.gather(
+                *(lookup_country(client, sem, ip) for ip in hits_by_ip)
+            )
+        country_of = dict(pairs)
+
+        hits = Counter()
+        errors = Counter()
+        for ip, n in hits_by_ip.items():
+            hits[country_of[ip]] += n
+            if ip in errors_by_ip:
+                errors[country_of[ip]] += errors_by_ip[ip]
+        return hits, errors
+
+
+    def summarize(path):
+        return asyncio.run(summarize_async(path))
+
+
+    if __name__ == "__main__":
+        hits, errors = summarize(sys.argv[1])
+        for country, n in hits.most_common(10):
+            print(f"{country}\t{n}\t{errors[country]}")
+    ```
+
+    **Green Notes**
+    - **Memoize repeated inputs** (reduces E and network): the old code made one HTTP call per log line, so a busy IP was looked up again and again. Now the file is read once, hits are counted per IP, and each distinct IP is looked up exactly once. In Green Metrics Tool micro-benchmarks, 1,000,000 computations over 200 distinct inputs used ~43 J uncached and ~4.7 J with a cache (about 9× less). The gain depends on repeats: if almost every IP in your logs is unique, you save very little here.
+    - **Concurrent lookups** (reduces idle wait time): the remaining calls now run together, capped at 20 at a time, instead of one after another. In Green Metrics Tool micro-benchmarks, 10 requests took ~9.1 J and 3.1 s with sync `urllib` and ~8.4 J and 2.6 s with async `httpx`. That is about 7% less CPU energy and about 17% less wall time. With few requests the gain is mostly time. It grows with the number of distinct IPs.
+    - The counts and the printed output stay the same. A failed lookup still raises, as before, and the 5 second timeout is kept. The code needs `httpx` installed. If a run only ever sees a handful of distinct IPs, the dedupe alone gets most of the benefit and async adds little.
+verify:
+  static_only: needs network access and the httpx package

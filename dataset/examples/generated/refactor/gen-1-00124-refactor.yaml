@@ -1,0 +1,85 @@
+id: gen-1-00124-refactor
+category: refactor
+language: python
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    hi, i am not so experienced with databases. i made this for our small gateway (mini PC in the greenhouse, it collects temp and humidity from the sensors and every 10 min saves the buffer to postgres, about 6000 readings each time). it works but the flush takes very long and the CPU is busy the whole time. i dont know what is wrong, can you make it better?
+
+    ```python
+    import logging
+
+    import psycopg
+
+    log = logging.getLogger("gateway")
+
+    DSN = "host=localhost dbname=greenhouse user=gateway"
+
+
+    def save_readings(buffer):
+        conn = psycopg.connect(DSN)
+        cur = conn.cursor()
+        saved = 0
+        for r in buffer:
+            if r["temp"] is None:
+                # sensor was offline, nothing to store
+                continue
+            cur.execute(
+                "INSERT INTO readings (sensor_id, ts, temp_c, humidity) "
+                "VALUES (%s, %s, %s, %s)",
+                (r["sensor"], r["ts"], r["temp"], r["hum"]),
+            )
+            conn.commit()
+            saved += 1
+        conn.close()
+        log.info("saved %d readings", saved)
+        return saved
+    ```
+- role: assistant
+  content: |
+    The slow part is the loop. Every reading is sent as its own `INSERT` and its own `commit()`, so one flush makes about 6000 round trips and 6000 commits. Send all rows in one `COPY` and commit once:
+
+    ```python
+    import logging
+
+    import psycopg
+
+    log = logging.getLogger("gateway")
+
+    DSN = "host=localhost dbname=greenhouse user=gateway"
+
+
+    def save_readings(buffer):
+        rows = [
+            (r["sensor"], r["ts"], r["temp"], r["hum"])
+            for r in buffer
+            if r["temp"] is not None  # sensor was offline, nothing to store
+        ]
+        if not rows:
+            return 0
+
+        with psycopg.connect(DSN) as conn:
+            with conn.cursor() as cur:
+                with cur.copy(
+                    "COPY readings (sensor_id, ts, temp_c, humidity) FROM STDIN"
+                ) as copy:
+                    for row in rows:
+                        copy.write_row(row)
+
+        log.info("saved %d readings", len(rows))
+        return len(rows)
+    ```
+
+    **Green Notes**
+    - **Batch database writes** (reduces E): 6000 `INSERT` + `commit` pairs become one `COPY` stream and one commit. In Green Metrics Tool micro-benchmarks (PostgreSQL 16, psycopg 3), inserting 500,000 rows in batches of 5,000 rows used about 22× less CPU energy with `COPY` than with one `execute()` per row. Your batches are about this size, so this is the case where the change pays off. Your loop also commits after every row, which should be even slower than that benchmark loop.
+    - **Same filter, same data:** offline sensors (`temp` is `None`) are still skipped. A missing `hum` is written as `NULL`, as before.
+
+    Behavior change: the whole flush is now one transaction. If one row is bad (for example a wrong type), nothing from that flush is saved and an exception is raised. Before, the rows before the bad one were already committed. For a buffer you can retry, this is usually what you want. Keep the buffer until `save_readings` returns, so you can try again.
+
+    If one flush only had a handful of rows, `executemany` would be enough, because the savings come from many rows per batch.
+verify:
+  static_only: needs a running PostgreSQL server and the psycopg 3 package

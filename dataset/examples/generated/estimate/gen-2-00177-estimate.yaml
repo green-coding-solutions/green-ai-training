@@ -1,0 +1,84 @@
+id: gen-2-00177-estimate
+category: estimate
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    Thinking about putting numba on our 1D heat solver. Nightly parameter sweep is ~200 solves on the cluster, 2000 grid points, 50k steps each. Rough estimate of the energy we'd save? Just the number and the diff, I know how numba works.
+
+    ```python
+    import numpy as np
+
+
+    def solve_rod(u0, alpha, dx, dt, n_steps, left_bc, right_bc):
+        """Explicit FTCS for u_t = alpha * u_xx with Dirichlet BCs."""
+        r = alpha * dt / dx**2
+        if r > 0.5:
+            raise ValueError(f"unstable: r={r:.3f} > 0.5")
+        u = np.asarray(u0, dtype=np.float64).copy()
+        new = np.empty_like(u)
+        n = u.shape[0]
+        for step in range(n_steps):
+            new[0] = left_bc
+            new[n - 1] = right_bc
+            for i in range(1, n - 1):
+                new[i] = u[i] + r * (u[i - 1] - 2.0 * u[i] + u[i + 1])
+            u, new = new, u
+        return u
+
+
+    def sweep(alphas, n_points=2000, n_steps=50_000):
+        x = np.linspace(0.0, 1.0, n_points)
+        dx = x[1] - x[0]
+        u0 = np.sin(np.pi * x)
+        results = {}
+        for a in alphas:
+            dt = 0.4 * dx**2 / a
+            results[a] = solve_rod(u0, a, dx, dt, n_steps, 0.0, 0.0)
+        return results
+    ```
+- role: assistant
+  content: |
+    I can't give you an honest number for your sweep without a measurement. Here is the closest measured reference.
+
+    **Measured reference:** in Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples in a pure Python loop used ~40 J of CPU energy, and the same loop with Numba `@njit` used ~9.5 J. That is about 4× less. Your kernel is different: it does a 3-point stencil with more indexing per element, and it does about 100 million cell updates per solve. So use the direction, not the figure. Don't multiply that ratio by your 200 solves.
+
+    **What drives the saving:** the per-element work. In pure Python, every `u[i - 1]` creates a boxed float and goes through bytecode dispatch. Numba compiles the loop to machine code that works on raw doubles. The fixed cost is compilation, about once per process. `cache=True` writes the compiled code to disk. On the cluster, make sure `__pycache__` (or `NUMBA_CACHE_DIR`) is writable from the compute nodes, or every job compiles again.
+
+    ```python
+    from numba import njit
+
+
+    @njit(cache=True)
+    def _ftcs(u, new, r, n_steps, left_bc, right_bc):
+        n = u.shape[0]
+        for step in range(n_steps):
+            new[0] = left_bc
+            new[n - 1] = right_bc
+            for i in range(1, n - 1):
+                new[i] = u[i] + r * (u[i - 1] - 2.0 * u[i] + u[i + 1])
+            u, new = new, u
+        return u
+
+
+    def solve_rod(u0, alpha, dx, dt, n_steps, left_bc, right_bc):
+        """Explicit FTCS for u_t = alpha * u_xx with Dirichlet BCs."""
+        r = alpha * dt / dx**2
+        if r > 0.5:
+            raise ValueError(f"unstable: r={r:.3f} > 0.5")
+        u = np.asarray(u0, dtype=np.float64).copy()
+        new = np.empty_like(u)
+        return _ftcs(u, new, float(r), int(n_steps), float(left_bc), float(right_bc))
+    ```
+
+    `sweep` doesn't change. The stability check stays in Python, so the f-string error message still works. The `float()`/`int()` casts keep the argument types fixed. Without them, an int boundary condition would trigger a second compilation. Leave `fastmath` off if you diff results against old runs, because it allows the compiler to reorder floating-point operations.
+
+    **How to get your own number:**
+    1. Make a `run_one.py` that does one `solve_rod` at your real size. Run it once with each version, after one warm-up run of the Numba version so the cache exists. Then run `perf stat -e power/energy-pkg/ python run_one.py` (this reads RAPL and needs perf access to the energy counters). `time` gives you a CPU-time proxy if you can't read RAPL.
+    2. For a figure you can report, run both versions as Green Metrics Tool usage scenarios on the same machine and compare CPU energy. Multiply the per-solve difference by your 200 nightly solves.
+verify:
+  static_only: Answer code needs numba, which is not in stdlib + numpy.

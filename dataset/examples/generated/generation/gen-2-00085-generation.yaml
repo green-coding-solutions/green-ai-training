@@ -1,0 +1,94 @@
+id: gen-2-00085-generation
+category: generation
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    hi, i need a function for our ETL. every hour we get one csv with machine sensor data, columns are `machine_id, ts, temperature, vibration, pressure, rpm`. normaly 60 rows per machine (one per minute), around 3000 machines. we trained a autoencoder for anomaly detection, class `SensorAE` is in our `model.py` and the weights are saved with `torch.save(model.state_dict())` in `models/ae.pt`. model take input shape (batch, 60, 4) and give back same shape. features must be scaled first with mean/std from `models/scaler.json` (keys "mean" and "std", 4 values each).
+
+    i want reconstruction error (MSE) per machine as anomaly_score, and write a new csv with `machine_id, window_start, anomaly_score`. it run in airflow on CPU worker, no gpu. machines with missing rows or empty values should be skiped with a warning, not crash the job.
+- role: assistant
+  content: |
+    ```python
+    import json
+    import logging
+
+    import numpy as np
+    import pandas as pd
+    import torch
+
+    from model import SensorAE
+
+    log = logging.getLogger(__name__)
+
+    FEATURES = ["temperature", "vibration", "pressure", "rpm"]
+    WINDOW = 60
+    OUT_COLUMNS = ["machine_id", "window_start", "anomaly_score"]
+
+
+    def load_model(path="models/ae.pt"):
+        model = SensorAE()
+        model.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
+        model.eval()
+        return model
+
+
+    def load_scaler(path="models/scaler.json"):
+        with open(path) as f:
+            s = json.load(f)
+        mean = np.asarray(s["mean"], dtype=np.float32)
+        std = np.asarray(s["std"], dtype=np.float32)
+        return mean, std
+
+
+    def score_hour(in_csv, out_csv, model, mean, std, batch_size=256):
+        df = pd.read_csv(in_csv, parse_dates=["ts"])
+        df = df.sort_values(["machine_id", "ts"])
+
+        ids, starts, windows = [], [], []
+        for machine_id, g in df.groupby("machine_id", sort=False):
+            if len(g) != WINDOW:
+                log.warning("machine %s: %d rows, expected %d, skipped", machine_id, len(g), WINDOW)
+                continue
+            values = g[FEATURES]
+            if values.isna().any().any():
+                log.warning("machine %s: empty sensor values, skipped", machine_id)
+                continue
+            ids.append(machine_id)
+            starts.append(g["ts"].iloc[0])
+            windows.append(values.to_numpy(dtype=np.float32))
+
+        if not windows:
+            pd.DataFrame(columns=OUT_COLUMNS).to_csv(out_csv, index=False)
+            return 0
+
+        x = torch.from_numpy((np.stack(windows) - mean) / std)
+
+        scores = []
+        with torch.inference_mode():
+            for i in range(0, len(x), batch_size):
+                batch = x[i:i + batch_size]
+                recon = model(batch)
+                scores.append(((recon - batch) ** 2).mean(dim=(1, 2)))
+
+        out = pd.DataFrame({
+            "machine_id": ids,
+            "window_start": starts,
+            "anomaly_score": torch.cat(scores).numpy(),
+        })
+        out.to_csv(out_csv, index=False)
+        return len(out)
+    ```
+
+    In the Airflow task, call `load_model()` and `load_scaler()` once, then call `score_hour(...)`. The function returns the number of scored machines, so you can log it or alert when it drops.
+
+    **Green Notes**
+    - **Inference without autograd** (reduces E): the forward pass runs inside `torch.inference_mode()`, a stricter form of `torch.no_grad()`. PyTorch then does not record the graph and buffers that are only needed for training. This happens on every run, for every machine. In Green Metrics Tool micro-benchmarks, 100,000 PyTorch CPU inferences used ~157 J without `torch.no_grad()` and ~135 J with it, about 14% less.
+
+    `model.eval()` is there for correctness, not speed. It turns off dropout and makes batch norm use its stored statistics, so the scores stay the same from run to run. `weights_only=True` stops `torch.load` from running arbitrary pickled code from the weights file.
+verify:
+  static_only: needs torch, pandas and the user's SensorAE model and weights files

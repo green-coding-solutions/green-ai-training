@@ -1,0 +1,65 @@
+id: gen-2-00415-generation
+category: generation
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    func to parse model tag like "resnet50:int8:bs16" into config, called on every inference request
+- role: assistant
+  content: |
+    ```python
+    from dataclasses import dataclass
+    from functools import lru_cache
+
+    PRECISIONS = frozenset({"fp32", "fp16", "bf16", "int8"})
+
+
+    @dataclass(frozen=True)
+    class ModelConfig:
+        name: str
+        precision: str
+        batch_size: int
+
+
+    @lru_cache(maxsize=256)
+    def parse_model_tag(tag: str) -> ModelConfig:
+        parts = tag.split(":")
+        if len(parts) != 3:
+            raise ValueError(f"expected name:precision:bsN, got {tag!r}")
+        name, precision, batch = parts
+        if not name:
+            raise ValueError("empty model name")
+        if precision not in PRECISIONS:
+            raise ValueError(f"unknown precision {precision!r}")
+        if not (batch.startswith("bs") and batch[2:].isdigit() and int(batch[2:]) > 0):
+            raise ValueError(f"bad batch size {batch!r}")
+        return ModelConfig(name, precision, int(batch[2:]))
+    ```
+
+    **Green Notes**
+    - **Memoize** (reduces E): a service sees only a handful of distinct tags, but parses one on every request. `lru_cache` makes repeat requests a dictionary hit. In Green Metrics Tool micro-benchmarks, 1,000,000 calls drawn from 200 distinct inputs used ~43 J uncached and ~4.7 J with `@lru_cache`, about 9× less.
+    - **Bounded and safe to share:** `maxsize=256` caps memory. The result is a frozen dataclass, so no caller can change the shared cached object. Invalid tags raise and are not cached.
+
+    *Not applied:* if tags were mostly unique, for example one per request ID, drop the cache. It would only add overhead.
+verify:
+  test: |-
+    c = parse_model_tag("resnet50:int8:bs16")
+    assert (c.name, c.precision, c.batch_size) == ("resnet50", "int8", 16)
+    assert parse_model_tag("resnet50:int8:bs16") is c
+    for bad in ["x", "a:int4:bs1", "a:int8:bs0", "a:int8:16", ":int8:bs1", "a:b:c:d"]:
+        try:
+            parse_model_tag(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(bad)
+    try:
+        c.name = "x"
+    except Exception:
+        pass
+    else:
+        raise AssertionError("not frozen")

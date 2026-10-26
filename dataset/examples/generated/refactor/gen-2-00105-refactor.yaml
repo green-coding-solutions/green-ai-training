@@ -1,0 +1,115 @@
+id: gen-2-00105-refactor
+category: refactor
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    Post-processing for our action-detection model. It runs on full match recordings (90 min, 25 fps, ~135,000 frames per label). The model pass is fast, but this step takes minutes per label. Diff only please.
+
+    ```python
+    ALPHA = 0.15
+    ON_THRESHOLD = 0.6
+    OFF_THRESHOLD = 0.4
+    MIN_FRAMES = 12
+
+
+    def forward_ema(scores, alpha):
+        out = []
+        prev = scores[0] if scores else 0.0
+        for s in scores:
+            prev = alpha * s + (1 - alpha) * prev
+            out.append(prev)
+        return out
+
+
+    def backward_ema(scores, alpha):
+        out = []
+        prev = scores[-1] if scores else 0.0
+        for s in reversed(scores):
+            prev = alpha * s + (1 - alpha) * prev
+            out.insert(0, prev)
+        return out
+
+
+    def zero_phase(scores, alpha=ALPHA):
+        # forward + backward pass so segment boundaries don't lag
+        return backward_ema(forward_ema(scores, alpha), alpha)
+
+
+    def _segment(probs, start, end, fps):
+        return {
+            "start": round(start / fps, 2),
+            "end": round(end / fps, 2),
+            "peak": round(max(probs[start:end]), 3),
+        }
+
+
+    def to_segments(probs, fps, on=ON_THRESHOLD, off=OFF_THRESHOLD, min_frames=MIN_FRAMES):
+        segments = []
+        start = None
+        for i, p in enumerate(probs):
+            if start is None and p >= on:
+                start = i
+            elif start is not None and p < off:
+                if i - start >= min_frames:
+                    segments.append(_segment(probs, start, i, fps))
+                start = None
+        if start is not None and len(probs) - start >= min_frames:
+            segments.append(_segment(probs, start, len(probs), fps))
+        return segments
+
+
+    def postprocess(frame_scores, fps, labels):
+        """frame_scores: per-frame dicts {label: prob} from the model."""
+        result = {}
+        for label in labels:
+            track = [f.get(label, 0.0) for f in frame_scores]
+            result[label] = to_segments(zero_phase(track), fps)
+        return result
+    ```
+- role: assistant
+  content: |
+    Only `backward_ema` changes:
+
+    ```python
+    def backward_ema(scores, alpha):
+        out = []
+        prev = scores[-1] if scores else 0.0
+        for s in reversed(scores):
+            prev = alpha * s + (1 - alpha) * prev
+            out.append(prev)
+        out.reverse()
+        return out
+    ```
+
+    **Green Notes**
+    - **Append + one reverse instead of `insert(0, ...)`** (reduces E): every front insert shifts the whole list. The backward pass was O(n²), which means billions of element moves for a 135,000-frame track, repeated for every label. Now it is O(n). In Green Metrics Tool micro-benchmarks, 1,000,000 × `list.insert(0, x)` used ~1515 J of CPU energy and 1,000,000 × `append` used ~1.2 J, over 1000× less.
+    - **List, not `deque`**: `to_segments` slices `probs[start:end]`, and a `deque` can't be sliced. Reversing once at the end keeps a plain list.
+
+    The output is identical: same values in the same order, computed with the same float operations.
+verify:
+  equivalence:
+    driver: |
+      import random
+      random.seed(7)
+      scores = [random.random() for _ in range(2000)]
+      res = backward_ema(scores, 0.15)
+      print(len(res))
+      print(res[:5])
+      print(res[-5:])
+      print(sum(res))
+      print(backward_ema([], 0.15))
+      print(backward_ema([0.5], 0.3))
+      print(backward_ema([0.1, 0.9, 0.4], 0.5))
+  benchmark:
+    driver: |
+      import random
+      random.seed(1)
+      scores = [random.random() for _ in range(30000)]
+      for _ in range(3):
+          backward_ema(scores, 0.15)
+    min_speedup: 1.5

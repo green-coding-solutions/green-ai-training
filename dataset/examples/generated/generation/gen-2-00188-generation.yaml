@@ -1,0 +1,52 @@
+id: gen-2-00188-generation
+category: generation
+language: sql
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    need postgres sql to load the gateway's 5-min buffer csv (device_id,ts,metric,value, header row, ~20k rows) into readings. replaying a file must not create dupes
+- role: assistant
+  content: |
+    You need a unique key once, then one load script per file.
+
+    ```sql
+    -- one-time setup: the key that makes replays safe
+    CREATE UNIQUE INDEX IF NOT EXISTS readings_device_ts_metric_uq
+        ON readings (device_id, ts, metric);
+    ```
+
+    ```sql
+    -- load_batch.sql
+    -- run: psql -v ON_ERROR_STOP=1 -f load_batch.sql < /var/spool/gw/batch.csv
+    BEGIN;
+
+    CREATE TEMP TABLE readings_in (
+        device_id text             NOT NULL,
+        ts        timestamptz      NOT NULL,
+        metric    text             NOT NULL,
+        value     double precision
+    ) ON COMMIT DROP;
+
+    \copy readings_in (device_id, ts, metric, value) FROM pstdin WITH (FORMAT csv, HEADER true)
+
+    INSERT INTO readings (device_id, ts, metric, value)
+    SELECT device_id, ts, metric, value
+    FROM readings_in
+    ON CONFLICT (device_id, ts, metric) DO NOTHING;
+
+    COMMIT;
+    ```
+
+    **Green Notes**
+    - **Batch database writes** (reduces E): the whole file goes in with one `COPY` and one set-based `INSERT ... SELECT`. There is no statement and round trip per row. In Green Metrics Tool benchmarks with 500,000 rows in batches of 5,000, `COPY` used about 22× less CPU energy than one `INSERT` per row, and about 8× less than `executemany`. Your files have thousands of rows each, so you are in the range where this pays off.
+    - **One transaction per file**: there is a single commit per flush. If anything fails, `ON_ERROR_STOP` aborts the script and nothing is half-loaded. You can simply replay the file.
+    - *Not applied:* nothing extra for tiny flushes. If the gateway ever sends only a few dozen rows per file, the method matters little. With batches of 100 rows the measured differences were small.
+
+    `ON CONFLICT DO NOTHING` also skips duplicates inside the same file. `pstdin` reads the CSV from psql's standard input, so the path doesn't have to be hard-coded in the script.
+verify:
+  static_only: PostgreSQL-specific (psql \copy FROM pstdin, ON COMMIT DROP, timestamptz); not runnable in SQLite

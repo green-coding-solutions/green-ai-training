@@ -1,0 +1,59 @@
+id: gen-1-00154-conceptual
+category: conceptual
+language: text
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    ```python
+    from flask import Flask, request, jsonify
+
+    app = Flask(__name__)
+
+    DISPOSABLE_DOMAINS = [
+        "mailinator.com", "10minutemail.com", "guerrillamail.com",
+        "tempmail.net", "trashmail.io", "yopmail.com",
+    ]
+
+    @app.post("/api/waitlist")
+    def join_waitlist():
+        data = request.get_json(silent=True) or {}
+        email = (data.get("email") or "").strip().lower()
+        if "@" not in email:
+            return jsonify(error="invalid email"), 400
+        domain = email.rsplit("@", 1)[1]
+        if domain in set(DISPOSABLE_DOMAINS):
+            return jsonify(error="please use a work or personal email"), 400
+        save_signup(email)
+        return jsonify(ok=True), 201
+    ```
+
+    ?
+- role: assistant
+  content: |
+    I guess you are asking about `domain in set(DISPOSABLE_DOMAINS)`. It is the one line worth a look. A set is not always faster than a list.
+
+    Here the set is built on every request and used for exactly one lookup. Building a set means touching every element, which costs more than one linear scan. In Green Metrics Tool micro-benchmarks, a single membership test on a 10,000,000-element list used ~6.9 J. Converting that list to a set first and testing once used ~10.5 J, about 50% more. A set only pays off when you look up many times.
+
+    Your lookups do repeat, but across requests. So build the set once, when the module loads:
+
+    ```python
+    DISPOSABLE_DOMAINS = frozenset({
+        "mailinator.com", "10minutemail.com", "guerrillamail.com",
+        "tempmail.net", "trashmail.io", "yopmail.com",
+    })
+
+    # in join_waitlist():
+    if domain in DISPOSABLE_DOMAINS:
+        return jsonify(error="please use a work or personal email"), 400
+    ```
+
+    - **With 6 domains, nothing measurable changes.** Either version is fine. Keeping the plain list and dropping `set()` is just as good.
+    - **Never rebuild the set per call.** It is the only really wasteful part of the original.
+    - **If the blocklist grows to thousands of entries,** the module-level set is the right choice. Each request then does one hash lookup instead of a scan.
+    - **Behavior stays the same.** Order and duplicates in the list do not matter for a yes/no check.
+verify:
+  static_only: conceptual answer

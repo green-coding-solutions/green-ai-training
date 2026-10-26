@@ -1,0 +1,118 @@
+id: gen-2-00175-multi-turn
+category: multi-turn
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    hi, I'm quite new to linux stuff. Our api-01 server gets a big CPU spike every 5 minutes and sometimes the API is slow then. In `top` I see `xz` using 100% CPU. I think it comes from this cron script someone wrote before me. Each snapshot is around 30-80 MB of JSON. Is something wrong with it?
+
+    ```bash
+    #!/bin/bash
+    # push-snapshots.sh - runs from cron every 5 min on api-01
+    # sends the latest order snapshots to the reporting service
+
+    SNAP_DIR=/var/lib/orders-api/snapshots
+    ENDPOINT=https://reporting.internal.example.com/ingest/orders
+    TOKEN=$(cat /etc/orders-api/reporting.token)
+
+    for f in $SNAP_DIR/*.json; do
+      [ -e "$f" ] || continue
+      xz -9e -k $f
+      curl -s -X POST \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        -H "Content-Encoding: xz" \
+        --data-binary @$f.xz \
+        $ENDPOINT
+      rm $f $f.xz
+    done
+    ```
+- role: assistant
+  content: |
+    Yes. `xz -9e` is the most expensive setting of one of the most expensive codecs, and the script runs it on tens of MB every 5 minutes. A fast codec does the same job for a small part of the CPU. The script also has a bug: it deletes the snapshot even when the upload failed.
+
+    ```bash
+    #!/usr/bin/env bash
+    # push-snapshots.sh - runs from cron every 5 min on api-01
+    # sends the latest order snapshots to the reporting service
+    set -euo pipefail
+
+    snap_dir=/var/lib/orders-api/snapshots
+    endpoint=https://reporting.internal.example.com/ingest/orders
+    token=$(< /etc/orders-api/reporting.token)
+
+    # skip this run if the previous one is still busy
+    exec 9> /run/lock/push-snapshots.lock
+    flock -n 9 || exit 0
+
+    shopt -s nullglob
+    for f in "$snap_dir"/*.json; do
+      if zstd -q -c -- "$f" | curl -sS --fail \
+          -H "Authorization: Bearer $token" \
+          -H 'Content-Type: application/json' \
+          -H 'Content-Encoding: zstd' \
+          --data-binary @- \
+          "$endpoint"; then
+        rm -- "$f"
+      else
+        echo "upload failed, keeping $f" >&2
+      fi
+    done
+    ```
+
+    **Green Notes**
+    - **Fast codec for data compressed often** (reduces E): in Green Metrics Tool benchmarks, compressing 100 MB of text with default settings used ~458 J with xz and ~16 J with zstd, so xz used about 29× more. Those runs used xz's default level. `-9e` is slower still. Please check first that the reporting service can decode zstd.
+    - **Stream instead of a temp file:** `zstd -c | curl --data-binary @-` no longer writes a `.xz` copy to disk.
+
+    Bug fixes:
+    - Before, `rm` ran even when `curl` failed, so snapshots were lost. Now `--fail` makes curl return an error on HTTP errors, and the file is kept for the next run.
+    - `flock` stops two runs from overlapping and sending the same snapshot twice. With `xz -9e` on big files, one run could take longer than 5 minutes.
+    - Variables are quoted, so paths with spaces don't break.
+- role: user
+  content: |
+    ok I asked the reporting team. their service can read gzip and xz but not zstd 😕 sorry I don't really know this stuff, is gzip ok?
+- role: assistant
+  content: |
+    Yes, gzip is a good choice here. In the same benchmarks gzip at its default level used ~67 J for 100 MB of text. That is still far below xz's ~458 J. zstd would have been about 4× cheaper than gzip, but gzip is the best option your receiver supports.
+
+    Replace the loop with this. Only the `gzip` command and the `Content-Encoding` header change:
+
+    ```bash
+    for f in "$snap_dir"/*.json; do
+      if gzip -c -- "$f" | curl -sS --fail \
+          -H "Authorization: Bearer $token" \
+          -H 'Content-Type: application/json' \
+          -H 'Content-Encoding: gzip' \
+          --data-binary @- \
+          "$endpoint"; then
+        rm -- "$f"
+      else
+        echo "upload failed, keeping $f" >&2
+      fi
+    done
+    ```
+
+    Everything else in the script stays the same. `Content-Encoding: gzip` is also the standard HTTP encoding, so most servers handle it without anything special.
+- role: user
+  content: |
+    my team lead now says the link to reporting goes over a VPN to another datacenter and we pay for the traffic. so maybe xz is better after all because the files are smaller?
+- role: assistant
+  content: |
+    That's a fair point. The numbers I quoted compare energy only, not file size. xz usually produces smaller files than gzip, and on a slow or paid link the bytes can matter more than the CPU.
+
+    You can check it with one real snapshot:
+
+    ```bash
+    f=/var/lib/orders-api/snapshots/some-snapshot.json
+    time gzip -c -- "$f" | wc -c
+    time xz -c -- "$f" | wc -c
+    time xz -9e -c -- "$f" | wc -c
+    ```
+
+    Compare the byte counts with the time each one took. If xz makes the files clearly smaller and your team lead wants that, use xz at its default level (`xz -c`, header `Content-Encoding: xz`). Avoid `-9e`, which usually saves only a little more space and costs much more CPU. The `--fail` and `flock` fixes stay either way.
+verify:
+  static_only: needs the reporting HTTP endpoint, zstd/xz binaries and flock on a real host

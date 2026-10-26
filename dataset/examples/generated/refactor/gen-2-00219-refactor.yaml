@@ -1,0 +1,96 @@
+id: gen-2-00219-refactor
+category: refactor
+language: bash
+patterns:
+- compress-stored
+- bash-quoting
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```bash
+    #!/usr/bin/env bash
+    # cron: 5 * * * *  -- archive the logs logrotate just rotated
+    set -u
+
+    LOG_DIR="/var/log/ingest"
+    ARCHIVE_DIR="/srv/archive/ingest"
+    MANIFEST="$ARCHIVE_DIR/MANIFEST.tsv"
+    RETENTION_DAYS=30
+    STAMP=$(date +%Y%m%d%H)
+
+    mkdir -p "$ARCHIVE_DIR"
+
+    if [ ! -f "$MANIFEST" ]; then
+        printf "%s\t%s\t%s\t%s\n" "stamp" "service" "archive" "codec" > "$MANIFEST"
+    fi
+
+    for f in "$LOG_DIR"/*.log.1; do
+        [ -e "$f" ] || continue
+        name="${f##*/}"
+        name="${name%.log.1}"
+        out="$ARCHIVE_DIR/$name-$STAMP.log.xz"
+
+        xz -9 -c "$f" > "$out"
+        rm -f "$f"
+
+        printf "%s\t%s\t%s\t%s\n" "$STAMP" "$name" "$out" "xz -9" >> "$MANIFEST"
+        echo "archived $name -> $out"
+    done
+
+    find "$ARCHIVE_DIR" -name "*.log.xz" -mtime +$RETENTION_DAYS -delete
+    ```
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # cron: 5 * * * *  -- archive the logs logrotate just rotated
+    set -u
+
+    LOG_DIR='/var/log/ingest'
+    ARCHIVE_DIR='/srv/archive/ingest'
+    MANIFEST="$ARCHIVE_DIR/MANIFEST.tsv"
+    RETENTION_DAYS=30
+    STAMP=$(date +%Y%m%d%H)
+
+    mkdir -p "$ARCHIVE_DIR"
+
+    if [ ! -f "$MANIFEST" ]; then
+        printf '%s\t%s\t%s\t%s\n' 'stamp' 'service' 'archive' 'codec' > "$MANIFEST"
+    fi
+
+    for f in "$LOG_DIR"/*.log.1; do
+        [ -e "$f" ] || continue
+        name="${f##*/}"
+        name="${name%.log.1}"
+        out="$ARCHIVE_DIR/$name-$STAMP.log.zst"
+
+        if ! zstd -q -c -- "$f" > "$out"; then
+            rm -f -- "$out"
+            echo "compression failed, keeping $f" >&2
+            continue
+        fi
+        rm -f -- "$f"
+
+        printf '%s\t%s\t%s\t%s\n' "$STAMP" "$name" "$out" 'zstd' >> "$MANIFEST"
+        echo "archived $name -> $out"
+    done
+
+    # old .xz archives keep aging out during the switch
+    find "$ARCHIVE_DIR" \( -name '*.log.zst' -o -name '*.log.xz' \) -mtime +"$RETENTION_DAYS" -delete
+    ```
+
+    **Green Notes**
+    - **Bug fixed:** `rm -f "$f"` ran even when `xz` failed. A full disk or a killed job deleted the log, and only a broken archive was left. Now the log is removed only after compression succeeds, and a partial archive is cleaned up.
+    - **Fast codec for logs compressed every hour** (reduces E): this runs 24 times a day, so the codec cost adds up. In Green Metrics Tool benchmarks on 100 MB of text with default settings, xz used about 29× the energy of zstd. Your `-9` is an even slower level than the xz default that was measured. Compressing is still right: you keep archives for weeks, and the estimated break-even for zstd is about 0.15 days of storage.
+    - **Size trade-off:** those figures compare energy, not compression ratio. `xz -9` files are usually smaller. If disk space for the archive is your hard limit, compare sizes on one day of logs before you switch.
+    - **Single quotes for literals** (reduces E, slightly): the printf formats, header names, codec name, paths and the `find` pattern no longer get scanned for expansions. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal 1,000,000 times used about 24% less CPU energy with single quotes. With a few short strings per run the saving here is tiny, but it costs nothing. Variables keep their double quotes, and `$RETENTION_DAYS` is now quoted too.
+
+    Behavior changes: new archives end in `.log.zst` and the manifest says `zstd`. Anything that reads them needs `zstdcat` or `zstd -dc` instead of `xzcat`, and `zstd` has to be installed on the host.
+verify:
+  static_only: bash script that needs zstd, cron context and /var/log, /srv paths; not runnable in the sandbox

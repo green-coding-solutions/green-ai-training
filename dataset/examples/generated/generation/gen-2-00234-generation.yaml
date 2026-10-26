@@ -1,0 +1,65 @@
+id: gen-2-00234-generation
+category: generation
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    hi, I'm new to the CI side of things. Our artifact storage for build outputs is almost full (about 400k zip files from all branches). The storage API gives me the listing page by page, oldest first. I want to keep the newest 20 artifacts per branch and delete all the others.
+
+    My plan was to put every item at the front of a list with `artifacts.insert(0, item)` so the newest is first, then loop over it and count per branch. A colleague said this will be very slow with so many files, but I don't really understand why. Can you write the function that decides what to delete? Each item looks like this:
+
+    ```python
+    {"key": "builds/feature-login/1842/app.zip", "branch": "feature-login", "created": "2026-09-14T08:12:55Z"}
+    ```
+- role: assistant
+  content: |
+    ```python
+    from collections import defaultdict
+
+
+    def plan_cleanup(listing, keep=20):
+        """Return the keys to delete, newest first.
+
+        `listing` is any iterable of artifact dicts in oldest-first order,
+        for example a generator that yields items page by page.
+        """
+        artifacts = list(listing)          # appends at the end, cheap
+        kept_per_branch = defaultdict(int)
+        to_delete = []
+
+        for art in reversed(artifacts):    # walks newest first, no copy, no shifting
+            branch = art["branch"]
+            if kept_per_branch[branch] < keep:
+                kept_per_branch[branch] += 1
+            else:
+                to_delete.append(art["key"])
+
+        return to_delete
+    ```
+
+    Your colleague is right. A Python list stores its items in one block. `insert(0, item)` has to move every existing item one slot to the right to make room. With 400k artifacts, the last insert moves almost 400k items, and all inserts together do quadratic work. Appending at the end moves nothing. `reversed()` then reads the list from the back, so you still process the newest first.
+
+    This trusts the API order. If the order is not guaranteed, use `sorted(listing, key=lambda a: a["created"], reverse=True)` and loop over that instead of `reversed(artifacts)`.
+
+    Print the result once before you pass it to your delete call. Deleting is hard to undo.
+
+    **Green Notes**
+    - **Append instead of front insertion** (reduces E): each item is added in O(1) instead of shifting the whole list, so building the list is O(n) instead of O(n²). In Green Metrics Tool micro-benchmarks, 1,000,000 × `list.insert(0, x)` used about 1515 J of CPU energy and 1,000,000 × `list.append(x)` about 1.2 J, over 1000× less.
+    - *Not applied:* `collections.deque` with `appendleft()`. It is also O(1) per item and is the right tool if you need a newest-first collection that you keep growing. Here a plain list plus `reversed()` is enough.
+verify:
+  test: |-
+    listing = [
+        {"key": f"{b}/{i}.zip", "branch": b, "created": f"2026-09-{i + 1:02d}T00:00:00Z"}
+        for i in range(10)
+        for b in ("main", "dev")
+    ]
+    expected = [f"{b}/{i}.zip" for i in range(6, -1, -1) for b in ("dev", "main")]
+    assert plan_cleanup(listing, keep=3) == expected
+    assert plan_cleanup(iter(listing), keep=3) == expected
+    assert plan_cleanup(listing, keep=20) == []
+    assert plan_cleanup([], keep=5) == []
+    assert len(plan_cleanup(listing, keep=0)) == 20

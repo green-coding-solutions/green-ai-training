@@ -1,0 +1,269 @@
+id: refactor-dockerfile-flask-dev-tools-001
+category: refactor
+language: dockerfile
+patterns: [small-container-images]
+facts: [F-CONTAINER-IMAGE]
+messages:
+  - role: user
+    content: |
+      can you clean up the Dockerfile of our Django shop? CI builds it on every push and it takes forever
+
+      ```dockerfile
+      FROM python:3.12
+      ENV DJANGO_SETTINGS_MODULE=shop.settings.prod
+      RUN apt-get update && apt-get install -y gcc libpq-dev postgresql-client nano less
+      COPY . /code
+      WORKDIR /code
+      RUN pip install -r requirements/dev.txt
+      RUN python manage.py collectstatic --noinput
+      CMD gunicorn shop.wsgi --bind 0.0.0.0:8000 --workers 3
+      ```
+  - role: assistant
+    content: |
+      ```dockerfile
+      FROM python:3.12-slim
+
+      ENV DJANGO_SETTINGS_MODULE=shop.settings.prod
+      WORKDIR /code
+
+      # dependencies first: this layer is reused as long as the requirements do not change
+      COPY requirements/base.txt requirements/prod.txt requirements/
+      RUN pip install --no-cache-dir -r requirements/prod.txt
+
+      COPY . .
+      RUN python manage.py collectstatic --noinput
+
+      USER nobody
+      CMD ["gunicorn", "shop.wsgi", "--bind", "0.0.0.0:8000", "--workers", "3"]
+      ```
+
+      **Green Notes**
+      - **Slim base, runtime dependencies only** (reduces E, storage, network): gcc, the PostgreSQL client, the editors and the dev requirements are gone from the production image. In Green Metrics Tool measurements of a similar change for a small Flask app, the image build used ~124 J instead of ~885 J, about 7× less, while serving requests cost the same. With a build on every push, that saving repeats many times a day.
+      - **Dependency layer before the source** (reduces E): `COPY . /code` came before `pip install`, so every code change reinstalled all packages. Now only a change to the requirements files does.
+      - **`--no-cache-dir`** (reduces storage): pip's download cache no longer ends up in the image.
+
+      This assumes a `requirements/prod.txt` that includes `base.txt` (`-r base.txt`) and lists `gunicorn`, with test and lint tools only in `dev.txt`. `libpq-dev` and `gcc` were only needed to compile `psycopg2`: use the `psycopg[binary]` wheel instead, or compile in a separate build stage rather than going back to the full image. The container now runs as `nobody`, so media uploads need a mounted volume, not a folder inside `/code`.
+verify:
+  static_only: "Dockerfile"
+---
+id: review-dockerfile-node-api-layers-001
+category: review
+language: dockerfile
+patterns: [small-container-images]
+facts: [F-CONTAINER-IMAGE]
+messages:
+  - role: user
+    content: |
+      Review please, this is the image for our Node API. Builds run in GitHub Actions for every PR.
+
+      ```dockerfile
+      FROM node:22
+      WORKDIR /srv
+      COPY . .
+      RUN npm install
+      RUN apt-get update && apt-get install -y python3 make g++ git
+      ENV NODE_ENV=production
+      CMD ["node", "server.js"]
+      ```
+  - role: assistant
+    content: |
+      **Workload:** cloud backend (container built in CI)
+
+      #### [High] Dependencies reinstalled on every code change
+      - **Where:** `COPY . .` before `RUN npm install`
+      - **Issue:** the source is copied first, so any change to any file invalidates the install layer. Every PR build downloads and installs all packages again.
+      - **Fix:**
+        ```dockerfile
+        FROM node:22-slim
+        WORKDIR /srv
+        COPY package.json package-lock.json ./
+        RUN npm ci --omit=dev && npm cache clean --force
+        COPY . .
+        ENV NODE_ENV=production
+        USER node
+        CMD ["node", "server.js"]
+        ```
+      - **Impact:** E on every build. The install layer is now rebuilt only when the lock file changes.
+
+      #### [Medium] Full base image plus build tools in production
+      - **Where:** `FROM node:22`, `apt-get install ... make g++ git`
+      - **Issue:** the full base image and the compiler toolchain end up in the image you deploy, and so do the dev dependencies, because `npm install` runs before `NODE_ENV=production`. In Green Metrics Tool measurements of a comparable change for a small Flask app (slim base, runtime dependencies only, dependency layer first), the build used about 7× less energy, while serving requests cost the same.
+      - **Fix:** the slim base and `npm ci --omit=dev` above. If a native module needs `python3`, `make` and `g++`, install them in a build stage and copy only `node_modules` into the final image.
+      - **Impact:** E, storage and network for every build, push, pull and stored copy.
+
+      #### [Low] `npm install` instead of `npm ci`
+      - **Where:** `RUN npm install`
+      - **Issue:** `npm install` can update the lock file and resolve different versions than you tested. `npm ci` installs exactly what `package-lock.json` says.
+verify:
+  static_only: "Dockerfile"
+---
+id: gen-dockerfile-fastapi-uvicorn-001
+category: generation
+language: dockerfile
+patterns: [small-container-images]
+facts: [F-CONTAINER-IMAGE]
+messages:
+  - role: user
+    content: |
+      Write a Dockerfile for my FastAPI app. Entry point is app/main.py with `app = FastAPI()`, deps in requirements.txt, served with uvicorn on port 8080.
+  - role: assistant
+    content: |
+      ```dockerfile
+      FROM python:3.12-slim
+
+      ENV PYTHONDONTWRITEBYTECODE=1 \
+          PYTHONUNBUFFERED=1
+
+      WORKDIR /srv
+
+      COPY requirements.txt .
+      RUN pip install --no-cache-dir -r requirements.txt
+
+      COPY app ./app
+
+      USER nobody
+      EXPOSE 8080
+      CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+      ```
+
+      Add a `.dockerignore` with at least `.git`, `.venv`, `__pycache__` and `tests`, so they are not sent to the build.
+
+      **Green Notes**
+      - **Small container image** (reduces E, storage, network): slim base, runtime dependencies only, and no pip cache in the image. In Green Metrics Tool measurements of a small Flask app, an image built this way used about 7× less energy to build than one on the full `python:3.12` base with build tools and dev packages, while serving requests cost the same.
+      - **Dependency layer first** (reduces E): `requirements.txt` is copied and installed before the code, so a code change only rebuilds the last layers.
+
+      `uvicorn` has to be in `requirements.txt`. Keep test and lint tools in a separate dev requirements file.
+verify:
+  static_only: "Dockerfile"
+---
+id: gen-yaml-pr-preview-teardown-001
+category: generation
+language: yaml
+patterns: [minimize-environments]
+facts: [F-PREVIEW-ENV]
+messages:
+  - role: user
+    content: |
+      write a GitHub Actions workflow that deploys a preview of our app for every pull request. We use helm, the chart is in ./chart, cluster credentials are in the KUBECONFIG secret.
+  - role: assistant
+    content: |
+      ```yaml
+      name: PR preview
+
+      on:
+        pull_request:
+          types: [opened, synchronize, reopened, closed]
+
+      concurrency:
+        group: preview-${{ github.event.pull_request.number }}
+        cancel-in-progress: true
+
+      env:
+        RELEASE: pr-${{ github.event.pull_request.number }}
+
+      jobs:
+        deploy:
+          if: github.event.action != 'closed'
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: azure/setup-helm@v4
+            - name: Write kubeconfig
+              run: echo "${{ secrets.KUBECONFIG }}" > "$RUNNER_TEMP/kubeconfig"
+            - name: Deploy preview
+              env:
+                KUBECONFIG: ${{ runner.temp }}/kubeconfig
+              run: >
+                helm upgrade --install "$RELEASE" ./chart
+                --namespace "$RELEASE" --create-namespace
+                --set replicaCount=1
+                --set image.tag=${{ github.sha }}
+                --wait
+
+        teardown:
+          if: github.event.action == 'closed'
+          runs-on: ubuntu-latest
+          steps:
+            - uses: azure/setup-helm@v4
+            - name: Write kubeconfig
+              run: echo "${{ secrets.KUBECONFIG }}" > "$RUNNER_TEMP/kubeconfig"
+            - name: Remove preview
+              env:
+                KUBECONFIG: ${{ runner.temp }}/kubeconfig
+              run: |
+                helm uninstall "$RELEASE" --namespace "$RELEASE" --ignore-not-found
+                kubectl delete namespace "$RELEASE" --ignore-not-found
+      ```
+
+      **Green Notes**
+      - **Minimize deployed environments** (reduces E and M): the preview is removed when the PR is merged or closed, so it doesn't run for weeks nobody looks at it. That is where the saving is: in Green Metrics Tool measurements, an idle preview with 3 replicas, Postgres, Redis and a worker used only about 3% more CPU energy per minute than one with 1 replica and Postgres. The hours an environment exists matter far more than its size.
+      - **One replica** (reduces M): a preview has a handful of users, so `replicaCount=1` reserves less memory and lets more previews share a node.
+
+      If previews are also left open over nights and weekends, a scheduled job that scales them to zero outside working hours removes most of the remaining hours.
+verify:
+  static_only: "GitHub Actions workflow"
+---
+id: review-yaml-compose-preview-stack-001
+category: review
+language: yaml
+patterns: [minimize-environments]
+facts: [F-PREVIEW-ENV]
+messages:
+  - role: user
+    content: |
+      This compose file is started on our preview host for every feature branch (`docker compose -p <branch> up -d`). Nobody really stops them, we clean up by hand every few weeks. Any feedback?
+
+      ```yaml
+      services:
+        web:
+          image: registry.example.com/shop/web:${TAG}
+          deploy:
+            replicas: 3
+          environment:
+            DATABASE_URL: postgres://shop:shop@db/shop
+            REDIS_URL: redis://cache:6379
+        worker:
+          image: registry.example.com/shop/web:${TAG}
+          command: python -m shop.worker --poll-interval 1
+        cache:
+          image: redis:7
+        db:
+          image: postgres:16
+          environment:
+            POSTGRES_PASSWORD: shop
+          volumes:
+            - dbdata:/var/lib/postgresql/data
+      volumes:
+        dbdata:
+      ```
+  - role: assistant
+    content: |
+      **Workload:** CI/CD and infrastructure (preview environments)
+
+      #### [High] Previews run until someone cleans up by hand
+      - **Where:** the `up -d` per branch, no teardown
+      - **Issue:** every branch keeps a full stack running for weeks after it is merged. The cost of an environment is mostly the hours it exists, not how many services it has.
+      - **Fix:** remove the stack when the branch is merged or deleted, from the same CI that starts it:
+        ```yaml
+        on:
+          delete:
+        jobs:
+          teardown:
+            runs-on: [self-hosted, preview]
+            steps:
+              - run: docker compose -p "${{ github.event.ref }}" down --volumes
+        ```
+        Also stop all previews at night with a scheduled job, and start one on demand when somebody opens it.
+      - **Impact:** E and M, all the idle hours of merged branches go away.
+
+      #### [Low] Three web replicas and a 1-second poller for a preview
+      - **Where:** `replicas: 3`, `worker --poll-interval 1`
+      - **Issue:** a preview has one or two users. In Green Metrics Tool measurements, an idle preview with 3 app replicas, Postgres, Redis and a polling worker used ~269 J per minute of CPU energy, and one with 1 replica and Postgres ~262 J, about 3% less. So per minute the extra services cost little, but they reserve memory and limit how many previews fit on the host.
+      - **Fix:** `replicas: 1`, and only start `worker` and `cache` for branches that need them (a compose profile like `profiles: [jobs]` does that).
+      - **Impact:** M, more previews per host.
+
+      #### [Security] Database password in the file
+      - **Where:** `POSTGRES_PASSWORD: shop`
+      - **Issue:** fine for throwaway data, but if previews ever get a copy of real data, use a generated secret per environment.
+verify:
+  static_only: "compose file"

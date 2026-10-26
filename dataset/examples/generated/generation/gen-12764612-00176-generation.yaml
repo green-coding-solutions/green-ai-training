@@ -1,0 +1,50 @@
+id: gen-12764612-00176-generation
+category: generation
+language: bash
+patterns:
+- compress-stored
+- bash-quoting
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    Need a nightly etcd snapshot script for our k8s control plane node. etcdctl v3, certs in /etc/kubernetes/pki/etcd, target /mnt/backup/etcd, keep 14 days. Snapshots are ~2 GB. Cron runs it as root. Script only.
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+    umask 077
+
+    backup_dir='/mnt/backup/etcd'
+    keep_days=14
+    stamp=$(date +%Y%m%d-%H%M%S)
+    raw="$backup_dir/.etcd-$stamp.db"
+    out="$backup_dir/etcd-$stamp.db.zst"
+
+    trap 'rm -f "$raw" "$out.part"' EXIT
+
+    export ETCDCTL_API=3
+    etcdctl --endpoints='https://127.0.0.1:2379' \
+      --cacert='/etc/kubernetes/pki/etcd/ca.crt' \
+      --cert='/etc/kubernetes/pki/etcd/server.crt' \
+      --key='/etc/kubernetes/pki/etcd/server.key' \
+      snapshot save "$raw"
+
+    zstd -q -T0 -o "$out.part" "$raw"
+    zstd -tq "$out.part"
+    mv "$out.part" "$out"
+
+    find "$backup_dir" -maxdepth 1 -name 'etcd-*.db.zst' -mtime +"$keep_days" -delete
+    ```
+
+    **Green Notes**
+    - **Compress stored data with zstd at its default level** (reduces E and storage): each snapshot is compressed once and then kept 14 days, so the smaller file pays for the CPU work. In Green Metrics Tool micro-benchmarks on 100 MB of English text, zstd used ~16 J, gzip ~67 J and xz ~458 J. Those figures compare energy only, not file size, and etcd snapshots are binary, so your ratio will differ. A Green Coding Solutions estimate puts the break-even for zstd at about 0.15 days of storage, far below your retention.
+    - **Single quotes for literals** (reduces E): paths and flags that need no expansion use single quotes, and the variables stay double-quoted.
+
+    *Not applied:* xz or brotli. They cost far more energy per run. Use them only if the backup volume is tight or the snapshots are kept for months.
+verify:
+  static_only: needs etcdctl, zstd and a running etcd

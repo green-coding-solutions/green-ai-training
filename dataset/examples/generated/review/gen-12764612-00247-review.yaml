@@ -1,0 +1,83 @@
+id: gen-12764612-00247-review
+category: review
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    review?
+
+    ```python
+    import torch
+    from flask import Flask, request, jsonify
+
+    from eta_model import ETANet
+
+    app = Flask(__name__)
+
+    FEATURES = [
+        "distance_km", "hour", "weekday", "parcel_weight_kg",
+        "stops_ahead", "rain_mm", "traffic_index", "vehicle_type", "zone_id",
+    ]
+
+    model = ETANet(n_features=len(FEATURES))
+    model.load_state_dict(torch.load("models/eta.pt", map_location="cpu"))
+
+
+    @app.route("/api/eta", methods=["POST"])
+    def eta():
+        data = request.get_json()
+        x = torch.tensor([[float(data[k]) for k in FEATURES]], dtype=torch.float32)
+        out = model(x)
+        minutes = float(out.item())
+        return jsonify({"eta_minutes": round(minutes, 1)})
+
+
+    if __name__ == "__main__":
+        app.run(host="0.0.0.0", port=8080, debug=True)
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (REST API, one model call per request)
+
+    #### [Security] Debug mode on all interfaces
+    - **Where:** `app.run(host="0.0.0.0", port=8080, debug=True)`
+    - **Issue:** the Werkzeug debugger allows remote code execution for anyone who can reach the port. Never combine `debug=True` with `0.0.0.0`.
+    - **Fix:** drop `debug=True`. Run the app behind a production server such as gunicorn.
+
+    #### [Bug] Model may still be in training mode
+    - **Where:** `model = ETANet(...)` after `load_state_dict`
+    - **Issue:** a new module starts in training mode. If `ETANet` has dropout or batch norm, predictions are random and change between identical requests. `load_state_dict` does not switch the mode.
+    - **Fix:** call `model.eval()` once after loading.
+
+    #### [High] Autograd graph built on every request
+    - **Where:** `out = model(x)` in `eta()`
+    - **Issue:** outside `torch.no_grad()` the forward pass records a graph for a backward pass that never happens. This is extra work and memory on every request.
+    - **Fix:** wrap the forward pass in `torch.no_grad()`.
+    - **Impact:** reduces E and M per request. In Green Metrics Tool micro-benchmarks, 100,000 CPU inferences used about 157 J without `torch.no_grad()` and about 135 J with it, about 14% less. Your model and traffic are different, so measure with `perf stat` or a load test before and after.
+
+    ```python
+    model = ETANet(n_features=len(FEATURES))
+    model.load_state_dict(torch.load("models/eta.pt", map_location="cpu"))
+    model.eval()
+
+
+    @app.route("/api/eta", methods=["POST"])
+    def eta():
+        data = request.get_json()
+        x = torch.tensor([[float(data[k]) for k in FEATURES]], dtype=torch.float32)
+        with torch.no_grad():
+            out = model(x)
+        return jsonify({"eta_minutes": round(float(out.item()), 1)})
+
+
+    if __name__ == "__main__":
+        app.run(host="127.0.0.1", port=8080)
+    ```
+
+    **Already good:** the model is loaded once at import time, not per request.
+verify:
+  static_only: needs torch, flask and a private model module

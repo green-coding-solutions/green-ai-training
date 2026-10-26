@@ -1,0 +1,48 @@
+id: gen-12764612-00293-generation
+category: generation
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    bash script: archive yesterday's signup csv from the landing page, /var/www/landing/data/signups-YYYY-MM-DD.csv, to /srv/archive/signups, keep 1 year. cron nightly
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    src_dir='/var/www/landing/data'
+    archive_dir='/srv/archive/signups'
+    day=$(date -d 'yesterday' +%F)
+    src="$src_dir/signups-$day.csv"
+    dest="$archive_dir/signups-$day.csv.zst"
+
+    [ -f "$src" ] || { echo "missing $src" >&2; exit 1; }
+
+    umask 077   # signups contain personal data
+    mkdir -p "$archive_dir"
+
+    zstd -q -f -o "$dest" "$src"
+    zstd -q -t "$dest"
+    rm -- "$src"
+
+    find "$archive_dir" -name 'signups-*.csv.zst' -mtime +365 -delete
+    ```
+
+    Cron entry:
+
+    ```text
+    15 0 * * * /usr/local/bin/archive-signups.sh
+    ```
+
+    **Green Notes**
+    - **zstd at its default level** (reduces E and storage): the file is compressed once and then stored for a year, so compressing pays off. zstd is a cheap codec for that. In Green Metrics Tool micro-benchmarks compressing 100 MB of text, zstd used about 4× less energy than gzip, and xz used about 29× more than zstd. Those figures compare energy, not file size. xz would make smaller files, but only matters if storage is tight.
+    - **Test, then delete the original**: `zstd -t` checks the archive before `rm`, so a failed compression never loses the day's data.
+    - *Not applied:* a heavier codec. CSV of signups is small, and a stronger ratio would not repay its CPU cost.
+verify:
+  static_only: bash cron script needing zstd and a landing page data directory

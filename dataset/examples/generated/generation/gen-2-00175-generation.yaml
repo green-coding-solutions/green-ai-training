@@ -1,0 +1,82 @@
+id: gen-2-00175-generation
+category: generation
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    flask api: need a helper that checks the Origin header against our CORS allowlist from config. entries can have wildcards like https://*.shop.example.com
+- role: assistant
+  content: |
+    This builds the patterns once from the config, and each request only runs the matches.
+
+    ```python
+    import re
+    from collections.abc import Iterable
+
+
+    def _wildcard_to_regex(entry: str) -> str:
+        # "*" stands for exactly one DNS label. Everything else is matched literally.
+        parts = re.split(r"(\*)", entry.strip().rstrip("/").lower())
+        return "".join("[a-z0-9-]+" if part == "*" else re.escape(part) for part in parts)
+
+
+    class OriginAllowlist:
+        def __init__(self, entries: Iterable[str]):
+            self._patterns = [
+                re.compile(_wildcard_to_regex(entry)) for entry in entries if entry.strip()
+            ]
+
+        def allows(self, origin: str | None) -> bool:
+            if not origin:
+                return False
+            origin = origin.lower()
+            return any(pattern.fullmatch(origin) for pattern in self._patterns)
+    ```
+
+    Wiring it into Flask:
+
+    ```python
+    from flask import request
+
+    allowlist = OriginAllowlist(app.config["CORS_ORIGINS"])
+
+
+    @app.after_request
+    def add_cors_headers(resp):
+        origin = request.headers.get("Origin")
+        if allowlist.allows(origin):
+            resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.vary.add("Origin")
+        return resp
+    ```
+
+    **Green Notes**
+    - **Compile once, outside the request path** (reduces E): the patterns come from config strings, so converting and compiling them in the handler would repeat that work on every request. Python's `re` caches compiled patterns. For a short allowlist, compiling up front is therefore a small win. In Green Metrics Tool micro-benchmarks, a precompiled pattern used about 18% less CPU energy than inline `re.match` over 1,000,000 matches. Forcing a recompile on every call cost about 200× more per match. That is what happens once a process uses more distinct patterns than the cache holds.
+
+    Security: `fullmatch` and `re.escape` are both required. Without them, `https://eu.shop.example.com.evil.io` or `https://euXshop.example.com` would pass the check. A wildcard entry does not cover the bare domain, so list `https://shop.example.com` on its own if you need it. Add ports to the entries where they apply, e.g. `http://localhost:3000`.
+verify:
+  green_block: 0
+  test: |-
+    al = OriginAllowlist([
+        "https://*.shop.example.com",
+        "https://admin.example.com/",
+        "http://localhost:3000",
+        "  ",
+    ])
+    assert al.allows("https://eu.shop.example.com")
+    assert al.allows("HTTPS://EU.Shop.Example.com")
+    assert al.allows("https://admin.example.com")
+    assert al.allows("http://localhost:3000")
+    assert not al.allows("https://shop.example.com")
+    assert not al.allows("https://a.b.shop.example.com")
+    assert not al.allows("https://eu.shop.example.com.evil.io")
+    assert not al.allows("https://adminXexample.com")
+    assert not al.allows("http://localhost:3001")
+    assert not al.allows("http://admin.example.com")
+    assert not al.allows(None)
+    assert not al.allows("")
+    print("ok")

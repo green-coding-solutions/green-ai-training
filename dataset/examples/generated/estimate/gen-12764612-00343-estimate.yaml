@@ -1,0 +1,85 @@
+id: gen-12764612-00343-estimate
+category: estimate
+language: javascript
+patterns:
+- css-animations
+facts:
+- F-ANIM
+messages:
+- role: user
+  content: |
+    We are adding a connector page to our ingestion admin UI (internal tool, analysts configure Postgres/S3/Kafka sources for our ETL). Each connector card has a small sync icon that rotates while a sync is running. Right now it is done in JS:
+
+    ```js
+    const icon = document.querySelector(`#connector-${id} .sync-icon`);
+    let angle = 0;
+    let rafId = null;
+
+    function spin() {
+      angle = (angle + 3) % 360;
+      icon.style.transform = `rotate(${angle}deg)`;
+      rafId = requestAnimationFrame(spin);
+    }
+
+    function onSyncState(state) {
+      if (state === 'running') {
+        if (rafId === null) spin();
+      } else {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+        icon.style.transform = '';
+      }
+    }
+    ```
+
+    Requirements from our sustainability lead: I need to put a number in the quarterly report, kWh and CO2 per year saved if we move this to CSS. Roughly 150 analysts use the page, and they often keep the tab open for a whole shift while syncs run. Please give me the number. If you can't, tell me what I can write instead and how to get a real one. Also, the spinner must stop when the sync ends, and we respect prefers-reduced-motion.
+- role: assistant
+  content: |
+    I can't give you a kWh or CO2 figure that I would stand behind. It depends on the browser, the device, the icon size, the refresh rate and how many hours a sync really runs. Any yearly number from me would be invented.
+
+    Direction: moving the rotation to CSS is the lower-energy choice. With `requestAnimationFrame`, your JS callback runs on every frame and writes a style each time. With a CSS animation, the browser runs the rotation itself and no script wakes up per frame.
+
+    Measured reference: in Green Metrics Tool micro-benchmarks, a 20-second animation in a real browser used ~161 J of CPU energy when driven by `requestAnimationFrame` with style updates, and ~145 J with CSS `@keyframes`. That is about 10% less. This was one specific animation, so don't scale it to your page. A small rotating icon is a much lighter load than that benchmark, so the absolute saving per analyst will be small. Only the fact that CSS is cheaper carries over.
+
+    What you can write in the report: "Moving the sync spinner from a JS animation loop to CSS removes per-frame script work. A browser micro-benchmark measured about 10% less CPU energy for CSS keyframes. The saving for our page is small per user and has not been measured yet."
+
+    To get a real number for your page:
+    1. Make two builds of the connector page, one with the rAF spinner and one with the CSS spinner.
+    2. Run each in the same browser on the same machine for a fixed time, for example 5 minutes with one sync running, as a Green Metrics Tool usage scenario. Also record a run with no spinner as a baseline.
+    3. Take the difference between the two builds per minute. Multiply by the real hours of running syncs per analyst and by the number of analysts. Convert with your own grid carbon intensity.
+
+    If you can't run the full tool, a browser performance profile of both builds shows the per-frame script time you remove.
+
+    The CSS version, with your requirements:
+
+    ```css
+    .sync-icon {
+      animation: sync-spin 1s linear infinite;
+      animation-play-state: paused;
+    }
+
+    .connector-card[data-sync='running'] .sync-icon {
+      animation-play-state: running;
+    }
+
+    @keyframes sync-spin {
+      to { transform: rotate(360deg); }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .sync-icon { animation: none; }
+    }
+    ```
+
+    ```javascript
+    function onSyncState(state) {
+      document.querySelector(`#connector-${id}`).dataset.sync = state;
+    }
+    ```
+
+    **Green Notes**
+    - **CSS animation instead of a JS loop** (reduces E): no per-frame callback and no style write from script while the sync runs.
+    - The spinner is paused when the sync ends, so no animation work is left idle. Note that a paused icon that is not running and is off screen costs nothing extra.
+    - The icon no longer rewinds to 0° via inline style, because the paused state keeps its last angle. Reset it with `animation: none` in a `[data-sync='idle']` rule if you want it to snap back.
+  verify:
+    static_only: needs a browser DOM and CSS engine

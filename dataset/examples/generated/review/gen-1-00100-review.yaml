@@ -1,0 +1,116 @@
+id: gen-1-00100-review
+category: review
+language: python
+patterns:
+- string-join
+- torch-no-grad
+facts:
+- F-STRCAT
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    Please review this batch script for our support-ticket triage. Requirements: it must run on CPU only (no GPU on the worker), the output file format (tab-separated: label, confidence, text) must stay exactly the same because a downstream importer parses it, and it should handle a nightly dump of a few hundred thousand tickets without falling over. Tell me what to change and how important each point is.
+
+    ```python
+    import sys
+    import torch
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+    MODEL_DIR = "models/ticket-triage-v3"
+    LABELS = ["billing", "bug", "feature", "other"]
+    BATCH_SIZE = 32
+    MAX_LEN = 256
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+    model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR)
+
+
+    def classify_batch(texts):
+        enc = tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=MAX_LEN,
+            return_tensors="pt",
+        )
+        logits = model(**enc).logits
+        return torch.softmax(logits, dim=-1)
+
+
+    def run(path_in, path_out):
+        with open(path_in, encoding="utf-8") as f:
+            lines = [l.rstrip("\n") for l in f if l.strip()]
+
+        report = ""
+        for i in range(0, len(lines), BATCH_SIZE):
+            batch = lines[i:i + BATCH_SIZE]
+            probs = classify_batch(batch)
+            for text, p in zip(batch, probs):
+                idx = int(p.argmax())
+                report += f"{LABELS[idx]}\t{p[idx].item():.4f}\t{text}\n"
+
+        with open(path_out, "w", encoding="utf-8") as f:
+            f.write(report)
+        print(f"classified {len(lines)} tickets")
+
+
+    if __name__ == "__main__":
+        run(sys.argv[1], sys.argv[2])
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly batch, CPU inference)
+
+    #### [High] Inference runs with autograd enabled
+    - **Where:** `classify_batch`, the `model(**enc)` call
+    - **Issue:** outside `torch.no_grad()` PyTorch records the graph for a backward pass that never happens. That costs CPU time and memory on every batch. In Green Metrics Tool micro-benchmarks, 100,000 CPU inferences used ~157 J without `torch.no_grad()` and ~135 J with it, about 14% less. The saving is moderate per call, but it repeats for every ticket and every night.
+    - **Fix:** decorate the function. Output values do not change.
+      ```python
+      @torch.no_grad()
+      def classify_batch(texts):
+          ...
+      ```
+    - **Impact:** E and M, a steady cut on every batch, with lower peak memory on a CPU-only worker.
+
+    #### [Medium] Report built with `+=` in the row loop
+    - **Where:** `report += f"..."` in `run`
+    - **Issue:** one string is grown once per ticket. Each `+=` can copy the string built so far, so the cost can grow faster than the row count. An f-string with `+=` behaves the same way. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces used ~469 J with `+=` and ~1.8 J with `"".join()`, roughly 260× less. That is a much larger piece count than your dump, and I would not scale the figure to it. Model inference will still dominate your run time, so this is Medium. It is a trivial fix and it removes a cost that grows with input size.
+    - **Fix:** collect the rows in a list and join once. The file content stays byte for byte the same, including the trailing newline on each row.
+
+    ```python
+    @torch.no_grad()
+    def classify_batch(texts):
+        enc = tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=MAX_LEN,
+            return_tensors="pt",
+        )
+        logits = model(**enc).logits
+        return torch.softmax(logits, dim=-1)
+
+
+    def run(path_in, path_out):
+        with open(path_in, encoding="utf-8") as f:
+            lines = [l.rstrip("\n") for l in f if l.strip()]
+
+        rows = []
+        for i in range(0, len(lines), BATCH_SIZE):
+            batch = lines[i:i + BATCH_SIZE]
+            probs = classify_batch(batch)
+            for text, p in zip(batch, probs):
+                idx = int(p.argmax())
+                rows.append(f"{LABELS[idx]}\t{p[idx].item():.4f}\t{text}\n")
+
+        with open(path_out, "w", encoding="utf-8") as f:
+            f.write("".join(rows))
+        print(f"classified {len(lines)} tickets")
+    ```
+
+    - **Impact:** E, the string cost stays linear in the number of tickets.
+
+    **Already good:** batching the tokenizer and model calls, `truncation` with a fixed `max_length`, the model loaded once at import, and explicit `encoding="utf-8"`.
+verify:
+  static_only: needs torch, transformers and a local model directory

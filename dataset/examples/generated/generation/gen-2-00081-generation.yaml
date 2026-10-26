@@ -1,0 +1,201 @@
+id: gen-2-00081-generation
+category: generation
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    hi, we need kubernetes yaml for staging of our inference service. its fastapi + onnxruntime (image registry.example.com/ml/sentiment-api:1.4.0, port 8000, health check on /healthz). also need redis for caching the predictions and a worker that do batch scoring from a redis queue (same image, command `python -m worker`).
+    staging is only used from our team to test new model versions before they go to prod, we work 8-18 monday to friday. namespace ml-staging pls
+- role: assistant
+  content: |
+    ```yaml
+    apiVersion: v1
+    kind: Namespace
+    metadata:
+      name: ml-staging
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: sentiment-api
+      namespace: ml-staging
+    spec:
+      replicas: 1
+      selector:
+        matchLabels: {app: sentiment-api}
+      template:
+        metadata:
+          labels: {app: sentiment-api}
+        spec:
+          containers:
+            - name: api
+              image: registry.example.com/ml/sentiment-api:1.4.0
+              ports:
+                - containerPort: 8000
+              env:
+                - name: REDIS_URL
+                  value: redis://redis:6379/0
+              readinessProbe:
+                httpGet: {path: /healthz, port: 8000}
+                initialDelaySeconds: 10
+                periodSeconds: 10
+              resources:
+                requests: {cpu: 500m, memory: 1Gi}
+                limits: {memory: 2Gi}
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: sentiment-api
+      namespace: ml-staging
+    spec:
+      selector: {app: sentiment-api}
+      ports:
+        - port: 80
+          targetPort: 8000
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: batch-worker
+      namespace: ml-staging
+    spec:
+      replicas: 1
+      selector:
+        matchLabels: {app: batch-worker}
+      template:
+        metadata:
+          labels: {app: batch-worker}
+        spec:
+          containers:
+            - name: worker
+              image: registry.example.com/ml/sentiment-api:1.4.0
+              command: ["python", "-m", "worker"]
+              env:
+                - name: REDIS_URL
+                  value: redis://redis:6379/0
+              resources:
+                requests: {cpu: 250m, memory: 1Gi}
+                limits: {memory: 2Gi}
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: redis
+      namespace: ml-staging
+    spec:
+      replicas: 1
+      selector:
+        matchLabels: {app: redis}
+      template:
+        metadata:
+          labels: {app: redis}
+        spec:
+          containers:
+            - name: redis
+              image: redis:7-alpine
+              args: ["--save", "", "--appendonly", "no"]
+              ports:
+                - containerPort: 6379
+              resources:
+                requests: {cpu: 50m, memory: 64Mi}
+                limits: {memory: 256Mi}
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: redis
+      namespace: ml-staging
+    spec:
+      selector: {app: redis}
+      ports:
+        - port: 6379
+    ---
+    # Scale staging to zero outside office hours
+    apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: staging-scaler
+      namespace: ml-staging
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: Role
+    metadata:
+      name: staging-scaler
+      namespace: ml-staging
+    rules:
+      - apiGroups: ["apps"]
+        resources: ["deployments", "deployments/scale"]
+        verbs: ["get", "list", "patch", "update"]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata:
+      name: staging-scaler
+      namespace: ml-staging
+    subjects:
+      - kind: ServiceAccount
+        name: staging-scaler
+        namespace: ml-staging
+    roleRef:
+      kind: Role
+      name: staging-scaler
+      apiGroup: rbac.authorization.k8s.io
+    ---
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata:
+      name: staging-sleep
+      namespace: ml-staging
+    spec:
+      schedule: "0 19 * * 1-5"
+      timeZone: Europe/Berlin
+      concurrencyPolicy: Forbid
+      jobTemplate:
+        spec:
+          backoffLimit: 2
+          template:
+            spec:
+              serviceAccountName: staging-scaler
+              restartPolicy: OnFailure
+              containers:
+                - name: kubectl
+                  image: registry.k8s.io/kubectl:v1.31.0
+                  args: ["scale", "deployment", "--all", "--replicas=0", "-n", "ml-staging"]
+    ---
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata:
+      name: staging-wake
+      namespace: ml-staging
+    spec:
+      schedule: "0 7 * * 1-5"
+      timeZone: Europe/Berlin
+      concurrencyPolicy: Forbid
+      jobTemplate:
+        spec:
+          backoffLimit: 2
+          template:
+            spec:
+              serviceAccountName: staging-scaler
+              restartPolicy: OnFailure
+              containers:
+                - name: kubectl
+                  image: registry.k8s.io/kubectl:v1.31.0
+                  args: ["scale", "deployment", "--all", "--replicas=1", "-n", "ml-staging"]
+    ```
+
+    Change `timeZone` to your own time zone. Staging starts at 07:00 so the model is loaded before you begin at 08:00. Do you need it in the evening or on a weekend? Run `kubectl scale deployment --all --replicas=1 -n ml-staging`, and the next 19:00 job turns it off again.
+
+    Redis runs without persistence. So the cache and any queued batch jobs are gone after the nightly stop, and a batch job still running at 19:00 is stopped too. For a test environment that is usually fine.
+
+    **Green Notes**
+    - **Minimize deployed environments** (reduces E and M): two CronJobs scale every deployment to zero at 19:00 on weekdays and start them again at 07:00. Nothing runs at night or on weekends. This is where the saving is. In Green Metrics Tool benchmarks, an idle preview environment with 3 app replicas, Postgres, Redis and a worker used ~269 J of CPU energy over 60 seconds. With 1 replica and Postgres it used ~262 J, only about 3% less. An idle service costs little per minute, but an environment that is not running costs nothing.
+    - **One replica per service** (reduces M): your team's test traffic does not need more. Each extra API replica loads the ONNX model again and reserves its own memory on the node.
+    - *Not applied:* dropping Redis or the worker. You need both to test the caching and batch scoring paths, and when idle they cost little.
+verify:
+  static_only: Kubernetes manifests, need a cluster

@@ -1,0 +1,82 @@
+id: gen-2-00049-generation
+category: generation
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    need a deadband filter for the gateway. keep a sample only if it moved more than `db` from the last kept one. numpy arrays (timestamps + float32 values), ~5M samples per batch, runs every minute
+- role: assistant
+  content: |
+    Each sample depends on the last kept one, so numpy can't vectorize this cleanly. A JIT-compiled loop is the right tool here.
+
+    ```python
+    import numpy as np
+
+    try:
+        from numba import njit
+    except ImportError:  # same results without numba, just much slower
+        def njit(*args, **kwargs):
+            if args and callable(args[0]):
+                return args[0]
+            return lambda f: f
+
+
+    @njit(cache=True)
+    def _deadband_mask(values, deadband):
+        n = values.shape[0]
+        keep = np.zeros(n, dtype=np.bool_)
+        have_last = False
+        last = 0.0
+        for i in range(n):
+            v = values[i]
+            if np.isnan(v):  # sensor dropouts are never kept
+                continue
+            if not have_last or abs(v - last) > deadband:
+                keep[i] = True
+                last = v
+                have_last = True
+        return keep
+
+
+    def deadband_filter(timestamps, values, deadband):
+        """Report-by-exception: keep samples that moved more than `deadband`
+        from the last kept sample. The first valid sample is always kept."""
+        timestamps = np.asarray(timestamps)
+        values = np.ascontiguousarray(values)
+        if timestamps.shape != values.shape or values.ndim != 1:
+            raise ValueError("timestamps and values must be 1-D arrays of equal length")
+        keep = _deadband_mask(values, float(deadband))
+        return timestamps[keep], values[keep]
+    ```
+
+    **Green Notes**
+    - **JIT-compile the hot numeric loop** (reduces E): 5M samples every minute is a steady CPU-bound workload. Plain Python interprets every loop step, and Numba compiles the loop to machine code. In Green Metrics Tool micro-benchmarks, a pure Python loop that quantized 10,000,000 samples used ~40 J. The same loop with Numba `@njit` used ~9.5 J, about 4× less.
+    - **`cache=True`** (reduces E): the compiled code is saved to disk, so a gateway service restart doesn't compile it again.
+    - The output keeps the input dtype (float32 stays float32), and the values are not converted to float64.
+
+    *Not applied:* for a one-off analysis of a few thousand samples, the plain loop is fine. There, compile time and the extra dependency cost more than the loop itself.
+verify:
+  test: |-
+    import numpy as np
+    ts = np.arange(8)
+    vals = np.array([20.0, 20.1, 20.6, 20.5, np.nan, 21.2, 21.25, 19.0], dtype=np.float32)
+    t, v = deadband_filter(ts, vals, 0.5)
+    assert t.tolist() == [0, 2, 5, 7], t
+    assert v.dtype == np.float32
+    assert np.allclose(v, [20.0, 20.6, 21.2, 19.0])
+
+    t2, v2 = deadband_filter(np.arange(4), np.array([np.nan, 1.0, 1.2, 2.0], dtype=np.float32), 0.5)
+    assert t2.tolist() == [1, 3], t2
+
+    t3, v3 = deadband_filter(np.array([], dtype=np.int64), np.array([], dtype=np.float32), 0.5)
+    assert t3.size == 0 and v3.size == 0
+
+    try:
+        deadband_filter(np.arange(3), np.zeros(4, dtype=np.float32), 0.5)
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass

@@ -1,0 +1,140 @@
+id: gen-12764612-00010-generation
+category: generation
+language: html
+patterns:
+- dom-size
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    hi, I wrote a small command line tool that scan our shared drive and write a file `scan.json`. It is a list of every file, with path, size in bytes and modified date, like this:
+
+    ```json
+    [{"path": "projects/2023/render/final_v2.mov", "size": 48211934, "modified": "2024-03-02T10:14:09Z"}, ...]
+    ```
+
+    For big drives it have about 30000 files. I want to open this in the browser and look at it as a table, biggest files first. I am not good with html and javascript, so I don't know how to start. can you write the page? one file is best, I just double click it.
+- role: assistant
+  content: |
+    Here is one file. Double-click it, then choose `scan.json` with the file picker. It shows the biggest files first, 100 per page, with a filter box for the path.
+
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <title>Disk scan report</title>
+      <style>
+        body { font-family: system-ui, sans-serif; margin: 1rem 2rem; }
+        table { border-collapse: collapse; width: 100%; margin-top: 0.5rem; }
+        th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid #ddd; }
+        td.num { text-align: right; white-space: nowrap; }
+        nav { margin-top: 0.75rem; }
+      </style>
+    </head>
+    <body>
+      <h1>Disk scan report</h1>
+      <input type="file" id="file" accept=".json">
+      <input type="search" id="filter" placeholder="Filter by path" hidden>
+      <p id="status">Choose scan.json to start.</p>
+
+      <nav>
+        <button id="prev" disabled>Previous</button>
+        <button id="next" disabled>Next</button>
+      </nav>
+
+      <table>
+        <thead>
+          <tr><th>Path</th><th>Size</th><th>Modified</th></tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+
+      <script>
+        const PAGE_SIZE = 100;
+        let all = [];
+        let shown = [];
+        let page = 0;
+
+        const fileInput = document.getElementById('file');
+        const filterInput = document.getElementById('filter');
+        const statusEl = document.getElementById('status');
+        const rowsEl = document.getElementById('rows');
+        const prevBtn = document.getElementById('prev');
+        const nextBtn = document.getElementById('next');
+
+        function formatSize(bytes) {
+          const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+          let i = 0;
+          while (bytes >= 1024 && i < units.length - 1) {
+            bytes /= 1024;
+            i++;
+          }
+          return bytes.toFixed(i === 0 ? 0 : 1) + ' ' + units[i];
+        }
+
+        function render() {
+          const pages = Math.max(1, Math.ceil(shown.length / PAGE_SIZE));
+          page = Math.min(page, pages - 1);
+
+          // Build only the rows of the current page, then insert them once.
+          const fragment = document.createDocumentFragment();
+          for (const f of shown.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)) {
+            const tr = document.createElement('tr');
+            const path = document.createElement('td');
+            const size = document.createElement('td');
+            const modified = document.createElement('td');
+            path.textContent = f.path;
+            size.textContent = formatSize(f.size);
+            size.className = 'num';
+            modified.textContent = f.modified.slice(0, 10);
+            tr.append(path, size, modified);
+            fragment.append(tr);
+          }
+          rowsEl.replaceChildren(fragment);
+
+          statusEl.textContent =
+            shown.length + ' files, page ' + (page + 1) + ' of ' + pages;
+          prevBtn.disabled = page === 0;
+          nextBtn.disabled = page >= pages - 1;
+        }
+
+        function applyFilter() {
+          const q = filterInput.value.trim().toLowerCase();
+          shown = q ? all.filter(f => f.path.toLowerCase().includes(q)) : all;
+          page = 0;
+          render();
+        }
+
+        fileInput.addEventListener('change', async () => {
+          const file = fileInput.files[0];
+          if (!file) return;
+          try {
+            all = JSON.parse(await file.text());
+          } catch (err) {
+            statusEl.textContent = 'This file is not valid JSON.';
+            return;
+          }
+          all.sort((a, b) => b.size - a.size);
+          filterInput.hidden = false;
+          filterInput.value = '';
+          applyFilter();
+        });
+
+        filterInput.addEventListener('input', applyFilter);
+        prevBtn.addEventListener('click', () => { page--; render(); });
+        nextBtn.addEventListener('click', () => { page++; render(); });
+      </script>
+    </body>
+    </html>
+    ```
+
+    I assumed each entry has `path`, `size` and `modified` as in your example. File names are inserted with `textContent`, so a strange file name can't inject HTML into the page.
+
+    **Green Notes**
+    - **Paginated table** (reduces E on the client): the page only ever holds 100 rows, however many files the scan has. Putting every file in the page makes the browser build and lay out tens of thousands of rows. In Green Metrics Tool browser benchmarks, a table of 10,000 rows with 14 elements per row, appended to the live DOM one by one, used about 56% less CPU energy when it was paginated to 100 rows per page.
+    - **Plain `<table>` with one `<td>` per value, built in a `DocumentFragment`** (reduces E): no wrapper elements around cells, and the page's rows are inserted in one step instead of one by one. This is the same layout that the benchmark used for the cheaper variant.
+    - *Not applied:* pagination matters for large lists. For a scan with only a few hundred files, you could show all rows in one table.
+verify:
+  static_only: browser page that needs a DOM and a file picker

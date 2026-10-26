@@ -1,0 +1,112 @@
+id: gen-2-00341-generation
+category: generation
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    I need a Python function for our product landing page. The page is rendered server-side, and the template gets a `hero` dict (headline, subline, CTA label, CTA link, image). Marketing wants the hero to change based on the UTM parameters of the visit.
+
+    Requirements:
+    - Input: the query params as a plain `dict[str, str]`. Our framework already takes the first value of each param.
+    - Look up `utm_campaign` first. If there is no match, try `utm_source`. If neither matches, use the default hero.
+    - Matching ignores case and surrounding whitespace (`?utm_campaign=Spring-Sale%20` happens).
+    - Marketing edits the override configs. An override usually sets only some fields, e.g. just the headline. Every field it leaves out comes from the default hero.
+    - Add a `variant` key to the result (`campaign:<name>`, `source:<name>` or `default`) for our analytics.
+    - The config dicts are module-level. The template must not be able to change them by editing the returned dict.
+    - This runs on every page view. Most visitors come without UTM params, or with campaigns nobody configured (old newsletter links, partner links). So the fallback is the normal case, not the exception.
+    - Empty params like `?utm_campaign=` must not crash it.
+
+    Please include a few example configs so I can see the shape.
+- role: assistant
+  content: |
+    ```python
+    from typing import Mapping
+
+    DEFAULT_HERO = {
+        "headline": "Ship faster with Acme",
+        "subline": "Preview deployments for every pull request.",
+        "cta_label": "Start free trial",
+        "cta_href": "/signup",
+        "image": "/img/hero-default.webp",
+    }
+
+    # Overrides only list the fields they change.
+    CAMPAIGN_HEROES = {
+        "spring-sale": {
+            "headline": "The spring discount is live",
+            "cta_label": "Claim the discount",
+            "cta_href": "/signup?promo=spring",
+        },
+        "devops-weekly": {
+            "subline": "Welcome, DevOps Weekly readers. Your first month is on us.",
+        },
+    }
+
+    SOURCE_HEROES = {
+        "github": {
+            "headline": "Previews for every pull request",
+            "image": "/img/hero-github.webp",
+        },
+        "producthunt": {
+            "cta_label": "Try the launch offer",
+        },
+    }
+
+
+    def _norm(value: str | None) -> str:
+        return value.strip().lower() if value else ""
+
+
+    def pick_hero(params: Mapping[str, str]) -> dict:
+        """Return a fresh hero dict for the template, with a 'variant' key for analytics."""
+        campaign = _norm(params.get("utm_campaign"))
+        override = CAMPAIGN_HEROES.get(campaign)
+        if override is not None:
+            return {**DEFAULT_HERO, **override, "variant": "campaign:" + campaign}
+
+        source = _norm(params.get("utm_source"))
+        override = SOURCE_HEROES.get(source)
+        if override is not None:
+            return {**DEFAULT_HERO, **override, "variant": "source:" + source}
+
+        return {**DEFAULT_HERO, "variant": "default"}
+    ```
+
+    Each call builds a new dict, so the template can change the result without touching the configs. An empty or missing param normalizes to `""`, which matches no key, so the code falls through to the next rule.
+
+    **Green Notes**
+    - **`dict.get` instead of `try/except KeyError`** (reduces E): here a miss is the common case, and raising and catching an exception on every page view costs more than a lookup that returns `None`. In Green Metrics Tool micro-benchmarks with about half the keys missing, `dict.get` used about 12% less CPU energy than `try/except KeyError`.
+    - **Merge with `{**DEFAULT_HERO, **override}`** (reduces E): missing fields are filled in one dict build. No per-field checks and no exceptions.
+    - Behavior note: the check is `is not None`, so an empty override like `"some-campaign": {}` still counts as a match. It shows the default content but reports `variant: campaign:some-campaign`.
+verify:
+  test: |-
+    h = pick_hero({})
+    assert h["variant"] == "default"
+    assert h["headline"] == DEFAULT_HERO["headline"]
+
+    h = pick_hero({"utm_campaign": "  Spring-Sale "})
+    assert h["variant"] == "campaign:spring-sale"
+    assert h["cta_label"] == CAMPAIGN_HEROES["spring-sale"]["cta_label"]
+    assert h["image"] == DEFAULT_HERO["image"]
+
+    h = pick_hero({"utm_campaign": "old-newsletter-2023", "utm_source": "GitHub"})
+    assert h["variant"] == "source:github"
+    assert h["image"] == "/img/hero-github.webp"
+    assert h["subline"] == DEFAULT_HERO["subline"]
+
+    h = pick_hero({"utm_campaign": "", "utm_source": "unknown-partner"})
+    assert h["variant"] == "default"
+
+    h = pick_hero({"utm_source": "producthunt"})
+    assert set(h) == set(DEFAULT_HERO) | {"variant"}
+
+    h["headline"] = "changed"
+    assert DEFAULT_HERO["headline"] != "changed"
+    h2 = pick_hero({"utm_campaign": "spring-sale"})
+    h2["cta_href"] = "/x"
+    assert CAMPAIGN_HEROES["spring-sale"]["cta_href"] == "/signup?promo=spring"
+    print("ok")

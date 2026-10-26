@@ -1,0 +1,178 @@
+id: gen-2-00146-review
+category: review
+language: javascript
+patterns:
+- dom-size
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    quick order page freezes on load, most customers have ~7k SKUs. review?
+
+    ```javascript
+    // quick-order.js – B2B quick order page
+    const tbody = document.querySelector("#quick-order tbody");
+    const totalEl = document.querySelector("#order-total");
+
+    async function loadCatalog() {
+      const res = await fetch(`/api/b2b/catalog?customer=${window.CUSTOMER_ID}`);
+      const products = await res.json();
+
+      for (const p of products) {
+        const tr = document.createElement("tr");
+        tr.className = "qo-row";
+        tr.innerHTML = `
+          <td><div class="cell"><span class="sku">${p.sku}</span></div></td>
+          <td><div class="cell"><div class="name-wrap"><span class="name">${p.name}</span></div></div></td>
+          <td><div class="cell"><span class="unit">${p.unit}</span></div></td>
+          <td><div class="cell"><span class="price">${(p.priceCents / 100).toFixed(2)}</span></div></td>
+          <td><div class="cell"><input type="number" min="0" class="qty"
+                data-sku="${p.sku}" data-price="${p.priceCents}"></div></td>`;
+        tbody.appendChild(tr);
+      }
+
+      tbody.querySelectorAll(".qty").forEach((input) => {
+        input.addEventListener("input", updateTotal);
+      });
+    }
+
+    function updateTotal() {
+      let cents = 0;
+      tbody.querySelectorAll(".qty").forEach((input) => {
+        cents += parseInt(input.value || 0, 10) * Number(input.dataset.price);
+      });
+      totalEl.textContent = (cents / 100).toFixed(2);
+    }
+
+    document.querySelector("#add-all").addEventListener("click", async () => {
+      const lines = [];
+      tbody.querySelectorAll(".qty").forEach((input) => {
+        if (input.value) lines.push({ sku: input.dataset.sku, qty: input.value });
+      });
+      await fetch("/api/cart/bulk", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lines }),
+      });
+      location.href = "/cart";
+    });
+
+    loadCatalog();
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (e-commerce frontend)
+
+    #### [Bug] Failed request throws away the whole order
+    - **Where:** `#add-all` click handler
+    - **Issue:** the handler never checks the response. If `/api/cart/bulk` fails, the page still redirects to `/cart`, and the buyer loses every quantity they typed.
+    - **Fix:**
+      ```javascript
+      document.querySelector("#add-all").addEventListener("click", async () => {
+        const lines = [];
+        tbody.querySelectorAll(".qty").forEach((input) => {
+          if (parseInt(input.value, 10) > 0) lines.push({ sku: input.dataset.sku, qty: input.value });
+        });
+        const res = await fetch("/api/cart/bulk", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ lines }),
+        });
+        if (!res.ok) {
+          alert("Could not add the items to your cart. Please try again.");
+          return;
+        }
+        location.href = "/cart";
+      });
+      ```
+
+    #### [Bug] Zero and negative quantities are sent
+    - **Where:** `if (input.value)` and `updateTotal`
+    - **Issue:** `"0"` and `"-3"` are truthy strings. `min="0"` only limits the spinner, so a typed `-3` gets through. These lines go to the cart endpoint, and negative values also lower the total.
+    - **Fix:** only accept `parseInt(value, 10) > 0`. The snippets above and below do this.
+
+    #### [Security] Catalog fields injected with `innerHTML`
+    - **Where:** `tr.innerHTML = ...` with `p.name`, `p.sku`, `p.unit`
+    - **Issue:** product names may come from supplier feeds or imports. A name with markup then runs as HTML/JS in a logged-in buyer session that can place orders.
+    - **Fix:** set cells with `textContent` (see below).
+
+    #### [High] ~119,000 DOM nodes appended one row at a time
+    - **Where:** `loadCatalog` loop
+    - **Issue:** each row has 17 elements (`tr`, 5 `td`, 6 wrapper `div`s, 4 `span`s, the input). With 7,000 SKUs that is about 119,000 nodes, and each row goes straight into the live `tbody`. The code then attaches 7,000 listeners, and each keystroke queries all 7,000 inputs again. This causes the freeze.
+    - **Fix:** keep quantities in a `Map` so they survive paging. Render 100 plain rows per page from a `DocumentFragment`, and add a search box so buyers still find SKUs fast. Use one delegated listener.
+      ```javascript
+      const PAGE_SIZE = 100;
+      const tbody = document.querySelector("#quick-order tbody");
+      const totalEl = document.querySelector("#order-total");
+      const pageEl = document.querySelector("#qo-page");
+      const qty = new Map(); // sku -> quantity, kept across pages and searches
+      let products = [];
+      let bySku = new Map();
+      let filtered = [];
+      let page = 0;
+
+      function td(text) {
+        const el = document.createElement("td");
+        el.textContent = text;
+        return el;
+      }
+
+      function render() {
+        const frag = document.createDocumentFragment();
+        for (const p of filtered.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)) {
+          const input = document.createElement("input");
+          input.type = "number";
+          input.min = "0";
+          input.dataset.sku = p.sku;
+          input.value = qty.get(p.sku) ?? "";
+          const qtyCell = document.createElement("td");
+          qtyCell.append(input);
+          const tr = document.createElement("tr");
+          tr.append(td(p.sku), td(p.name), td(p.unit), td((p.priceCents / 100).toFixed(2)), qtyCell);
+          frag.append(tr);
+        }
+        tbody.replaceChildren(frag);
+        pageEl.textContent = `${page + 1} / ${Math.max(1, Math.ceil(filtered.length / PAGE_SIZE))}`;
+      }
+
+      async function loadCatalog() {
+        const res = await fetch(`/api/b2b/catalog?customer=${window.CUSTOMER_ID}`);
+        products = await res.json();
+        bySku = new Map(products.map((p) => [p.sku, p]));
+        filtered = products;
+        render();
+      }
+
+      tbody.addEventListener("input", (e) => {
+        const sku = e.target.dataset.sku;
+        if (!sku) return;
+        const n = parseInt(e.target.value, 10);
+        if (n > 0) qty.set(sku, n);
+        else qty.delete(sku);
+        let cents = 0;
+        for (const [s, q] of qty) cents += q * bySku.get(s).priceCents;
+        totalEl.textContent = (cents / 100).toFixed(2);
+      });
+
+      document.querySelector("#qo-search").addEventListener("input", (e) => {
+        const q = e.target.value.trim().toLowerCase();
+        filtered = q
+          ? products.filter((p) => p.sku.toLowerCase().includes(q) || p.name.toLowerCase().includes(q))
+          : products;
+        page = 0;
+        render();
+      });
+      document.querySelector("#qo-prev").addEventListener("click", () => {
+        if (page > 0) { page--; render(); }
+      });
+      document.querySelector("#qo-next").addEventListener("click", () => {
+        if ((page + 1) * PAGE_SIZE < filtered.length) { page++; render(); }
+      });
+
+      loadCatalog();
+      ```
+      Only one page is in the DOM now, so the submit handler must read from `qty`, not from the inputs: `const lines = [...qty].map(([sku, n]) => ({ sku, qty: String(n) }));`. The HTML needs a search input and prev/next buttons. Move any `.cell` / `.sku` styles to `td` selectors.
+    - **Impact:** E and M on every buyer's device on every page load. In Green Metrics Tool measurements, a 10,000-row table with 14 elements per row was appended to the live DOM one by one. Paginated to 100 rows per page as a plain `<table>` built in a `DocumentFragment`, it used about 56% less CPU energy over 30 page loads.
+verify:
+  static_only: browser DOM code that needs fetch endpoints and page elements

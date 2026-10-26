@@ -1,0 +1,110 @@
+id: gen-2-00297-generation
+category: generation
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    I need a pick queue for our warehouse service. Requirements:
+
+    - Orders come in from the checkout webhook, one at a time.
+    - Express orders must be picked before standard orders. Inside each class it's first come, first served.
+    - Pickers call `next_order()` to get the next order, or `None` when nothing is open.
+    - `cancel(order_id)` for when a customer cancels before picking. A canceled order must never be handed out. Return True/False depending on whether it was still open.
+    - A customer can cancel and then re-order with the same order id (our shop does that on payment retries). The new one goes to the back of its lane.
+    - Adding an order id that is already open should raise.
+    - `len(queue)` = number of open orders, for the dashboard.
+    - In-process only, a single worker thread, so no locking. Python 3.11.
+
+    On Black Friday we had around 300k open orders at peak, so it has to handle that.
+- role: assistant
+  content: |
+    ```python
+    from collections import deque
+    from dataclasses import dataclass
+    from itertools import count
+
+
+    @dataclass(frozen=True)
+    class Order:
+        order_id: str
+        express: bool
+        items: tuple[tuple[str, int], ...] = ()  # (sku, quantity)
+
+
+    class PickQueue:
+        """Express orders before standard ones, FIFO within each class."""
+
+        def __init__(self) -> None:
+            self._express: deque[tuple[int, Order]] = deque()
+            self._standard: deque[tuple[int, Order]] = deque()
+            self._open: dict[str, int] = {}  # order_id -> ticket of its live entry
+            self._tickets = count()
+
+        def add(self, order: Order) -> None:
+            if order.order_id in self._open:
+                raise ValueError(f"order {order.order_id} is already queued")
+            ticket = next(self._tickets)
+            self._open[order.order_id] = ticket
+            lane = self._express if order.express else self._standard
+            lane.append((ticket, order))
+
+        def cancel(self, order_id: str) -> bool:
+            return self._open.pop(order_id, None) is not None
+
+        def next_order(self) -> Order | None:
+            for lane in (self._express, self._standard):
+                while lane:
+                    ticket, order = lane.popleft()
+                    # Skip canceled entries and stale entries of re-added orders.
+                    if self._open.get(order.order_id) == ticket:
+                        del self._open[order.order_id]
+                        return order
+            return None
+
+        def __len__(self) -> int:
+            return len(self._open)
+    ```
+
+    `cancel()` does not search the lanes. It drops the order from `_open`, and `next_order()` skips the dead entry when it reaches the front. The ticket number tells a re-added order apart from its canceled earlier entry, so the old entry can't be handed out by mistake. Canceled entries keep their memory until a picker reaches them.
+
+    **Green Notes**
+    - **Avoid front insertion / removal on lists** (reduces E): each lane is a `deque`, so `append()` and `popleft()` are O(1). A list used as a queue (`pop(0)`, or `insert(0, ...)` to push to the front) shifts every queued order on each call, and that cost grows with the backlog exactly when it is largest. In Green Metrics Tool micro-benchmarks, 1,000,000 × `list.insert(0, x)` used ~1515 J and 1,000,000 × `list.append(x)` used ~1.2 J, over 1000× less.
+verify:
+  test: |-
+    q = PickQueue()
+    q.add(Order("s1", False))
+    q.add(Order("e1", True))
+    q.add(Order("s2", False))
+    q.add(Order("e2", True))
+    assert len(q) == 4
+    assert q.cancel("s1") is True
+    assert q.cancel("s1") is False
+    assert q.cancel("nope") is False
+    assert len(q) == 3
+    q.add(Order("s1", False))  # re-order after cancel goes to the back
+    assert len(q) == 4
+    try:
+        q.add(Order("e1", True))
+        raise AssertionError("duplicate add should raise")
+    except ValueError:
+        pass
+    assert [q.next_order().order_id for _ in range(4)] == ["e1", "e2", "s2", "s1"]
+    assert q.next_order() is None
+    assert len(q) == 0
+
+    q2 = PickQueue()
+    for i in range(200_000):
+        q2.add(Order(str(i), i % 2 == 0))
+    for i in range(0, 200_000, 4):
+        q2.cancel(str(i))
+    assert len(q2) == 150_000
+    out = []
+    while (o := q2.next_order()) is not None:
+        out.append(int(o.order_id))
+    expected = [i for i in range(0, 200_000, 2) if i % 4 != 0] + list(range(1, 200_000, 2))
+    assert out == expected
+    assert len(q2) == 0

@@ -1,0 +1,68 @@
+id: gen-2-00198-no-change
+category: no-change
+language: python
+patterns:
+- async-concurrent-io
+- context-tradeoff
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    Colleague opened a PR that rewrites this with httpx.AsyncClient + asyncio.gather over all batches "for efficiency". Context: nightly job, re-embeds docs changed since the last run (a few hundred up to ~20k texts). TEI runs on the same box, one GPU, started with `--max-concurrent-requests 1`. If it's worth it, just give me the diff.
+
+    ```python
+    import logging
+
+    import numpy as np
+    import requests
+
+    log = logging.getLogger(__name__)
+
+    EMBED_URL = "http://127.0.0.1:8080/embed"
+    EMBED_DIM = 768
+    BATCH_SIZE = 128
+
+
+    def _batches(items, size):
+        for i in range(0, len(items), size):
+            yield items[i:i + size]
+
+
+    def embed_corpus(texts: list[str], session: requests.Session | None = None) -> np.ndarray:
+        session = session or requests.Session()
+        out = []
+        for n, batch in enumerate(_batches(texts, BATCH_SIZE)):
+            resp = session.post(
+                EMBED_URL,
+                json={"inputs": batch, "truncate": True},
+                timeout=120,
+            )
+            resp.raise_for_status()
+            out.append(np.asarray(resp.json(), dtype=np.float32))
+            if n % 50 == 0:
+                done = min((n + 1) * BATCH_SIZE, len(texts))
+                log.info("embedded %d/%d", done, len(texts))
+        vecs = np.vstack(out)
+        assert vecs.shape[1] == EMBED_DIM
+        return vecs
+    ```
+- role: assistant
+  content: |
+    Not worth it. I'd close the PR. There is no async diff to give you.
+
+    - With `--max-concurrent-requests 1` the server processes one batch at a time. `gather` over all batches does not make the GPU work faster. The extra requests wait in a queue or get rejected as overloaded, so you also need retry logic you don't have today.
+    - The cost here is GPU compute per batch. The client's wait is the work itself, not idle network time that async could overlap.
+    - The client is already lean. It sends batches of 128 instead of one request per text, and the `Session` reuses one localhost connection.
+    - Async gains are modest even when there is real waiting to overlap. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async used about 7% less CPU energy and about 17% less wall time. Most of the gain was shorter waiting, which this setup doesn't have.
+
+    One real diff, unrelated to async: on a night with no changed docs, `np.vstack([])` raises `ValueError`.
+
+    ```python
+    def embed_corpus(texts: list[str], session: requests.Session | None = None) -> np.ndarray:
+        if not texts:
+            return np.empty((0, EMBED_DIM), dtype=np.float32)
+        session = session or requests.Session()
+    ```
+verify:
+  static_only: needs a running TEI embedding server on localhost and the requests package

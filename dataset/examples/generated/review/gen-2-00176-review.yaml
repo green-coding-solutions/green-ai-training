@@ -1,0 +1,135 @@
+id: gen-2-00176-review
+category: review
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    ?
+
+    ```bash
+    #!/bin/bash
+    # histogram of ADC values per detector channel
+    # usage: ./hist.sh events.txt [binwidth]
+    # events.txt: "event_id channel adc" per line, comment lines start with #
+
+    infile=$1
+    bw=${2:-50}
+    declare -A counts
+    total=0
+
+    grep -v '^#' $infile | while read line; do
+        ch=$(echo $line | cut -d' ' -f2)
+        adc=$(echo $line | cut -d' ' -f3)
+        bin=$(expr $adc / $bw)
+        key="$ch:$bin"
+        counts[$key]=$(expr ${counts[$key]:-0} + 1)
+        total=$(expr $total + 1)
+    done
+
+    echo "# channel bin_low bin_high count"
+    for key in "${!counts[@]}"; do
+        ch=${key%%:*}
+        bin=${key##*:}
+        lo=$(expr $bin \* $bw)
+        hi=$(expr $lo + $bw)
+        echo "$ch $lo $hi ${counts[$key]}"
+    done | sort -k1,1n -k2,2n
+    echo "# total events: $total"
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (detector data analysis)
+
+    #### [Bug] The histogram is always empty
+    - **Where:** `grep -v '^#' $infile | while read line; do ... done`
+    - **Issue:** the `while` loop sits on the right side of a pipe, so bash runs it in a subshell. `counts` and `total` get filled in that subshell and are lost when the loop ends. The script only ever prints the header and `# total events: 0`.
+    - **Fix:** feed the loop with a redirect, `done < <(grep -v '^#' "$infile")`, or move the counting into awk (below). Also quote `"$infile"`, so paths with spaces work.
+
+    #### [High] Several process starts for every event line
+    - **Where:** the two `$(echo $line | cut ...)` and the two `$(expr ...)` calls inside the loop
+    - **Issue:** every line starts two `echo | cut` pipelines and two `expr` processes, each in its own subshell. Starting those processes costs far more than the counting itself. In Green Metrics Tool micro-benchmarks, a 20,000-line log summary written this way used about 300× more CPU energy than the same loop with builtins only. One `awk` pass used over 1000× less than the subprocess loop.
+    - **Fix:** a single awk pass parses, bins and counts. awk pipes the rows through one `sort` and prints the total after them, so the output format stays the same:
+      ```bash
+      #!/bin/bash
+      # histogram of ADC values per detector channel
+      # usage: ./hist.sh events.txt [binwidth]
+
+      infile=$1
+      bw=${2:-50}
+
+      echo '# channel bin_low bin_high count'
+      awk -v bw="$bw" \
+          -v cmd='sort -k1,1n -k2,2n' \
+          -v label='# total events:' '
+          /^#/ { next }
+          { counts[$2, int($3 / bw)]++; total++ }
+          END {
+              for (key in counts) {
+                  split(key, k, SUBSEP)
+                  lo = k[2] * bw
+                  print k[1], lo, lo + bw, counts[key] | cmd
+              }
+              close(cmd)
+              print label, total + 0
+          }' "$infile"
+      ```
+    - **Impact:** E. The cost grows with every event line. With long event lists, process starts are almost the whole runtime.
+
+    The output matches what your loop prints once the subshell bug is fixed: same rows, same sort order, same total line. If you'd rather keep a bash loop, `while read -r _ ch adc _` with `(( ... ))` arithmetic also removes the per-line processes. The awk pass is still cheaper.
+verify:
+  lang: bash
+  setup: |
+    d="$(mktemp -d)"
+    cd "$d"
+    {
+      echo '# event channel adc'
+      for i in $(seq 1 300); do
+        echo "$i $((i % 4)) $(( (i * 37) % 2000 ))"
+      done
+    } > events.txt
+  original_code: |
+    infile=events.txt
+    bw=50
+    declare -A counts
+    total=0
+    while read line; do
+        ch=$(echo $line | cut -d' ' -f2)
+        adc=$(echo $line | cut -d' ' -f3)
+        bin=$(expr $adc / $bw)
+        key="$ch:$bin"
+        counts[$key]=$(expr ${counts[$key]:-0} + 1)
+        total=$(expr $total + 1)
+    done < <(grep -v '^#' "$infile")
+    echo "# channel bin_low bin_high count"
+    for key in "${!counts[@]}"; do
+        ch=${key%%:*}
+        bin=${key##*:}
+        lo=$(expr $bin \* $bw)
+        hi=$(expr $lo + $bw)
+        echo "$ch $lo $hi ${counts[$key]}"
+    done | sort -k1,1n -k2,2n
+    echo "# total events: $total"
+  green_code: |
+    infile=events.txt
+    bw=50
+    echo '# channel bin_low bin_high count'
+    awk -v bw="$bw" \
+        -v cmd='sort -k1,1n -k2,2n' \
+        -v label='# total events:' '
+        /^#/ { next }
+        { counts[$2, int($3 / bw)]++; total++ }
+        END {
+            for (key in counts) {
+                split(key, k, SUBSEP)
+                lo = k[2] * bw
+                print k[1], lo, lo + bw, counts[key] | cmd
+            }
+            close(cmd)
+            print label, total + 0
+        }' "$infile"
+  equivalence:
+    driver: 'true'

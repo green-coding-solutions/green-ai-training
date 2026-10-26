@@ -1,0 +1,73 @@
+id: gen-2-00220-generation
+category: generation
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    need a bash script that checks users.csv (id,email,role) before we send it to the /api/users bulk import. roles are admin/editor/viewer. print bad lines with line number, exit 1 if any
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # Usage: validate_users.sh users.csv
+    # Checks id,email,role rows before the bulk import. Exits 1 if any line is invalid.
+    set -euo pipefail
+
+    if [[ $# -ne 1 || ! -r $1 ]]; then
+      echo 'usage: validate_users.sh users.csv' >&2
+      exit 2
+    fi
+
+    awk -F',' \
+      -v role_list='admin editor viewer' \
+      -v errout='/dev/stderr' \
+      -v msg_fields='expected 3 fields, got ' \
+      -v msg_id='id is not a number' \
+      -v msg_dup='duplicate id, first seen on line ' \
+      -v msg_email='invalid email' \
+      -v msg_role='unknown role: ' '
+      BEGIN {
+        n = split(role_list, r)
+        for (i = 1; i <= n; i++) roles[r[i]] = 1
+      }
+      { sub(/\r$/, "") }                    # tolerate CRLF exports
+      NR == 1 && $1 ~ /^id$/ { next }       # skip header
+      /^[[:space:]]*$/ { next }             # skip blank lines
+      {
+        err = ""
+        if (NF != 3) {
+          err = msg_fields NF
+        } else if ($1 !~ /^[0-9]+$/) {
+          err = msg_id
+        } else if ($1 in seen) {
+          err = msg_dup seen[$1]
+        } else {
+          seen[$1] = NR
+          if ($2 !~ /^[^@ ]+@[^@ ]+[.][^@ ]+$/) err = msg_email
+          else if (!($3 in roles))             err = msg_role $3
+        }
+        if (err != "") {
+          printf "line %d: %s: %s\n", NR, err, $0
+          bad++
+        }
+      }
+      END {
+        if (bad) {
+          printf "%d invalid line(s)\n", bad > errout
+          exit 1
+        }
+      }
+    ' "$1"
+    ```
+
+    Use it as a gate before the upload: `./validate_users.sh users.csv && <your import call>`. It splits on plain commas, so quoted fields that contain commas are not supported. That is fine for ids, emails and these roles.
+
+    **Green Notes**
+    - **One `awk` pass instead of a per-line shell loop** (reduces E): every row is checked inside a single process. No `cut`, `grep` or `expr` process starts for each line. In Green Metrics Tool micro-benchmarks that summarized a 20,000-line access log, a `while read` loop that ran `$(echo | cut)` and `$(expr)` per field used over 1000× more CPU energy than one `awk` pass with the same output.
+    - **Duplicate ids in an awk array** (reduces E): each lookup is O(1). Running `grep` over the file once per row would make it O(n²) and start one process per row.
+verify:
+  static_only: bash script; the verifier runs only python, javascript and SQL code

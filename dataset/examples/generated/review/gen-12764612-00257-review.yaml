@@ -1,0 +1,111 @@
+id: gen-12764612-00257-review
+category: review
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import re
+
+    MAX_LEN = 16
+    PAD_ID = 0
+    UNK_ID = 1
+
+    # loaded from vocab.txt in production, ~30k entries
+    VOCAB = [
+        "[PAD]", "[UNK]", "order", "refund", "cancel", "my", "where", "is",
+        "the", "package", "delivery", "late", "i", "want", "to", "money",
+        "back", "account", "password", "reset", "charge", "card", "twice",
+        "please", "help",
+    ]
+
+    STOPWORDS = ["the", "a", "an", "is", "to", "of"]
+
+
+    def encode(text):
+        ids = []
+        for tok in re.findall(r"[a-z0-9']+", text.lower()):
+            if tok in STOPWORDS:
+                continue
+            if tok in VOCAB:
+                ids.append(VOCAB.index(tok))
+            else:
+                ids.append(UNK_ID)
+        ids = ids[:MAX_LEN]
+        return ids + [PAD_ID] * (MAX_LEN - len(ids))
+
+
+    def encode_batch(texts):
+        return [encode(t) for t in texts]
+    ```
+- role: assistant
+  content: |
+    **Workload:** AI/ML (inference preprocessing, per request)
+
+    #### [High] Two linear scans of the vocabulary for every token
+    - **Where:** `if tok in VOCAB` and `VOCAB.index(tok)` in `encode`
+    - **Issue:** `VOCAB` is a list. `in` scans it, and for known tokens `.index()` scans it again. With a ~30k vocabulary that is up to ~60k string comparisons per token. Unknown tokens scan the whole list once and then fall back to `UNK_ID`. This runs for every token of every request, before the model even starts.
+    - **Fix:** build a `token -> id` dict once at startup and use one `.get()` per token. A dict looks up in O(1), and it replaces both the check and the id lookup.
+    - **Impact:** reduces E for every request, because the work per token goes from O(vocab size) to O(1). A lookup structure only pays off when you query it many times. In Green Metrics Tool micro-benchmarks, building a set from a 10M-element list for a single lookup used about 50% more CPU energy than one plain scan. Here the dict is built once at import and reused for every token, so it wins.
+
+    ```python
+    import re
+
+    MAX_LEN = 16
+    PAD_ID = 0
+    UNK_ID = 1
+
+    # loaded from vocab.txt in production, ~30k entries
+    VOCAB = [
+        "[PAD]", "[UNK]", "order", "refund", "cancel", "my", "where", "is",
+        "the", "package", "delivery", "late", "i", "want", "to", "money",
+        "back", "account", "password", "reset", "charge", "card", "twice",
+        "please", "help",
+    ]
+
+    # first occurrence wins, same as list.index()
+    TOKEN_TO_ID = {}
+    for i, tok in enumerate(VOCAB):
+        TOKEN_TO_ID.setdefault(tok, i)
+
+    STOPWORDS = ["the", "a", "an", "is", "to", "of"]
+
+
+    def encode(text):
+        ids = []
+        for tok in re.findall(r"[a-z0-9']+", text.lower()):
+            if tok in STOPWORDS:
+                continue
+            ids.append(TOKEN_TO_ID.get(tok, UNK_ID))
+        ids = ids[:MAX_LEN]
+        return ids + [PAD_ID] * (MAX_LEN - len(ids))
+
+
+    def encode_batch(texts):
+        return [encode(t) for t in texts]
+    ```
+
+    The output is identical. Duplicate vocabulary entries still map to their first index.
+
+    **Already good:** `STOPWORDS` has six entries, so a list scan is as cheap as a set lookup and needs no change. Truncating and padding to a fixed `MAX_LEN` keeps batch shapes constant.
+verify:
+  equivalence:
+    driver: |-
+      samples = [
+          "Where is my order?",
+          "I want my money back, please help",
+          "reset my password",
+          "the card was charged twice",
+          "zzz unknown words qqq",
+          "",
+          "order " * 40,
+      ]
+      for row in encode_batch(samples):
+          print(row)
+      print(encode("Cancel the delivery of my package"))

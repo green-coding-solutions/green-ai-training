@@ -1,0 +1,71 @@
+id: gen-1-00287-no-change
+category: no-change
+language: python
+patterns:
+- keep-star-imports
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    We run this release gate in GitLab CI on every push to main, as its own job. I want to make the job lighter on CPU and energy. Requirements: same output and same exit codes, stdlib only, no new dependencies, and it must stay readable for the team. Please optimize it as you see fit. I suspect the `from os.path import *` at the top is a waste.
+
+    ```python
+    #!/usr/bin/env python3
+    """Release gate: check built artifacts before upload."""
+    import sys
+    from os import listdir, environ
+    from os.path import *
+
+    DIST = environ.get("DIST_DIR", "dist")
+    MAX_BYTES = 50 * 1024 * 1024
+
+
+    def read_version():
+        with open(join(dirname(abspath(__file__)), "VERSION")) as f:
+            return f.read().strip()
+
+
+    def main():
+        version = read_version()
+        if not isdir(DIST):
+            print("missing dist dir: " + DIST)
+            return 2
+
+        problems = []
+        wheels = 0
+        for name in sorted(listdir(DIST)):
+            path = join(DIST, name)
+            if not isfile(path):
+                continue
+            if name.endswith(".whl"):
+                wheels += 1
+                if "-" + version + "-" not in name:
+                    problems.append(name + ": version mismatch, expected " + version)
+            if getsize(path) > MAX_BYTES:
+                problems.append(name + ": too large")
+
+        if wheels == 0:
+            problems.append("no wheel found")
+
+        for p in problems:
+            print(p)
+        print("checked %d wheel(s), %d problem(s)" % (wheels, len(problems)))
+        return 1 if problems else 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+- role: assistant
+  content: |
+    This script is already efficient. I would not change it.
+
+    **Green Notes**
+    - **Star import** (no measurable effect): in Green Metrics Tool micro-benchmarks, `from module import *` and `import module` used the same energy, for both a heavy module (sympy) and a built-in one (posix). `os.path` is already loaded when Python starts, so the import costs almost nothing. Switching to `import os.path as osp` or explicit names would only touch readability, so I left it as is.
+    - **Work per run**: one `listdir` and one `getsize` per file, with a single pass over the directory. Nothing runs inside a loop that could be done once, and there are no subprocesses.
+    - **Dependencies**: stdlib only, so the job starts fast and pulls nothing extra.
+
+    If you want to cut energy in this job, look at the job around the script rather than the script. Heavy libraries loaded at startup in short-lived processes are the real cost: in the same micro-benchmarks, a Python start that imported sympy used about 25× the energy of a start that imported only a built-in module. This script imports none, so there is nothing to gain here.
+verify:
+  static_only: The answer keeps the user's code unchanged and contains no code block to run.

@@ -1,0 +1,80 @@
+id: gen-2-00123-generation
+category: generation
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    hello, i need a Dockerfile for our log parser service. it is python 3.12, it read the nginx acces logs from /var/log/nginx (we mount it as volume from the host) and push the metrics to prometheus pushgateway. config file is mounted in /etc/logparse/config.yaml
+
+    structure of repo:
+    ```text
+    logparse/
+      requirements.txt        # pyyaml, prometheus-client, python-dateutil
+      requirements-dev.txt    # pytest, ruff, mypy, ipython
+      src/logparse/__init__.py
+      src/logparse/__main__.py
+      src/logparse/parser.py
+      src/logparse/push.py
+      tests/
+    ```
+
+    we start it with `python -m logparse --config /etc/logparse/config.yaml`. jenkins build the image on every commit and push to our registry, then it run as daemonset on all 40 nodes of the cluster. please dont run as root if posible
+- role: assistant
+  content: |
+    ```dockerfile
+    FROM python:3.12-slim
+
+    ENV PYTHONDONTWRITEBYTECODE=1 \
+        PYTHONUNBUFFERED=1 \
+        PIP_DISABLE_PIP_VERSION_CHECK=1 \
+        PYTHONPATH=/app/src
+
+    RUN useradd --system --no-create-home --uid 10001 logparse
+
+    WORKDIR /app
+
+    # Dependencies first: this layer stays cached while only the code changes
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY src/ ./src/
+
+    USER logparse
+
+    ENTRYPOINT ["python", "-m", "logparse"]
+    CMD ["--config", "/etc/logparse/config.yaml"]
+    ```
+
+    Add a `.dockerignore` so tests and local files stay out of the build context:
+
+    ```text
+    .git
+    tests/
+    **/__pycache__
+    .venv
+    .mypy_cache
+    .pytest_cache
+    .ruff_cache
+    requirements-dev.txt
+    ```
+
+    The container runs as the unprivileged user `logparse` (uid 10001). Nginx access logs are often `root:adm` with mode `0640`. If so, the user can't read them. Don't switch back to root. Give the pod the `adm` group (gid 4) in the DaemonSet instead:
+
+    ```yaml
+    securityContext:
+      runAsUser: 10001
+      runAsNonRoot: true
+      supplementalGroups: [4]
+    ```
+
+    **Green Notes**
+    - **Small container image** (reduces E, network, storage): slim base, only the runtime packages from `requirements.txt`, no compilers or dev tools. `pytest`, `ruff` and `mypy` belong in a separate Jenkins step, not in the shipped image. In Green Metrics Tool measurements of a small Flask app, building a full `python:3.12` image with build tools and dev packages used ~885 J. The slim image with runtime dependencies only, the dependency layer first and `pip --no-cache-dir` used ~124 J, about 7× less. Serving requests cost the same with both images. Here you build on every commit, and each new image is pulled by 40 nodes, so the smaller image saves something every time.
+    - **Dependency layer before source** (reduces E): most commits only touch `src/`, so Docker reuses the cached `pip install` layer and doesn't install the packages again.
+    - **`pip --no-cache-dir`** (reduces storage, network): the pip download cache doesn't end up in the image, so every node pulls fewer bytes.
+    - *Not applied:* multi-stage build. All three dependencies install from prebuilt wheels with no compile step, so a second stage would only add complexity.
+verify:
+  static_only: Dockerfile, needs Docker and the project sources to build

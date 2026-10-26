@@ -1,0 +1,238 @@
+id: gen-2-00069-review
+category: review
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    We maintain `pkgctl`, a CLI for publishing packages to our internal registry. For every PR we spin up a "playground" on our shared k8s cluster. Reviewers build the CLI from the branch and test it against that PR's registry backend.
+
+    Requirements:
+    - reviewers must be able to run `pkgctl login`, `publish` and `yank` against the PR backend
+    - every PR is isolated (own namespace)
+    - internal repo only, no fork PRs
+    - the platform team asked us to cut what we use on the shared cluster
+
+    Can you review the workflow? Correctness first, then anything we can trim.
+
+    ```yaml
+    name: pr-playground
+
+    on:
+      pull_request:
+        types: [opened, synchronize, reopened]
+
+    permissions:
+      contents: read
+      packages: write
+      pull-requests: write
+
+    jobs:
+      deploy:
+        runs-on: ubuntu-latest
+        env:
+          NAMESPACE: pkgctl-pr-${{ github.head_ref }}
+          REGISTRY_DB_PASSWORD: pkgctl-dev-2024
+        steps:
+          - uses: actions/checkout@v4
+
+          - uses: docker/login-action@v3
+            with:
+              registry: ghcr.io
+              username: ${{ github.actor }}
+              password: ${{ secrets.GITHUB_TOKEN }}
+
+          - name: Build backend image
+            run: |
+              docker build -t ghcr.io/acme/pkgctl-registry:pr-${{ github.event.number }} ./server
+              docker push ghcr.io/acme/pkgctl-registry:pr-${{ github.event.number }}
+
+          - uses: azure/setup-kubectl@v4
+          - uses: azure/setup-helm@v4
+
+          - name: Configure kubeconfig
+            run: |
+              mkdir -p ~/.kube
+              echo "${{ secrets.KUBECONFIG_PLAYGROUND }}" > ~/.kube/config
+
+          - name: Deploy playground
+            run: |
+              kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+              helm upgrade --install playground ./deploy/chart \
+                --namespace "$NAMESPACE" \
+                --set image.tag=pr-${{ github.event.number }} \
+                --set ingress.host=pr-${{ github.event.number }}.playground.acme.internal \
+                --set api.replicas=3 \
+                --set worker.enabled=true \
+                --set redis.enabled=true \
+                --set minio.enabled=true \
+                --set postgres.enabled=true \
+                --set postgres.password="$REGISTRY_DB_PASSWORD"
+
+          - name: Comment URL
+            uses: actions/github-script@v7
+            with:
+              script: |
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body: `Playground: https://pr-${context.issue.number}.playground.acme.internal`
+                });
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (per-PR preview environments in CI)
+
+    #### [Bug] Namespace name breaks for most branch names
+    - **Where:** `NAMESPACE: pkgctl-pr-${{ github.head_ref }}`
+    - **Issue:** namespace names must be lowercase DNS labels of at most 63 characters. `feature/oauth-login` or `Fix-Yank` makes `kubectl create namespace` fail. The image tag and URL already use the PR number, so the namespace is also the only thing that doesn't match them.
+    - **Fix:** `NAMESPACE: pkgctl-pr-${{ github.event.number }}`
+
+    #### [Bug] Two quick pushes run `helm upgrade` at the same time
+    - **Where:** no `concurrency` on the workflow
+    - **Issue:** the second run fails with "another operation is in progress", or the older commit finishes last and wins.
+    - **Fix:** one concurrency group per PR. Use `cancel-in-progress: false`, because cancelling a running `helm upgrade` can leave the release stuck in `pending-upgrade`.
+
+    #### [Security] Database password committed to the repo
+    - **Where:** `REGISTRY_DB_PASSWORD: pkgctl-dev-2024`
+    - **Issue:** everyone with read access sees it, and it is the same in every playground.
+    - **Fix:** store it as a repository secret: `REGISTRY_DB_PASSWORD: ${{ secrets.PLAYGROUND_DB_PASSWORD }}`. Better still, let the chart generate a random password per release.
+
+    #### [High] Playgrounds are never torn down
+    - **Where:** `types: [opened, synchronize, reopened]`, with no `closed` handling
+    - **Issue:** every PR ever opened leaves a full stack running on the shared cluster until someone deletes it by hand. Running hours are the real cost here: an environment that doesn't exist uses nothing.
+    - **Fix:** add `closed` to the trigger types, skip the deploy job on `closed`, and add a teardown job that deletes the namespace (see the full workflow below). It also covers PRs closed without merging.
+    - **Impact:** E and M. Removes all hours after the PR is merged or closed. Frees reserved memory and nodes for other teams.
+
+    #### [Medium] Open playgrounds run all night and weekend
+    - **Where:** whole environment
+    - **Issue:** reviewers only use a playground during working hours, but it runs 24/7 while the PR is open.
+    - **Fix:** a scheduled workflow that scales every playground to zero in the evening, and a matching morning job that scales back to `--replicas=1`. PVCs stay, so Postgres and MinIO data survive.
+      ```yaml
+      name: playground-night
+
+      on:
+        schedule:
+          - cron: '0 19 * * 1-5'   # Friday evening also covers the weekend
+
+      jobs:
+        scale-down:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: azure/setup-kubectl@v4
+
+            - name: Configure kubeconfig
+              run: |
+                mkdir -p ~/.kube
+                echo "${{ secrets.KUBECONFIG_PLAYGROUND }}" > ~/.kube/config
+
+            - name: Scale playgrounds to zero
+              run: |
+                for ns in $(kubectl get ns -o name | grep '^namespace/pkgctl-pr-' | cut -d/ -f2); do
+                  kubectl scale deployment,statefulset --all --replicas=0 -n "$ns"
+                done
+      ```
+    - **Impact:** E and M. Removes most of the remaining hours.
+
+    #### [Low] More services than a one-reviewer playground needs
+    - **Where:** `api.replicas=3`, `worker.enabled`, `redis.enabled`
+    - **Issue:** one reviewer doesn't need 3 API replicas. Keep Postgres and MinIO, because `publish` needs storage. Check if `login`/`publish`/`yank` work without the worker and Redis, and turn them off if they do.
+    - **Fix:** `--set api.replicas=1`, and disable worker and Redis if they are not needed.
+    - **Impact:** mainly M, because fewer pods reserve less memory on the shared cluster. Idle CPU energy changes little. In Green Metrics Tool measurements of a preview environment idling for 60 seconds, 3 app replicas with Postgres, Redis and a polling worker used ~269 J CPU energy. 1 replica with Postgres used ~262 J, about 3% less. Machine energy differed by less than 1%. Teardown and the night schedule matter far more than trimming.
+
+    ```yaml
+    name: pr-playground
+
+    on:
+      pull_request:
+        types: [opened, synchronize, reopened, closed]
+
+    permissions:
+      contents: read
+      packages: write
+      pull-requests: write
+
+    concurrency:
+      group: playground-${{ github.event.number }}
+      cancel-in-progress: false
+
+    env:
+      NAMESPACE: pkgctl-pr-${{ github.event.number }}
+
+    jobs:
+      deploy:
+        if: github.event.action != 'closed'
+        runs-on: ubuntu-latest
+        env:
+          REGISTRY_DB_PASSWORD: ${{ secrets.PLAYGROUND_DB_PASSWORD }}
+        steps:
+          - uses: actions/checkout@v4
+
+          - uses: docker/login-action@v3
+            with:
+              registry: ghcr.io
+              username: ${{ github.actor }}
+              password: ${{ secrets.GITHUB_TOKEN }}
+
+          - name: Build backend image
+            run: |
+              docker build -t ghcr.io/acme/pkgctl-registry:pr-${{ github.event.number }} ./server
+              docker push ghcr.io/acme/pkgctl-registry:pr-${{ github.event.number }}
+
+          - uses: azure/setup-kubectl@v4
+          - uses: azure/setup-helm@v4
+
+          - name: Configure kubeconfig
+            run: |
+              mkdir -p ~/.kube
+              echo "${{ secrets.KUBECONFIG_PLAYGROUND }}" > ~/.kube/config
+
+          - name: Deploy playground
+            run: |
+              kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+              helm upgrade --install playground ./deploy/chart \
+                --namespace "$NAMESPACE" \
+                --set image.tag=pr-${{ github.event.number }} \
+                --set ingress.host=pr-${{ github.event.number }}.playground.acme.internal \
+                --set api.replicas=1 \
+                --set worker.enabled=true \
+                --set redis.enabled=true \
+                --set minio.enabled=true \
+                --set postgres.enabled=true \
+                --set postgres.password="$REGISTRY_DB_PASSWORD"
+
+          - name: Comment URL
+            uses: actions/github-script@v7
+            with:
+              script: |
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body: `Playground: https://pr-${context.issue.number}.playground.acme.internal`
+                });
+
+      teardown:
+        if: github.event.action == 'closed'
+        runs-on: ubuntu-latest
+        steps:
+          - uses: azure/setup-kubectl@v4
+
+          - name: Configure kubeconfig
+            run: |
+              mkdir -p ~/.kube
+              echo "${{ secrets.KUBECONFIG_PLAYGROUND }}" > ~/.kube/config
+
+          - name: Delete playground
+            run: kubectl delete namespace "$NAMESPACE" --ignore-not-found --wait=false
+    ```
+
+    Worker and Redis are still on in this version. Set them to `false` once you have confirmed the CLI commands work without them. For PRs that are already closed, delete their `pkgctl-pr-*` namespaces once by hand.
+
+    **Already good:** one namespace per PR, an image tag per PR number, idempotent namespace creation, minimal `permissions`.
+verify:
+  static_only: GitHub Actions workflow that needs a runner, registry and Kubernetes cluster

@@ -1,0 +1,145 @@
+id: gen-2-00379-review
+category: review
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    Can you review our Matrix Market exporter? We dump the assembled stiffness matrices from our FE code so we can compare them against the reference solver and load them in MATLAB. Requirements:
+
+    - output must stay byte-identical, CI diffs the files against stored reference `.mtx` files
+    - stdlib only, it runs on cluster nodes where we can't install scipy
+    - `to_matrix_market` must keep returning a `str`, a notebook uses it directly
+    - the 3D cases have 3-8 million nonzeros and the export alone takes minutes, the coarse 2D cases are fine
+
+    ```python
+    """Export assembled stiffness matrices to Matrix Market for comparison with the reference solver."""
+    import os
+
+    MM_HEADER = "%%MatrixMarket matrix coordinate real {sym}\n"
+
+
+    def coo_from_dict(acc):
+        """acc: {(row, col): value} from the assembly loop. Sorted for stable output."""
+        return [(i, j, v) for (i, j), v in sorted(acc.items())]
+
+
+    def to_matrix_market(entries, shape, comment="", symmetric=False):
+        """entries: iterable of (row, col, value), 0-based. shape: (nrows, ncols)."""
+        nrows, ncols = shape
+        sym = "symmetric" if symmetric else "general"
+        out = MM_HEADER.format(sym=sym)
+        for line in comment.splitlines():
+            out += "% " + line + "\n"
+        out += f"{nrows} {ncols} {len(entries)}\n"
+        for i, j, v in entries:
+            if v == 0.0:
+                continue
+            if symmetric and j > i:
+                continue  # symmetric files store the lower triangle only
+            out += f"{i + 1} {j + 1} {v:.17g}\n"
+        return out
+
+
+    def write_mtx(path, entries, shape, comment="", symmetric=False):
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(to_matrix_market(entries, shape, comment, symmetric))
+        os.replace(tmp, path)
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (solver output export)
+
+    #### [Bug] Header entry count includes skipped entries
+    - **Where:** `out += f"{nrows} {ncols} {len(entries)}\n"`
+    - **Issue:** the count is taken before the loop drops zero values and, in symmetric mode, upper-triangle entries. The file then announces more entries than it contains, and Matrix Market readers either fail or misread it. `len(entries)` also raises `TypeError` if someone passes a generator, although the docstring says "iterable".
+    - **Fix:** build the entry lines first and write `len(body)` in the header (see code below).
+    - **Impact:** correctness. Files where nothing is skipped stay byte-identical. Files that had zeros or upper-triangle entries get a different header, but those files were invalid before. Regenerate those reference files.
+
+    #### [High] String built with `+=` over millions of entries
+    - **Where:** `out += f"{i + 1} {j + 1} {v:.17g}\n"` in the entry loop
+    - **Issue:** every `+=` can copy the whole string built so far, so the cost grows much faster than the entry count. Using an f-string does not help: it is still `+=` in a loop. This is why the 3D cases take minutes and the 2D ones don't.
+    - **Fix:** collect the lines in a list and call `"".join()` once. The function still returns a `str`, and the bytes are the same.
+    - **Impact:** E, large on the 3D cases. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces used ~469 J with `+=` and ~1.8 J with `"".join()`, roughly 260× less CPU energy. f-string concatenation in a loop behaved like `+=` (~455 J).
+
+    **Already good:** `os.replace` after writing to a temp file, so a crash never leaves a half-written `.mtx`. Sorted COO output keeps the CI diffs stable. The float format round-trips exactly.
+
+    ```python
+    """Export assembled stiffness matrices to Matrix Market for comparison with the reference solver."""
+    import os
+
+    MM_HEADER = "%%MatrixMarket matrix coordinate real {sym}\n"
+
+
+    def coo_from_dict(acc):
+        """acc: {(row, col): value} from the assembly loop. Sorted for stable output."""
+        return [(i, j, v) for (i, j), v in sorted(acc.items())]
+
+
+    def to_matrix_market(entries, shape, comment="", symmetric=False):
+        """entries: iterable of (row, col, value), 0-based. shape: (nrows, ncols)."""
+        nrows, ncols = shape
+        sym = "symmetric" if symmetric else "general"
+        # symmetric files store the lower triangle only
+        body = [
+            f"{i + 1} {j + 1} {v:.17g}\n"
+            for i, j, v in entries
+            if v != 0.0 and not (symmetric and j > i)
+        ]
+        parts = [MM_HEADER.format(sym=sym)]
+        parts.extend("% " + line + "\n" for line in comment.splitlines())
+        parts.append(f"{nrows} {ncols} {len(body)}\n")
+        parts.extend(body)
+        return "".join(parts)
+
+
+    def write_mtx(path, entries, shape, comment="", symmetric=False):
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(to_matrix_market(entries, shape, comment, symmetric))
+        os.replace(tmp, path)
+    ```
+verify:
+  test: |
+    s = to_matrix_market([(0, 0, 1.0), (0, 1, 0.0), (1, 0, 2.5)], (2, 2))
+    lines = s.splitlines()
+    assert lines[0] == "%%MatrixMarket matrix coordinate real general"
+    assert lines[1] == "2 2 2"
+    assert lines[2] == "1 1 1"
+    assert lines[3] == "2 1 2.5"
+    assert len(lines) == 4
+    g = to_matrix_market(((i, i, 1.0) for i in range(3)), (3, 3), comment="a\nb", symmetric=True)
+    gl = g.splitlines()
+    assert gl[0] == "%%MatrixMarket matrix coordinate real symmetric"
+    assert gl[1] == "% a" and gl[2] == "% b"
+    assert gl[3] == "3 3 3"
+    assert len(gl) == 7
+    u = to_matrix_market([(0, 0, 4.0), (0, 1, 1.0), (1, 0, 1.0), (1, 1, 4.0)], (2, 2), symmetric=True)
+    assert u.splitlines()[1] == "2 2 3"
+    import os, tempfile
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "k.mtx")
+    write_mtx(p, [(0, 0, 1.5)], (1, 1), comment="x")
+    with open(p) as f:
+        assert f.read() == to_matrix_market([(0, 0, 1.5)], (1, 1), comment="x")
+    assert not os.path.exists(p + ".tmp")
+  equivalence:
+    driver: |-
+      import hashlib
+      acc = {}
+      for k in range(20000):
+          i = (k * 7919) % 3000
+          j = (k * 104729) % 3000
+          acc[(i, j)] = ((k % 97) + 1) * 0.125 - 0.0625 * (k % 5) + 1e-3
+      entries = coo_from_dict(acc)
+      general = to_matrix_market(entries, (3000, 3000), comment="run 42\nmesh blade_coarse")
+      lower = [(i, j, v) for i, j, v in entries if j <= i]
+      sym = to_matrix_market(lower, (3000, 3000), comment="sym case", symmetric=True)
+      for s in (general, sym):
+          print(hashlib.sha256(s.encode()).hexdigest())
+          print("\n".join(s.splitlines()[:5]))
+          print(len(s))

@@ -1,0 +1,54 @@
+id: gen-12764612-00111-conceptual
+category: conceptual
+language: text
+patterns:
+- avoid-exception-flow
+- context-tradeoff
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    We are writing a coding guideline for our Python REST backend (FastAPI, about 15 developers). One open point is lookups in dicts: API key -> tenant, feature flag name -> config, route alias -> handler, and so on. Some people want "EAFP everywhere, use try/except KeyError". Others want "always use .get() or `in`".
+
+    I want a rule we can put in the guideline that is short, based on what is actually more efficient, and says when each style is OK. Requirements: it must cover the case where most keys are missing and the case where almost all keys exist, and it must not make the code less correct. What would you write?
+- role: assistant
+  content: |
+    Make the rule depend on how often the key is missing. Efficiency is only a secondary reason, and correctness comes first.
+
+    **What was measured**
+
+    In Green Metrics Tool micro-benchmarks, 10,000,000 dict lookups where about half of the keys were missing used ~67 J with `dict.get(key, default)` and ~76 J with `try/except KeyError`. That is about 12% less with `get`. An `if key in d` check performed like `get`.
+
+    The cost is in raising and catching the exception, not in the `try` block. When misses are rare, `try/except` is cheap.
+
+    **Suggested guideline text**
+
+    1. **Misses are normal or common** (unknown API keys, optional feature flags, optional headers): use `.get()` or `in`. Do not use exceptions for expected control flow.
+    2. **Misses are rare and a miss means an error** (a required config key, an internal id that must exist): `try/except KeyError` is fine, and often reads better.
+    3. **Keep the `try` body to the lookup only.** A wide `try` can catch a `KeyError` from somewhere else and hide a bug.
+
+       ```python
+       try:
+           tenant = TENANTS[api_key]
+       except KeyError:
+           raise HTTPException(status_code=401) from None
+       ```
+
+    4. **Use `get` with care when `None` is a valid stored value.** `d.get(k)` cannot tell "missing" from "stored `None`". Use a sentinel in that case:
+
+       ```python
+       _MISSING = object()
+
+       value = flags.get(name, _MISSING)
+       if value is _MISSING:
+           ...
+       ```
+
+    5. **Do not rewrite working code for this alone.** The benchmark measured a tight loop of lookups. In a request handler, the database call, serialization and network time are far larger than one dict miss. The gain is real only on hot paths with many misses, such as per-request auth or per-row enrichment.
+
+    **Not a green rule:** `get` vs `in` vs `try/except` for rare misses. Pick the one that reads best.
+
+    To check a specific hot path, profile it with realistic traffic and compare CPU time (`perf stat` or `time`) with both versions.
+verify:
+  static_only: conceptual answer

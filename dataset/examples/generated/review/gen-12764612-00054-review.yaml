@@ -1,0 +1,98 @@
+id: gen-12764612-00054-review
+category: review
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    Please review the Dockerfile for our invoice-export service (Python 3.12, Django + gunicorn, talks to Postgres). Some context so you can judge it properly:
+
+    - GitLab CI builds and pushes this image on every push to every branch, roughly 40-60 pipelines a day
+    - Production runs the same image on 4 nodes
+    - We do not compile anything ourselves, all dependencies are on PyPI with wheels (Django, psycopg[binary], gunicorn, reportlab)
+    - The app listens on port 8000
+    - We want to keep builds reproducible and keep the image safe to run
+
+    ```dockerfile
+    FROM python:3.12
+
+    RUN apt-get update && apt-get install -y \
+        build-essential \
+        git \
+        curl \
+        vim \
+        libpq-dev
+
+    WORKDIR /app
+
+    COPY . /app
+
+    RUN pip install -r requirements.txt
+    RUN pip install pytest black mypy ipython
+
+    ENV DJANGO_SETTINGS_MODULE=invoices.settings.prod
+    ENV PYTHONUNBUFFERED=1
+
+    EXPOSE 8000
+
+    CMD ["gunicorn", "invoices.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "3"]
+    ```
+
+    Our requirements.txt has pinned versions, and dev tools are listed in requirements-dev.txt (not used in the image build, as far as I know).
+- role: assistant
+  content: |
+    **Workload:** cloud backend (container built in CI on every push, run on 4 nodes)
+
+    #### [Security] Container runs as root
+    - **Where:** no `USER` instruction
+    - **Issue:** gunicorn runs as root. If the app is compromised, the attacker has root inside the container.
+    - **Fix:** create a non-root user and switch to it before `CMD` (see the full Dockerfile below).
+
+    #### [High] Source copied before dependencies are installed
+    - **Where:** `COPY . /app` before `RUN pip install -r requirements.txt`
+    - **Issue:** any change to any file invalidates the install layer. With 40-60 pipelines a day, every push downloads and installs all packages again.
+    - **Fix:** copy only `requirements.txt` first, install, then copy the source.
+    - **Impact:** E on every build. The install layer is now rebuilt only when `requirements.txt` changes.
+
+    #### [High] Full base image plus compilers and dev tools in the runtime image
+    - **Where:** `FROM python:3.12`, the `apt-get install` list, `pip install pytest black mypy ipython`
+    - **Issue:** you said all dependencies have wheels, so `build-essential`, `git`, `curl`, `vim` and `libpq-dev` are not needed. `psycopg[binary]` brings its own libpq. The dev tools are installed in the production image, even though they are not needed at runtime. The apt lists and pip cache also stay in the layers.
+    - **Fix:** use `python:3.12-slim`, install only `requirements.txt`, and use `--no-cache-dir`. In Green Metrics Tool micro-benchmarks, a comparable change for a small Flask app (slim base, runtime dependencies only, dependency layer before the source) made the image build use about 7× less energy. Serving requests afterwards cost the same, so the saving comes from every build, push, pull and stored copy. Your CI and 4 nodes repeat all of these.
+    - **Impact:** E, storage and network for every build, push and pull.
+
+    #### [Low] Process manager and reproducibility details
+    - **Where:** `ENV PYTHONUNBUFFERED=1`, missing `PYTHONDONTWRITEBYTECODE`
+    - **Issue:** `.pyc` files written at runtime are lost anyway. Compile once at build time or skip them. Also, add a `.dockerignore` (`.git`, `__pycache__`, `*.md`, `tests/`, `requirements-dev.txt`), so `COPY . .` does not send them into the build context and the image.
+
+    **Suggested Dockerfile**
+
+    ```dockerfile
+    FROM python:3.12-slim
+
+    ENV PYTHONUNBUFFERED=1 \
+        PYTHONDONTWRITEBYTECODE=1 \
+        DJANGO_SETTINGS_MODULE=invoices.settings.prod
+
+    WORKDIR /app
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY . .
+
+    RUN useradd --system --no-create-home app
+    USER app
+
+    EXPOSE 8000
+
+    CMD ["gunicorn", "invoices.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "3"]
+    ```
+
+    Run tests and linters in a separate CI job or a separate `dev` stage that installs `requirements-dev.txt`, so they never ship in the image you deploy.
+
+    **Already good:** pinned versions in `requirements.txt`, exec-form `CMD`, and `PYTHONUNBUFFERED=1` for logs.
+verify:
+  static_only: Dockerfile review, no executable code

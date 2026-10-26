@@ -1,0 +1,99 @@
+id: gen-2-00112-generation
+category: generation
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    ```python
+    #!/usr/bin/env python3
+    """bindump - small xxd-style dump for the firmware blobs we pull off field units."""
+    import argparse
+    import sys
+
+
+    def format_dump(data: bytes, width: int = 16, offset: int = 0) -> str:
+        """Return the whole dump as one string, one line per `width` bytes, e.g.
+
+        00000000: 7f45 4c46 0201 0100 0000 0000 0000 0000  .ELF............
+
+        - offset: 8 hex digits, starts at `offset`
+        - hex in groups of 2 bytes, last line padded so the ascii column lines up
+        - ascii column: printable 0x20-0x7e as is, everything else '.'
+        - empty input -> empty string
+        """
+        # TODO
+        ...
+
+
+    def main() -> int:
+        ap = argparse.ArgumentParser(description=__doc__)
+        ap.add_argument("file")
+        ap.add_argument("-w", "--width", type=int, default=16)
+        ap.add_argument("-s", "--skip", type=lambda s: int(s, 0), default=0,
+                        help="start offset, e.g. 0x400")
+        args = ap.parse_args()
+        with open(args.file, "rb") as f:
+            f.seek(args.skip)
+            data = f.read()
+        sys.stdout.write(format_dump(data, args.width, args.skip))
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+
+    ?
+- role: assistant
+  content: |
+    Here is the `format_dump` body. The rest of your script stays as it is.
+
+    ```python
+    # Translation table: printable ASCII stays, every other byte becomes "."
+    _ASCII_COLUMN = bytes(b if 0x20 <= b < 0x7F else 0x2E for b in range(256))
+
+
+    def format_dump(data: bytes, width: int = 16, offset: int = 0) -> str:
+        """Return the whole dump as one string, one line per `width` bytes."""
+        if width < 1:
+            raise ValueError("width must be at least 1")
+        # Width of a full hex column: 2 chars per byte plus one space between 2-byte groups.
+        hex_width = width * 2 + (width + 1) // 2 - 1
+        lines = []
+        for start in range(0, len(data), width):
+            chunk = data[start:start + width]
+            hex_part = chunk.hex(" ", -2)  # group 2 bytes, counted from the left
+            ascii_part = chunk.translate(_ASCII_COLUMN).decode("ascii")
+            lines.append(f"{offset + start:08x}: {hex_part:<{hex_width}}  {ascii_part}")
+        if not lines:
+            return ""
+        return "\n".join(lines) + "\n"
+    ```
+
+    `hex(" ", -2)` counts groups from the left. A short last line like `6162 63` therefore keeps the same grouping as `xxd`. The hex part is then padded, so the ascii column lines up.
+
+    **Green Notes**
+    - **Collect lines, then one `"\n".join()`** (reduces E): firmware blobs give many lines. Appending each one to the dump with `+=` copies the growing string again and again. `join` builds the result in one pass. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces with `"".join()` used about 260× less CPU energy than `+=`.
+    - The f-string only formats one short line. It is never appended to the full dump. f-string concatenation onto an accumulator in a loop behaved like `+=` in the same benchmarks.
+verify:
+  test: |-
+    elf = b"\x7fELF\x02\x01\x01\x00" + bytes(8)
+    assert format_dump(elf) == "00000000: 7f45 4c46 0201 0100 0000 0000 0000 0000  .ELF............\n"
+    assert format_dump(b"") == ""
+    assert format_dump(b"abc") == "00000000: " + "6162 63".ljust(39) + "  abc\n"
+    out = format_dump(b"A" * 20, offset=0x100)
+    lines = out.split("\n")
+    assert lines[0] == "00000100: 4141 4141 4141 4141 4141 4141 4141 4141  AAAAAAAAAAAAAAAA"
+    assert lines[1] == "00000110: " + "4141 4141".ljust(39) + "  AAAA"
+    assert lines[2] == ""
+    assert format_dump(b"\x00\x1f\x20\x7e\x7f\xff", width=8) == "00000000: " + "001f 207e 7fff".ljust(19) + "  .. ~..\n"
+    assert format_dump(b"xyz", width=3) == "00000000: 7879 7a  xyz\n"
+    try:
+        format_dump(b"a", width=0)
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass

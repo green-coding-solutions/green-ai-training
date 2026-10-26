@@ -1,0 +1,157 @@
+id: gen-2-00092-multi-turn
+category: multi-turn
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    add compression to this. /v1/embed returns huge json (float arrays)
+
+    ```nginx
+    upstream embed_api {
+        server 127.0.0.1:8000;
+        keepalive 32;
+    }
+
+    server {
+        listen 443 ssl;
+        server_name infer.example.com;
+
+        ssl_certificate     /etc/nginx/tls/infer.crt;
+        ssl_certificate_key /etc/nginx/tls/infer.key;
+
+        client_max_body_size 20m;
+
+        location /v1/ {
+            proxy_pass http://embed_api;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Host $host;
+            proxy_set_header X-Request-Id $request_id;
+            proxy_read_timeout 120s;
+        }
+
+        location /playground/ {
+            root /srv;
+            try_files $uri $uri/ /playground/index.html;
+        }
+
+        location = /healthz {
+            access_log off;
+            return 200 "ok\n";
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    ```nginx
+    upstream embed_api {
+        server 127.0.0.1:8000;
+        keepalive 32;
+    }
+
+    server {
+        listen 443 ssl;
+        server_name infer.example.com;
+
+        ssl_certificate     /etc/nginx/tls/infer.crt;
+        ssl_certificate_key /etc/nginx/tls/infer.key;
+
+        client_max_body_size 20m;
+
+        # Dynamic API responses: compressed per request, moderate level
+        gzip on;
+        gzip_comp_level 5;
+        gzip_min_length 1024;
+        gzip_proxied any;      # also compress when requests arrive via a load balancer
+        gzip_vary on;
+        gzip_types application/json;
+
+        location /v1/ {
+            proxy_pass http://embed_api;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Host $host;
+            proxy_set_header X-Request-Id $request_id;
+            proxy_read_timeout 120s;
+        }
+
+        location /playground/ {
+            root /srv;
+            gzip_static on;    # serve the .gz files created at build time
+            try_files $uri $uri/ /playground/index.html;
+        }
+
+        location = /healthz {
+            access_log off;
+            return 200 "ok\n";
+        }
+    }
+    ```
+
+    Add this to the playground build, after the files are copied to `/srv/playground`:
+
+    ```bash
+    find /srv/playground -type f \( -name '*.html' -o -name '*.js' -o -name '*.css' -o -name '*.json' -o -name '*.svg' \) \
+        -exec gzip -k -9 -f {} +
+    ```
+
+    **Green Notes**
+    - **Precompress static assets** (reduces E): the playground files are compressed once per build, and `gzip_static` sends the `.gz` file. In Green Metrics Tool benchmarks with nginx serving 2,000 requests for text assets, compressing on every request cost about 4× the CPU energy of serving precompressed files. The highest level is fine here because it runs once per build.
+    - **Per-request gzip only for the dynamic JSON** (reduces network): embedding responses can't be precompressed, so they get on-the-fly gzip at level 5 to keep CPU per request moderate. In the same benchmark, compression sent about 10× fewer bytes for text assets.
+    - `gzip_vary` adds `Vary: Accept-Encoding`, so caches keep the compressed and uncompressed versions apart.
+- role: user
+  content: |
+    the /v1 clients are our batch jobs, same k8s cluster. only playground is public
+- role: assistant
+  content: |
+    Then drop compression for `/v1/`. Inside the cluster the bytes cost almost nothing to move. Gzip costs CPU in nginx, and again in every client that decompresses. The same benchmark ran on a local network, and there per-request gzip cost about 7× the CPU energy of sending the files uncompressed.
+
+    Remove the server-level `gzip` block and keep compression on the playground only:
+
+    ```nginx
+        location /v1/ {
+            proxy_pass http://embed_api;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Host $host;
+            proxy_set_header X-Request-Id $request_id;
+            proxy_read_timeout 120s;
+        }
+
+        location /playground/ {
+            root /srv;
+            gzip_static on;
+            gzip_proxied any;
+            gzip_vary on;
+            try_files $uri $uri/ /playground/index.html;
+        }
+    ```
+
+    `gzip` is off by default, so `/v1/` now goes out uncompressed, even when a client sends `Accept-Encoding: gzip`. Python's `requests` sends that header by default. One case to check: if the public playground calls `/v1/` from the browser, those responses do cross a real network, so they would need `gzip on` back.
+- role: user
+  content: |
+    ci cant do the gzip step. just compress playground on the fly
+- role: assistant
+  content: |
+    Sure. Replace the playground location with this:
+
+    ```nginx
+        location /playground/ {
+            root /srv;
+            gzip on;
+            gzip_comp_level 5;
+            gzip_min_length 1024;
+            gzip_proxied any;
+            gzip_vary on;
+            gzip_types text/css application/javascript application/json image/svg+xml;
+            try_files $uri $uri/ /playground/index.html;
+        }
+    ```
+
+    `text/html` is always compressed when `gzip` is on, so it isn't listed. Level 5 keeps the CPU cost per request moderate. If CI gets a build step later, switching back to `gzip_static on` with the `gzip -k` line is the only change you'd need.
+verify:
+  static_only: nginx configuration, needs a running nginx server to test

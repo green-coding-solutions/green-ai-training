@@ -1,0 +1,55 @@
+id: gen-1-00263-refactor
+category: refactor
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    ```dockerfile
+    FROM python:3.12
+
+    ENV PYTHONUNBUFFERED=1
+
+    RUN apt-get update && apt-get install -y build-essential git curl vim htop
+
+    WORKDIR /app
+    COPY . .
+
+    RUN pip install -r requirements.txt
+    RUN pip install pytest black mypy ipython
+
+    EXPOSE 8000
+    CMD ["gunicorn", "-b", "0.0.0.0:8000", "-w", "3", "orders.wsgi:application"]
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```dockerfile
+    FROM python:3.12-slim
+
+    ENV PYTHONUNBUFFERED=1
+
+    WORKDIR /app
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY . .
+
+    EXPOSE 8000
+    CMD ["gunicorn", "-b", "0.0.0.0:8000", "-w", "3", "orders.wsgi:application"]
+    ```
+
+    **Green Notes**
+    - **Slim base image** (reduces E and M): `python:3.12-slim` replaces the full image. Compilers, git, curl, vim and htop are not needed to run gunicorn, so they are gone from every build, pull and stored copy.
+    - **Runtime dependencies only** (reduces E and M): `pytest`, `black`, `mypy` and `ipython` are removed. Run tests and linters in a separate CI step, not in the image you ship.
+    - **Dependency layer before the source** (reduces E): `requirements.txt` is copied and installed first, so a code-only change reuses the cached dependency layer instead of reinstalling everything. `--no-cache-dir` keeps pip's download cache out of the image.
+    - In Green Metrics Tool micro-benchmarks of a small Flask app, building without a build cache used ~885 J with the full `python:3.12` image and dev tools, and ~124 J with the slim setup (about 7× less). Serving 2,000 requests afterwards cost the same with both images. The saving is in the build, pull and storage, so it repeats with every CI build.
+
+    Check two things. If a package in `requirements.txt` has no prebuilt wheel for Python 3.12, it needs a compiler, and the build will fail now. Add those build packages in a separate build stage, not back into the final image. Also, `vim` and `htop` are no longer inside the container, so debug with an ephemeral debug container instead.
+verify:
+  static_only: Dockerfile, needs Docker build

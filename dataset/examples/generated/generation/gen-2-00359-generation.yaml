@@ -1,0 +1,100 @@
+id: gen-2-00359-generation
+category: generation
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    ```python
+    import re
+    from collections import Counter
+
+    LOG_RE = re.compile(
+        r'(?P<ip>\S+) \S+ \S+ \[(?P<ts>[^\]]+)\] '
+        r'"(?P<method>\S+) (?P<path>\S+) [^"]*" (?P<status>\d{3}) (?P<size>\d+|-)'
+    )
+
+
+    def load_ignore_list(path):
+        with open(path) as f:
+            return [line.strip() for line in f if line.strip() and not line.startswith("#")]
+
+
+    def top_paths(log_path, ignore_ips, n=20):
+        """Count 4xx/5xx responses per path, skipping requests from ignore_ips
+        (monitoring probes + office NAT, ~1.5k entries from load_ignore_list).
+        nginx access logs, ~3M lines per day. Return the n paths with most errors."""
+        ...
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```python
+    import re
+    from collections import Counter
+
+    LOG_RE = re.compile(
+        r'(?P<ip>\S+) \S+ \S+ \[(?P<ts>[^\]]+)\] '
+        r'"(?P<method>\S+) (?P<path>\S+) [^"]*" (?P<status>\d{3}) (?P<size>\d+|-)'
+    )
+
+
+    def load_ignore_list(path):
+        with open(path) as f:
+            return [line.strip() for line in f if line.strip() and not line.startswith("#")]
+
+
+    def top_paths(log_path, ignore_ips, n=20):
+        """Count 4xx/5xx responses per path, skipping requests from ignore_ips
+        (monitoring probes + office NAT, ~1.5k entries from load_ignore_list).
+        nginx access logs, ~3M lines per day. Return the n paths with most errors."""
+        ignored = set(ignore_ips)  # built once, then one lookup per log line
+        errors = Counter()
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = LOG_RE.match(line)
+                if m is None:
+                    continue  # skip malformed lines
+                if m["ip"] in ignored:
+                    continue
+                if m["status"][0] in "45":
+                    errors[m["path"]] += 1
+        return errors.most_common(n)
+    ```
+
+    **Green Notes**
+    - **Set for the ignore list** (reduces E): every one of the ~3M lines checks its IP. With a list, each check scans up to ~1.5k entries. With a set, each check is O(1).
+    - **Built once per file, not per line:** a set only pays off when you look it up many times. In Green Metrics Tool micro-benchmarks, converting a 10,000,000-element list to a set for a *single* lookup cost about 50% more than scanning the list once. Here the conversion happens once and serves millions of lookups.
+    - The file is streamed line by line and only per-path counters are kept, so memory stays small however big the log is.
+
+    `top_paths` still accepts the list from `load_ignore_list`, so callers don't change. Paths are counted as logged, including query strings.
+verify:
+  test: |-
+    import os
+    import tempfile
+
+    lines = [
+        '10.0.0.5 - - [25/Oct/2026:10:00:00 +0000] "GET /health HTTP/1.1" 503 12 "-" "probe"\n',
+        '203.0.113.7 - - [25/Oct/2026:10:00:01 +0000] "GET /cart HTTP/1.1" 500 120 "-" "Mozilla"\n',
+        '203.0.113.8 - - [25/Oct/2026:10:00:02 +0000] "GET /cart HTTP/1.1" 502 120 "-" "Mozilla"\n',
+        '203.0.113.9 - - [25/Oct/2026:10:00:03 +0000] "POST /login HTTP/1.1" 401 0 "-" "Mozilla"\n',
+        '203.0.113.9 - - [25/Oct/2026:10:00:04 +0000] "GET / HTTP/1.1" 200 512 "-" "Mozilla"\n',
+        'garbage line\n',
+    ]
+    d = tempfile.mkdtemp()
+    log = os.path.join(d, "access.log")
+    with open(log, "w") as f:
+        f.writelines(lines)
+    ign = os.path.join(d, "ignore.txt")
+    with open(ign, "w") as f:
+        f.write("# probes\n10.0.0.5\n\n")
+
+    assert load_ignore_list(ign) == ["10.0.0.5"]
+    res = top_paths(log, load_ignore_list(ign))
+    assert res == [("/cart", 2), ("/login", 1)], res
+    assert top_paths(log, [], n=1) == [("/cart", 2)]
+    assert dict(top_paths(log, [])) == {"/cart": 2, "/health": 1, "/login": 1}

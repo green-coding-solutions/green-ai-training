@@ -1,0 +1,87 @@
+id: gen-2-00136-estimate
+category: estimate
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    hi, our team serve a sentiment model (onnxruntime behind fastapi). Gitlab CI build this image on every merge to main and also every night for the security scan, and after each deploy 8 inference nodes pull it. image is now around 2.3GB.
+
+    My lead ask me how much energy we would save if we make the image smaller, and if the inference itself get cheaper too. can you give me a estimation?
+
+    ```dockerfile
+    FROM python:3.11
+
+    RUN apt-get update && apt-get install -y \
+        build-essential git curl vim htop \
+        && rm -rf /var/lib/apt/lists/*
+
+    WORKDIR /srv/sentiment
+
+    COPY . .
+
+    RUN pip install --upgrade pip && \
+        pip install -r requirements.txt && \
+        pip install -r requirements-dev.txt
+
+    ENV MODEL_PATH=/srv/sentiment/models/sentiment-int8.onnx \
+        OMP_NUM_THREADS=4
+
+    EXPOSE 8000
+    CMD ["uvicorn", "serve.app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+    ```
+
+    requirements.txt is onnxruntime, fastapi, uvicorn, numpy, tokenizers. requirements-dev.txt is pytest, black, jupyterlab, ipython.
+- role: assistant
+  content: |
+    I can't give you a reliable number for your pipeline without measuring it. I can give you the direction and a measured reference.
+
+    **Short answer for your lead:** the saving is in building, pulling and storing the image. Inference does not get cheaper.
+
+    **What drives the saving here:**
+    - **Full base image + build tools.** `python:3.11` plus `build-essential`, `git`, `vim`, `htop` is downloaded, unpacked and stored on every build and every node. Your runtime packages ship as prebuilt wheels, so nothing needs compiling.
+    - **Dev dependencies in production.** `jupyterlab`, `pytest`, `black` and `ipython` are installed on every build and pulled by all inference nodes, but never used there.
+    - **Layer order.** `COPY . .` comes before `pip install`. Every commit invalidates the cache, so each merge reinstalls all packages from scratch.
+    - **pip cache.** Without `--no-cache-dir`, the downloaded wheels stay inside the image.
+
+    **Measured reference:** in Green Metrics Tool measurements, a small Flask app was built without a build cache. A full Python base with `build-essential`, `git`, `curl`, `vim` and dev tools took ~885 J of CPU energy and 157 s. `python:3.12-slim` with runtime dependencies only, the dependency layer before the source and `pip --no-cache-dir` took ~124 J and 25 s, about 7× less. Serving 2,000 requests afterwards cost the same with both images (~17 J). That matches your second question: the model runs the same code with the same libraries, so inference energy stays the same.
+
+    Your image is larger and the app is different, so don't scale that figure to your pipeline. Your ONNX model file is also part of the image, and a slim base does not shrink it.
+
+    **How to get your own number:**
+    1. **Quick proxy:** run `time docker build --no-cache -t sentiment:old .` and the same for the new Dockerfile. Compare sizes with `docker image ls`.
+    2. **Real energy:** run both builds as Green Metrics Tool usage scenarios on the same machine and compare the CPU energy per build.
+    3. **Per day:** multiply the per-build difference by your merge builds plus the nightly build. Add the pulls separately (image size × 8 nodes per deploy), because the network and registry side is not part of the build measurement.
+
+    Note: if the nightly security build runs with `--no-cache`, the layer order does not help there. The slim base and the missing dev tools still do.
+
+    ```dockerfile
+    FROM python:3.11-slim
+
+    WORKDIR /srv/sentiment
+
+    # Dependency layer first: only rebuilt when requirements.txt changes
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    # Model weights change less often than the code
+    COPY models/ models/
+    COPY serve/ serve/
+
+    ENV MODEL_PATH=/srv/sentiment/models/sentiment-int8.onnx \
+        OMP_NUM_THREADS=4
+
+    EXPOSE 8000
+    CMD ["uvicorn", "serve.app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+    ```
+
+    Two things to check before you switch:
+    - The new file copies only `models/` and `serve/`. If the app imports code from other folders, add a `COPY` for them.
+    - If anything at runtime calls `curl` or `git` (a health check script, for example), install only that tool in the slim image.
+
+    Run the tests in a separate CI job that installs `requirements-dev.txt`, not in the production image.
+verify:
+  static_only: Dockerfile; checking it needs a Docker build and the project's requirements

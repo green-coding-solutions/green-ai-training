@@ -1,0 +1,88 @@
+id: gen-2-00265-generation
+category: generation
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    Need an archive step in this. Every tenant file of the day also goes to /mnt/archive/tenants/<tenant>/<day>, kept 400 days (contract retention, audits pull maybe a handful of files per year). daily/ is the inbox of billing-collector, it ingests and deletes within minutes, it expects plain .log files there. Diff only.
+
+    ```bash
+    #!/usr/bin/env bash
+    # split-tenant-logs.sh -- cron 00:10 on logproc-01
+    set -euo pipefail
+
+    src=/var/log/gateway/access.log.1
+    out_dir=/srv/logsplit/daily   # billing-collector polls this every few min, ingests + deletes
+    day=$(date -d yesterday +%F)
+
+    if [[ ! -s $src ]]; then
+      logger -t split-tenant-logs "nothing to split: $src missing or empty"
+      exit 0
+    fi
+
+    mkdir -p "$out_dir"
+
+    # one file per tenant, tenant id is field 3 of the gateway format
+    awk -v dir="$out_dir" -v day="$day" '
+      $3 ~ /^[a-z0-9-]+$/ { print > (dir "/" $3 "_" day ".log") }
+    ' "$src"
+
+    logger -t split-tenant-logs "split $src for $day"
+    ```
+- role: assistant
+  content: |
+    ```text
+    --- a/split-tenant-logs.sh
+    +++ b/split-tenant-logs.sh
+    @@ -4,6 +4,9 @@
+
+     src=/var/log/gateway/access.log.1
+     out_dir=/srv/logsplit/daily   # billing-collector polls this every few min, ingests + deletes
+    +work=/srv/logsplit/work       # same filesystem as out_dir, so the hand-over mv is atomic
+    +archive=/mnt/archive/tenants
+    +keep_days=400
+     day=$(date -d yesterday +%F)
+
+     if [[ ! -s $src ]]; then
+    @@ -11,11 +14,24 @@
+       exit 0
+     fi
+
+    -mkdir -p "$out_dir"
+    +mkdir -p "$out_dir" "$work"
+
+     # one file per tenant, tenant id is field 3 of the gateway format
+    -awk -v dir="$out_dir" -v day="$day" '
+    +awk -v dir="$work" -v day="$day" '
+       $3 ~ /^[a-z0-9-]+$/ { print > (dir "/" $3 "_" day ".log") }
+     ' "$src"
+
+    +# archive a compressed copy first, then hand the plain file to billing-collector
+    +for f in "$work"/*_"$day".log; do
+    +  [[ -e $f ]] || continue
+    +  name=${f##*/}
+    +  tenant=${name%_"$day".log}
+    +  mkdir -p "$archive/$tenant"
+    +  zstd -q -T0 -f "$f" -o "$archive/$tenant/$day.log.zst.partial"
+    +  mv -f "$archive/$tenant/$day.log.zst.partial" "$archive/$tenant/$day.log.zst"
+    +  mv -f "$f" "$out_dir/"
+    +done
+    +
+    +find "$archive" -type f -name '*.log.zst' -mtime +"$keep_days" -delete
+    +
+     logger -t split-tenant-logs "split $src for $day"
+    ```
+
+    The split now writes to `work/` and moves each file into `daily/` only after it is archived. Without this, billing-collector could delete a file before the archive step copies it.
+
+    **Green Notes**
+    - **Compress stored data with zstd** (reduces E and storage): the archive keeps 400 days of text logs, so compressing them is clearly worth it. At its default level, zstd keeps the nightly cost low. In Green Metrics Tool micro-benchmarks with default settings on 100 MB of text, zstd used ~16 J to compress, gzip ~67 J and xz ~458 J. Decompressing with zstd cost ~5.3 J, so the few audit reads are cheap.
+    - *Not applied:* compressing the `daily/` files. They live for minutes. Green Coding Solutions estimates that stored data must be kept about 0.15 days before even zstd compression pays off, and these files are deleted long before that. They also stay plain `.log`, as billing-collector expects.
+    - Those measurements compare energy, not compression ratio. If space on the archive volume is what limits you over 400 days, a higher zstd level gives smaller files but costs more CPU every night. Test it on one day's files before you change it.
+verify:
+  static_only: unified diff of a bash cron script; needs zstd, logger and the gateway log files

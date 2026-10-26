@@ -1,0 +1,157 @@
+id: gen-1-00201-review
+category: review
+language: python
+patterns:
+- async-concurrent-io
+- vectorize-or-jit
+facts:
+- F-HTTP
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    hello, I have script for our webshop that run every night. it take exchange rates from outside service and then make a count of order sizes for the report. now it need 25 minutes and I dont know why. can you give me feedback please?
+
+    ```python
+    import csv
+    import requests
+
+    API_KEY = "fx_live_51Hq8Zk2eXampleKey93"
+    CURRENCIES = ["USD", "GBP", "CHF", "SEK", "NOK", "DKK", "PLN", "CZK", "HUF", "RON"]
+
+
+    def get_rates():
+        rates = {}
+        for cur in CURRENCIES:
+            url = f"https://api.fxrates.example/v1/latest?base=EUR&symbols={cur}&key={API_KEY}"
+            r = requests.get(url)
+            rates[cur] = r.json()["rates"][cur]
+        return rates
+
+
+    def load_totals(path):
+        totals = []
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                totals.append(int(row["total_cents"]))
+        return totals
+
+
+    def price_buckets(order_totals_cents, step=500, n_buckets=200):
+        counts = [0] * n_buckets
+        for i in range(len(order_totals_cents)):
+            b = order_totals_cents[i] // step
+            if b >= n_buckets:
+                b = n_buckets - 1
+            counts[b] += 1
+        return counts
+
+
+    if __name__ == "__main__":
+        rates = get_rates()
+        totals = load_totals("orders_2026.csv")   # about 6 million rows
+        counts = price_buckets(totals)
+        for cur, rate in rates.items():
+            print(cur, rate)
+        for i, c in enumerate(counts):
+            print(i * 5, c)
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (nightly batch, about 6 million rows)
+
+    #### [Security] API key in the source code and in the URL
+    - **Where:** `API_KEY` and the f-string URL in `get_rates`
+    - **Issue:** the live key is committed with the code. It is also part of the URL, so it can end up in proxy and server logs.
+    - **Fix:** read it from the environment (`os.environ["FX_API_KEY"]`) and pass it with `params=`. Rotate the key that is in the file now.
+
+    #### [Bug] No timeout and no status check
+    - **Where:** `requests.get(url)` and `r.json()["rates"][cur]`
+    - **Issue:** without a timeout, one hanging call blocks the whole job. On an error response (401, 429, 500) you get a confusing `KeyError` instead of a clear message.
+    - **Fix:** set a timeout and call `raise_for_status()` (both are in the code below).
+
+    #### [High] Pure Python loop over 6 million rows
+    - **Where:** `price_buckets`
+    - **Issue:** this is a tight numeric loop. Every row goes through the interpreter: index, floor division, compare, increment. Most of your 25 minutes is probably here, since the 10 API calls are only a few seconds. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples in a pure Python loop used ~40 J, and the same loop with Numba `@njit` ~9.5 J, about 4× less.
+    - **Fix:** compile the loop with Numba and give it a NumPy array. Results are the same, including the clamp to the last bucket.
+    - **Impact:** E, per run and per row. The first call compiles the function (`cache=True` keeps the result for the next nights). For a few thousand rows this would not be worth it, but for 6 million rows it is.
+
+    #### [Medium] 10 API calls one after another
+    - **Where:** the `for cur in CURRENCIES` loop in `get_rates`
+    - **Issue:** each call waits for the previous one. The script is idle during every round trip.
+    - **Fix:** send the calls together with `httpx.AsyncClient` and `asyncio.gather`.
+    - **Impact:** mostly wall time. In Green Metrics Tool micro-benchmarks, 10 HTTP requests with async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. Do not expect a big energy change from this part. If you only had one or two calls, I would keep it sync.
+
+    Here is the changed code:
+
+    ```python
+    import asyncio
+    import csv
+    import os
+
+    import httpx
+    import numpy as np
+    from numba import njit
+
+    API_KEY = os.environ["FX_API_KEY"]
+    CURRENCIES = ["USD", "GBP", "CHF", "SEK", "NOK", "DKK", "PLN", "CZK", "HUF", "RON"]
+
+
+    async def _fetch_rate(client, cur):
+        r = await client.get(
+            "https://api.fxrates.example/v1/latest",
+            params={"base": "EUR", "symbols": cur, "key": API_KEY},
+        )
+        r.raise_for_status()
+        return cur, r.json()["rates"][cur]
+
+
+    async def _get_rates_async():
+        async with httpx.AsyncClient(timeout=10) as client:
+            results = await asyncio.gather(*(_fetch_rate(client, c) for c in CURRENCIES))
+        return dict(results)
+
+
+    def get_rates():
+        return asyncio.run(_get_rates_async())
+
+
+    def load_totals(path):
+        totals = []
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                totals.append(int(row["total_cents"]))
+        return totals
+
+
+    @njit(cache=True)
+    def _count(totals, step, n_buckets):
+        counts = np.zeros(n_buckets, np.int64)
+        for i in range(totals.shape[0]):
+            b = totals[i] // step
+            if b >= n_buckets:
+                b = n_buckets - 1
+            counts[b] += 1
+        return counts
+
+
+    def price_buckets(order_totals_cents, step=500, n_buckets=200):
+        arr = np.asarray(order_totals_cents, dtype=np.int64)
+        return _count(arr, step, n_buckets).tolist()
+
+
+    if __name__ == "__main__":
+        rates = get_rates()
+        totals = load_totals("orders_2026.csv")   # about 6 million rows
+        counts = price_buckets(totals)
+        for cur, rate in rates.items():
+            print(cur, rate)
+        for i, c in enumerate(counts):
+            print(i * 5, c)
+    ```
+
+    Output order and format are the same as before. If one currency call fails, the job now stops with a clear HTTP error instead of a `KeyError`.
+
+    **Already good:** `load_totals` streams the file row by row, and the bucket clamp is simple and correct.
+verify:
+  static_only: needs network access, an orders CSV and packages beyond stdlib and numpy (httpx, numba)

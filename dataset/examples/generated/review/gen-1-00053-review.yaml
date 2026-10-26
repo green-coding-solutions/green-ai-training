@@ -1,0 +1,116 @@
+id: gen-1-00053-review
+category: review
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    review pls
+
+    ```python
+    import html
+    import re
+
+
+    def inline_md(text):
+        out = html.escape(text)
+        out = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", out)
+        out = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', out)
+        return out
+
+
+    def render_landing(plans, quotes):
+        parts = []
+        for plan in plans:
+            items = "".join("<li>%s</li>" % inline_md(f) for f in plan["features"])
+            parts.append(
+                '<section class="plan"><h2>%s</h2><ul>%s</ul></section>'
+                % (html.escape(plan["name"]), items)
+            )
+        for q in quotes:
+            # quotes come from the public testimonial form, approved by us
+            parts.append("<blockquote>%s</blockquote>" % inline_md(q["text"]))
+        return "\n".join(parts)
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (landing page rendered on every request)
+
+    #### [Security] `javascript:` links in user text
+    - **Where:** `inline_md`, the link `re.sub`
+    - **Issue:** `html.escape` stops attribute break-outs, but any URL is accepted. A testimonial like `[click](javascript:alert(1))` becomes a live `<a href="javascript:...">` on your landing page.
+    - **Fix:** link only `http://`, `https://` and site-relative URLs. Leave anything else as plain text (see code below).
+    - **Impact:** none on energy, but this is a real XSS hole because the quotes are user input.
+
+    #### [Medium] Same plan texts re-rendered on every request
+    - **Where:** `render_landing`, the `inline_md(f)` call for plan features
+    - **Issue:** the plan features are a small fixed set of strings, but both regex passes run for each of them on every page view. `inline_md` is pure and returns a string, so it is safe to cache. In Green Metrics Tool micro-benchmarks of 1,000,000 repeated computations over 200 distinct inputs, `@functools.lru_cache` used ~4.7 J against ~43 J uncached, about 9× less. That was a different function, so the size of the gain here depends on how costly the work is. The saving only exists because the inputs repeat.
+    - **Fix:** cache the plan features with a bounded cache. Do not cache the testimonials. Those texts are mostly unique, so a cache would only add overhead and fill with entries that never hit again.
+    - **Impact:** E on the server for every page view, small per request and growing with traffic.
+
+    ```python
+    import html
+    import re
+    from functools import lru_cache
+
+
+    def _link(m):
+        label, url = m.group(1), m.group(2)
+        if url.startswith(("http://", "https://")) or (
+            url.startswith("/") and not url.startswith("//")
+        ):
+            return '<a href="%s">%s</a>' % (url, label)
+        return m.group(0)
+
+
+    def inline_md(text):
+        out = html.escape(text)
+        out = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", out)
+        out = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _link, out)
+        return out
+
+
+    @lru_cache(maxsize=256)
+    def feature_html(text):
+        return inline_md(text)
+
+
+    def render_landing(plans, quotes):
+        parts = []
+        for plan in plans:
+            items = "".join("<li>%s</li>" % feature_html(f) for f in plan["features"])
+            parts.append(
+                '<section class="plan"><h2>%s</h2><ul>%s</ul></section>'
+                % (html.escape(plan["name"]), items)
+            )
+        for q in quotes:
+            parts.append("<blockquote>%s</blockquote>" % inline_md(q["text"]))
+        return "\n".join(parts)
+    ```
+
+    The cache holds strings only, so callers cannot change a cached value. If you edit plan texts at runtime, call `feature_html.cache_clear()`.
+
+    **Already good:** `html.escape` runs before the markdown rules, and the output is built with `"".join` and one final `join`.
+verify:
+  equivalence:
+    driver: |
+      plans = [
+          {"name": "Starter", "features": ["**3 projects** included", "Email support", "See [limits](/docs/limits)"]},
+          {"name": "Team & Co", "features": ["**Unlimited** projects", "Email support", "[SLA](https://example.com/sla?a=1&b=2)"]},
+      ]
+      quotes = [
+          {"text": "Love it, **so fast**"},
+          {"text": "Read [more](https://example.com/a?b=1&c=2)"},
+          {"text": "<script>x</script>"},
+      ]
+      print(render_landing(plans, quotes))
+      print(render_landing(plans, quotes))
+  test: |-
+    assert '<a ' not in inline_md("[x](javascript:alert(1))")
+    assert inline_md("[x](/a/b)") == '<a href="/a/b">x</a>'
+    assert feature_html("**a**") == "<strong>a</strong>"
+    feature_html("**a**")
+    assert feature_html.cache_info().hits >= 1

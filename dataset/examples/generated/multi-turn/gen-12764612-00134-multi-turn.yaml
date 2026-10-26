@@ -1,0 +1,72 @@
+id: gen-12764612-00134-multi-turn
+category: multi-turn
+language: javascript
+patterns:
+- minify-assets
+facts:
+- F-MINIFY
+messages:
+- role: user
+  content: |
+    hello, I need small node script for build the JS of our ETL monitor page. It show the state of the nightly jobs, only the data team use it inside the company. Entry is src/monitor.js and it import src/charts.js. Please use esbuild and put the result in dist/monitor.min.js
+- role: assistant
+  content: |
+    ```javascript
+    // build.mjs
+    import { build } from 'esbuild';
+
+    await build({
+      entryPoints: ['src/monitor.js'],
+      bundle: true,
+      minify: true,
+      target: 'es2020',
+      outfile: 'dist/monitor.min.js',
+    });
+    ```
+
+    Run it with `node build.mjs`. `bundle: true` pulls `charts.js` into the one output file, so the page makes one request for its script.
+
+    **Green Notes**
+    - **Minify** (reduces network): the bundle is smaller on the wire. For a small bundle like this, the saving is bytes, not CPU. In Green Metrics Tool micro-benchmarks on a small page, an esbuild minified build used about 2% less client energy, which is within measurement noise.
+    - **One bundle:** one file means one request instead of one per module.
+- role: user
+  content: |
+    ok thanks. but when a job fail I must read the stack trace in browser and minified code is not readable. also we use console.warn for the bad rows, I dont want it removed
+- role: assistant
+  content: |
+    The script above does not remove `console` calls. esbuild only does that if you set `drop: ['console']`, so your `console.warn` stays.
+
+    For readable stack traces, add a source map. I also added a `--dev` flag for an unminified build:
+
+    ```javascript
+    // build.mjs
+    import { build } from 'esbuild';
+
+    const dev = process.argv.includes('--dev');
+
+    await build({
+      entryPoints: ['src/monitor.js'],
+      bundle: true,
+      minify: !dev,
+      sourcemap: true,
+      target: 'es2020',
+      outfile: dev ? 'dist/monitor.js' : 'dist/monitor.min.js',
+    });
+    ```
+
+    - `node build.mjs` makes the minified file plus `monitor.min.js.map`.
+    - `node build.mjs --dev` makes plain `dist/monitor.js`.
+
+    With the map, browser devtools show your original file names and line numbers in stack traces, even for the minified file. Browsers only download the map when devtools are open.
+- role: user
+  content: |
+    good. but my chief say minify is "more green". is this true? or I can just not minify and keep it simple
+- role: assistant
+  content: |
+    For this page, it is mostly not true. In Green Metrics Tool micro-benchmarks, a minified build of a small page used about 2% less client energy than the unminified sources. That is within measurement noise. Minifying saves bytes on the network. It does not save measurable CPU for a small bundle.
+
+    Your page is small and internal, on a fast company network. So skipping minification is a fair choice, and `--dev` already gives you that build.
+
+    I would still keep minified output for anything served over slower links or to many users, because the byte saving is real there. With the source map in place, it costs you nothing in debugging.
+verify:
+  static_only: needs the esbuild package and project source files

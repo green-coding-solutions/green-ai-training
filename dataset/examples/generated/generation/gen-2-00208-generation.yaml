@@ -1,0 +1,75 @@
+id: gen-2-00208-generation
+category: generation
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    ```python
+    import json
+    from typing import Iterable, Iterator
+
+
+    def records_for_traces(log_lines: Iterable[str], trace_ids: list[str]) -> Iterator[dict]:
+        """Yield parsed JSON log records whose "trace_id" is in trace_ids.
+
+        log_lines: lines from our app's JSON-lines logs (one day is ~3M lines)
+        trace_ids: ids pasted from the incident ticket, usually 50-500
+        Skip lines that aren't valid JSON or have no trace_id.
+        Keep the original order.
+        """
+        # TODO
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```python
+    import json
+    from typing import Iterable, Iterator
+
+
+    def records_for_traces(log_lines: Iterable[str], trace_ids: list[str]) -> Iterator[dict]:
+        """Yield parsed JSON log records whose "trace_id" is in trace_ids, in input order."""
+        wanted = set(trace_ids)
+        if not wanted:
+            return
+        for line in log_lines:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            trace_id = record.get("trace_id")
+            if isinstance(trace_id, str) and trace_id in wanted:
+                yield record
+    ```
+
+    The function skips blank lines, invalid JSON and JSON that isn't an object. It also skips records whose `trace_id` is missing or isn't a string. Matching records keep their log order.
+
+    **Green Notes**
+    - **Set for repeated membership tests** (reduces E): `trace_ids` becomes a set once per call. Each of the ~3M records then costs one hash lookup, not a scan over up to 500 ids.
+    - **The conversion only pays off because there are many lookups:** in Green Metrics Tool micro-benchmarks, converting a 10,000,000-element list to a set and testing once used about 50% more energy than a single scan of the list. Here one conversion serves millions of lookups.
+    - **Empty `trace_ids` returns at once**, so the function doesn't parse a whole day of logs to find nothing.
+verify:
+  test: |-
+    lines = [
+        '{"trace_id": "a1", "msg": "start"}\n',
+        'not json\n',
+        '{"msg": "no trace"}\n',
+        '{"trace_id": "b2", "msg": "other"}\n',
+        '[1, 2]\n',
+        '{"trace_id": ["a1"], "msg": "bad type"}\n',
+        '\n',
+        '{"trace_id": "a1", "msg": "end"}\n',
+        '{"trace_id": "c3", "msg": "third"}\n',
+    ]
+    out = list(records_for_traces(lines, ["c3", "a1"]))
+    assert [r["msg"] for r in out] == ["start", "end", "third"]
+    assert list(records_for_traces(lines, [])) == []
+    assert list(records_for_traces(iter(lines), ["zz"])) == []
+    assert list(records_for_traces(iter(lines), ["b2", "b2"])) == [{"trace_id": "b2", "msg": "other"}]

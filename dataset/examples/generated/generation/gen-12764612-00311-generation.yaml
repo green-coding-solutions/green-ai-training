@@ -1,0 +1,48 @@
+id: gen-12764612-00311-generation
+category: generation
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    hi, i am new to backend stuff. i need a script that copy our order export to the reporting server. the file is /srv/shop/exports/orders_latest.csv, about 80 MB, a new one is made every 15 minutes and i want to run the script from cron. ssh key is already set up for the server report01 and the folder there is /data/incoming. our internet is slow sometimes so i think it should be smaller when sending but i dont know what is the best way. thank you
+- role: assistant
+  content: |
+    This compresses the CSV with zstd, streams it over ssh, and unpacks it on the server. The reporting server gets the same plain CSV as before.
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    SRC=/srv/shop/exports/orders_latest.csv
+    HOST=report01
+    DEST_DIR=/data/incoming
+    NAME=orders_latest.csv
+
+    # Skip this run if the previous one is still sending
+    exec 9>/tmp/ship_orders.lock
+    flock -n 9 || exit 0
+
+    [ -f "$SRC" ] || { echo 'export file missing' >&2; exit 1; }
+
+    # Compress locally, unpack remotely, then rename so readers never see a half file
+    zstd -q -c "$SRC" | ssh "$HOST" \
+      "zstd -q -d -c > '$DEST_DIR/.$NAME.tmp' && mv '$DEST_DIR/.$NAME.tmp' '$DEST_DIR/$NAME'"
+    ```
+
+    Cron line for every 15 minutes:
+
+    ```bash
+    */15 * * * * /usr/local/bin/ship_orders.sh
+    ```
+
+    **Green Notes**
+    - **Compress transmitted data with a fast codec** (reduces network and E): the CSV is text, so it shrinks a lot, and this runs 96 times a day. zstd at its default level is the right choice for data compressed this often. In Green Metrics Tool micro-benchmarks on 100 MB of text, zstd used ~16 J, gzip ~67 J and xz ~458 J to compress. Those figures are CPU energy only, not compression ratio. xz would make smaller files, but it costs far more CPU on every run.
+    - **Compress once, in the pipe** (reduces E): no temporary compressed copy is written to disk, and the same stream goes straight into ssh. The `.tmp` plus `mv` step is for safety: the server never reads a half-written file.
+
+    *Note:* zstd must be installed on both machines. If the link is much slower than the CPU, a higher zstd level (for example `-9`) sends fewer bytes, but it costs more energy per run.
+verify:
+  static_only: needs ssh access to a remote host and zstd on both sides

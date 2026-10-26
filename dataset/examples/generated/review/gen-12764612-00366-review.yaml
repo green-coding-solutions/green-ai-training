@@ -1,0 +1,88 @@
+id: gen-12764612-00366-review
+category: review
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```nginx
+    server {
+        listen 80;
+        server_name sim.example.org;
+        root /srv/sim/site;
+
+        gzip on;
+        gzip_comp_level 9;
+        gzip_types text/plain text/csv application/json image/svg+xml image/png;
+
+        location /results {
+            alias /srv/sim/results/;
+            autoindex on;
+        }
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (static results portal)
+
+    #### [Security] Path traversal through `alias`
+    - **Where:** `location /results` with `alias /srv/sim/results/;`
+    - **Issue:** the location has no trailing slash, but the alias does. A request like `/results../` is mapped to `/srv/sim/results/../`, so visitors can read files next to your results folder.
+    - **Fix:** make both sides match: `location /results/ { alias /srv/sim/results/; }`
+
+    #### [High] Static files compressed again on every request
+    - **Where:** `gzip on` with `gzip_comp_level 9`
+    - **Issue:** the plots, CSV and JSON files are written once by your runs, but nginx compresses them again for every download, at the most expensive level. In Green Metrics Tool measurements of nginx serving 2,000 requests for text assets, gzip level 5 per request used ~54 J of CPU energy. Serving precompressed files with `gzip_static` used ~14 J, about 4× less. Both sent about 10× fewer bytes than no compression. Level 9 was not measured, but it costs more CPU than level 5.
+    - **Fix:** compress once, right after the job writes the results. A slow level is fine here, because it runs once per file:
+      ```bash
+      find /srv/sim/results /srv/sim/site -type f \( -name '*.csv' -o -name '*.json' -o -name '*.svg' -o -name '*.txt' \) -exec gzip -k -f -9 {} +
+      ```
+      Use `-f` so a rerun replaces old `.gz` files. A stale `.gz` is served instead of the new file.
+      ```nginx
+      gzip_static on;
+      gzip on;
+      gzip_comp_level 5;
+      ```
+      `gzip on` stays as a fallback for files without a `.gz`.
+    - **Impact:** E on the server for every request. Visitors still download the same small files.
+
+    #### [Low] PNG in `gzip_types`
+    - **Where:** `gzip_types ... image/png`
+    - **Issue:** PNG is already compressed. Gzip costs CPU and saves almost nothing.
+    - **Fix:** remove `image/png` from the list.
+
+    #### Fixed config
+    ```nginx
+    server {
+        listen 80;
+        server_name sim.example.org;
+        root /srv/sim/site;
+
+        gzip_static on;
+        gzip on;
+        gzip_comp_level 5;
+        gzip_types text/plain text/csv application/json image/svg+xml;
+
+        location /results/ {
+            alias /srv/sim/results/;
+            autoindex on;
+        }
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+    }
+    ```
+
+    **Already good:** compression is on for text types, so downloads stay small.
+verify:
+  static_only: nginx config

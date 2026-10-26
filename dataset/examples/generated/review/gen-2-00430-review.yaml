@@ -1,0 +1,81 @@
+id: gen-2-00430-review
+category: review
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    Review this before I deploy it to the collector boxes. Diff only please, no rewrite of the whole thing. Logs are about 8 GB/day per box, we keep the archive 90 days.
+
+    ```bash
+    #!/bin/bash
+    # archive-gateway-logs.sh - cron 00:10 daily
+    LOG_DIR=/var/log/gwcollect
+    ARCHIVE_DIR=/srv/archive/gwcollect
+    KEEP_DAYS=90
+
+    mkdir -p $ARCHIVE_DIR
+    YESTERDAY=$(date -d yesterday +%F)
+
+    for f in $(ls $LOG_DIR/*-$YESTERDAY.log); do
+      bzip2 -9 -c $f > $ARCHIVE_DIR/$(basename $f).bz2
+      rm $f
+    done
+
+    find $ARCHIVE_DIR -name '*.bz2' -mtime +$KEEP_DAYS -delete
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (daily cron job on large log files)
+
+    #### [Bug] Original log is deleted even if compression failed
+    - **Where:** `bzip2 ... > ...` followed by `rm $f`
+    - **Issue:** the `rm` runs no matter what bzip2 returned. If the archive disk fills up, you keep a truncated `.bz2` and lose the only full copy of the log. Also, `ls` on a missing match prints an error and the loop then runs with garbage.
+    - **Fix:** write to a temp file, test it, move it into place, and only then remove the log (see the diff below).
+
+    #### [Bug] Unquoted variables and `for f in $(ls ...)`
+    - **Where:** every `$f`, `$ARCHIVE_DIR`, `$LOG_DIR`, `$KEEP_DAYS`
+    - **Issue:** a path with a space splits into several words. A glob in the loop header is safe and needs no `ls`.
+    - **Fix:** quote the variables and loop over the glob directly. Skip the loop body when nothing matches.
+
+    #### [Medium] `bzip2 -9` for data that is compressed every day
+    - **Where:** `bzip2 -9 -c`
+    - **Issue:** these logs are compressed daily, so the compression cost repeats. In Green Metrics Tool micro-benchmarks on 100 MB of text, compressing used ~106 J with bzip2 and ~16 J with zstd at its default level. Decompressing (when someone reads an old log) used ~52 J with bzip2 and ~5.3 J with zstd. Compression itself is right here, because the data is kept for 90 days. A Green Coding Solutions estimate puts the break-even for zstd at about 0.15 days of storage.
+    - **Fix:** use `zstd` and change the extension to `.zst`.
+    - **Impact:** reduces E on every box, every night. These measurements compare energy only, not compression ratio. bzip2 may give smaller files, so check the size on a sample day if archive space is tight.
+
+    #### Diff
+
+    ```diff
+    -mkdir -p $ARCHIVE_DIR
+    +mkdir -p "$ARCHIVE_DIR"
+     YESTERDAY=$(date -d yesterday +%F)
+
+    -for f in $(ls $LOG_DIR/*-$YESTERDAY.log); do
+    -  bzip2 -9 -c $f > $ARCHIVE_DIR/$(basename $f).bz2
+    -  rm $f
+    -done
+    +for f in "$LOG_DIR"/*-"$YESTERDAY".log; do
+    +  [ -e "$f" ] || continue
+    +  out="$ARCHIVE_DIR/$(basename "$f").zst"
+    +  if zstd -q -c "$f" > "$out.tmp" && zstd -q -t "$out.tmp"; then
+    +    mv "$out.tmp" "$out" && rm -- "$f"
+    +  else
+    +    rm -f "$out.tmp"
+    +    echo "archive failed: $f" >&2
+    +  fi
+    +done
+
+    -find $ARCHIVE_DIR -name '*.bz2' -mtime +$KEEP_DAYS -delete
+    +find "$ARCHIVE_DIR" \( -name '*.bz2' -o -name '*.zst' \) -mtime +"$KEEP_DAYS" -delete
+    ```
+
+    The `find` line matches both extensions, so the old `.bz2` archives still expire on schedule. There is no need to recompress them.
+
+    **Already good:** `-c` with a redirect keeps the source file untouched until the end, and the retention cleanup runs in one `find` call.
+verify:
+  static_only: needs zstd, cron paths and log files on the host

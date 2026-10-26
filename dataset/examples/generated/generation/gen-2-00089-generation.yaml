@@ -1,0 +1,170 @@
+id: gen-2-00089-generation
+category: generation
+language: python
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    Hi, i am building a gateway on a industrial PC for our production line. There are around 250 sensors, every one publish to MQTT (mosquitto on same box) about 5 times per second. Payload is json like this:
+
+    ```json
+    {"device": "press-07", "metric": "vibration_rms", "ts": "2026-10-23T08:15:02.120+00:00", "value": 0.412}
+    ```
+
+    Topic is `factory/<device>/readings`. I need a python service that subscribe and store everything in postgres table:
+
+    ```sql
+    CREATE TABLE sensor_readings (
+        device_id text NOT NULL,
+        metric    text NOT NULL,
+        ts        timestamptz NOT NULL,
+        value     double precision NOT NULL
+    );
+    ```
+
+    Dashboard (grafana) can be some seconds behind, its no problem. But when postgres restart for update the service should not crash and loose all data. We use paho-mqtt 2 and psycopg 3. Can you write it please?
+- role: assistant
+  content: |
+    ```python
+    import json
+    import logging
+    import queue
+    import signal
+    import threading
+    import time
+    from datetime import datetime
+
+    import paho.mqtt.client as mqtt
+    import psycopg
+
+    DSN = "postgresql://gateway@localhost/telemetry"
+    BROKER = "localhost"
+    TOPIC = "factory/+/readings"
+    BATCH_ROWS = 5000        # flush when this many rows are buffered ...
+    FLUSH_SECONDS = 5.0      # ... or after this long, whichever comes first
+    RETRY_SECONDS = 5.0
+
+    COPY_SQL = "COPY sensor_readings (device_id, metric, ts, value) FROM STDIN"
+
+    log = logging.getLogger("gateway")
+    rows: queue.Queue = queue.Queue(maxsize=500_000)  # bounds memory while Postgres is down
+    shutdown = threading.Event()   # set by SIGTERM/SIGINT
+    stop_writer = threading.Event()  # set after MQTT is disconnected
+
+
+    def on_connect(client, userdata, flags, reason_code, properties):
+        if reason_code.is_failure:
+            log.error("MQTT connect failed: %s", reason_code)
+            return
+        client.subscribe(TOPIC, qos=1)  # here, so it resubscribes after reconnects
+
+
+    def on_message(client, userdata, msg):
+        try:
+            p = json.loads(msg.payload)
+            row = (
+                str(p["device"]),
+                str(p["metric"]),
+                datetime.fromisoformat(p["ts"]),
+                float(p["value"]),
+            )
+        except (ValueError, KeyError, TypeError) as exc:
+            log.warning("bad payload on %s: %s", msg.topic, exc)
+            return
+        try:
+            rows.put_nowait(row)
+        except queue.Full:
+            log.error("buffer full, dropping reading from %s", row[0])
+
+
+    def collect_batch():
+        batch = []
+        deadline = time.monotonic() + FLUSH_SECONDS
+        while len(batch) < BATCH_ROWS:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or (stop_writer.is_set() and rows.empty()):
+                break
+            try:
+                batch.append(rows.get(timeout=min(remaining, 0.5)))
+            except queue.Empty:
+                pass
+        return batch
+
+
+    def write_batch(conn, batch):
+        with conn.transaction(), conn.cursor() as cur:
+            with cur.copy(COPY_SQL) as copy:
+                for row in batch:
+                    copy.write_row(row)
+
+
+    def writer():
+        conn = None
+        batch = []
+        while True:
+            if not batch:
+                batch = collect_batch()
+            if not batch:
+                if stop_writer.is_set():
+                    break
+                continue
+            try:
+                if conn is None or conn.closed:
+                    conn = psycopg.connect(DSN)
+                write_batch(conn, batch)
+                batch = []  # only cleared after a successful commit
+            except psycopg.OperationalError as exc:
+                # Postgres restarting or unreachable: keep the batch and retry
+                log.error("write failed, retrying in %.0f s: %s", RETRY_SECONDS, exc)
+                if conn is not None:
+                    conn.close()
+                conn = None
+                if stop_writer.is_set():
+                    log.error("shutting down, %d buffered rows not written", len(batch) + rows.qsize())
+                    break
+                time.sleep(RETRY_SECONDS)
+            except psycopg.Error:
+                log.exception("batch rejected by Postgres, dropping %d rows", len(batch))
+                batch = []
+        if conn is not None:
+            conn.close()
+
+
+    def main():
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, lambda *_: shutdown.set())
+
+        db_thread = threading.Thread(target=writer, name="db-writer")
+        db_thread.start()
+
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="gw-db-writer")
+        client.on_connect = on_connect
+        client.on_message = on_message
+        client.connect(BROKER, 1883, keepalive=30)
+        client.loop_start()
+
+        shutdown.wait()
+        log.info("stopping: disconnecting MQTT, flushing buffer")
+        client.disconnect()
+        client.loop_stop()
+        stop_writer.set()
+        db_thread.join()
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    MQTT callbacks only parse each message and put it in a queue. A single writer thread sends the buffered rows to Postgres with one `COPY` per batch. If Postgres is down, the writer holds on to the current batch and tries again, and new readings wait in the queue. The queue has a size limit, so memory stays bounded during a long outage.
+
+    **Green Notes**
+    - **Batch database writes with `COPY`** (reduces E): at about 1,250 readings per second, one `INSERT` per message means one statement and one commit per reading. Here it is one `COPY` with up to 5,000 rows and one commit every few seconds. In Green Metrics Tool micro-benchmarks on PostgreSQL with 5,000-row batches, `COPY` used about 22× less CPU energy than one `INSERT` per row, and about 8× less than `executemany()`.
+    - **Keep the batches big** (reduces E): in the same benchmark, batches of only 100 rows showed small differences, because the per-batch overhead dominates. So don't lower `BATCH_ROWS` to get a "more live" dashboard. `FLUSH_SECONDS` already limits how far Grafana can fall behind.
+
+    One trade-off: readings in the memory buffer are lost on a power cut or `kill -9`. SIGTERM (for example `systemctl stop`) flushes them first.
+verify:
+  static_only: needs a running PostgreSQL server, an MQTT broker, psycopg 3 and paho-mqtt

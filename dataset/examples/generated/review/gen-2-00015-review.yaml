@@ -1,0 +1,197 @@
+id: gen-2-00015-review
+category: review
+language: html
+patterns:
+- dom-size
+- system-fonts-and-deps
+facts:
+- F-DOM-SIZE
+- F-FONTS
+messages:
+- role: user
+  content: |
+    results viewer for our batch inference jobs takes forever to open. fix this
+
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <title>Batch inference results</title>
+      <style>
+        @font-face { font-family: "IBM Plex Sans"; src: url("/fonts/IBMPlexSans-Regular.ttf") format("truetype"); font-weight: 400; }
+        @font-face { font-family: "IBM Plex Sans"; src: url("/fonts/IBMPlexSans-Italic.ttf") format("truetype"); font-weight: 400; font-style: italic; }
+        @font-face { font-family: "IBM Plex Sans"; src: url("/fonts/IBMPlexSans-Medium.ttf") format("truetype"); font-weight: 500; }
+        @font-face { font-family: "IBM Plex Sans"; src: url("/fonts/IBMPlexSans-SemiBold.ttf") format("truetype"); font-weight: 600; }
+        @font-face { font-family: "IBM Plex Sans"; src: url("/fonts/IBMPlexSans-Bold.ttf") format("truetype"); font-weight: 700; }
+        @font-face { font-family: "IBM Plex Mono"; src: url("/fonts/IBMPlexMono-Regular.ttf") format("truetype"); font-weight: 400; }
+
+        body { font-family: "IBM Plex Sans", sans-serif; margin: 0; color: #1d2330; background: #f6f7f9; }
+        .toolbar h1 { font-size: 18px; font-weight: 600; }
+        .results { display: flex; flex-direction: column; }
+        .row { display: flex; border-bottom: 1px solid #e3e6ea; }
+        .row:nth-child(even) { background: #fbfbfc; }
+        .cell-wrap { flex: 1; min-width: 0; padding: 6px 10px; }
+        .cell-inner { display: flex; align-items: center; gap: 4px; }
+        .cell-inner .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .score { font-family: "IBM Plex Mono", monospace; }
+        .score.low { color: #b42318; }
+      </style>
+    </head>
+    <body>
+      <div class="toolbar">
+        <h1>Batch inference results</h1>
+        <select id="job">
+          <option value="">Pick a job</option>
+          <option value="2291">2291 - resnet50 nightly</option>
+          <option value="2290">2290 - resnet50 nightly</option>
+        </select>
+      </div>
+      <div class="results"></div>
+
+      <script>
+        async function render(jobId) {
+          const res = await fetch(`/api/jobs/${jobId}/predictions`);
+          const preds = await res.json(); // ~15k predictions per job
+          const list = document.querySelector(".results");
+          for (const p of preds) {
+            const row = document.createElement("div");
+            row.className = "row";
+            for (const v of [p.sample_id, p.label, p.score.toFixed(3), p.model_version]) {
+              const wrap = document.createElement("div");
+              wrap.className = "cell-wrap";
+              const inner = document.createElement("div");
+              inner.className = "cell-inner";
+              const span = document.createElement("span");
+              span.className = "label";
+              span.textContent = v;
+              inner.appendChild(span);
+              wrap.appendChild(inner);
+              row.appendChild(wrap);
+            }
+            const s = row.children[2].querySelector("span");
+            s.classList.add("score");
+            if (p.score < 0.5) s.classList.add("low");
+            list.appendChild(row);
+          }
+        }
+
+        document.querySelector("#job").addEventListener("change", (e) => render(e.target.value));
+      </script>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (internal results viewer for batch inference jobs)
+
+    #### [Bug] Switching jobs stacks the results
+    - **Where:** `render()`, `list.appendChild(row)`
+    - **Issue:** the list is never cleared. Each time someone picks a job in `#job`, its rows are added below the previous job's rows. The page then shows a mix of jobs and keeps getting bigger.
+    - **Fix:** replace the contents instead of appending to them (`replaceChildren`, see the page below).
+
+    #### [High] About 195,000 elements, appended one by one
+    - **Where:** the `for (const p of preds)` loop
+    - **Issue:** each prediction becomes 13 elements: a row plus `cell-wrap` > `cell-inner` > `span` for each of the 4 cells. With ~15k predictions that is about 195,000 elements. Every row is appended to the live DOM on its own, and the browser has to lay out the whole flex list.
+    - **Fix:** show 100 rows per page in a plain `<table>` with one `<td>` per value. Build each page in a `DocumentFragment` and swap it in with one call. Add a small pager.
+    - **Impact:** E on the client, every time the page opens or the job changes. The DOM drops from ~195,000 elements to about 500. In Green Metrics Tool page-load benchmarks, a 10,000-row table with 14 elements per row, appended one by one, used ~1036 J over 30 loads. The same data as 100-row pages in a plain `<table>` built in a `DocumentFragment` used ~457 J, about 56% less.
+    - **Behavior change:** Ctrl+F now only finds rows on the current page.
+
+    #### [Medium] Six TTF font files for an internal tool
+    - **Where:** the `@font-face` rules, `body` and `.score`
+    - **Issue:** every face is an uncompressed TrueType file, and IBM Plex TTFs are large. Users open this viewer with an empty cache after each deploy, and the text waits on these downloads.
+    - **Fix:** use the system font stack for body text and a system monospace stack for scores, and delete all six `@font-face` rules. If you have to keep Plex, ship only the faces you use (400 and 600 sans, 400 mono) as Latin-subset WOFF2 files.
+    - **Impact:** network and E per cold load. In Green Metrics Tool page-load benchmarks, six local TTF files (~4 MB) used ~556 J over 30 cold loads. Two Latin-subset WOFF2 files used ~488 J (about 12% less), and the system font stack ~410 J (about 26% less than TTF).
+
+    Updated page with all three fixes:
+
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <title>Batch inference results</title>
+      <style>
+        body {
+          font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+          margin: 0;
+          color: #1d2330;
+          background: #f6f7f9;
+        }
+        .toolbar h1 { font-size: 18px; font-weight: 600; }
+
+        .results { width: 100%; table-layout: fixed; border-collapse: collapse; }
+        .results td {
+          padding: 6px 10px;
+          border-bottom: 1px solid #e3e6ea;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .results tr:nth-child(even) { background: #fbfbfc; }
+
+        .score { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+        .score.low { color: #b42318; }
+
+        .pager { display: flex; align-items: center; gap: 8px; padding: 8px 10px; }
+      </style>
+    </head>
+    <body>
+      <div class="toolbar">
+        <h1>Batch inference results</h1>
+        <select id="job">
+          <option value="">Pick a job</option>
+          <option value="2291">2291 - resnet50 nightly</option>
+          <option value="2290">2290 - resnet50 nightly</option>
+        </select>
+      </div>
+      <table class="results"><tbody></tbody></table>
+      <div class="pager">
+        <button id="prev">Prev</button>
+        <span id="page"></span>
+        <button id="next">Next</button>
+      </div>
+
+      <script>
+        const PAGE_SIZE = 100;
+        const tbody = document.querySelector(".results tbody");
+        let preds = [];
+        let page = 0;
+
+        function showPage() {
+          const frag = document.createDocumentFragment();
+          for (const p of preds.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)) {
+            const tr = document.createElement("tr");
+            for (const v of [p.sample_id, p.label, p.score.toFixed(3), p.model_version]) {
+              tr.insertCell().textContent = v;
+            }
+            tr.cells[2].className = p.score < 0.5 ? "score low" : "score";
+            frag.appendChild(tr);
+          }
+          tbody.replaceChildren(frag);
+          const pages = Math.max(1, Math.ceil(preds.length / PAGE_SIZE));
+          document.querySelector("#page").textContent = `${page + 1} / ${pages}`;
+        }
+
+        async function render(jobId) {
+          const res = await fetch(`/api/jobs/${jobId}/predictions`);
+          preds = await res.json();
+          page = 0;
+          showPage();
+        }
+
+        document.querySelector("#job").addEventListener("change", (e) => render(e.target.value));
+        document.querySelector("#prev").addEventListener("click", () => {
+          if (page > 0) { page--; showPage(); }
+        });
+        document.querySelector("#next").addEventListener("click", () => {
+          if ((page + 1) * PAGE_SIZE < preds.length) { page++; showPage(); }
+        });
+      </script>
+    </body>
+    </html>
+    ```
+
+    **Already good:** values go in with `textContent`, so labels from the model output can't inject HTML.
+verify:
+  static_only: browser page with DOM code and CSS; needs the predictions API and a real browser to render

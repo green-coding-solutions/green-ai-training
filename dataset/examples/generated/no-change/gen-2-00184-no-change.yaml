@@ -1,0 +1,53 @@
+id: gen-2-00184-no-change
+category: no-change
+language: dockerfile
+patterns:
+- small-container-images
+- none
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    orders api image still ~190MB, fix this
+
+    ```dockerfile
+    # syntax=docker/dockerfile:1
+    FROM python:3.12-slim AS build
+    RUN apt-get update \
+     && apt-get install -y --no-install-recommends build-essential libpq-dev \
+     && rm -rf /var/lib/apt/lists/*
+    WORKDIR /src
+    COPY requirements.txt .
+    RUN pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt
+
+    FROM python:3.12-slim
+    RUN apt-get update \
+     && apt-get install -y --no-install-recommends libpq5 \
+     && rm -rf /var/lib/apt/lists/*
+    RUN useradd --create-home --uid 10001 app
+    WORKDIR /app
+    RUN --mount=type=bind,from=build,source=/wheels,target=/wheels \
+        pip install --no-cache-dir --no-index /wheels/*.whl
+    COPY src/ ./src/
+    USER app
+    ENV PYTHONUNBUFFERED=1
+    EXPOSE 8000
+    CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "3", "src.orders.wsgi:app"]
+    ```
+- role: assistant
+  content: |
+    There is nothing to fix here. This Dockerfile already does the things that make an image cheap to build, pull and store:
+
+    - **Slim base, runtime dependencies only:** the compilers and `libpq-dev` stay in the build stage. The final image only gets `libpq5` and prebuilt wheels.
+    - **Wheels through a bind mount:** `RUN --mount` installs the wheels without copying them into a layer, so they don't stay in the image.
+    - **Dependency layer before the source:** if only the code changes, the cached `pip install` layer is reused.
+    - **No leftover caches:** `--no-cache-dir` and the apt list cleanup.
+
+    Green Metrics Tool measurements tested this same setup on a small Flask app, built without a build cache. The slim, runtime-only image with the dependency layer first used about 7× less energy to build than a full base image with build tools and dev packages. Serving requests afterwards cost the same with both images. So the saving comes from builds, pulls and stored copies, and you already have it.
+
+    What is left of the size is mostly the slim Python base plus your installed packages. Run `docker history <image>` to see which layer holds what. If one package is unexpectedly large, the fix is in `requirements.txt`, not in the Dockerfile.
+
+    One thing to check outside the Dockerfile: putting dependencies first only helps if CI keeps the layer cache. On fresh runners every build starts from zero. In that case, persist the cache, for example with `docker buildx build --cache-from type=registry,ref=<registry>/orders-api:cache --cache-to type=registry,ref=<registry>/orders-api:cache,mode=max`.
+verify:
+  static_only: Dockerfile only, no runnable Python or JavaScript code to test

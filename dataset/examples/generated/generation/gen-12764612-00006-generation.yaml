@@ -1,0 +1,83 @@
+id: gen-12764612-00006-generation
+category: generation
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    hi, i want to make a small python script for the command line. you give it a folder and it makes a text file that shows all the folders and files inside, with the file size next to each file, like a tree. our shared drive has maybe 100000 files. i only know a little python so i am not sure how to do it the right way. can you write it?
+- role: assistant
+  content: |
+    ```python
+    import argparse
+    import os
+    import sys
+
+
+    def format_size(n: int) -> str:
+        for unit in ("B", "KB", "MB", "GB"):
+            if n < 1024 or unit == "GB":
+                return f"{n} B" if unit == "B" else f"{n:.1f} {unit}"
+            n /= 1024
+
+
+    def build_tree(root: str) -> str:
+        root = os.path.abspath(root)
+        lines = [root]
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames.sort()  # sorted in place, so os.walk visits folders in order
+            depth = 0 if dirpath == root else os.path.relpath(dirpath, root).count(os.sep) + 1
+            if depth:
+                lines.append("  " * depth + os.path.basename(dirpath) + "/")
+            for name in sorted(filenames):
+                try:
+                    size = format_size(os.path.getsize(os.path.join(dirpath, name)))
+                except OSError:
+                    size = "unreadable"
+                lines.append("  " * (depth + 1) + f"{name} ({size})")
+        return "\n".join(lines) + "\n"
+
+
+    def main() -> None:
+        parser = argparse.ArgumentParser(description="Write a tree of a folder with file sizes.")
+        parser.add_argument("folder")
+        parser.add_argument("-o", "--output", default="tree.txt")
+        args = parser.parse_args()
+
+        if not os.path.isdir(args.folder):
+            sys.exit(f"Not a folder: {args.folder}")
+
+        text = build_tree(args.folder)
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write(text)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    Run it like this: `python tree.py /path/to/folder -o tree.txt`
+
+    **Green Notes**
+    - **Collect lines in a list, join once** (reduces E): with 100000 files you build 100000+ lines. Every line is appended to a list and `"\n".join(lines)` makes the final text in one step. Doing `text += line` in a loop copies the growing string again and again. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces used roughly 260× less CPU energy with `join` than with `+=`.
+    - **One write call:** the file is written once at the end, not once per line.
+
+    Files that cannot be read (for example no permission) are shown as `unreadable` instead of stopping the script.
+verify:
+  module: true
+  test: |-
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "a"))
+        with open(os.path.join(d, "b.txt"), "wb") as f:
+            f.write(b"x" * 2048)
+        with open(os.path.join(d, "a", "x.txt"), "wb") as f:
+            f.write(b"hello")
+        out = build_tree(d)
+        lines = out.splitlines()
+        assert lines[0] == os.path.abspath(d)
+        assert lines[1:] == ["  b.txt (2.0 KB)", "  a/", "    x.txt (5 B)"], lines
+        assert out.endswith("\n")

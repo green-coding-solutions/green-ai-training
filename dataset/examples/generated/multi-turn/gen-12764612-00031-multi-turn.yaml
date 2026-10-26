@@ -1,0 +1,59 @@
+id: gen-12764612-00031-multi-turn
+category: multi-turn
+language: sql
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    hello, this query is for the log viewer page in our admin tool. it show the last warnings and errors. the page is slow when many peoples open it. can you make it better? the table app_logs have about 40 columns, some are big (stack_trace, request_body, headers)
+
+    ```sql
+    -- recent problems for the log viewer
+    SELECT *
+    FROM app_logs
+    WHERE level IN ('WARN', 'ERROR')
+      AND ts > now() - interval '1 hour'
+    ORDER BY ts DESC
+    LIMIT 100;
+    ```
+- role: assistant
+  content: |
+    The list only needs a few columns. Name them, and the big ones stay in the database.
+
+    ```sql
+    SELECT id, ts, host, service, level, message
+    FROM app_logs
+    WHERE level IN ('WARN', 'ERROR')
+      AND ts > now() - interval '1 hour'
+    ORDER BY ts DESC
+    LIMIT 100;
+    ```
+
+    **Green Notes**
+    - **Only the columns the list shows** (reduces E, network): `SELECT *` sends `stack_trace`, `request_body` and `headers` for all 100 rows on every page open, and the page never shows them. In Green Metrics Tool micro-benchmarks on a wide table with large text columns, reading only the needed columns was about 5.5× to 7× cheaper than `SELECT *`. The saving grows with the size of the columns you skip.
+
+    I guessed the column list from your description. Change it to match what the table really shows.
+- role: user
+  content: |
+    thank you. but now product want when I click one row, it show the stack trace and the request body too. maybe I put back SELECT * so is more easy?
+- role: assistant
+  content: |
+    Better keep the list query as it is. Run a second query only when someone clicks a row, and fetch just that one row:
+
+    ```sql
+    SELECT id, ts, host, service, level, message, stack_trace, request_body
+    FROM app_logs
+    WHERE id = $1;
+    ```
+
+    - The list still reads only the small columns for 100 rows.
+    - The big columns are read for one row, and only when somebody asks for them.
+    - If you went back to `SELECT *` in the list, every page open would again carry the big columns of all 100 rows, even if nobody clicks.
+
+    The `headers` column is still not selected. Add it to the detail query only if the detail view really shows it.
+verify:
+  static_only: PostgreSQL syntax (interval, now(), $1 parameter); not runnable in SQLite

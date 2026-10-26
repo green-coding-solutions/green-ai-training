@@ -1,0 +1,70 @@
+id: gen-2-00262-generation
+category: generation
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    hi, im new to python and ML. We have a small sentiment model (pytorch) that runs on our support tickets. Before the model I need to turn the ticket text into token ids. The vocab is a dict loaded from vocab.json, like {"<pad>": 0, "<unk>": 1, "the": 2, ...}. Tickets have lots of typos, product codes and order numbers, so many words are not in the vocab.
+
+    My try crashes with KeyError:
+
+    ```python
+    def encode(text):
+        ids = []
+        for w in text.split():
+            ids.append(vocab[w])
+        return ids
+    ```
+
+    Can you write an encode function that lowercases the text, uses <unk> for words that are not in the vocab, and pads or cuts the result to max_len 128? I read I should wrap the lookup in try/except KeyError, is that the right way? Not sure what I am doing wrong.
+- role: assistant
+  content: |
+    The crash comes from `vocab[w]`. Indexing a dict with a missing key raises `KeyError`. Use `dict.get` with the `<unk>` id as the default instead:
+
+    ```python
+    import json
+
+
+    def load_vocab(path="vocab.json"):
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+
+
+    def encode(text, vocab, max_len=128):
+        """Turn a ticket into a fixed-length list of token ids."""
+        pad_id = vocab["<pad>"]
+        unk_id = vocab["<unk>"]
+        ids = [vocab.get(word, unk_id) for word in text.lower().split()]
+        ids = ids[:max_len]
+        ids += [pad_id] * (max_len - len(ids))
+        return ids
+
+
+    if __name__ == "__main__":
+        vocab = load_vocab()
+        print(encode("Printer XJ-200 not wroking after update", vocab))
+    ```
+
+    Load the vocab once at startup and pass it to `encode` for every ticket. Lowercasing only helps if the vocab was built from lowercased text, so check that it matches how the model was trained.
+
+    **Green Notes**
+    - **`dict.get` instead of try/except for unknown words** (reduces E): your tickets miss the vocab often, and raising and catching an exception for every miss is the expensive part. In Green Metrics Tool micro-benchmarks with about half of the keys missing, `dict.get(key, default)` used about 12% less CPU energy than `try/except KeyError`. Encoding runs for every word of every ticket, so this is the hot path.
+    - **Direct indexing where a miss is a real error**: `vocab["<pad>"]` and `vocab["<unk>"]` should always succeed. If they fail, the vocab file is broken and a `KeyError` is the right result. When misses are rare like this, the exception costs nothing in practice.
+verify:
+  module: true
+  test: |-
+    import json, os, tempfile
+    v = {"<pad>": 0, "<unk>": 1, "printer": 2, "not": 3, "working": 4}
+    assert encode("Printer XJ-200 NOT wroking", v, max_len=6) == [2, 1, 3, 1, 0, 0]
+    assert encode("a " * 10, v, max_len=4) == [1, 1, 1, 1]
+    assert encode("", v) == [0] * 128
+    assert len(encode("printer " * 300, v)) == 128
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+        json.dump(v, f)
+        p = f.name
+    assert load_vocab(p) == v
+    os.remove(p)

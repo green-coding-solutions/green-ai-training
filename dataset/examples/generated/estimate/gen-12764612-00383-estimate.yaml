@@ -1,0 +1,75 @@
+id: gen-12764612-00383-estimate
+category: estimate
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    We run a data pipeline that lands raw JSON-lines extracts from partner APIs into /data/landing every night. Today they sit there uncompressed for 90 days (audit requirement), then a cleanup job deletes them. The next ETL step reads each file once, right after it lands. Later reads are rare, only for audits or re-runs.
+
+    I want to add a compression step to the landing job, but I need to justify it to our platform team, and they want an estimate of how much energy it saves. Requirements:
+
+    - The estimate must be honest. No made-up numbers, please.
+    - I need to choose between zstd and xz. Someone on the team wants xz because the files are smaller.
+    - I also need a way to measure this on our own data before we roll it out.
+
+    What can you tell me?
+- role: assistant
+  content: |
+    I can't give you a trustworthy joule figure for your pipeline. The saving depends on your compression ratio, your storage hardware and how often the files are read. Here is what can be said honestly.
+
+    **Direction**
+
+    With 90 days of retention and almost no reads, compressing is the right call. Compression costs CPU once, at write time. Smaller files then save storage for 90 days. The reads are rare and decompression is cheap, so they add little.
+
+    **Measured reference**
+
+    In Green Metrics Tool micro-benchmarks, compressing 100 MB of English text used:
+
+    - zstd ~16 J
+    - gzip ~67 J
+    - xz ~458 J
+
+    xz therefore cost about 29× the energy of zstd for the compression step. Decompressing 100 MB cost ~5.3 J with zstd and ~11.7 J with xz. These figures compare energy only, not file size. xz usually produces smaller files, but the benchmark did not measure by how much.
+
+    A break-even estimate (not a direct measurement) points the same way. Compressing 100 MB to 30 MB with zstd has to be kept about 0.15 days to pay for itself. With xz the break-even is about 7 days. Treat both as lower bounds, because the measured compression energy was higher than that estimate assumed. At 90 days both clear the bar, so the choice between them is not about whether to compress.
+
+    **zstd vs xz for your case**
+
+    - The xz cost is paid every night, on every file.
+    - The extra size saving from xz is only paid back if it beats that cost over 90 days.
+    - I would start with zstd, and only consider xz if a sample shows a much better ratio on your data.
+    - Do not compress inputs that are already compressed (Parquet, gzipped API responses, ZIP). They gain nothing.
+
+    **How to measure on your data**
+
+    Take one representative night's file and compare both codecs:
+
+    ```bash
+    #!/usr/bin/env bash
+    # usage: ./codec-compare.sh sample.jsonl
+    set -euo pipefail
+    sample=$1
+    TIMEFORMAT='%U s user CPU'
+    printf 'raw bytes: %s\n' "$(wc -c < "$sample")"
+    for codec in 'zstd -3 -c' 'xz -6 -c'; do
+      printf '%s -> compressed bytes: ' "$codec"
+      time { $codec < "$sample" | wc -c; }
+    done
+    ```
+
+    CPU time is a proxy for energy. For real energy, wrap each run in `perf stat -e power/energy-pkg/` on a machine with RAPL. Better still, run the whole landing job with and without the step as a Green Metrics Tool usage scenario.
+
+    Then compare the extra CPU of xz against the extra bytes it saves, over 90 days. If the ratio gain is small, zstd wins.
+
+    The landing step itself can be this simple:
+
+    ```bash
+    zstd -q --rm -- "$file"
+    ```
+verify:
+  static_only: bash snippets use zstd/xz CLI tools and sample files; estimate answer, not runnable in the test sandbox

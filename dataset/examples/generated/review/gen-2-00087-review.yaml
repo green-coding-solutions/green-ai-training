@@ -1,0 +1,71 @@
+id: gen-2-00087-review
+category: review
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```dockerfile
+    # ocean model postprocessing (regrid + monthly means)
+    # built by gitlab-ci on every push, pulled on the cluster nodes before each job array
+    FROM python:3.11
+
+    RUN apt-get update
+    RUN apt-get install -y build-essential gfortran git vim htop wget libnetcdf-dev libhdf5-dev
+
+    WORKDIR /work
+    COPY . /work
+
+    RUN pip install -r requirements.txt
+    RUN pip install jupyterlab pytest black ipython
+
+    ENV COPERNICUS_API_KEY=7f3a9c1e2b4d48a6b0e5c2f19d8a7e33
+    ENV OMP_NUM_THREADS=1
+
+    CMD ["python", "postprocess/regrid.py"]
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (image built in CI on every push, pulled on every cluster node)
+
+    #### [Security] API key baked into the image
+    - **Where:** `ENV COPERNICUS_API_KEY=...`
+    - **Issue:** the key is stored in the image config. Anyone who can pull the image from the registry can read it with `docker inspect`.
+    - **Fix:** remove the line and pass the key when the job starts (`docker run -e COPERNICUS_API_KEY ...`, or a secret from your scheduler or orchestrator). Rotate the key, because it is already in every image you pushed.
+
+    #### [High] Dependencies reinstalled on every push
+    - **Where:** `COPY . /work` before `RUN pip install -r requirements.txt`
+    - **Issue:** the whole repo is copied before the install, so any commit invalidates the pip layers. Each CI run downloads and installs the full scientific stack again, and the nodes pull new dependency layers each time too.
+    - **Fix:** copy `requirements.txt` alone, install, then copy the source (see below).
+    - **Impact:** E and network on every build. The dependency layer is rebuilt only when `requirements.txt` changes, and nodes can reuse it from their local cache.
+
+    #### [Medium] Full base image, compiler toolchain and dev tools in the job image
+    - **Where:** `FROM python:3.11`, the `apt-get install` line, `pip install jupyterlab pytest black ipython`
+    - **Issue:** the regrid job needs none of `gfortran`, `git`, `vim`, `htop`, Jupyter or the test and lint tools. They make every build, push, pull and stored copy bigger. In Green Metrics Tool measurements of the same kind of change on a small Flask app (slim base, runtime dependencies only, dependency layer first), the image build used about 7× less energy, and the running service cost the same with both images. Also, `apt-get update` in its own `RUN` gets cached apart from the install, so a later edit to the install line can run against an old package index and fail.
+    - **Fix:** use `python:3.11-slim` and install only what the job imports. netCDF4, h5py, numpy and scipy ship binary wheels that include the netCDF and HDF5 libraries, so you usually need no `-dev` packages or compiler. If something in `requirements.txt` builds from source (for example an f2py Fortran extension), compile it in a builder stage and copy only the result into the slim image. Keep Jupyter, pytest and black in a separate dev image or a `requirements-dev.txt`.
+    - **Impact:** E, storage and network on every CI build and every node pull. Job runtime doesn't change.
+
+    ```dockerfile
+    FROM python:3.11-slim
+
+    ENV OMP_NUM_THREADS=1 \
+        PYTHONDONTWRITEBYTECODE=1
+
+    WORKDIR /work
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY . .
+
+    CMD ["python", "postprocess/regrid.py"]
+    ```
+
+    If `pip install` fails on the slim image, a package is building from source. Add a builder stage for that one package. Don't go back to the full base image.
+verify:
+  static_only: Dockerfile, needs a container build and the project's requirements.txt

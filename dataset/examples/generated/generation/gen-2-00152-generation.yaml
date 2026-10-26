@@ -1,0 +1,101 @@
+id: gen-2-00152-generation
+category: generation
+language: python
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import numpy as np
+    import onnxruntime as ort
+
+    FEATURES = ["amount", "merchant_risk", "txn_count_24h", "avg_amount_30d", "km_from_home", "is_foreign"]
+
+    session = ort.InferenceSession("models/fraud_v7.onnx")
+    input_name = session.get_inputs()[0].name
+
+
+    def load_batch(conn, txn_ids):
+        # transactions: ~45 cols, raw_payload (full PSP json), device_fingerprint, notes, ...
+        # TODO: return (ids, float32 matrix in FEATURES order)
+        ...
+
+
+    def score_pending(conn, batch_size=512):
+        cur = conn.execute(
+            "SELECT id FROM transactions WHERE status = 'pending' ORDER BY id LIMIT ?",
+            (batch_size,),
+        )
+        ids = [r[0] for r in cur]
+        if not ids:
+            return 0
+        ids, X = load_batch(conn, ids)
+        scores = session.run(None, {input_name: X})[0].ravel()
+        conn.executemany(
+            "UPDATE transactions SET fraud_score = ?, status = 'scored' WHERE id = ?",
+            [(float(s), i) for s, i in zip(scores, ids)],
+        )
+        conn.commit()
+        return len(ids)
+    ```
+- role: assistant
+  content: |
+    Here is `load_batch`. It fetches the whole batch with one query and reads only `id` and the six feature columns:
+
+    ```python
+    import numpy as np
+
+    FEATURES = ["amount", "merchant_risk", "txn_count_24h", "avg_amount_30d", "km_from_home", "is_foreign"]
+    _FEATURE_COLS = ", ".join(FEATURES)
+
+
+    def load_batch(conn, txn_ids):
+        if not txn_ids:
+            return [], np.empty((0, len(FEATURES)), dtype=np.float32)
+        placeholders = ", ".join("?" * len(txn_ids))
+        rows = conn.execute(
+            f"SELECT id, {_FEATURE_COLS} FROM transactions "
+            f"WHERE id IN ({placeholders}) ORDER BY id",
+            list(txn_ids),
+        ).fetchall()
+        ids = [r[0] for r in rows]
+        X = np.array([r[1:] for r in rows], dtype=np.float32)
+        return ids, X
+    ```
+
+    - Rows come back sorted by `id`, which matches the order in `score_pending`. `ids` is built from the result, so scores and ids stay aligned even if a row was deleted between the two queries.
+    - NULL features become `NaN` in the matrix. If the model can't handle `NaN`, filter or impute those values first.
+    - The SQL text is built only from the constant `FEATURES` list. The ids are bound as parameters, so there's no injection risk.
+
+    **Green Notes**
+    - **Select only the needed columns** (reduces E): the worker never reads, transfers or decodes `raw_payload`, `device_fingerprint`, `notes` or the other unused columns, and this query runs for every batch it scores. In Green Metrics Tool micro-benchmarks on PostgreSQL with a 52-column table that had large text columns, naming the 10 needed columns instead of using `SELECT *` used between about 5.5× and 7× less CPU energy, depending on the row count. The saving grows with the size of the skipped columns, and a full PSP JSON payload is large.
+verify:
+  test: |-
+    import sqlite3
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE transactions (id INTEGER PRIMARY KEY, status TEXT, amount REAL, merchant_risk REAL, "
+        "txn_count_24h INTEGER, avg_amount_30d REAL, km_from_home REAL, is_foreign INTEGER, "
+        "raw_payload TEXT, device_fingerprint TEXT, notes TEXT, fraud_score REAL)"
+    )
+    conn.executemany(
+        "INSERT INTO transactions (id, status, amount, merchant_risk, txn_count_24h, avg_amount_30d, "
+        "km_from_home, is_foreign, raw_payload, device_fingerprint, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        [(i, "pending", 10.0 * i, 0.1 * i, i, 5.0 * i, 2.0 * i, i % 2, "x" * 5000, "fp", "n") for i in range(1, 21)],
+    )
+    seen = []
+    conn.set_trace_callback(seen.append)
+    ids, X = load_batch(conn, [7, 3, 15])
+    assert ids == [3, 7, 15]
+    assert X.dtype == np.float32 and X.shape == (3, 6)
+    assert np.allclose(X[0], [30.0, 0.3, 3, 15.0, 6.0, 1])
+    assert np.allclose(X[2], [150.0, 1.5, 15, 75.0, 30.0, 1])
+    assert seen and all("raw_payload" not in s and "*" not in s for s in seen)
+    ids, X = load_batch(conn, [])
+    assert ids == [] and X.shape == (0, 6) and X.dtype == np.float32
+    print("ok")

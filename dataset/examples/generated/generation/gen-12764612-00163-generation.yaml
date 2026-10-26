@@ -1,0 +1,53 @@
+id: gen-12764612-00163-generation
+category: generation
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    python: parse lines from our LoRa gateway serial log, one call per line, like `2024-05-01T10:22:01Z node=A3F2 rssi=-87 snr=7.5 payload=0x1A2B`. give me dicts, skip junk lines
+- role: assistant
+  content: |-
+    ```python
+    import re
+    from datetime import datetime, timezone
+
+    LINE_RE = re.compile(
+        r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s+"
+        r"node=(?P<node>[0-9A-Fa-f]{4})\s+"
+        r"rssi=(?P<rssi>-?\d+)\s+"
+        r"snr=(?P<snr>-?\d+(?:\.\d+)?)\s+"
+        r"payload=0x(?P<payload>(?:[0-9A-Fa-f]{2})+)\s*$"
+    )
+
+
+    def parse_line(line):
+        """Return a dict for a valid log line, or None for anything else."""
+        m = LINE_RE.match(line)
+        if m is None:
+            return None
+        ts = datetime.strptime(m["ts"], "%Y-%m-%dT%H:%M:%SZ")
+        return {
+            "ts": ts.replace(tzinfo=timezone.utc),
+            "node": m["node"].upper(),
+            "rssi": int(m["rssi"]),
+            "snr": float(m["snr"]),
+            "payload": bytes.fromhex(m["payload"]),
+        }
+
+
+    def parse_lines(lines):
+        for line in lines:
+            rec = parse_line(line)
+            if rec is not None:
+                yield rec
+    ```
+
+    Payloads with an odd number of hex digits count as junk and are skipped. `bytes.fromhex` would raise on them.
+
+    **Green Notes**
+    - **Compile the regex once** (reduces E): `LINE_RE` is built at import time, not on every line. The gateway calls `parse_line` for every serial line, so this is the per-row work that matters. In Green Metrics Tool micro-benchmarks, a precompiled pattern used about 18% less CPU energy than inline `re.match` over 1,000,000 matches. The gain is modest because Python's `re` caches compiled patterns itself. It gets large only when patterns are built dynamically or there are more than 512 distinct ones.
+    - The pattern is anchored and fixed, so a junk line is rejected at the first mismatch without extra work.

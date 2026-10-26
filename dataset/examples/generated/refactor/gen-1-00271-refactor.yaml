@@ -1,0 +1,87 @@
+id: gen-1-00271-refactor
+category: refactor
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    hello, this class calculate gross price for all the order lines in our shop export. It run on about 1 million lines every night and my boss say it is too slow. can you make it more fast? thanks
+
+    ```python
+    import math
+
+
+    class VatCalculator:
+        def __init__(self, settings):
+            self.settings = settings
+
+        def gross_prices(self, lines):
+            """lines: list of (sku, category, net_cents). Returns list of (sku, gross_cents)."""
+            result = []
+            for sku, category, net in lines:
+                discount = self.settings.discounts.get(category, 0)
+                net = net - net * discount // 100
+                gross = net + math.ceil(net * self.settings.vat_rate / 100)
+                if gross > self.settings.max_price_cents:
+                    gross = self.settings.max_price_cents
+                result.append((sku, gross))
+            return result
+    ```
+- role: assistant
+  content: |
+    ```python
+    import math
+
+
+    class VatCalculator:
+        def __init__(self, settings):
+            self.settings = settings
+
+        def gross_prices(self, lines):
+            """lines: list of (sku, category, net_cents). Returns list of (sku, gross_cents)."""
+            discounts = self.settings.discounts
+            vat_rate = self.settings.vat_rate
+            max_price = self.settings.max_price_cents
+            ceil = math.ceil
+            result = []
+            for sku, category, net in lines:
+                discount = discounts.get(category, 0)
+                net = net - net * discount // 100
+                gross = net + ceil(net * vat_rate / 100)
+                if gross > max_price:
+                    gross = max_price
+                result.append((sku, gross))
+            return result
+    ```
+
+    **Green Notes**
+    - **Hoist loop-invariant lookups** (reduces E): `self.settings.discounts`, `self.settings.vat_rate`, `self.settings.max_price_cents` and `math.ceil` were looked up again for every line. They are now read once before the loop. The output is identical.
+    - **Keep expectations small:** this is a micro-optimization. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local variable before a 10,000,000-iteration loop saved about 4-5%. Expect a few percent at most, not a fix for a slow job. If the export is still too slow, profile it first to see where the time goes.
+    - **Assumption:** the settings must not change while `gross_prices` runs. If another thread can change them mid-call, read them per line as before.
+verify:
+  equivalence:
+    driver: |
+      class S:
+          pass
+
+      s = S()
+      s.discounts = {"toys": 10, "books": 25, "food": 5}
+      s.vat_rate = 19.0
+      s.max_price_cents = 50000
+      cats = ["toys", "books", "food", "misc"]
+      lines = [(f"sku{i}", cats[i % 4], (i * 3779) % 70000) for i in range(2000)]
+      lines += [("edge1", "misc", 0), ("edge2", "toys", 49999), ("edge3", "books", 1)]
+      out = VatCalculator(s).gross_prices(lines)
+      print(len(out))
+      print(sum(g for _, g in out))
+      for row in out[:25] + out[-5:]:
+          print(row)
+  test: |-
+    s = type("S", (), {})()
+    s.discounts = {"x": 10}
+    s.vat_rate = 19.0
+    s.max_price_cents = 1050
+    assert VatCalculator(s).gross_prices([("a", "x", 1000), ("b", "y", 100)]) == [("a", 1050), ("b", 119)]

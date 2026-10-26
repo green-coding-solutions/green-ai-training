@@ -1,0 +1,129 @@
+id: gen-12764612-00210-review
+category: review
+language: python
+patterns:
+- regex-precompile
+- async-concurrent-io
+facts:
+- F-REGEX
+- F-HTTP
+messages:
+- role: user
+  content: |
+    hello, can you check my code pls? its for our webshop, every night it ask the supplier api for the price of each SKU (about 400 to 600 sku) and then we update our db. it take very long time and my boss is not happy. sorry for my english
+
+    ```python
+    import re
+    import json
+    import ssl
+    import urllib.request
+
+    ctx = ssl._create_unverified_context()
+    BASE = "https://api.supplier-hub.example/v1/stock/"
+
+
+    def fetch_stock(sku):
+        with urllib.request.urlopen(BASE + sku, context=ctx, timeout=10) as r:
+            return json.loads(r.read())
+
+
+    def clean_price(txt):
+        m = re.match(r"^\s*(\d+)[.,](\d{2})\s*(EUR|€)?\s*$", txt)
+        if not m:
+            return None
+        return int(m.group(1)) + int(m.group(2)) / 100
+
+
+    def sync_prices(skus):
+        out = {}
+        for sku in skus:
+            if not re.match(r"^[A-Z]{2,4}-\d{4,8}$", sku):
+                continue
+            try:
+                data = fetch_stock(sku)
+            except:
+                continue
+            price = clean_price(data["price"])
+            if price is not None:
+                out[sku] = price
+        return out
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly batch, one network call per SKU)
+
+    #### [Security] TLS certificate check is turned off
+    - **Where:** `ctx = ssl._create_unverified_context()`
+    - **Issue:** anyone on the network path can answer as the supplier and feed you fake prices. Those prices go into your shop database.
+    - **Fix:** use the default verification. `httpx` does this for you (see the code below).
+
+    #### [Bug] Bare `except:` hides every error
+    - **Where:** `try: fetch_stock(sku) ... except: continue`
+    - **Issue:** it also catches `KeyboardInterrupt` and real bugs. A failed SKU disappears with no trace, so you never know that 50 prices were missing last night. A response without `"price"` would crash the whole run at `data["price"]`.
+    - **Fix:** catch only network and JSON errors, log the SKU, and use `data.get("price")`.
+
+    #### [Medium] Requests run one after another
+    - **Where:** the `for sku in skus` loop with `fetch_stock`
+    - **Issue:** 400-600 requests, and each one waits for the full answer before the next starts. The run time is the sum of all waits, and the process sits idle most of that time.
+    - **Fix:** send the requests concurrently with `httpx.AsyncClient`, limited by a semaphore so you don't hammer the supplier.
+    - **Impact:** reduces wall time and the time the job holds its machine. In Green Metrics Tool micro-benchmarks with 10 requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. So the gain is mostly time, not CPU. With hundreds of requests the wall-time gain should be larger, but I can't give a number for your job. Measure one run before and after.
+
+    #### [Low] Regex is written inline in the loop
+    - **Where:** both `re.match(...)` calls
+    - **Issue:** Python caches compiled patterns, so this is not a big problem. In the same micro-benchmarks, a precompiled pattern used about 18% less CPU energy over 1,000,000 matches. For 600 SKUs it is tiny.
+    - **Fix:** compile once at module level. It costs nothing and names the patterns.
+
+    ```python
+    import asyncio
+    import logging
+    import re
+
+    import httpx
+
+    log = logging.getLogger(__name__)
+
+    BASE = "https://api.supplier-hub.example/v1/stock/"
+    SKU_RE = re.compile(r"^[A-Z]{2,4}-\d{4,8}$")
+    PRICE_RE = re.compile(r"^\s*(\d+)[.,](\d{2})\s*(EUR|€)?\s*$")
+    MAX_PARALLEL = 10
+
+
+    def clean_price(txt):
+        m = PRICE_RE.match(txt)
+        if not m:
+            return None
+        return int(m.group(1)) + int(m.group(2)) / 100
+
+
+    async def _fetch(client, sem, sku):
+        async with sem:
+            try:
+                r = await client.get(BASE + sku)
+                r.raise_for_status()
+                return sku, r.json()
+            except (httpx.HTTPError, ValueError) as exc:
+                log.warning("stock fetch failed for %s: %s", sku, exc)
+                return sku, None
+
+
+    async def sync_prices(skus):
+        valid = [s for s in skus if SKU_RE.match(s)]
+        sem = asyncio.Semaphore(MAX_PARALLEL)
+        async with httpx.AsyncClient(timeout=10) as client:
+            results = await asyncio.gather(*(_fetch(client, sem, s) for s in valid))
+
+        out = {}
+        for sku, data in results:
+            if not isinstance(data, dict):
+                continue
+            price = clean_price(str(data.get("price", "")))
+            if price is not None:
+                out[sku] = price
+        return out
+    ```
+
+    `sync_prices` is now `async`, so call it with `asyncio.run(sync_prices(skus))`. The result has the same order and content as before. The one difference is that a SKU with no `"price"` is skipped and not a crash.
+
+    **Already good:** the timeout on every request, and SKUs are checked before any request is sent.
+verify:
+  static_only: needs network access and httpx, which is not in the standard library

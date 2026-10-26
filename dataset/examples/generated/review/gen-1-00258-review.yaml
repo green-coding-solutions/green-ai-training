@@ -1,0 +1,154 @@
+id: gen-1-00258-review
+category: review
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    Can you review this step of our nightly meter-data ETL? It normalizes readings to kWh before they go into the warehouse.
+
+    Requirements:
+    - about 30M rows per night, from roughly 4k meters
+    - only a handful of unit spellings show up in the files
+    - output must stay identical, with no new dependencies
+    - memory must stay bounded, because the job shares a small worker
+
+    ```python
+    import csv
+    import sys
+
+    FACTORS = {"Wh": 0.001, "kWh": 1.0, "MWh": 1000.0}
+
+
+    def unit_factor(unit):
+        cleaned = unit.strip().replace(" ", "").replace("\u00a0", "")
+        for name, factor in FACTORS.items():
+            if cleaned.lower() == name.lower():
+                return factor
+        raise ValueError("unknown unit: " + unit)
+
+
+    def convert_row(row):
+        value = float(row["reading"].replace(",", "."))
+        return value * unit_factor(row["unit"])
+
+
+    def run(src, dst):
+        reader = csv.DictReader(src)
+        writer = csv.writer(dst)
+        writer.writerow(["meter_id", "ts", "kwh"])
+        bad = 0
+        for row in reader:
+            try:
+                kwh = convert_row(row)
+            except (ValueError, KeyError):
+                bad += 1
+                continue
+            writer.writerow([row["meter_id"], row["ts"], round(kwh, 6)])
+        return bad
+
+
+    if __name__ == "__main__":
+        bad = run(sys.stdin, sys.stdout)
+        if bad:
+            print(bad, "bad rows", file=sys.stderr)
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly batch, about 30M rows)
+
+    #### [Bug] `mWh` is read as `MWh`
+    - **Where:** `unit_factor`, the `cleaned.lower() == name.lower()` comparison
+    - **Issue:** lower-casing makes `mWh` (milliwatt-hour) and `MWh` (megawatt-hour) the same string. A milliwatt-hour reading is multiplied by 1000.0 instead of a tiny factor, so the value is wrong by a factor of 10⁹ and nothing reports an error.
+    - **Fix:** match exact spellings. List the spellings you really have in the files. Anything else is counted as a bad row.
+
+    #### [High] Same unit string normalized again for every row
+    - **Where:** `unit_factor`, called once per row from `convert_row`
+    - **Issue:** the function is pure, and its argument comes from a handful of distinct strings. Still, each of the 30M rows runs `strip`, two `replace` calls and a loop with `lower()` calls. Caching removes that repeated work. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over 200 distinct inputs used about 9× less CPU energy with `functools.lru_cache`. That benchmark had few distinct inputs, as you do here.
+    - **Fix:** `@lru_cache(maxsize=256)` on `unit_factor`. The key is a string and the result is a float, so sharing the cached value is safe. The size limit keeps memory bounded even if a file contains odd spellings. Calls that raise are not cached, so unknown units are re-checked each time, which is fine for rare bad rows.
+    - **Impact:** E (CPU), per row, across the whole nightly run.
+
+    ```python
+    import csv
+    import sys
+    from functools import lru_cache
+
+    FACTORS = {
+        "Wh": 0.001, "WH": 0.001,
+        "kWh": 1.0, "kwh": 1.0, "KWH": 1.0,
+        "MWh": 1000.0, "MWH": 1000.0,
+    }
+
+
+    @lru_cache(maxsize=256)
+    def unit_factor(unit):
+        cleaned = unit.strip().replace(" ", "").replace("\u00a0", "")
+        factor = FACTORS.get(cleaned)
+        if factor is None:
+            raise ValueError("unknown unit: " + unit)
+        return factor
+
+
+    def convert_row(row):
+        value = float(row["reading"].replace(",", "."))
+        return value * unit_factor(row["unit"])
+
+
+    def run(src, dst):
+        reader = csv.DictReader(src)
+        writer = csv.writer(dst)
+        writer.writerow(["meter_id", "ts", "kwh"])
+        bad = 0
+        for row in reader:
+            try:
+                kwh = convert_row(row)
+            except (ValueError, KeyError):
+                bad += 1
+                continue
+            writer.writerow([row["meter_id"], row["ts"], round(kwh, 6)])
+        return bad
+
+
+    if __name__ == "__main__":
+        bad = run(sys.stdin, sys.stdout)
+        if bad:
+            print(bad, "bad rows", file=sys.stderr)
+    ```
+
+    Behavior change: spellings that are not in `FACTORS` (for example `Kwh` or `mwh`) used to be accepted and are now counted as bad rows. Add the ones that really occur in your data, and check the `bad rows` count after the first run.
+
+    **Already good:** `convert_row` is not cached, and it should stay that way. Every reading is a different value, so a cache there would mostly store misses and evict entries. Streaming through `csv.DictReader` keeps memory flat.
+verify:
+  module: true
+  test: |
+    assert unit_factor("kWh") == 1.0
+    assert unit_factor(" KWH ") == 1.0
+    try:
+        unit_factor("mWh")
+    except ValueError:
+        pass
+    else:
+        assert False, "mWh must be rejected"
+    unit_factor("kWh")
+    assert unit_factor.cache_info().hits >= 1
+  equivalence:
+    driver: |-
+      import io
+      src = io.StringIO(
+          "meter_id,ts,reading,unit\n"
+          "m1,2026-10-01T00:00,\"1,5\",kWh\n"
+          "m2,2026-10-01T00:00,250,Wh\n"
+          "m3,2026-10-01T00:00,0.002,MWh\n"
+          "m4,2026-10-01T00:00,3,KWH\n"
+          "m5,2026-10-01T00:00,abc,kWh\n"
+          "m6,2026-10-01T00:00,4,furlong\n"
+          "m7,2026-10-01T00:00,2.25, kWh \n"
+          "m8,2026-10-01T00:00,7,kwh\n"
+      )
+      dst = io.StringIO()
+      bad = run(src, dst)
+      print(dst.getvalue())
+      print("bad", bad)

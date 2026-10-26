@@ -1,0 +1,122 @@
+id: gen-1-00280-refactor
+category: refactor
+language: python
+patterns:
+- deque-or-append
+- vectorize-or-jit
+facts:
+- F-LISTINS
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    Hello, we have small flask api for our factory machines. The vibration upload is very slow when the night batch come, one request have around 1-2 million samples. Also I think the event feed part is not so nice. Can you optimise and clean it please? Behaviour must stay same, other services read this.
+
+    ```python
+    import time
+    from flask import Flask, request, jsonify
+
+    app = Flask(__name__)
+
+    MAX_FEED = 20000
+    feeds = {}  # machine_id -> events, newest first
+
+
+    def add_event(machine_id, kind, value):
+        feed = feeds.setdefault(machine_id, [])
+        feed.insert(0, {"ts": time.time(), "kind": kind, "value": value})
+        if len(feed) > MAX_FEED:
+            feed.pop()
+
+
+    def quantize_samples(samples, levels=256, lo=-1.0, hi=1.0):
+        step = (hi - lo) / (levels - 1)
+        out = []
+        for s in samples:
+            if s < lo:
+                s = lo
+            elif s > hi:
+                s = hi
+            out.append(int((s - lo) / step + 0.5))
+        return out
+
+
+    @app.route("/api/machines/<machine_id>/vibration", methods=["POST"])
+    def upload_vibration(machine_id):
+        samples = request.get_json()["samples"]
+        codes = quantize_samples(samples)
+        add_event(machine_id, "vibration", len(codes))
+        return jsonify({"count": len(codes), "codes": codes})
+
+
+    @app.route("/api/machines/<machine_id>/events")
+    def get_events(machine_id):
+        limit = int(request.args.get("limit", 50))
+        return jsonify(feeds.get(machine_id, [])[:limit])
+    ```
+- role: assistant
+  content: |
+    ```python
+    import time
+    from collections import deque
+    from itertools import islice
+
+    import numpy as np
+    from flask import Flask, request, jsonify
+    from numba import njit
+
+    app = Flask(__name__)
+
+    MAX_FEED = 20000
+    feeds = {}  # machine_id -> events, newest first
+
+
+    def add_event(machine_id, kind, value):
+        feed = feeds.setdefault(machine_id, deque(maxlen=MAX_FEED))
+        feed.appendleft({"ts": time.time(), "kind": kind, "value": value})
+
+
+    @njit(cache=True)
+    def _quantize(samples, step, lo, hi):
+        out = np.empty(samples.shape[0], dtype=np.int32)
+        for i in range(samples.shape[0]):
+            s = samples[i]
+            if s < lo:
+                s = lo
+            elif s > hi:
+                s = hi
+            out[i] = int((s - lo) / step + 0.5)
+        return out
+
+
+    def quantize_samples(samples, levels=256, lo=-1.0, hi=1.0):
+        lo = float(lo)
+        hi = float(hi)
+        step = (hi - lo) / (levels - 1)
+        arr = np.asarray(samples, dtype=np.float64)
+        return _quantize(arr, step, lo, hi).tolist()
+
+
+    @app.route("/api/machines/<machine_id>/vibration", methods=["POST"])
+    def upload_vibration(machine_id):
+        samples = request.get_json()["samples"]
+        codes = quantize_samples(samples)
+        add_event(machine_id, "vibration", len(codes))
+        return jsonify({"count": len(codes), "codes": codes})
+
+
+    @app.route("/api/machines/<machine_id>/events")
+    def get_events(machine_id):
+        limit = int(request.args.get("limit", 50))
+        return jsonify(list(islice(feeds.get(machine_id, ()), limit)))
+    ```
+
+    The API output is the same: same codes, same newest-first order, same cap of 20,000 events.
+
+    **Green Notes**
+    - **`deque(maxlen=...)` with `appendleft`** (reduces E on every event): `list.insert(0, x)` moves every item in the list, so each event costs O(n). `appendleft` is O(1), and `maxlen` drops the oldest event for you, so the `pop()` check is gone. In Green Metrics Tool micro-benchmarks, 1,000,000 front inserts into a growing list used ~1515 J, while 1,000,000 `append` calls used ~1.2 J. Your list stops at 20,000 items, so the gap is smaller for you, but it is paid on every event of every machine. A deque cannot be sliced, so `get_events` uses `islice` and `list()`.
+    - **Numba `@njit` for the quantize loop** (reduces E on large uploads): a pure Python loop over 1-2 million floats is CPU-bound number work, which is what Numba is good at. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples took ~40 J in a pure Python loop and ~9.5 J with `@njit` (about 4× less). JSON parsing and building the response are unchanged and still cost time. `cache=True` saves the compiled code on disk, so only the first call after a deploy pays the compile cost.
+
+    *Not applied:* Numba is only worth it because your uploads are huge. For payloads of a few hundred samples, keep the plain loop.
+verify:
+  static_only: needs flask and numba, which are beyond stdlib + numpy

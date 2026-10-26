@@ -1,0 +1,115 @@
+id: gen-1-00285-review
+category: review
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    hello, i made small tool for our support team to read the app event log (json lines, one event per line). the log files are around 300k lines some days. they want newest event first, so i put every new line at the begining of the list. it works but is slow on the big files. can you review it pls?
+
+    ```python
+    #!/usr/bin/env python3
+    import sys
+    import json
+
+
+    def load_events(path):
+        events = []
+        f = open(path)
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            events.insert(0, rec)
+        return events
+
+
+    def main():
+        path = sys.argv[1]
+        level = sys.argv[2] if len(sys.argv) > 2 else None
+        events = load_events(path)
+        shown = 0
+        for ev in events:
+            if level and ev.get("level") != level:
+                continue
+            print(ev["ts"], ev["level"], ev["msg"])
+            shown += 1
+        print("shown:", shown, "of", len(events))
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (run on demand, with large inputs)
+
+    #### [Bug] File is never closed
+    - **Where:** `f = open(path)` in `load_events`
+    - **Issue:** the handle stays open until the function's reference goes away. It is also not closed if `json.loads` raises on a bad line.
+    - **Fix:** use `with open(path) as f:`.
+
+    #### [High] Insert at the front of the list for every line
+    - **Where:** `events.insert(0, rec)`
+    - **Issue:** each front insert shifts all items already in the list. For 300k lines that is about 45 billion element moves in total (O(n²)), where an append is O(1). In Green Metrics Tool micro-benchmarks, 1,000,000 front inserts used about 1515 J, while 1,000,000 appends used about 1.2 J, over 1000× less.
+    - **Fix:** append while reading, then reverse once at the end. The output order stays the same: newest first.
+    - **Impact:** reduces E (CPU time and energy) on every run, and the gap grows with file size.
+
+    ```python
+    #!/usr/bin/env python3
+    import sys
+    import json
+
+
+    def load_events(path):
+        events = []
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                events.append(json.loads(line))
+        events.reverse()
+        return events
+
+
+    def main():
+        path = sys.argv[1]
+        level = sys.argv[2] if len(sys.argv) > 2 else None
+        events = load_events(path)
+        shown = 0
+        for ev in events:
+            if level and ev.get("level") != level:
+                continue
+            print(ev["ts"], ev["level"], ev["msg"])
+            shown += 1
+        print("shown:", shown, "of", len(events))
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    `events.reverse()` is O(n) and runs once. The result is identical to the version with `insert(0, ...)`. A `deque` with `appendleft` would also work, but a plain list plus one reverse is simpler here, because you only need the list once at the end.
+
+    **Already good:** the `main()` guard, skipping empty lines, and `ev.get("level")` for the filter.
+verify:
+  equivalence:
+    driver: |-
+      import os, tempfile, json
+      p = os.path.join(tempfile.mkdtemp(), "events.jsonl")
+      with open(p, "w") as fh:
+          for i in range(200):
+              lvl = ["info", "warn", "error"][i % 3]
+              fh.write(json.dumps({"ts": i, "level": lvl, "msg": "event %d" % i}) + "\n")
+              if i % 17 == 0:
+                  fh.write("\n")
+      evs = load_events(p)
+      print(len(evs))
+      for ev in evs[:8]:
+          print(ev["ts"], ev["level"], ev["msg"])
+      print(evs[-1]["ts"])

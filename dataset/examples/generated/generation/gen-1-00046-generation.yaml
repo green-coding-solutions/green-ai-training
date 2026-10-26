@@ -1,0 +1,96 @@
+id: gen-1-00046-generation
+category: generation
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    I need a Python function for our nightly clickstream ETL. Input is a JSONL file of events (a few million lines per night, one JSON object per line, each with an `account_id` field). We also have a text file `internal_accounts.txt` with one account ID per line (about 8,000 QA and staff accounts). Requirements:
+
+    - Drop every event whose account is in that file
+    - Write the kept events to an output JSONL file, same order, lines unchanged
+    - Skip blank lines and lines that are not valid JSON objects, but count them
+    - Return the counts (kept, excluded, malformed) and the number of kept events per account
+    - Stdlib only, and don't load the whole event file into memory
+- role: assistant
+  content: |
+    ```python
+    import json
+    from collections import Counter
+
+
+    def load_excluded(path):
+        with open(path, encoding="utf-8") as f:
+            return {line.strip() for line in f if line.strip()}
+
+
+    def filter_events(events_path, excluded_path, out_path):
+        excluded = load_excluded(excluded_path)  # built once, reused for every event
+        stats = Counter(kept=0, excluded=0, malformed=0)
+        per_account = Counter()
+
+        with open(events_path, encoding="utf-8") as src, \
+             open(out_path, "w", encoding="utf-8") as dst:
+            for line in src:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    stats["malformed"] += 1
+                    continue
+                if not isinstance(event, dict):
+                    stats["malformed"] += 1
+                    continue
+
+                account = str(event.get("account_id", ""))
+                if account in excluded:
+                    stats["excluded"] += 1
+                    continue
+
+                dst.write(line + "\n")
+                per_account[account] += 1
+                stats["kept"] += 1
+
+        return dict(stats), dict(per_account)
+    ```
+
+    Account IDs are compared as strings, so a numeric `42` in the JSON matches `42` in the text file. Events without `account_id` are kept under the empty ID.
+
+    **Green Notes**
+    - **Set for membership** (reduces E): the 8,000 excluded IDs go into a set once. Each of the millions of events then costs one hash lookup instead of a scan over up to 8,000 list entries.
+    - *Not applied:* a set for a single check. In Green Metrics Tool micro-benchmarks, one membership test on a 10,000,000-element list used less energy than building a set first and testing once (about 50% more for the set). Here the lookups repeat for every event, so the set wins.
+    - **Streaming** (reduces M): the file is read line by line and written straight out, so memory stays flat however large the export gets.
+verify:
+  test: |-
+    import os, tempfile, json
+    d = tempfile.mkdtemp()
+    ex = os.path.join(d, "ex.txt")
+    ev = os.path.join(d, "ev.jsonl")
+    out = os.path.join(d, "out.jsonl")
+    with open(ex, "w") as f:
+        f.write("qa-1\n\n42\n  staff-7  \n")
+    lines = [
+        '{"account_id": "u1", "e": "click"}',
+        '{"account_id": "qa-1", "e": "click"}',
+        '',
+        'not json',
+        '[1, 2]',
+        '{"account_id": 42, "e": "view"}',
+        '{"account_id": "u1", "e": "view"}',
+        '{"account_id": "staff-7"}',
+        '{"e": "anon"}',
+    ]
+    with open(ev, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    stats, per = filter_events(ev, ex, out)
+    assert stats == {"kept": 3, "excluded": 3, "malformed": 2}, stats
+    assert per == {"u1": 2, "": 1}, per
+    with open(out) as f:
+        got = f.read().splitlines()
+    assert got == [lines[0], lines[6], lines[8]], got
+    assert load_excluded(ex) == {"qa-1", "42", "staff-7"}

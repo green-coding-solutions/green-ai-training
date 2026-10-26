@@ -1,0 +1,71 @@
+id: gen-12764612-00136-generation
+category: generation
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    hi, i am new to docker and i dont know if i did this right. i have a small flask app for our webshop that sends the order confirmation emails (it reads orders from a queue and renders html templates). I wrote this Dockerfile but my colleague said the image is "huge" and our pipeline is slow. i dont know what is wrong, can you write a better one?
+
+    ```dockerfile
+    FROM python:3.12
+
+    RUN apt-get update && apt-get install -y build-essential git curl vim
+    RUN pip install pytest black mypy ipython
+
+    WORKDIR /app
+    COPY . .
+    RUN pip install -r requirements.txt
+
+    EXPOSE 5000
+    CMD ["python", "app.py"]
+    ```
+
+    the requirements.txt has flask, gunicorn, jinja2, redis and requests. our CI builds it on every push to every branch.
+- role: assistant
+  content: |
+    Your Dockerfile works, but it ships a lot the app never needs at runtime: compilers, git, vim and test tools. Also, `COPY . .` comes before `pip install`, so every code change reinstalls all packages. Here is a leaner version:
+
+    ```dockerfile
+    FROM python:3.12-slim
+
+    WORKDIR /app
+
+    # dependencies first: this layer is reused until requirements.txt changes
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    # source last: code changes only rebuild from here
+    COPY . .
+
+    RUN useradd --create-home appuser
+    USER appuser
+
+    EXPOSE 5000
+    CMD ["gunicorn", "--bind", "0.0.0.0:5000", "app:app"]
+    ```
+
+    Add a `.dockerignore` so the build context stays small:
+
+    ```text
+    .git
+    __pycache__/
+    *.pyc
+    .venv/
+    tests/
+    ```
+
+    **Green Notes**
+    - **Slim base image, runtime dependencies only** (reduces E, network, storage): `python:3.12-slim` replaces the full image, and the compilers, git, vim, pytest, black, mypy and ipython are gone. In Green Metrics Tool micro-benchmarks of a small Flask app built without a cache, the slim image with runtime dependencies only used about 7× less energy to build (~124 J vs ~885 J). Serving requests afterwards cost the same, so the saving comes from every build, pull and stored copy. That adds up when CI builds on every push to every branch.
+    - **Dependency layer before the source** (reduces E): when only your code changes, Docker reuses the cached install layer instead of running `pip install` again.
+
+    Two things to check:
+    - I assumed the entry point is `app` inside `app.py`. Change `app:app` if your Flask object has another name.
+    - I used `gunicorn` because it is already in your requirements. `python app.py` starts the Flask development server, which is not meant for production. If you really want to keep it, replace the `CMD` line.
+    - Your packages are all pure Python, so they install from wheels and need no compiler. If a package ever fails to build, add only the one system library it names, not the whole toolchain.
+    - Keep your dev tools (pytest, black, mypy) in a separate `requirements-dev.txt` for local use and CI test jobs.
+verify:
+  static_only: Dockerfile

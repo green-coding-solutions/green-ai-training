@@ -1,0 +1,147 @@
+id: gen-12764612-00233-review
+category: review
+language: python
+patterns:
+- async-concurrent-io
+- simple-conditions
+facts:
+- F-HTTP
+- F-COND
+messages:
+- role: user
+  content: |
+    hi, im new to backend and our FastAPI shipping endpoint is slow when customers open checkout, sometimes the whole site feels stuck for other users too. i dont know what is wrong. can you look?
+
+    ```python
+    import requests
+    from fastapi import FastAPI
+
+    app = FastAPI()
+
+    API_KEY = "ck_live_8f3a91c2d7e4"
+
+    CARRIERS = {
+        "dhl": "https://api.dhl-partner.example.com/v2/quote",
+        "dpd": "https://api.dpd-partner.example.com/rates",
+        "gls": "https://api.gls-partner.example.com/quote",
+    }
+
+
+    def delivery_class(days):
+        if days >= 0 and days < 2:
+            return "express"
+        elif days >= 2 and days <= 3:
+            return "standard"
+        elif days > 3 and days <= 7:
+            return "economy"
+        else:
+            return "freight"
+
+
+    @app.get("/shipping/{order_id}")
+    async def shipping_options(order_id: int, weight_kg: float, zip_code: str):
+        options = []
+        for name, url in CARRIERS.items():
+            resp = requests.get(
+                url,
+                params={"weight": weight_kg, "zip": zip_code, "key": API_KEY},
+            )
+            data = resp.json()
+            options.append({
+                "carrier": name,
+                "price": data["price"],
+                "days": data["days"],
+                "class": delivery_class(data["days"]),
+            })
+        options.sort(key=lambda o: o["price"])
+        return {"order_id": order_id, "options": options}
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (REST API, runs on every checkout)
+
+    #### [Bug] Blocking calls inside `async def`
+    - **Where:** `requests.get(...)` in `shipping_options`
+    - **Issue:** `requests` is blocking. In an `async def` endpoint it freezes the event loop while it waits for the carrier. No other request can run in that time. This is why the whole site feels stuck.
+    - **Fix:** use an async client (`httpx.AsyncClient`) and `await` the calls. Full code is below.
+    - **Impact:** E and M. Worker time is wasted waiting, and one slow carrier delays every user.
+
+    #### [Bug] No timeout on carrier calls
+    - **Where:** `requests.get(...)`
+    - **Issue:** `requests` waits forever by default. One hanging carrier hangs the checkout.
+    - **Fix:** set a timeout on the client (5 seconds in the code below).
+
+    #### [Security] API key in the source code
+    - **Where:** `API_KEY = "ck_live_8f3a91c2d7e4"`, sent in the query string
+    - **Issue:** the key is in git, and query strings often end up in logs. Load it from an environment variable. If the carriers accept a header, send it there instead.
+
+    #### [Medium] Carriers are called one after another
+    - **Where:** the `for` loop
+    - **Issue:** the total wait is the sum of all three calls. They do not depend on each other, so they can run together. The wait then becomes the slowest single call. In Green Metrics Tool micro-benchmarks, 10 HTTP requests with async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. With 3 carriers the CPU saving is small and the gain is mostly shorter waiting. The bigger win here is fixing the blocking above.
+    - **Fix:** `asyncio.gather` over the carriers. The result order stays the same, so the price sort behaves as before.
+    - **Impact:** latency per checkout, and shorter time that a worker is held.
+
+    #### [Low] Range checks in `delivery_class`
+    - **Where:** `delivery_class`
+    - **Issue:** every branch has a two-sided range check. In Green Metrics Tool micro-benchmarks, simple equality branches used about 16% less CPU energy than complex range conditions over 10,000,000 classifications. Here it runs three times per checkout, so the saving is tiny. It is still easier to read.
+    - **Fix:** equality checks with `in`. This assumes `days` is always a whole number. If a carrier can send `1.5`, keep the range checks.
+
+    ```python
+    import asyncio
+    import os
+
+    import httpx
+    from fastapi import FastAPI
+
+    app = FastAPI()
+
+    API_KEY = os.environ["CARRIER_API_KEY"]
+
+    CARRIERS = {
+        "dhl": "https://api.dhl-partner.example.com/v2/quote",
+        "dpd": "https://api.dpd-partner.example.com/rates",
+        "gls": "https://api.gls-partner.example.com/quote",
+    }
+
+    client = httpx.AsyncClient(timeout=5.0)
+
+
+    def delivery_class(days):
+        if days in (0, 1):
+            return "express"
+        elif days in (2, 3):
+            return "standard"
+        elif days in (4, 5, 6, 7):
+            return "economy"
+        else:
+            return "freight"
+
+
+    async def fetch_option(name, url, weight_kg, zip_code):
+        resp = await client.get(
+            url,
+            params={"weight": weight_kg, "zip": zip_code, "key": API_KEY},
+        )
+        data = resp.json()
+        return {
+            "carrier": name,
+            "price": data["price"],
+            "days": data["days"],
+            "class": delivery_class(data["days"]),
+        }
+
+
+    @app.get("/shipping/{order_id}")
+    async def shipping_options(order_id: int, weight_kg: float, zip_code: str):
+        options = await asyncio.gather(
+            *(fetch_option(n, u, weight_kg, zip_code) for n, u in CARRIERS.items())
+        )
+        options = sorted(options, key=lambda o: o["price"])
+        return {"order_id": order_id, "options": options}
+    ```
+
+    If one carrier fails, the endpoint still returns an error, as it did before. The shared `client` is created once, so connections can be reused between requests.
+
+    **Already good:** the route and parameter types are clean, and sorting by price happens once at the end.
+verify:
+  static_only: needs FastAPI, httpx and live carrier APIs

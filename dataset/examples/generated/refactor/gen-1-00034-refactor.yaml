@@ -1,0 +1,51 @@
+id: gen-1-00034-refactor
+category: refactor
+language: sql
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    fix this. its our nightly job log archive, real file has ~40k lines like these
+
+    ```sql
+    INSERT INTO job_log (job_id, logged_at, level, message) VALUES (4101, '2026-10-24 02:15:03', 'INFO', 'job started');
+    INSERT INTO job_log (job_id, logged_at, level, message) VALUES (4101, '2026-10-24 02:15:04', 'INFO', 'fetching batch 1');
+    INSERT INTO job_log (job_id, logged_at, level, message) VALUES (4101, '2026-10-24 02:15:09', 'WARN', 'slow upstream, retry 1');
+    INSERT INTO job_log (job_id, logged_at, level, message) VALUES (4101, '2026-10-24 02:15:15', 'INFO', 'fetching batch 2');
+    INSERT INTO job_log (job_id, logged_at, level, message) VALUES (4101, '2026-10-24 02:15:21', 'ERROR', 'row 88: can''t parse "n/a"');
+    INSERT INTO job_log (job_id, logged_at, level, message) VALUES (4101, '2026-10-24 02:15:22', 'INFO', 'skipped 1 row');
+    INSERT INTO job_log (job_id, logged_at, level, message) VALUES (4101, '2026-10-24 02:15:40', 'INFO', 'batch 2 done');
+    INSERT INTO job_log (job_id, logged_at, level, message) VALUES (4101, '2026-10-24 02:15:41', 'INFO', 'job finished');
+    ```
+- role: assistant
+  content: |
+    ```sql
+    BEGIN;
+
+    INSERT INTO job_log (job_id, logged_at, level, message) VALUES
+      (4101, '2026-10-24 02:15:03', 'INFO',  'job started'),
+      (4101, '2026-10-24 02:15:04', 'INFO',  'fetching batch 1'),
+      (4101, '2026-10-24 02:15:09', 'WARN',  'slow upstream, retry 1'),
+      (4101, '2026-10-24 02:15:15', 'INFO',  'fetching batch 2'),
+      (4101, '2026-10-24 02:15:21', 'ERROR', 'row 88: can''t parse "n/a"'),
+      (4101, '2026-10-24 02:15:22', 'INFO',  'skipped 1 row'),
+      (4101, '2026-10-24 02:15:40', 'INFO',  'batch 2 done'),
+      (4101, '2026-10-24 02:15:41', 'INFO',  'job finished');
+    -- for the full file: start a new INSERT every ~1000 rows
+
+    COMMIT;
+    ```
+
+    For the real 40k-line file, have the generator emit one multi-row `INSERT` per 1,000 rows, all inside one `BEGIN ... COMMIT`. If the archive can be written as CSV instead, `\copy job_log (job_id, logged_at, level, message) FROM 'job_log.csv' CSV` is the cheapest option.
+
+    **Green Notes**
+    - **Batched inserts** (reduces E): the old file runs one statement per row. Each one is parsed, planned and committed on its own. Now it is about 40 statements and one commit instead of 40,000. In Green Metrics Tool micro-benchmarks on Postgres, with 5,000-row batches, one `INSERT` per row used about 22× more CPU energy than `COPY`, and about 2.8× more than `executemany`. With batches of only ~100 rows the differences were small, so keep batches large.
+    - **One transaction:** the load is now all-or-nothing. A bad row fails its statement and the whole load rolls back, instead of leaving a half-loaded archive. If you prefer to skip bad rows, load into a staging table first.
+    - Row order, values and escaping are unchanged, including the `''` in the ERROR line.
+verify:
+  sql:
+    setup: CREATE TABLE job_log (job_id INTEGER, logged_at TEXT, level TEXT, message TEXT);
+    compare: true

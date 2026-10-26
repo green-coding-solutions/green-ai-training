@@ -1,0 +1,114 @@
+id: gen-2-00261-generation
+category: generation
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    Fill the TODO in our catalog import worker. I need `find_broken_images(client, rows)` returning `dict[sku, list[(url, status)]]`. It should HEAD every image URL. Anything that isn't 2xx counts as broken, and a timeout or connection error gives status `None`. Products with a broken image get rejected. Batches have up to 500 products with 1-8 images each, mostly hosted on 3-4 supplier CDNs. `ProductRow` has `.sku` and `.image_urls: list[str]`.
+
+    Just the diff please, no module rewrite.
+
+    ```python
+    import asyncio
+    import logging
+
+    import httpx
+
+    from .models import ProductRow, ImportResult
+    from .db import upsert_products, mark_import_failed
+
+    log = logging.getLogger(__name__)
+
+    SUPPLIER_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+
+
+    async def fetch_feed(client: httpx.AsyncClient, feed_url: str) -> list[ProductRow]:
+        resp = await client.get(feed_url)
+        resp.raise_for_status()
+        return [ProductRow.from_json(item) for item in resp.json()["products"]]
+
+
+    async def run_import(import_id: int, feed_url: str) -> ImportResult:
+        async with httpx.AsyncClient(timeout=SUPPLIER_TIMEOUT, follow_redirects=True) as client:
+            try:
+                rows = await fetch_feed(client, feed_url)
+            except httpx.HTTPError as exc:
+                log.warning("import %s: feed fetch failed: %s", import_id, exc)
+                await mark_import_failed(import_id, reason="feed_unreachable")
+                return ImportResult(import_id, imported=0, rejected=0)
+
+            # TODO: reject products whose images are dead before upserting
+
+            valid = [r for r in rows if r.price_cents > 0 and r.sku]
+            await upsert_products(valid)
+            return ImportResult(import_id, imported=len(valid), rejected=len(rows) - len(valid))
+    ```
+- role: assistant
+  content: |
+    New code, above `run_import`:
+
+    ```python
+    IMAGE_CHECK_CONCURRENCY = 20
+
+
+    async def _image_status(
+        client: httpx.AsyncClient, url: str, sem: asyncio.Semaphore
+    ) -> int | None:
+        async with sem:
+            try:
+                resp = await client.head(url)
+                if resp.status_code == 405:
+                    # some CDNs refuse HEAD: open a GET, take the status, close without reading the body
+                    async with client.stream("GET", url) as resp:
+                        pass
+                return resp.status_code
+            except (httpx.HTTPError, httpx.InvalidURL):
+                return None
+
+
+    async def find_broken_images(
+        client: httpx.AsyncClient, rows: list[ProductRow]
+    ) -> dict[str, list[tuple[str, int | None]]]:
+        sem = asyncio.Semaphore(IMAGE_CHECK_CONCURRENCY)
+        checks = [(row.sku, url) for row in rows for url in row.image_urls]
+        statuses = await asyncio.gather(
+            *(_image_status(client, url, sem) for _, url in checks)
+        )
+        broken: dict[str, list[tuple[str, int | None]]] = {}
+        for (sku, url), status in zip(checks, statuses):
+            if status is None or not 200 <= status < 300:
+                broken.setdefault(sku, []).append((url, status))
+        return broken
+    ```
+
+    `run_import` with the TODO filled in. Only the lines after the feed fetch changed:
+
+    ```python
+    async def run_import(import_id: int, feed_url: str) -> ImportResult:
+        async with httpx.AsyncClient(timeout=SUPPLIER_TIMEOUT, follow_redirects=True) as client:
+            try:
+                rows = await fetch_feed(client, feed_url)
+            except httpx.HTTPError as exc:
+                log.warning("import %s: feed fetch failed: %s", import_id, exc)
+                await mark_import_failed(import_id, reason="feed_unreachable")
+                return ImportResult(import_id, imported=0, rejected=0)
+
+            valid = [r for r in rows if r.price_cents > 0 and r.sku]
+            broken = await find_broken_images(client, valid)
+            if broken:
+                log.info("import %s: %d products with broken images", import_id, len(broken))
+                valid = [r for r in valid if r.sku not in broken]
+            await upsert_products(valid)
+            return ImportResult(import_id, imported=len(valid), rejected=len(rows) - len(valid))
+    ```
+
+    **Green Notes**
+    - **Concurrent async I/O** (reduces E): a full batch is up to about 4,000 HEAD requests. They now run 20 at a time on the client you already have, instead of waiting on each round trip in turn. The worker spends far less time idle. In Green Metrics Tool micro-benchmarks with 10 requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. Most of the gain is the waiting time that goes away.
+
+    Behavior notes: images are checked only for rows that pass the price/SKU filter, so the request count stays lower. The semaphore caps open connections so the supplier CDNs don't rate-limit you. Malformed URLs count as broken with status `None`. If a feed repeats a SKU, every row with that SKU is rejected when any of them has a broken image.
+verify:
+  static_only: needs httpx and network access to image URLs

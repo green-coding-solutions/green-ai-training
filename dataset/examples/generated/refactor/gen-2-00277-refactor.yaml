@@ -1,0 +1,144 @@
+id: gen-2-00277-refactor
+category: refactor
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    Hi, this module export our FEM results to legacy VTK format so we can open them in ParaView. For the big turbine blade mesh (around 3 million nodes, 15M tets) only the writing take very long, almost longer than the solver :) Can you make it better? The output file must stay exactly same, we have regression test that compare it byte by byte.
+
+    ```python
+    VTK_TETRA = 10
+
+
+    def write_vtk(path, mesh, title="fem result"):
+        s = to_vtk_string(mesh, title)
+        with open(path, "w") as f:
+            f.write(s)
+
+
+    def to_vtk_string(mesh, title="fem result"):
+        nodes = mesh["nodes"]
+        elems = mesh["elements"]
+        fields = mesh.get("point_data", {})
+
+        out = "# vtk DataFile Version 3.0\n"
+        out += title + "\n"
+        out += "ASCII\n"
+        out += "DATASET UNSTRUCTURED_GRID\n"
+
+        out += f"POINTS {len(nodes)} double\n"
+        for x, y, z in nodes:
+            out += f"{x:.9e} {y:.9e} {z:.9e}\n"
+
+        size = sum(len(e) + 1 for e in elems)
+        out += f"CELLS {len(elems)} {size}\n"
+        for e in elems:
+            line = str(len(e))
+            for n in e:
+                line += " " + str(n)
+            out += line + "\n"
+
+        out += f"CELL_TYPES {len(elems)}\n"
+        for e in elems:
+            out += str(VTK_TETRA) + "\n"
+
+        if fields:
+            out += f"POINT_DATA {len(nodes)}\n"
+            for name, values in fields.items():
+                if len(values) != len(nodes):
+                    raise ValueError(
+                        f"field {name} has {len(values)} values, expected {len(nodes)}"
+                    )
+                out += f"SCALARS {name} double 1\n"
+                out += "LOOKUP_TABLE default\n"
+                for v in values:
+                    out += f"{v:.9e}\n"
+
+        return out
+    ```
+- role: assistant
+  content: |
+    ```python
+    VTK_TETRA = 10
+
+
+    def write_vtk(path, mesh, title="fem result"):
+        s = to_vtk_string(mesh, title)
+        with open(path, "w") as f:
+            f.write(s)
+
+
+    def to_vtk_string(mesh, title="fem result"):
+        nodes = mesh["nodes"]
+        elems = mesh["elements"]
+        fields = mesh.get("point_data", {})
+
+        parts = [
+            "# vtk DataFile Version 3.0\n",
+            title + "\n",
+            "ASCII\n",
+            "DATASET UNSTRUCTURED_GRID\n",
+            f"POINTS {len(nodes)} double\n",
+        ]
+        parts.extend(f"{x:.9e} {y:.9e} {z:.9e}\n" for x, y, z in nodes)
+
+        size = sum(len(e) + 1 for e in elems)
+        parts.append(f"CELLS {len(elems)} {size}\n")
+        parts.extend(" ".join(map(str, (len(e), *e))) + "\n" for e in elems)
+
+        parts.append(f"CELL_TYPES {len(elems)}\n")
+        parts.append(f"{VTK_TETRA}\n" * len(elems))
+
+        if fields:
+            parts.append(f"POINT_DATA {len(nodes)}\n")
+            for name, values in fields.items():
+                if len(values) != len(nodes):
+                    raise ValueError(
+                        f"field {name} has {len(values)} values, expected {len(nodes)}"
+                    )
+                parts.append(f"SCALARS {name} double 1\nLOOKUP_TABLE default\n")
+                parts.extend(f"{v:.9e}\n" for v in values)
+
+        return "".join(parts)
+    ```
+
+    **Green Notes**
+    - **Join strings instead of `+=` in loops** (reduces E): every `out += ...` can copy the growing file content again. Your output has one line per node, per element and per field value, so the copying grows with the mesh. Now the lines go into a list and are joined once at the end. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces with `+=` used ~469 J and `"".join()` ~1.8 J, roughly 260× less. f-strings in a `+=` loop behaved the same as plain `+=`.
+    - **Inner loops** (reduces E): the per-element `line += " " + str(n)` is now one `" ".join(...)` per element. The `CELL_TYPES` block is now a single string repetition, not one append per element.
+
+    The output is byte for byte the same, including the error message, so your regression test should still pass. Memory use is similar: the whole file is still built in memory before it is written.
+verify:
+  test: |
+    m = {"nodes": [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)],
+         "elements": [(0, 1, 2, 3)],
+         "point_data": {"T": [1.0, 2.0, 3.0, 4.0]}}
+    s = to_vtk_string(m, "t")
+    assert s.startswith("# vtk DataFile Version 3.0\nt\nASCII\nDATASET UNSTRUCTURED_GRID\nPOINTS 4 double\n")
+    assert "CELLS 1 5\n4 0 1 2 3\nCELL_TYPES 1\n10\nPOINT_DATA 4\nSCALARS T double 1\nLOOKUP_TABLE default\n" in s
+    assert s.endswith("4.000000000e+00\n")
+    try:
+        to_vtk_string({"nodes": [(0.0, 0.0, 0.0)], "elements": [], "point_data": {"p": [1.0, 2.0]}})
+        assert False
+    except ValueError as e:
+        assert str(e) == "field p has 2 values, expected 1"
+  equivalence:
+    driver: |-
+      mesh = {
+          "nodes": [(i * 0.1, (i % 7) * 0.25, -i / 3) for i in range(30)],
+          "elements": [(i, i + 1, i + 2, i + 3) for i in range(0, 26, 2)],
+          "point_data": {
+              "temperature": [293.15 + i * 0.5 for i in range(30)],
+              "von_mises": [i * 1.5e6 for i in range(30)],
+          },
+      }
+      print(to_vtk_string(mesh, "beam test"))
+      print(to_vtk_string({"nodes": [(0.0, 0.0, 0.0)], "elements": []}))
+      print(to_vtk_string({"nodes": [(1.0, 2.0, 3.0)], "elements": [(0,)], "point_data": {}}))
+      try:
+          to_vtk_string({"nodes": [(0.0, 0.0, 0.0)], "elements": [], "point_data": {"p": [1.0, 2.0]}})
+      except ValueError as e:
+          print(e)

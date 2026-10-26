@@ -1,0 +1,60 @@
+id: gen-2-00091-estimate
+category: estimate
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    how much energy per build do we save if i slim this down? CI builds it on every push
+
+    ```dockerfile
+    FROM python:3.12
+
+    RUN apt-get update && apt-get install -y build-essential git curl vim jq
+
+    WORKDIR /opt/logrelay
+    COPY . .
+
+    RUN pip install -r requirements.txt -r requirements-dev.txt
+
+    ENV LOG_LEVEL=info
+    CMD ["python", "-m", "logrelay", "--input", "/var/log/app", "--sink", "loki"]
+    ```
+- role: assistant
+  content: |
+    I can't give you a number for your image. A closely matching measurement exists, though.
+
+    In Green Metrics Tool measurements of a small Flask app built without a build cache, a `python:3.12` image with `build-essential`, `git`, `curl`, `vim` and dev tools used ~885 J and 157 s per build. A `python:3.12-slim` image with runtime dependencies only, the dependency layer before the source, and `pip --no-cache-dir` used ~124 J and 25 s. That is about 7× less. Serving requests afterwards cost the same with both images, so the whole saving is in building, pulling and storing.
+
+    Your Dockerfile has the same ingredients, so expect a similar direction:
+
+    ```dockerfile
+    FROM python:3.12-slim
+
+    WORKDIR /opt/logrelay
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY . .
+
+    ENV LOG_LEVEL=info
+    CMD ["python", "-m", "logrelay", "--input", "/var/log/app", "--sink", "loki"]
+    ```
+
+    What drives the saving here:
+    - **Smaller base, no apt packages:** less to download, unpack and store on every build and on every node that pulls the image.
+    - **No dev requirements:** pytest and the other dev tools don't belong in the image that ships logs. Run tests in a separate CI job or a separate build stage.
+    - **`requirements.txt` before `COPY . .`:** right now every code change invalidates the pip layer. With cached CI builds, a code-only push now reuses the dependency layer instead of reinstalling everything.
+
+    Check before you switch:
+    - If a dependency has no wheel and needs compiling, install `build-essential` in a builder stage and copy only the installed packages into the slim image.
+    - If `requirements.txt` has `git+` URLs, you need `git` in that builder stage too.
+    - Keep `curl` or `jq` only if your entrypoint or a healthcheck calls them.
+
+    To get your own number, build both versions with `docker build --no-cache` in a Green Metrics Tool usage scenario and compare. Without it, `perf stat` or `time` around the build gives a CPU-time proxy. `docker image ls` shows the size difference that every pull pays. Don't multiply my figure by your push count: it comes from one app on one machine.
+verify:
+  static_only: Dockerfile, needs Docker and the project's requirements to build

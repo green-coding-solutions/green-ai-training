@@ -1,0 +1,138 @@
+id: gen-2-00052-refactor
+category: refactor
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    Hi, I made a small gateway on a Raspberry Pi. It reads our greenhouse sensor nodes over wifi (18 nodes right now). It should save readings every 30 seconds. But when some nodes are offline, the timestamps in the file are 1-2 minutes apart. And yesterday the script stopped completely and I had to restart it. I don't really understand what is wrong. Can you improve it?
+
+    ```python
+    import json
+    import time
+    import urllib.request
+    import urllib.error
+    from datetime import datetime, timezone
+
+    POLL_INTERVAL = 30
+    TIMEOUT = 5
+    NODES_FILE = "/etc/gateway/nodes.json"
+    BUFFER_FILE = "/var/lib/gateway/readings.jsonl"
+
+
+    def load_nodes():
+        with open(NODES_FILE) as f:
+            return json.load(f)  # [{"id": "gh1-north", "ip": "10.0.4.11"}, ...]
+
+
+    def read_node(node):
+        url = f"http://{node['ip']}/api/v1/readings"
+        try:
+            with urllib.request.urlopen(url, timeout=TIMEOUT) as resp:
+                data = json.loads(resp.read())
+        except urllib.error.URLError as e:
+            print(f"{node['id']}: offline ({e.reason})")
+            return None
+        return {
+            "node": node["id"],
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "temp_c": data["temperature"],
+            "humidity": data["humidity"],
+            "battery_v": data.get("battery"),
+        }
+
+
+    def save(readings):
+        with open(BUFFER_FILE, "a") as f:
+            for r in readings:
+                f.write(json.dumps(r) + "\n")
+
+
+    def main():
+        nodes = load_nodes()
+        while True:
+            readings = []
+            for node in nodes:
+                r = read_node(node)
+                if r is not None:
+                    readings.append(r)
+            save(readings)
+            print(f"saved {len(readings)}/{len(nodes)} readings")
+            time.sleep(POLL_INTERVAL)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    ```python
+    import asyncio
+    import json
+    import time
+    from datetime import datetime, timezone
+
+    import httpx  # pip install httpx
+
+    POLL_INTERVAL = 30
+    TIMEOUT = 5
+    NODES_FILE = "/etc/gateway/nodes.json"
+    BUFFER_FILE = "/var/lib/gateway/readings.jsonl"
+
+
+    def load_nodes():
+        with open(NODES_FILE) as f:
+            return json.load(f)  # [{"id": "gh1-north", "ip": "10.0.4.11"}, ...]
+
+
+    async def read_node(client, node):
+        url = f"http://{node['ip']}/api/v1/readings"
+        try:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.HTTPError as e:
+            print(f"{node['id']}: offline ({type(e).__name__})")
+            return None
+        return {
+            "node": node["id"],
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "temp_c": data["temperature"],
+            "humidity": data["humidity"],
+            "battery_v": data.get("battery"),
+        }
+
+
+    def save(readings):
+        with open(BUFFER_FILE, "a") as f:
+            for r in readings:
+                f.write(json.dumps(r) + "\n")
+
+
+    async def main():
+        nodes = load_nodes()
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            while True:
+                started = time.monotonic()
+                results = await asyncio.gather(*(read_node(client, n) for n in nodes))
+                readings = [r for r in results if r is not None]
+                save(readings)
+                print(f"saved {len(readings)}/{len(nodes)} readings")
+                elapsed = time.monotonic() - started
+                await asyncio.sleep(max(0, POLL_INTERVAL - elapsed))
+
+
+    if __name__ == "__main__":
+        asyncio.run(main())
+    ```
+
+    **Green Notes**
+    - **Concurrent requests** (reduces E, mostly wall time): the old loop asked the nodes one at a time. Each offline node made it wait for the full 5 s timeout before it moved on to the next one, so a few dead nodes stretched every cycle well past 30 s. Now all 18 requests go out together, so one round takes about as long as the slowest node. One shared `AsyncClient` also reuses connections instead of opening a new one for every request. In Green Metrics Tool micro-benchmarks, 10 HTTP requests with async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. So the main win is time, not CPU energy: the Pi spends much less of each cycle waiting on sockets.
+    - **Bug fixed, the crash:** `urlopen` wraps connection errors in `URLError`, but a timeout while reading the response raises a plain `TimeoutError`. Your `except` did not catch it, so the script stopped. `httpx.HTTPError` covers connect errors, read timeouts and (through `raise_for_status()`) HTTP error codes. All of these now count as "offline", the same as before.
+    - **Steady 30 s cycle:** the loop now sleeps only for the time that is left in the interval. A new round starts every 30 s and no longer 30 s after the previous one finished.
+    - **Same output:** the readings come out in the same node order (`gather` keeps the order), and the records look the same. The one difference is the offline message: it now shows the error type, for example `ConnectTimeout`, instead of `e.reason`.
+verify:
+  static_only: needs the httpx package and live sensor nodes on the network

@@ -1,0 +1,77 @@
+id: gen-12764612-00283-estimate
+category: estimate
+language: python
+patterns:
+- simple-conditions
+facts:
+- F-COND
+messages:
+- role: user
+  content: |
+    hi, i am new with python and i made this for our nightly ETL job. a colleague said the if conditions look "heavy" but i dont know whats wrong with them. it works fine. if i change them, how much energy do we save? we run about a few million rows every night
+
+    ```python
+    import csv
+    from collections import Counter
+
+
+    def stage_name(code):
+        if code // 10 == 1 and code % 10 == 0:
+            return "extract"
+        elif code // 10 == 2 and code % 10 == 0:
+            return "validate"
+        elif code // 10 == 3 and code % 10 == 0:
+            return "transform"
+        elif code // 10 == 4 and code % 10 == 0:
+            return "load"
+        elif code // 10 == 9 and code % 10 == 0:
+            return "error"
+        return "unknown"
+
+
+    def summarize(path):
+        counts = Counter()
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                counts[stage_name(int(row["stage_code"]))] += 1
+        return counts
+    ```
+- role: assistant
+  content: |
+    Your code is correct. The conditions are just more work than needed. Each one does a division and a modulo to test something that is a plain equality: `code // 10 == 1 and code % 10 == 0` is the same as `code == 10` for whole numbers.
+
+    In Green Metrics Tool micro-benchmarks, 10,000,000 classifications with simple equality branches used ~46 J of CPU energy. The same task with complex range/modulo conditions used ~54 J. That is about 16% less for the simple version.
+
+    ```python
+    def stage_name(code):
+        if code == 10:
+            return "extract"
+        elif code == 20:
+            return "validate"
+        elif code == 30:
+            return "transform"
+        elif code == 40:
+            return "load"
+        elif code == 90:
+            return "error"
+        return "unknown"
+    ```
+
+    It returns the same result for every code. Rewriting it as `match` would not help: with the same conditions, `match` and `if/elif` differed by about 1%, which is noise.
+
+    Don't scale the 16% to your job. It only covers the classification step. Reading the CSV and parsing each row probably costs more than this function, so the saving for the whole nightly run will be smaller. It depends on your row count and on how much time the rest of the pipeline takes.
+
+    To measure, run `summarize` on a real file before and after the change. Use `perf stat` or `time` as a CPU-time proxy, or a Green Metrics Tool usage scenario for energy. The change is small and safe, so it is worth making, but don't expect a large drop.
+verify:
+  equivalence:
+    driver: |
+      for c in [-10, 0, 5, 10, 11, 15, 20, 25, 30, 40, 41, 50, 90, 91, 99, 100, 190, 1000, -90]:
+          print(c, stage_name(c))
+  test: |-
+    assert stage_name(10) == "extract"
+    assert stage_name(20) == "validate"
+    assert stage_name(30) == "transform"
+    assert stage_name(40) == "load"
+    assert stage_name(90) == "error"
+    assert stage_name(15) == "unknown"
+    assert stage_name(100) == "unknown"

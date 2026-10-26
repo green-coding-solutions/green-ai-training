@@ -1,0 +1,119 @@
+id: gen-1-00012-refactor
+category: refactor
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    hello, i have script for check our nginx access log against list of bad IPs. it work but is very slow when log is big (some millions lines) and the blocked file have about 40k IPs. can you make it more better? sorry for my english
+
+    ```python
+    import sys
+
+
+    def load_ips(path):
+        with open(path) as f:
+            return [line.strip() for line in f if line.strip()]
+
+
+    def scan(log_path, blocked_path):
+        blocked = load_ips(blocked_path)
+        seen_blocked = []
+        total = 0
+        hits = 0
+        with open(log_path) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 9:
+                    continue
+                total += 1
+                ip = parts[0]
+                if ip in blocked:
+                    hits += 1
+                    if ip not in seen_blocked:
+                        seen_blocked.append(ip)
+        return total, hits, seen_blocked
+
+
+    def report(log_path, blocked_path):
+        total, hits, seen = scan(log_path, blocked_path)
+        print(f"lines checked: {total}")
+        print(f"requests from blocked IPs: {hits}")
+        print(f"distinct blocked IPs: {len(seen)}")
+        for ip in seen:
+            print(ip)
+
+
+    if __name__ == "__main__":
+        report(sys.argv[1], sys.argv[2])
+    ```
+- role: assistant
+  content: |
+    ```python
+    import sys
+
+
+    def load_ips(path):
+        with open(path) as f:
+            return [line.strip() for line in f if line.strip()]
+
+
+    def scan(log_path, blocked_path):
+        blocked = set(load_ips(blocked_path))
+        seen_blocked = {}  # dict keeps first-seen order
+        total = 0
+        hits = 0
+        with open(log_path) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 9:
+                    continue
+                total += 1
+                ip = parts[0]
+                if ip in blocked:
+                    hits += 1
+                    seen_blocked[ip] = None
+        return total, hits, list(seen_blocked)
+
+
+    def report(log_path, blocked_path):
+        total, hits, seen = scan(log_path, blocked_path)
+        print(f"lines checked: {total}")
+        print(f"requests from blocked IPs: {hits}")
+        print(f"distinct blocked IPs: {len(seen)}")
+        for ip in seen:
+            print(ip)
+
+
+    if __name__ == "__main__":
+        report(sys.argv[1], sys.argv[2])
+    ```
+
+    **Green Notes**
+    - **Set for the blocked IPs** (reduces E): `ip in blocked` ran once per log line, and on a list each check scans up to 40k entries. With millions of lines that is billions of string comparisons. A set checks each IP in about constant time, so the work is now proportional to the log size. Here the set is the right choice because you look up once per line. In Green Metrics Tool micro-benchmarks, a single lookup in a 10,000,000-element list (~6.9 J) was cheaper than building a set first (~10.5 J). A set pays off only with many lookups, and a big log gives you that.
+    - **Dict instead of `not in` on a list** (reduces E): `ip not in seen_blocked` scanned a growing list for every hit. Writing `seen_blocked[ip] = None` does the same job in constant time. The dict keeps first-seen order, so the printed IP order is the same as before.
+
+    The output is identical. The only difference is speed: the set loses the order and duplicates of the blocked file, but you never used them.
+verify:
+  equivalence:
+    driver: |-
+      import os, tempfile
+      d = tempfile.mkdtemp()
+      blocked_path = os.path.join(d, "blocked.txt")
+      log_path = os.path.join(d, "access.log")
+      with open(blocked_path, "w") as f:
+          f.write("10.0.0.5\n\n  10.0.0.9  \n10.0.0.5\n192.168.1.77\n")
+      lines = []
+      ips = ["10.0.0.9", "8.8.8.8", "10.0.0.5", "1.1.1.1", "192.168.1.77", "10.0.0.9", "10.0.0.5"]
+      for i in range(200):
+          ip = ips[i % len(ips)]
+          lines.append(f'{ip} - - [10/Oct/2026:13:55:{i % 60:02d} +0000] "GET /p/{i} HTTP/1.1" 200 {i * 3}')
+      lines.append("broken line")
+      lines.append("")
+      with open(log_path, "w") as f:
+          f.write("\n".join(lines) + "\n")
+      print(scan(log_path, blocked_path))
+      report(log_path, blocked_path)

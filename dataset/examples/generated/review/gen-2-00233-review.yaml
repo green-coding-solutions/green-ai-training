@@ -1,0 +1,111 @@
+id: gen-2-00233-review
+category: review
+language: bash
+patterns:
+- compress-transmitted
+- compress-stored
+facts:
+- F-COMPRESS
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    fix this, it eats the cpu on our inference boxes
+
+    ```bash
+    #!/usr/bin/env bash
+    # called by infer-worker after every batch (~every 2 min), $1 = batch id
+    BATCH=$1
+    OUT=/data/infer/out/$BATCH
+    ARCHIVE=/mnt/audit/$(date +%F)
+    RESULTS_API="https://results.internal/api/v1/batches"
+
+    mkdir -p $ARCHIVE
+
+    # predictions -> results service
+    brotli -q 11 -f -o $OUT/preds.jsonl.br $OUT/preds.jsonl
+    curl -s -X POST \
+      -H "Content-Type: application/x-ndjson" \
+      -H "Content-Encoding: br" \
+      --data-binary @$OUT/preds.jsonl.br \
+      "$RESULTS_API/$BATCH"
+
+    # input crops (jpg) for audit, kept 90 days
+    tar -cf - -C $OUT crops | xz -9 > $ARCHIVE/$BATCH-crops.tar.xz
+
+    # embeddings for the reranker, it picks them up within a few minutes and deletes them
+    gzip -9 -c $OUT/embeddings.npy > /scratch/rerank/$BATCH.npy.gz
+
+    # predictions also go to the audit archive (90 days)
+    xz -9 -c $OUT/preds.jsonl > $ARCHIVE/$BATCH-preds.jsonl.xz
+
+    rm -rf $OUT
+    ```
+- role: assistant
+  content: |
+    **Workload:** AI/ML (batch inference, runs after every batch)
+
+    #### [Bug] Batch output is deleted even when the upload fails
+    - **Where:** `curl -s ...` and `rm -rf $OUT`
+    - **Issue:** `curl -s` without `--fail` exits 0 on HTTP 4xx/5xx, and the script has no error checks anyway. The batch directory is deleted after a failed upload, so those predictions are gone. If `$1` is empty, `OUT` becomes `/data/infer/out/` and `rm -rf` wipes every batch on the node.
+    - **Fix:** `set -euo pipefail`, `BATCH=${1:?...}`, `curl --fail`, and quote all paths.
+
+    #### [High] Brotli at max quality for a one-time upload
+    - **Where:** `brotli -q 11` before the POST
+    - **Issue:** the predictions are compressed once and sent once. Quality 11 is meant for static assets that are compressed once and served many times. In Green Metrics Tool measurements on 100 MB of text, brotli at quality 11 used ~3019 J, gzip ~67 J and zstd ~16 J. That makes brotli about 190× zstd. You pay this on every batch on every node.
+    - **Fix:** use zstd if the results service accepts `Content-Encoding: zstd`. Otherwise use `gzip` at the default level with `Content-Encoding: gzip`. Compress once and reuse the same file for the archive (see below).
+    - **Impact:** E, large. This and the next finding are likely most of the CPU load.
+
+    #### [High] xz -9 on JPEG crops
+    - **Where:** `tar ... crops | xz -9`
+    - **Issue:** JPEGs are already compressed. xz saves almost no space on them, but it is one of the most expensive codecs: xz at its default level used about 29× the energy of zstd in the same measurements, and `-9` is heavier still.
+    - **Fix:** plain `tar -cf "$ARCHIVE/$BATCH-crops.tar" -C "$OUT" crops`.
+    - **Impact:** E, large, with almost no change in archive size.
+
+    #### [Medium] Compressing scratch files that live for minutes
+    - **Where:** `gzip -9 -c $OUT/embeddings.npy > /scratch/rerank/...`
+    - **Issue:** the reranker deletes these within minutes. A Green Coding Solutions estimate puts the break-even for stored data at about 0.15 days even with zstd, and about 7 days with xz. Those are lower bounds. Data that lives for minutes never earns back the compression CPU.
+    - **Fix:** move the file uncompressed. **The reranker must then read `$BATCH.npy` instead of `$BATCH.npy.gz`.**
+    - **Impact:** E, one `gzip -9` run per batch removed.
+
+    #### [Low] xz -9 for the 90-day prediction archive
+    - **Where:** `xz -9 -c $OUT/preds.jsonl`
+    - **Issue:** compressing here is right, because 90 days is far past the break-even. The choice of codec is a trade-off. xz gives smaller files. zstd costs a fraction of the CPU, and it runs on every batch. The measurements compare energy only, not compression ratio. If archive storage is the tight resource, xz is defensible.
+    - **Fix:** reuse the zstd file you already made for the upload. That is one compression per batch instead of two.
+
+    ```bash
+    #!/usr/bin/env bash
+    # called by infer-worker after every batch (~every 2 min), $1 = batch id
+    set -euo pipefail
+
+    BATCH=${1:?usage: ship_batch.sh <batch-id>}
+    OUT="/data/infer/out/$BATCH"
+    ARCHIVE="/mnt/audit/$(date +%F)"
+    RESULTS_API='https://results.internal/api/v1/batches'
+
+    mkdir -p "$ARCHIVE"
+
+    # compress predictions once, use the file for upload and archive
+    zstd -q -f -o "$OUT/preds.jsonl.zst" "$OUT/preds.jsonl"
+
+    curl -sS --fail -X POST \
+      -H 'Content-Type: application/x-ndjson' \
+      -H 'Content-Encoding: zstd' \
+      --data-binary "@$OUT/preds.jsonl.zst" \
+      "$RESULTS_API/$BATCH"
+
+    cp "$OUT/preds.jsonl.zst" "$ARCHIVE/$BATCH-preds.jsonl.zst"
+
+    # JPEG crops are already compressed: plain tar
+    tar -cf "$ARCHIVE/$BATCH-crops.tar" -C "$OUT" crops
+
+    # the reranker deletes these within minutes: no compression
+    mv "$OUT/embeddings.npy" "/scratch/rerank/$BATCH.npy"
+
+    rm -rf -- "$OUT"
+    ```
+
+    Behavior changes to coordinate: the results service must accept zstd, or switch both lines to gzip. Audit files are now `.tar` and `.jsonl.zst` instead of `.xz`. The reranker reads uncompressed `.npy`.
+verify:
+  static_only: needs zstd, brotli, curl, the results service and the mount points; script is syntax checked only

@@ -1,0 +1,67 @@
+id: gen-1-00176-refactor
+category: refactor
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    hi, i made a small python CLI that turns our monthly sales excel files into invoice PDFs (`invoicer`). i put it in docker so colleagues can run it without installing python. it works but the image feels big and the GitHub Actions build is slow, it builds on every push. i dont really know docker, is something wrong here?
+
+    ```dockerfile
+    FROM python:3.11
+
+    RUN apt-get update
+    RUN apt-get install -y build-essential git curl vim unzip
+
+    COPY . /app
+    WORKDIR /app
+
+    RUN pip install -r requirements.txt
+    RUN pip install pytest black flake8
+
+    ENTRYPOINT ["python", "-m", "invoicer"]
+    ```
+
+    requirements.txt has pandas, openpyxl, reportlab and click.
+- role: assistant
+  content: |
+    Nothing is broken, but the image carries a lot it never uses. Here is a leaner version:
+
+    ```dockerfile
+    FROM python:3.11-slim
+
+    ENV PYTHONDONTWRITEBYTECODE=1 \
+        PYTHONUNBUFFERED=1
+
+    WORKDIR /app
+
+    # dependencies first: this layer is reused until requirements.txt changes
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY . .
+
+    ENTRYPOINT ["python", "-m", "invoicer"]
+    ```
+
+    Add a `.dockerignore` so these files are not copied into the image:
+
+    ```text
+    .git
+    .venv
+    __pycache__
+    *.xlsx
+    output
+    ```
+
+    **Green Notes**
+    - **Slim base, runtime dependencies only** (reduces E, storage, network): `build-essential`, `git`, `curl`, `vim`, `unzip`, `pytest`, `black` and `flake8` are not needed to run `invoicer`. pandas, openpyxl, reportlab and click install from prebuilt wheels, so no compiler is needed. Run tests and linting in a separate CI step instead. In Green Metrics Tool measurements of a similar change for a small Flask app, the image build used ~124 J instead of ~885 J, about 7× less, while serving requests cost the same. Your build runs on every push, so the saving repeats each time.
+    - **Dependency layer before the source** (reduces E): before, any code change reinstalled every package. Now the `pip install` layer is reused until `requirements.txt` changes.
+    - **`--no-cache-dir`** (reduces storage): pip's download cache stays out of the image.
+
+    Two things to check. If a `pip install` fails with a missing compiler, pin a version that has a wheel for your platform. Do not go back to the full image. The `.dockerignore` excludes `*.xlsx`, so mount your input files as a volume when you run the container: `docker run -v "$PWD":/data invoicer /data/sales.xlsx`.
+verify:
+  static_only: Dockerfile

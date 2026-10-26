@@ -1,0 +1,70 @@
+id: gen-1-00203-review
+category: review
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    hello, can you make a review of my Dockerfile please? its for our small cli tool "invoicer", it read csv files and make pdf invoices. my colegues run it with docker run, and the github action build the image on every push. I am not sure if its good, sorry for my english
+
+    ```dockerfile
+    FROM python:3.12
+
+    RUN apt-get update && apt-get install -y build-essential git curl vim htop
+
+    WORKDIR /app
+    COPY . .
+
+    RUN pip install -r requirements.txt
+    RUN pip install pytest black mypy ipython
+
+    ENV REPORT_API_TOKEN=tok_9f2c1a77d0e4b8836a
+    ENV PYTHONUNBUFFERED=1
+
+    ENTRYPOINT ["python", "-m", "invoicer"]
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (CLI tool, image built by CI on every push)
+
+    #### [Security] API token is stored in the image
+    - **Where:** `ENV REPORT_API_TOKEN=...`
+    - **Issue:** anyone who can pull the image can read the token with `docker inspect` or `docker history`. It also stays in every copy of the image in your registry.
+    - **Fix:** remove the line, rotate the token, and pass it when you run the container: `docker run -e REPORT_API_TOKEN ...`.
+
+    #### [High] Large base image with tools the tool never uses at runtime
+    - **Where:** `FROM python:3.12`, the `apt-get install` line, `pip install pytest black mypy ipython`
+    - **Issue:** the full Python image plus a compiler, git, curl, vim, htop and dev tools makes every build, pull and stored copy bigger. `invoicer` only needs Python and your requirements at runtime. In Green Metrics Tool micro-benchmarks, building a small Flask app image without a build cache used about 7× less energy with `python:3.12-slim`, runtime dependencies only and no pip cache. Serving requests afterwards cost the same, so the saving is in the build, pull and storage, which repeat on every push.
+    - **Fix:** use `python:3.12-slim`, drop the apt line, and run pytest, black and mypy in a separate CI step or a separate dev image. If one of your packages really needs a compiler, install it in a build stage and copy only the result into the final image.
+    - **Impact:** E for every CI build and every pull by your colleagues. It is large for the build and has no effect on runtime.
+
+    #### [Medium] Source copied before dependencies are installed
+    - **Where:** `COPY . .` before `pip install`
+    - **Issue:** any code change breaks the layer cache, so pip installs all dependencies again on every push.
+    - **Fix:** copy `requirements.txt` first, install, then copy the source. Also add `--no-cache-dir` so pip's download cache is not kept in the layer.
+    - **Impact:** E and time in CI on every push where only code changed.
+
+    Suggested Dockerfile:
+
+    ```dockerfile
+    FROM python:3.12-slim
+
+    ENV PYTHONUNBUFFERED=1
+    WORKDIR /app
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY invoicer/ invoicer/
+
+    ENTRYPOINT ["python", "-m", "invoicer"]
+    ```
+
+    Adjust the `COPY invoicer/ invoicer/` line if your package has a different name or needs other files.
+
+    **Already good:** `ENTRYPOINT` in exec form, `PYTHONUNBUFFERED` set, and a fixed Python version.
+verify:
+  static_only: Dockerfile review, no executable code

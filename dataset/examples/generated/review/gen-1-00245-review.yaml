@@ -1,0 +1,71 @@
+id: gen-1-00245-review
+category: review
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```python
+    import logging
+
+    log = logging.getLogger("auth")
+
+
+    class KeyGuard:
+        def __init__(self, revoked_keys):
+            # loaded once at startup from revoked_keys.json (~25k ids)
+            self.revoked = list(revoked_keys)
+
+        def authorize(self, headers):
+            key = headers.get("X-Api-Key", "")
+            log.info("auth attempt key=%s", key)
+            if not key:
+                return 401, {"error": "missing key"}
+            if key in self.revoked:
+                return 403, {"error": "key revoked"}
+            return 200, {"ok": True}
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (REST API, runs on every request)
+
+    #### [Security] Full API keys are written to the log
+    - **Where:** `log.info("auth attempt key=%s", key)`
+    - **Issue:** anyone who can read the logs can copy a valid key. Revoked and wrong keys also end up in the log.
+    - **Fix:** don't log the key. Log the outcome if you need an audit trail.
+
+    #### [High] Linear scan of a list on every request
+    - **Where:** `key in self.revoked`
+    - **Issue:** `self.revoked` is a list of about 25k ids, so each valid request compares against all of them. The revoked keys are loaded once, but the check runs for every request. That is the case where a set pays off.
+    - **Fix:** build a `frozenset` once in `__init__`. Each check is then O(1) instead of O(n).
+    - **Impact:** reduces E per request, and the saving grows with the list size and the request rate. Building a set costs more than one scan: in Green Metrics Tool micro-benchmarks, converting a 10,000,000-element list to a set for a single lookup used about 50% more CPU energy than scanning once. Here the set is built once and used many times, so it is worth it. With only a handful of revoked keys, the list would be fine.
+
+    ```python
+    class KeyGuard:
+        def __init__(self, revoked_keys):
+            # loaded once at startup from revoked_keys.json (~25k ids)
+            self.revoked = frozenset(revoked_keys)
+
+        def authorize(self, headers):
+            key = headers.get("X-Api-Key", "")
+            if not key:
+                return 401, {"error": "missing key"}
+            if key in self.revoked:
+                return 403, {"error": "key revoked"}
+            return 200, {"ok": True}
+    ```
+
+    The responses are the same as before. The `logging` import and `log` are now unused, so I removed them. Keys must be hashable, which strings from JSON are. If revoked keys change while the service runs, build a new set and swap the attribute. Don't mutate a shared one.
+verify:
+  green_block: 0
+  equivalence:
+    driver: |-
+      guard = KeyGuard(["k%d" % i for i in range(0, 100, 3)] + ["k3"])
+      cases = [{}, {"X-Api-Key": ""}, {"X-Api-Key": "k3"}, {"X-Api-Key": "k4"}, {"X-Api-Key": "k99"}, {"X-Api-Key": "k100"}]
+      for h in cases:
+          print(guard.authorize(h))

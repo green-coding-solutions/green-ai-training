@@ -1,0 +1,85 @@
+id: gen-12764612-00033-generation
+category: generation
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    hello, I need python script for our nginx access logs. Every line start with client IP. I want count how many requests come from office, vpn, other internal, monitoring and public. Our logs have some millions lines per day but not so many different clients. Networks: office 10.20.0.0/16, vpn 10.99.0.0/16, internal is rest of 10.0.0.0/8 and 192.168.0.0/16, monitoring 172.16.5.0/24. Read from stdin pls, thanks
+- role: assistant
+  content: |
+    ```python
+    import ipaddress
+    import sys
+    from collections import Counter
+    from functools import lru_cache
+
+    # More specific networks first: the first match wins.
+    NETWORKS = [
+        ("office", ipaddress.ip_network("10.20.0.0/16")),
+        ("vpn", ipaddress.ip_network("10.99.0.0/16")),
+        ("internal", ipaddress.ip_network("10.0.0.0/8")),
+        ("internal", ipaddress.ip_network("192.168.0.0/16")),
+        ("monitoring", ipaddress.ip_network("172.16.5.0/24")),
+    ]
+
+
+    @lru_cache(maxsize=50_000)
+    def classify_ip(ip: str) -> str:
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return "invalid"
+        for name, net in NETWORKS:
+            if addr in net:
+                return name
+        return "public"
+
+
+    def count_sources(lines) -> Counter:
+        counts = Counter()
+        for line in lines:
+            ip, _, _ = line.partition(" ")
+            if ip:
+                counts[classify_ip(ip)] += 1
+        return counts
+
+
+    if __name__ == "__main__":
+        for name, n in count_sources(sys.stdin).most_common():
+            print(f"{name}\t{n}")
+    ```
+
+    Use it like this: `zcat access.log.gz | python count_sources.py`.
+
+    **Green Notes**
+    - **Memoize the IP classification** (reduces E): the answer depends only on the IP string, and your logs repeat the same clients again and again. With the cache, each distinct IP is parsed and checked against the networks once, and every other line is a dictionary lookup. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over 200 distinct inputs used about 4.7 J with `lru_cache` and about 43 J without it (about 9× less).
+    - **Bounded cache** (reduces M): `maxsize` keeps memory fixed, even if the log contains many one-time IPs (scanners, bots).
+    - The file is read line by line, so memory does not grow with the log size.
+
+    *Not applied:* none. But the cache only helps when IPs repeat. If most lines had a unique IP, it would only add overhead, so remove it then. If you change `NETWORKS` while the program runs, call `classify_ip.cache_clear()`.
+verify:
+  module: true
+  test: |-
+    classify_ip.cache_clear()
+    assert classify_ip("10.20.1.5") == "office"
+    assert classify_ip("10.99.0.1") == "vpn"
+    assert classify_ip("10.1.2.3") == "internal"
+    assert classify_ip("192.168.1.1") == "internal"
+    assert classify_ip("172.16.5.9") == "monitoring"
+    assert classify_ip("8.8.8.8") == "public"
+    assert classify_ip("2001:db8::1") == "public"
+    assert classify_ip("not-an-ip") == "invalid"
+    lines = [
+        '10.20.1.5 - - [x] "GET / HTTP/1.1" 200 1',
+        '8.8.8.8 - - [x] "GET / HTTP/1.1" 200 1',
+        '10.20.1.5 - - [x] "GET /a HTTP/1.1" 200 1',
+    ]
+    classify_ip.cache_clear()
+    c = count_sources(lines)
+    assert c == {"office": 2, "public": 1}
+    info = classify_ip.cache_info()
+    assert info.hits == 1 and info.misses == 2

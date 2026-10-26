@@ -1,0 +1,123 @@
+id: gen-2-00067-review
+category: review
+language: html
+patterns:
+- modern-image-formats
+- css-animations
+facts:
+- F-IMGENC
+- F-IMGRENDER
+- F-ANIM
+messages:
+- role: user
+  content: |
+    Hi, I'm new to frontend. I made the start page for the developer portal of our shipping API. When I leave it open, my laptop fan gets loud, and the first load is slow too. I don't really know what is wrong. Our FastAPI backend serves the screenshots through `/api/v1/media/...`. That endpoint reads the original PNG, resizes it and converts it to the format in the query, every time. I read that AVIF is the best format, so I added `?format=avif` to everything. Can you review it?
+
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <title>Parcelo API – Developer Portal</title>
+      <link rel="stylesheet" href="/static/portal.css">
+      <style>
+        .hero { position: relative; min-height: 520px; }
+        .hero-bg { width: 100%; height: 520px; object-fit: cover; }
+        .hero-art { position: absolute; right: 4rem; top: 120px; width: 420px; }
+      </style>
+    </head>
+    <body>
+      <header class="topbar">
+        <a href="/" class="logo">Parcelo API</a>
+        <nav>
+          <a href="/docs">Docs</a>
+          <a href="/reference">Reference</a>
+          <a href="/status">Status</a>
+          <a href="/login">Sign in</a>
+        </nav>
+      </header>
+
+      <section class="hero">
+        <img class="hero-bg" src="/static/img/warehouse-hero.png" alt="">
+        <h1>Ship parcels with one API call</h1>
+        <p>Labels, tracking and returns for 40 carriers.</p>
+        <a class="btn" href="/signup">Get an API key</a>
+        <img id="heroArt" class="hero-art" src="/static/img/parcel-robot.png" alt="Parcel robot">
+      </section>
+
+      <section class="screens">
+        <h2>See it in action</h2>
+        <img src="/api/v1/media/screens/dashboard?format=avif&w=1200" alt="Shipment dashboard">
+        <img src="/api/v1/media/screens/tracking?format=avif&w=1200" alt="Tracking view">
+        <img src="/api/v1/media/screens/returns?format=avif&w=1200" alt="Returns portal">
+      </section>
+
+      <script>
+        const art = document.getElementById('heroArt');
+        let t = 0;
+        function floatArt() {
+          t += 0.03;
+          art.style.top = (120 + Math.sin(t) * 12) + 'px';
+          requestAnimationFrame(floatArt);
+        }
+        window.addEventListener('load', floatArt);
+        window.addEventListener('resize', floatArt);
+      </script>
+    </body>
+    </html>
+    ```
+
+    The hero PNG is a photo of our warehouse, about 2.4 MB.
+- role: assistant
+  content: |
+    **Workload:** web (public portal page, server-side image endpoint)
+
+    #### [Bug] Every resize starts another animation loop
+    - **Where:** `window.addEventListener('resize', floatArt)`
+    - **Issue:** `resize` fires many times while someone drags or rotates the window. Each call starts a new `requestAnimationFrame` chain, and none of them ever stops. All the chains add to the same `t`, so after a few resizes the robot moves faster and faster, and the browser runs many loops every frame. That is most likely why your fan gets loud.
+    - **Fix:** remove the JavaScript and use a CSS animation instead (see the animation finding below).
+
+    #### [High] AVIF is encoded again on every request
+    - **Where:** the three `/api/v1/media/screens/...?format=avif&w=1200` images
+    - **Issue:** for every visitor, the backend decodes the PNG, resizes it and encodes AVIF again, even though the result is the same each time. AVIF is expensive to encode. In Green Metrics Tool micro-benchmarks, encoding images to AVIF cost about 7× as much as encoding them to JPG. Also, the endpoint always returns AVIF, so browsers without AVIF support get broken images.
+    - **Fix:** convert each screenshot once, when it is uploaded or in the build. Store the files and serve them as static files, with a fallback:
+      ```html
+      <picture>
+        <source srcset="/static/screens/dashboard-1200.avif" type="image/avif">
+        <source srcset="/static/screens/dashboard-1200.webp" type="image/webp">
+        <img src="/static/screens/dashboard-1200.png" alt="Shipment dashboard">
+      </picture>
+      ```
+      Do the same for `tracking` and `returns`. If you need the dynamic endpoint for other reasons, at least cache its output by URL, so each variant is encoded only once.
+    - **Impact:** E on the server, for every page view. The encoding work goes from once per request to once per image.
+
+    #### [Medium] Hero photo is a 2.4 MB PNG
+    - **Where:** `<img class="hero-bg" src="/static/img/warehouse-hero.png">`
+    - **Issue:** PNG is lossless and makes photos very large, and every first-time visitor downloads it. In Green Metrics Tool page-load benchmarks, PNG was also the most expensive format for the browser to decode (~181 J vs ~134 J for JPG over 50 page loads).
+    - **Fix:** export the photo once as AVIF, WebP and JPEG, and let the browser pick:
+      ```html
+      <picture>
+        <source srcset="/static/img/warehouse-hero.avif" type="image/avif">
+        <source srcset="/static/img/warehouse-hero.webp" type="image/webp">
+        <img class="hero-bg" src="/static/img/warehouse-hero.jpg" alt="">
+      </picture>
+      ```
+    - **Impact:** network, mostly. Here the saving comes from far fewer bytes, not from cheaper decoding. AVIF actually cost about 19% more CPU than JPG to decode in the same benchmark. So AVIF is not "best" in every way: it wins on file size, and it only makes sense if you encode it once.
+
+    #### [Medium] Floating robot is animated with JavaScript
+    - **Where:** `floatArt()` changes `style.top` on every frame
+    - **Issue:** the loop runs as long as the tab is open. Changing `top` also makes the browser recalculate the page layout on every frame. A CSS animation with `transform` gives the same motion, and the browser handles it without running your script.
+    - **Fix:** delete the `<script>` block and add this to the `<style>`:
+      ```css
+      .hero-art {
+        position: absolute; right: 4rem; top: 120px; width: 420px;
+        animation: float 4s ease-in-out infinite;
+      }
+      @keyframes float {
+        0%, 100% { transform: translateY(-12px); }
+        50%      { transform: translateY(12px); }
+      }
+      ```
+    - **Impact:** E on the client, for every open tab. In Green Metrics Tool browser benchmarks, a 20-second animation with CSS `@keyframes` used about 10% less CPU energy than the same animation driven by `requestAnimationFrame`. This fix also removes the stacking-loop bug above.
+verify:
+  static_only: HTML page that needs a browser, the image assets and the FastAPI media endpoint

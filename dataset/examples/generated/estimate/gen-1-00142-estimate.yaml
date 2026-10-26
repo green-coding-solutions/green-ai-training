@@ -1,0 +1,62 @@
+id: gen-1-00142-estimate
+category: estimate
+language: python
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    nightly job loads a 2M row csv into postgres, one INSERT per row, commit every 5000. how much energy would we save with batching?
+
+    ```python
+    import csv
+    import psycopg
+
+    with psycopg.connect(DSN) as conn:
+        cur = conn.cursor()
+        with open("sessions.csv", newline="") as f:
+            r = csv.reader(f)
+            next(r)
+            for i, row in enumerate(r, 1):
+                cur.execute(
+                    "INSERT INTO sessions (session_id, user_id, started_at, duration_s) "
+                    "VALUES (%s, %s, %s, %s)",
+                    row,
+                )
+                if i % 5000 == 0:
+                    conn.commit()
+    ```
+- role: assistant
+  content: |
+    Your setup (large batches, one execute per row) is the case where batching helps most. In Green Metrics Tool micro-benchmarks with PostgreSQL 16, inserting 500,000 rows in batches of 5,000:
+
+    - one `execute()` per row: ~384 J
+    - `executemany()`: ~139 J, about 2.8× less
+    - `COPY ... FROM STDIN`: ~17 J, about 22× less than the loop and about 8× less than `executemany`
+
+    With batches of 1,000 rows, COPY was still about 5× better than the loop. Only with batches of 100 rows did the three get close.
+
+    ```python
+    import csv
+    import psycopg
+
+    with psycopg.connect(DSN) as conn, conn.cursor() as cur:
+        with open("sessions.csv", newline="") as f:
+            r = csv.reader(f)
+            next(r)
+            with cur.copy(
+                "COPY sessions (session_id, user_id, started_at, duration_s) FROM STDIN"
+            ) as copy:
+                for row in r:
+                    copy.write_row(row)
+    ```
+
+    Things to check before you switch:
+    - This is one transaction, so a bad row rolls back the whole load. Your loop kept the batches already committed.
+    - COPY has no `ON CONFLICT`. If you need upserts, COPY into a staging table first, then run one `INSERT ... SELECT`.
+
+    I can't give you a number for your job. The saving depends on row width, indexes, and whether the database is on the same machine, so don't scale the figures above. To measure it, run the old and new loader on the same file in a Green Metrics Tool usage scenario. For a quick proxy, compare `perf stat` or `time` on the job process and the database server.
+verify:
+  static_only: needs a running PostgreSQL server and a CSV file

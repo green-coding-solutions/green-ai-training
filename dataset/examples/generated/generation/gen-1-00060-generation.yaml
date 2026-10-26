@@ -1,0 +1,40 @@
+id: gen-1-00060-generation
+category: generation
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    Edge gateway for heat pumps, MQTT in, CPU only. Need a scorer class: loads TorchScript autoencoder models/hp_ae.pt, takes a numpy batch of shape (n, 64) float readings (one row per pump, last 64 samples), returns the per-row reconstruction error (MSE) as a numpy array. Called on every MQTT batch, no training on the device. Code only, I'll wire it up myself.
+- role: assistant
+  content: |
+    ```python
+    import numpy as np
+    import torch
+
+
+    class WindowScorer:
+        def __init__(self, path: str = "models/hp_ae.pt", window: int = 64):
+            self.window = window
+            self.model = torch.jit.load(path, map_location="cpu")
+            self.model.eval()
+
+        @torch.inference_mode()
+        def score(self, windows: np.ndarray) -> np.ndarray:
+            x = np.ascontiguousarray(windows, dtype=np.float32)
+            if x.ndim != 2 or x.shape[1] != self.window:
+                raise ValueError(f"expected shape (n, {self.window}), got {x.shape}")
+            t = torch.from_numpy(x)
+            recon = self.model(t)
+            return ((recon - t) ** 2).mean(dim=1).numpy()
+    ```
+
+    **Green Notes**
+    - **No gradient tracking** (reduces E): `torch.inference_mode()` skips autograd bookkeeping on every call, and it runs on every MQTT batch. It is the stricter form of `torch.no_grad()`. In Green Metrics Tool micro-benchmarks of 100,000 PyTorch CPU inferences, `torch.no_grad()` used about 14% less CPU energy than the same inference without it.
+    - **`model.eval()` once in `__init__`**: this fixes dropout and batch-norm behavior for scoring. It is a correctness step, not an energy saving.
+    - Tensors made inside `inference_mode()` cannot be used in autograd later. Here only a numpy array leaves the method, so this is safe.
+verify:
+  static_only: needs PyTorch and a TorchScript model file

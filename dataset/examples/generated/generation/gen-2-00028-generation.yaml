@@ -1,0 +1,103 @@
+id: gen-2-00028-generation
+category: generation
+language: python
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    Hi, I'm pretty new to databases. Every morning our carrier sends us a file with shipment tracking events (JSON Lines, around 200k lines). Each line looks like this:
+
+    ```json
+    {"shipment_id": "SH-104233", "status": "out_for_delivery", "location": "Hamburg DC", "ts": "2026-10-23T08:12:00Z"}
+    ```
+
+    `location` is sometimes missing. I need to load all of them into this Postgres table:
+
+    ```sql
+    CREATE TABLE tracking_events (
+        shipment_id text NOT NULL,
+        status      text NOT NULL,
+        location    text,
+        event_time  timestamptz NOT NULL
+    );
+    ```
+
+    My first try looks like this and it takes like 20 minutes for one file. Is something wrong with my Postgres? Could you write me a proper loader script? We use psycopg 3.
+
+    ```python
+    for line in f:
+        e = json.loads(line)
+        cur.execute("INSERT INTO tracking_events VALUES (%s, %s, %s, %s)",
+                    (e["shipment_id"], e["status"], e.get("location"), e["ts"]))
+        conn.commit()
+    ```
+- role: assistant
+  content: |
+    Your Postgres is fine. The slow part is the loop. It sends one statement for every line and commits after every line, so the database does a round trip and a commit for every line. A loader should send all rows in one `COPY` stream and commit once:
+
+    ```python
+    import json
+    import os
+    import sys
+
+    import psycopg
+
+    COPY_SQL = (
+        "COPY tracking_events (shipment_id, status, location, event_time) "
+        "FROM STDIN"
+    )
+
+
+    def iter_events(path):
+        """Yield one row tuple per event and stream the file line by line."""
+        with open(path, encoding="utf-8") as f:
+            for lineno, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                    yield (e["shipment_id"], e["status"], e.get("location"), e["ts"])
+                except (json.JSONDecodeError, KeyError) as exc:
+                    raise ValueError(f"{path}:{lineno}: bad event: {exc!r}") from exc
+
+
+    def load_events(conn, path):
+        count = 0
+        with conn.transaction():
+            with conn.cursor() as cur, cur.copy(COPY_SQL) as copy:
+                for row in iter_events(path):
+                    copy.write_row(row)
+                    count += 1
+        return count
+
+
+    def main():
+        if len(sys.argv) != 2:
+            sys.exit("usage: load_tracking.py EVENTS.jsonl")
+        path = sys.argv[1]
+        dsn = os.environ.get("DATABASE_URL", "dbname=logistics")
+        with psycopg.connect(dsn) as conn:
+            n = load_events(conn, path)
+        print(f"loaded {n} events from {path}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    Run it with `DATABASE_URL=postgresql://user@host/db python load_tracking.py events.jsonl`.
+
+    What changed compared to your loop:
+    - The column list is spelled out, so a later change to the column order in the table can't silently mix up values.
+    - A missing `location` becomes `NULL`. The ISO timestamps are parsed by Postgres into `timestamptz`.
+    - The whole file is one transaction. If line 150,000 is broken, the script stops with the line number and nothing is stored. You can fix the file and run it again without cleaning up half-loaded data.
+    - The script does not deduplicate. If you run the same file twice after a successful load, the events are stored twice.
+
+    **Green Notes**
+    - **Batch database writes** (reduces E): one `COPY` stream with one commit replaces one `INSERT` and one commit per line. Green Metrics Tool micro-benchmarks inserted 500,000 rows in batches of 5,000. There, `COPY` used about 22× less energy than one `execute()` per row and about 8× less than `executemany()`. Your file has far more rows than a typical request, so this is the case where batching pays off.
+verify:
+  static_only: needs psycopg 3 and a running PostgreSQL server

@@ -1,0 +1,140 @@
+id: gen-1-00039-refactor
+category: refactor
+language: python
+patterns:
+- set-membership
+- hoist-invariants
+facts:
+- F-MEMB
+- F-ATTR
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import sys
+    import math
+
+    STOPWORDS = [
+        "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from",
+        "had", "has", "have", "he", "her", "his", "i", "if", "in", "into", "is",
+        "it", "its", "of", "on", "or", "she", "that", "the", "their", "them",
+        "then", "there", "they", "this", "to", "was", "we", "were", "which",
+        "will", "with", "you", "your",
+    ]
+
+
+    def load_words(path):
+        words = []
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                for raw in line.split():
+                    w = raw.strip(".,;:!?\"'()").lower()
+                    if w and w not in STOPWORDS:
+                        words.append(w)
+        return words
+
+
+    def weights(words):
+        counts = {}
+        for w in words:
+            counts[w] = counts.get(w, 0) + 1
+        out = []
+        for w, c in counts.items():
+            out.append((w, 1 + math.log(c)))
+        out.sort(key=lambda t: (-t[1], t[0]))
+        return out
+
+
+    def main():
+        if len(sys.argv) != 2:
+            print("usage: keywords.py FILE")
+            return 1
+        for w, score in weights(load_words(sys.argv[1]))[:20]:
+            print(f"{score:6.3f}  {w}")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+- role: assistant
+  content: |
+    ```python
+    import sys
+    import math
+
+    STOPWORDS = frozenset([
+        "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from",
+        "had", "has", "have", "he", "her", "his", "i", "if", "in", "into", "is",
+        "it", "its", "of", "on", "or", "she", "that", "the", "their", "them",
+        "then", "there", "they", "this", "to", "was", "we", "were", "which",
+        "will", "with", "you", "your",
+    ])
+
+
+    def load_words(path):
+        words = []
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                for raw in line.split():
+                    w = raw.strip(".,;:!?\"'()").lower()
+                    if w and w not in STOPWORDS:
+                        words.append(w)
+        return words
+
+
+    def weights(words):
+        counts = {}
+        for w in words:
+            counts[w] = counts.get(w, 0) + 1
+        log = math.log
+        out = [(w, 1 + log(c)) for w, c in counts.items()]
+        out.sort(key=lambda t: (-t[1], t[0]))
+        return out
+
+
+    def main():
+        if len(sys.argv) != 2:
+            print("usage: keywords.py FILE")
+            return 1
+        for w, score in weights(load_words(sys.argv[1]))[:20]:
+            print(f"{score:6.3f}  {w}")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+
+    **Green Notes**
+    - **Set for repeated membership tests** (reduces E): `w not in STOPWORDS` runs once for every word in the file, and on a list each check scans the whole list for most words. A `frozenset` is built once at import, and each check is then a hash lookup. Building a set only pays off with many lookups: in Green Metrics Tool micro-benchmarks, one test on a 10,000,000-element list (~6.9 J) was cheaper than converting it to a set first (~10.5 J). Here you test every word of the input, so the set wins.
+    - **Local alias for `math.log`** (reduces E): the lookup is done once instead of once per unique word. This is a small gain. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` before a 10,000,000-iteration loop saved about 4-5%. It is a cheap change, but it will not change much for this script.
+
+    Output is identical. `load_words` keeps the same order and duplicates, and the ranking sorts the same way.
+verify:
+  module: true
+  test: |
+    import tempfile, os
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+        f.write("The cat and the dog. A cat, a Cat!\nThey saw (the) dog in your yard.\n")
+        p = f.name
+    ws = load_words(p)
+    os.unlink(p)
+    assert ws == ["cat", "dog", "cat", "cat", "saw", "dog", "yard"]
+    r = weights(ws)
+    assert [w for w, _ in r] == ["cat", "dog", "saw", "yard"]
+    assert abs(r[0][1] - (1 + math.log(3))) < 1e-12
+  equivalence:
+    driver: |-
+      import tempfile, os
+      with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+          f.write("The cat and the dog. A cat, a Cat!\nThey saw (the) dog in your yard.\n")
+          f.write("Which of them will go? Is it his or her bird; we were there, with bird.\n")
+          p = f.name
+      words = load_words(p)
+      os.unlink(p)
+      print(words)
+      for w, s in weights(words):
+          print(f"{s:.6f}", w)

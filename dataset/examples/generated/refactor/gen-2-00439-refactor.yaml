@@ -1,0 +1,116 @@
+id: gen-2-00439-refactor
+category: refactor
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    hello, I have small script for our weather data pipeline. Every night it download reading from 25 weather stations and make one csv for the analyst. It work ok but it is slow, take almost 2 minute and most of time it is just waiting. Can you make it more better and fast? sorry for my english
+
+    ```python
+    import csv
+    import json
+    import urllib.error
+    import urllib.request
+    from datetime import date
+
+    BASE = "https://stations.example-weather.net/api/v2/stations"
+    STATION_IDS = [f"ST{n:03d}" for n in range(1, 26)]
+
+
+    def fetch_station(station_id, day):
+        url = f"{BASE}/{station_id}/readings?date={day}"
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+
+    def run(day=None):
+        day = day or date.today().isoformat()
+        rows = []
+        for sid in STATION_IDS:
+            try:
+                data = fetch_station(sid, day)
+            except (urllib.error.URLError, ValueError) as exc:
+                print(f"skip {sid}: {exc}")
+                continue
+            for r in data["readings"]:
+                rows.append([sid, r["ts"], r["temp_c"], r["humidity"]])
+
+        with open(f"readings_{day}.csv", "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["station", "ts", "temp_c", "humidity"])
+            writer.writerows(rows)
+        print(f"{len(rows)} rows written")
+
+
+    if __name__ == "__main__":
+        run()
+    ```
+- role: assistant
+  content: |
+    The 25 requests run one after another, so the script waits for each station. This version fetches them together and keeps the same output.
+
+    ```python
+    import asyncio
+    import csv
+    from datetime import date
+
+    import httpx
+
+    BASE = "https://stations.example-weather.net/api/v2/stations"
+    STATION_IDS = [f"ST{n:03d}" for n in range(1, 26)]
+    MAX_PARALLEL = 10
+
+
+    async def fetch_station(client, sem, station_id, day):
+        url = f"{BASE}/{station_id}/readings"
+        async with sem:
+            try:
+                resp = await client.get(url, params={"date": day})
+                resp.raise_for_status()
+                return station_id, resp.json()
+            except (httpx.HTTPError, ValueError) as exc:
+                print(f"skip {station_id}: {exc}")
+                return station_id, None
+
+
+    async def fetch_all(day):
+        sem = asyncio.Semaphore(MAX_PARALLEL)
+        async with httpx.AsyncClient(timeout=10) as client:
+            return await asyncio.gather(
+                *(fetch_station(client, sem, sid, day) for sid in STATION_IDS)
+            )
+
+
+    def run(day=None):
+        day = day or date.today().isoformat()
+        results = asyncio.run(fetch_all(day))
+
+        rows = []
+        for sid, data in results:
+            if data is None:
+                continue
+            for r in data["readings"]:
+                rows.append([sid, r["ts"], r["temp_c"], r["humidity"]])
+
+        with open(f"readings_{day}.csv", "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["station", "ts", "temp_c", "humidity"])
+            writer.writerows(rows)
+        print(f"{len(rows)} rows written")
+
+
+    if __name__ == "__main__":
+        run()
+    ```
+
+    **Green Notes**
+    - **Concurrent requests with one shared `AsyncClient`** (reduces E and wall time): the old loop idled while each station answered. Now the waits overlap, and one client reuses its connections. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. The gain is mostly wall time, so expect a much faster run rather than a big energy drop.
+    - **Same output:** `gather` keeps the station order, so the CSV rows are in the same order as before. A failed station is still skipped with a message. HTTP error codes are still treated as failures, as `urlopen` did.
+    - **At most 10 requests at once:** the semaphore keeps the load on the station server polite. Change `MAX_PARALLEL` if the server allows more.
+    - `httpx` is a third-party package, so add it to your requirements. Async only pays off here because there are many requests. For a single request, keep plain `urllib`.
+verify:
+  static_only: needs network access and the third-party package httpx

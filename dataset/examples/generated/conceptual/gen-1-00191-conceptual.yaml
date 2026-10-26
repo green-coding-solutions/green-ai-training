@@ -1,0 +1,36 @@
+id: gen-1-00191-conceptual
+category: conceptual
+language: text
+patterns:
+- batch-db-writes
+- context-tradeoff
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    Inference service, writes one row per prediction (features, score, model version) to Postgres. Considering buffering and flushing with COPY. When does that actually pay off vs. keeping plain INSERTs? Short answer please, no essay.
+- role: assistant
+  content: |
+    It pays off when each flush carries thousands of rows. Below a few hundred rows per flush, it barely matters.
+
+    In Green Metrics Tool micro-benchmarks (PostgreSQL 16, 500,000 rows, one commit per batch):
+
+    - **5,000-row batches:** one `execute()` per row used ~384 J, `executemany()` ~139 J, `COPY` ~17 J. COPY used about 22× less than the loop and about 8× less than `executemany`.
+    - **100-row batches:** loop ~13 J, `executemany` ~15 J, COPY ~9.5 J. The differences were small, because per-batch overhead dominates.
+
+    What this means for your service:
+
+    - **High, steady prediction volume:** buffer in memory and flush with COPY when the buffer reaches a size or an age limit.
+    - **Low volume, or a few rows per request:** keep plain INSERTs. A buffer adds code, and the energy gain is small.
+    - **Latency or durability matters:** a buffer can lose rows on a crash. If the logs must not be lost, keep the direct write or add a queue.
+
+    ```python
+    with cur.copy("COPY predictions (ts, model_version, features, score) FROM STDIN") as copy:
+        for row in buffer:
+            copy.write_row(row)
+    ```
+
+    Measure your own flush size first. If it is far below 1,000 rows, the benchmark suggests the saving will be small.
+verify:
+  static_only: conceptual answer

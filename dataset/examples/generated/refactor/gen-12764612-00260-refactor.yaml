@@ -1,0 +1,109 @@
+id: gen-12764612-00260-refactor
+category: refactor
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    We run a product-category classifier behind a REST endpoint. Before the model runs, every request item has its raw category string mapped to a label id. The raw strings come from merchant feeds, so there are many spelling variants, but in practice only a few hundred distinct strings show up. Millions of items per day.
+
+    Requirements:
+    - same output as now for every input
+    - keep the `encode_batch` signature, other services import it
+    - memory must stay bounded, because sometimes a feed sends free text that never repeats
+    - the service runs with several threads
+
+    Can you optimize `canonical_label`? Profiling says it is the top hotspot before inference.
+
+    ```python
+    import difflib
+    import unicodedata
+
+    KNOWN_LABELS = [
+        "running shoes", "trail shoes", "sandals", "rain jacket", "winter jacket",
+        "fleece jacket", "backpack", "daypack", "tent", "sleeping bag",
+        "sleeping pad", "camp stove", "water bottle", "headlamp", "trekking poles",
+        "yoga mat", "dumbbells", "kettlebell", "jump rope", "bike helmet",
+        "cycling shorts", "road bike", "mountain bike", "bike pump", "swim goggles",
+        "wetsuit", "paddle board", "ski goggles", "snowboard", "climbing harness",
+    ]
+    LABEL_INDEX = {name: i for i, name in enumerate(KNOWN_LABELS)}
+    UNKNOWN_ID = -1
+
+
+    def canonical_label(raw):
+        text = unicodedata.normalize("NFKC", raw).strip().lower()
+        text = " ".join(text.replace("_", " ").replace("-", " ").split())
+        if text in LABEL_INDEX:
+            return LABEL_INDEX[text]
+        match = difflib.get_close_matches(text, KNOWN_LABELS, n=1, cutoff=0.8)
+        if match:
+            return LABEL_INDEX[match[0]]
+        return UNKNOWN_ID
+
+
+    def encode_batch(raw_labels):
+        return [canonical_label(r) for r in raw_labels]
+    ```
+- role: assistant
+  content: |
+    ```python
+    import difflib
+    import unicodedata
+    from functools import lru_cache
+
+    KNOWN_LABELS = [
+        "running shoes", "trail shoes", "sandals", "rain jacket", "winter jacket",
+        "fleece jacket", "backpack", "daypack", "tent", "sleeping bag",
+        "sleeping pad", "camp stove", "water bottle", "headlamp", "trekking poles",
+        "yoga mat", "dumbbells", "kettlebell", "jump rope", "bike helmet",
+        "cycling shorts", "road bike", "mountain bike", "bike pump", "swim goggles",
+        "wetsuit", "paddle board", "ski goggles", "snowboard", "climbing harness",
+    ]
+    LABEL_INDEX = {name: i for i, name in enumerate(KNOWN_LABELS)}
+    UNKNOWN_ID = -1
+
+
+    @lru_cache(maxsize=4096)
+    def canonical_label(raw):
+        text = unicodedata.normalize("NFKC", raw).strip().lower()
+        text = " ".join(text.replace("_", " ").replace("-", " ").split())
+        if text in LABEL_INDEX:
+            return LABEL_INDEX[text]
+        match = difflib.get_close_matches(text, KNOWN_LABELS, n=1, cutoff=0.8)
+        if match:
+            return LABEL_INDEX[match[0]]
+        return UNKNOWN_ID
+
+
+    def encode_batch(raw_labels):
+        return [canonical_label(r) for r in raw_labels]
+    ```
+
+    **Green Notes**
+    - **Memoize the pure function** (reduces E): `canonical_label` depends only on its input string. The Unicode normalization and the fuzzy match against all labels now run once per distinct string, not once per item. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over 200 distinct inputs used about 9× less CPU energy with `functools.lru_cache`. Your few hundred distinct strings are the same shape of workload.
+    - **Bounded cache** (reduces M): `maxsize=4096` caps memory, and least recently used entries are evicted. Free text that never repeats cannot grow it without limit. It also gets no benefit: for mostly unique inputs, caching only adds overhead.
+    - **Safe for your requirements:** the function returns an `int`, which is immutable, so callers cannot change a shared cached value. `lru_cache` is thread-safe. At worst two threads compute the same miss at once, and both get the same result. Output is identical for every input.
+    - Check the hit rate in production with `canonical_label.cache_info()`. If hits stay low, the cache is not paying off and you can remove it.
+verify:
+  equivalence:
+    driver: |
+      raws = [
+          "Running Shoes", "running_shoes", "  RAIN-JACKET ", "rain jakcet", "back pack",
+          "tent", "Tent", "snowbord", "wet suit", "garden gnome", "", "   ",
+          "ｙｏｇａ ｍａｔ", "climbing harnes", "kettle bell", "xyz123",
+      ]
+      batch = raws * 20 + ["mountain-bike", "road_bike", "bike pump"] * 10
+      ids = encode_batch(batch)
+      print(ids[:16])
+      print(sum(ids), len(ids), ids.count(-1))
+  test: |-
+    encode_batch(["Running Shoes", "running_shoes", "Running Shoes"])
+    info = canonical_label.cache_info()
+    assert info.hits >= 1
+    assert info.maxsize == 4096
+    assert canonical_label("running_shoes") == 0
+    assert canonical_label("garden gnome") == -1

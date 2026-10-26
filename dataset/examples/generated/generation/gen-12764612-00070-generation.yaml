@@ -1,0 +1,52 @@
+id: gen-12764612-00070-generation
+category: generation
+language: sql
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    Hello, I have a batch inference job in the night. The model make recommendations for every user and write a file recs.csv with columns user_id,item_id,score,rank (it has header line). Around 3 million rows, 5 per user. I need sql for postgres to put this in table recommendations, so our API can read it. Every night come new file and the old recommendations must be replaced, but the API must never see half of the data. I use psql. Can you write the script? Thank you
+- role: assistant
+  content: |-
+    This script loads the file in one bulk step, then swaps the data in a single short transaction.
+
+    ```sql
+    \set ON_ERROR_STOP on
+
+    CREATE TABLE IF NOT EXISTS recommendations (
+        user_id bigint   NOT NULL,
+        item_id bigint   NOT NULL,
+        score   real     NOT NULL,
+        rank    smallint NOT NULL,
+        PRIMARY KEY (user_id, rank)
+    );
+
+    -- session-local staging table: no indexes, not visible to the API
+    CREATE TEMP TABLE recs_stage (LIKE recommendations);
+
+    -- one bulk load of the whole file
+    \copy recs_stage (user_id, item_id, score, rank) FROM 'recs.csv' WITH (FORMAT csv, HEADER true)
+
+    -- swap: readers see the old data until COMMIT, then the new data
+    BEGIN;
+    DELETE FROM recommendations;
+    INSERT INTO recommendations (user_id, item_id, score, rank)
+    SELECT user_id, item_id, score, rank FROM recs_stage;
+    COMMIT;
+
+    DROP TABLE recs_stage;
+    ANALYZE recommendations;
+    ```
+
+    Notes on behavior:
+    - If the file is bad, `\copy` fails and the script stops. The old recommendations stay untouched.
+    - `\copy` reads the file on the machine where psql runs. If the file is on the database server, use `COPY` with a server path instead.
+    - The `DELETE` leaves dead rows behind, so autovacuum cleans up after each run. `TRUNCATE` would be faster, but it blocks the API readers until the commit.
+
+    **Green Notes**
+    - **Bulk load with COPY** (reduces E): the file goes in as one stream, not as 3 million single-row INSERTs. In Green Metrics Tool micro-benchmarks of PostgreSQL writes with 5,000-row batches, COPY used about 22× less CPU energy than one INSERT per row, and about 8× less than `executemany`. With 3 million rows you are far in the range where this pays off.
+    - **Set-based swap** (reduces E): the move into the real table is one `INSERT ... SELECT` statement, so there is no per-row round trip and the transaction stays short.

@@ -1,0 +1,55 @@
+id: gen-12764612-00345-conceptual
+category: conceptual
+language: text
+patterns:
+- bash-builtins
+- context-tradeoff
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    ```bash
+    #!/bin/bash
+    # build sitemap for the landing page
+    BASE="https://nordlicht-app.example"
+    OUT=dist/sitemap.xml
+
+    mkdir -p dist
+    echo '<?xml version="1.0" encoding="UTF-8"?>' > "$OUT"
+    echo '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' >> "$OUT"
+
+    count=0
+    while read line; do
+      slug=$(echo $line | cut -d'|' -f1)
+      prio=$(echo $line | cut -d'|' -f2)
+      count=$(expr $count + 1)
+      echo "  <url><loc>$BASE/$slug</loc><priority>$prio</priority></url>" >> "$OUT"
+    done < pages.txt
+
+    echo '</urlset>' >> "$OUT"
+    echo "wrote $count urls"
+    ```
+
+    ?
+- role: assistant
+  content: |-
+    I'm guessing you want to know if this is fine. It works, and for a landing page with a few dozen URLs it is fine as is.
+
+    The pattern to know about is the per-line subprocess. Each loop turn starts several processes: `echo | cut` twice (a subshell and two forks each) and `expr` once. Starting processes costs far more than the work the shell does itself. In Green Metrics Tool micro-benchmarks on a 20,000-line log, a loop that ran about 10 processes per line used about 1302 J. The same loop with builtins only used about 4.3 J, about 300× less, with identical output.
+
+    So it depends on the size of `pages.txt`:
+    - **Dozens of lines, run on each deploy:** leave it. The cost is tiny, and your time is worth more.
+    - **Thousands of lines, or a script that runs on every push:** switch to builtins. It is a small change:
+
+    ```bash
+    count=0
+    while IFS='|' read -r slug prio _; do
+      count=$((count + 1))
+      echo "  <url><loc>$BASE/$slug</loc><priority>$prio</priority></url>" >> "$OUT"
+    done < pages.txt
+    ```
+
+    `read` splits the fields itself, `$(( ))` replaces `expr`, and no extra process starts. The output is the same. As a bonus, `read -r` stops backslashes in the input from being eaten.
+
+    If a file ever gets large and you only need one pass of transformation, a single `awk` call over the whole file is cheaper still.

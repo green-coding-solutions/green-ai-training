@@ -1,0 +1,189 @@
+id: gen-2-00035-multi-turn
+category: multi-turn
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    hi, this script convert the bank export for our accounting team. bank give the csv newest first, we need oldest first with running balance. for one month it is instant, but for full year export (~400k lines) it run more than one minute. is the csv parsing slow? can you make it faster
+
+    ```python
+    #!/usr/bin/env python3
+    """Convert bank export (newest first) to oldest-first CSV with running balance."""
+    import argparse
+    import csv
+    from decimal import Decimal
+
+
+    def load_transactions(path):
+        rows = []
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter=";")
+            for rec in reader:
+                amount = Decimal(rec["Betrag"].replace(".", "").replace(",", "."))
+                rows.insert(0, {
+                    "date": rec["Buchungstag"],
+                    "text": rec["Verwendungszweck"].strip(),
+                    "amount": amount,
+                })
+        return rows
+
+
+    def add_running_balance(rows, opening):
+        balance = opening
+        for row in rows:
+            balance += row["amount"]
+            row["balance"] = balance
+        return rows
+
+
+    def write_out(rows, path):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["date", "text", "amount", "balance"])
+            for r in rows:
+                writer.writerow([r["date"], r["text"], r["amount"], r["balance"]])
+
+
+    def main():
+        p = argparse.ArgumentParser()
+        p.add_argument("export")
+        p.add_argument("out")
+        p.add_argument("--opening", default="0")
+        args = p.parse_args()
+        rows = load_transactions(args.export)
+        rows = add_running_balance(rows, Decimal(args.opening))
+        write_out(rows, args.out)
+        print(f"{len(rows)} transactions written to {args.out}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    The CSV parsing is fine. The slow part is `rows.insert(0, ...)`. Only `load_transactions` changes:
+
+    ```python
+    def load_transactions(path):
+        rows = []
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter=";")
+            for rec in reader:
+                amount = Decimal(rec["Betrag"].replace(".", "").replace(",", "."))
+                rows.append({
+                    "date": rec["Buchungstag"],
+                    "text": rec["Verwendungszweck"].strip(),
+                    "amount": amount,
+                })
+        rows.reverse()  # export is newest first, balance needs oldest first
+        return rows
+    ```
+
+    **Green Notes**
+    - **Append, then reverse once** (reduces E): every `insert(0, ...)` moves all the rows already in the list one place over, so loading n rows costs O(n²). `append` is O(1) and a single `reverse()` is O(n). That's why one month runs instantly and a full year doesn't. In Green Metrics Tool micro-benchmarks, 1,000,000 front inserts used over 1000× more CPU energy than 1,000,000 appends.
+
+    The output is the same: same rows, same order, same balances.
+- role: user
+  content: |
+    thx, it work and now its 2 sec. but my teamlead dont like the reverse() at the end. she say it is easy to miss and some day somebody delete it as "cleanup" and then all balances are wrong. she want the order is clear at the line where we add the row. possible without the slow insert?
+- role: assistant
+  content: |
+    Yes. Use `collections.deque` and `appendleft`. It adds at the front in O(1), so the order is visible right where the row is added, like in your original code.
+
+    ```python
+    #!/usr/bin/env python3
+    """Convert bank export (newest first) to oldest-first CSV with running balance."""
+    import argparse
+    import csv
+    from collections import deque
+    from decimal import Decimal
+
+
+    def load_transactions(path):
+        rows = deque()
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter=";")
+            for rec in reader:
+                amount = Decimal(rec["Betrag"].replace(".", "").replace(",", "."))
+                # export is newest first: prepend so rows end up oldest first
+                rows.appendleft({
+                    "date": rec["Buchungstag"],
+                    "text": rec["Verwendungszweck"].strip(),
+                    "amount": amount,
+                })
+        return rows
+
+
+    def add_running_balance(rows, opening):
+        balance = opening
+        for row in rows:
+            balance += row["amount"]
+            row["balance"] = balance
+        return rows
+
+
+    def write_out(rows, path):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["date", "text", "amount", "balance"])
+            for r in rows:
+                writer.writerow([r["date"], r["text"], r["amount"], r["balance"]])
+
+
+    def main():
+        p = argparse.ArgumentParser()
+        p.add_argument("export")
+        p.add_argument("out")
+        p.add_argument("--opening", default="0")
+        args = p.parse_args()
+        rows = load_transactions(args.export)
+        rows = add_running_balance(rows, Decimal(args.opening))
+        write_out(rows, args.out)
+        print(f"{len(rows)} transactions written to {args.out}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    The rest of the script works with a deque as it is: looping and `len()` behave the same. One difference: `load_transactions` now returns a deque, not a list. Deques don't support slicing, and indexing into the middle is slow. If other code slices the result, call `list(rows)` once at that point.
+verify:
+  module: true
+  test: |
+    import os, tempfile
+    _d = tempfile.mkdtemp()
+    _p = os.path.join(_d, "t.csv")
+    with open(_p, "w", encoding="utf-8", newline="") as _f:
+        _f.write("Buchungstag;Verwendungszweck;Betrag\n")
+        _f.write("2026-03-03;c;-1.000,00\n2026-03-02;b;2,50\n2026-03-01;a;1.234,56\n")
+    _rows = load_transactions(_p)
+    assert isinstance(_rows, deque)
+    assert [r["text"] for r in _rows] == ["a", "b", "c"]
+    _rows = add_running_balance(_rows, Decimal("0"))
+    assert [r["balance"] for r in _rows] == [Decimal("1234.56"), Decimal("1237.06"), Decimal("237.06")]
+  equivalence:
+    driver: |-
+      import os, tempfile
+      from decimal import Decimal
+      d = tempfile.mkdtemp()
+      src = os.path.join(d, "export.csv")
+      with open(src, "w", encoding="utf-8", newline="") as f:
+          f.write("Buchungstag;Verwendungszweck;Betrag\n")
+          for i in range(300, 0, -1):
+              euros = i * 137
+              cents = i % 100
+              sign = "-" if i % 3 == 0 else ""
+              amount = sign + f"{euros:,}".replace(",", ".") + f",{cents:02d}"
+              date = f"2026-{(i % 12) + 1:02d}-{(i % 28) + 1:02d}"
+              f.write(f"{date};  Ref {i} ;{amount}\n")
+      rows = load_transactions(src)
+      rows = add_running_balance(rows, Decimal("1000.00"))
+      out = os.path.join(d, "out.csv")
+      write_out(rows, out)
+      with open(out, encoding="utf-8") as f:
+          print(f.read())
+      print(len(rows))

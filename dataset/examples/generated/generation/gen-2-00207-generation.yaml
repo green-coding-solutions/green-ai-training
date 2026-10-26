@@ -1,0 +1,157 @@
+id: gen-2-00207-generation
+category: generation
+language: javascript
+patterns:
+- dom-size
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    ```javascript
+    #!/usr/bin/env node
+    // lint-report.mjs
+    // usage: npx eslint . -f json | node lint-report.mjs > lint-report.html
+    // legacy monorepo, currently ~20k warnings. we want to burn them down rule by rule
+    import { readFileSync } from 'node:fs';
+    import { relative } from 'node:path';
+
+    const results = JSON.parse(readFileSync(0, 'utf8'));
+    const rows = [];
+    for (const file of results) {
+      for (const m of file.messages) {
+        rows.push({
+          file: relative(process.cwd(), file.filePath),
+          line: m.line ?? 0,
+          rule: m.ruleId ?? '(parse error)',
+          severity: m.severity === 2 ? 'error' : 'warning',
+          message: m.message,
+        });
+      }
+    }
+
+    process.stdout.write(`<!doctype html>
+    <html lang="en">
+    <meta charset="utf-8">
+    <title>ESLint report</title>
+    <style>
+      body { font: 14px system-ui, sans-serif; margin: 1rem; }
+      table { border-collapse: collapse; width: 100%; }
+      td, th { padding: 2px 8px; border-bottom: 1px solid #ddd; text-align: left; }
+    </style>
+    <h1>ESLint report (${rows.length} findings)</h1>
+    <table>
+      <thead><tr><th>File</th><th>Line</th><th>Severity</th><th>Rule</th><th>Message</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <script>
+      const ROWS = ${JSON.stringify(rows)};
+      function renderTable(rows) {
+        // TODO
+      }
+      renderTable(ROWS);
+    </script>
+    `);
+    ```
+
+    ?
+- role: assistant
+  content: |
+    Here is `renderTable` with paging and a filter by rule or file, so you can work through the warnings one rule at a time:
+
+    ```javascript
+    #!/usr/bin/env node
+    // lint-report.mjs
+    // usage: npx eslint . -f json | node lint-report.mjs > lint-report.html
+    import { readFileSync } from 'node:fs';
+    import { relative } from 'node:path';
+
+    const results = JSON.parse(readFileSync(0, 'utf8'));
+    const rows = [];
+    for (const file of results) {
+      for (const m of file.messages) {
+        rows.push({
+          file: relative(process.cwd(), file.filePath),
+          line: m.line ?? 0,
+          rule: m.ruleId ?? '(parse error)',
+          severity: m.severity === 2 ? 'error' : 'warning',
+          message: m.message,
+        });
+      }
+    }
+
+    // Escape "<" so a message containing "</script>" cannot end the script block.
+    const data = JSON.stringify(rows).replace(/</g, '\\u003c');
+
+    process.stdout.write(`<!doctype html>
+    <html lang="en">
+    <meta charset="utf-8">
+    <title>ESLint report</title>
+    <style>
+      body { font: 14px system-ui, sans-serif; margin: 1rem; }
+      table { border-collapse: collapse; width: 100%; }
+      td, th { padding: 2px 8px; border-bottom: 1px solid #ddd; text-align: left; }
+      td.error { color: #b00020; }
+      nav { margin: 0.5rem 0; }
+    </style>
+    <h1>ESLint report (${rows.length} findings)</h1>
+    <input id="filter" type="search" placeholder="Filter by rule or file">
+    <nav><button id="prev">Prev</button> <span id="page"></span> <button id="next">Next</button></nav>
+    <table>
+      <thead><tr><th>File</th><th>Line</th><th>Severity</th><th>Rule</th><th>Message</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <script>
+      const ROWS = ${data};
+      const PAGE_SIZE = 100;
+      const tbody = document.getElementById('rows');
+      const pageInfo = document.getElementById('page');
+      const prevBtn = document.getElementById('prev');
+      const nextBtn = document.getElementById('next');
+      const filterInput = document.getElementById('filter');
+      let view = ROWS;
+      let page = 0;
+
+      function renderTable(rows) {
+        const pages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
+        page = Math.min(page, pages - 1);
+        const frag = document.createDocumentFragment();
+        for (const r of rows.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)) {
+          const tr = document.createElement('tr');
+          for (const value of [r.file, r.line, r.severity, r.rule, r.message]) {
+            const td = document.createElement('td');
+            td.textContent = value;
+            tr.appendChild(td);
+          }
+          tr.children[2].className = r.severity;
+          frag.appendChild(tr);
+        }
+        tbody.replaceChildren(frag);
+        pageInfo.textContent = 'Page ' + (page + 1) + ' of ' + pages + ' (' + rows.length + ' shown)';
+        prevBtn.disabled = page === 0;
+        nextBtn.disabled = page >= pages - 1;
+      }
+
+      prevBtn.addEventListener('click', () => { page--; renderTable(view); });
+      nextBtn.addEventListener('click', () => { page++; renderTable(view); });
+      filterInput.addEventListener('input', () => {
+        const q = filterInput.value.trim().toLowerCase();
+        view = q
+          ? ROWS.filter((r) => r.rule.toLowerCase().includes(q) || r.file.toLowerCase().includes(q))
+          : ROWS;
+        page = 0;
+        renderTable(view);
+      });
+
+      renderTable(view);
+    </script>
+    `);
+    ```
+
+    I also fixed one bug in the original. Lint messages can quote code. A message that contains `</script>` would have closed the script tag early and broken the page, so the embedded JSON now escapes `<`. The cells are filled with `textContent`, so messages show up as plain text and are never parsed as HTML.
+
+    **Green Notes**
+    - **Avoid excessive DOM size** (reduces E): the page has only 100 plain `<tr>`/`<td>` rows in the DOM at any time. They are built in a `DocumentFragment` and inserted with one `replaceChildren` call. In Green Metrics Tool browser benchmarks, a 10,000-row table with wrappers around every cell, appended to the live DOM row by row, was compared with the same data shown as 100 rows per page in a plain table built in a `DocumentFragment`. Over 30 page loads, the paginated version used about 56% less CPU energy.
+    - **Filter on the data, not the DOM** (reduces E): the filter searches the in-memory array and renders one page of matches. Hiding rows with CSS would still keep every row in the DOM.
+verify:
+  static_only: Node CLI that reads ESLint JSON from stdin and writes an HTML page; the rendering code runs in a browser DOM

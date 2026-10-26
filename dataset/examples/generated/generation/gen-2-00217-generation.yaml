@@ -1,0 +1,90 @@
+id: gen-2-00217-generation
+category: generation
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    I need a small CLI for our release tooling. It should give each commit subject a changelog section, so we can draft release notes faster. Requirements:
+
+    - reads commit subjects from a file or from stdin, one per line. We usually pipe `git log --format=%s v2.3.0..HEAD` into it
+    - the model is a TorchScript classifier at `models/commit_cls.pt`. It outputs logits for `feat, fix, docs, perf, refactor, chore`, in that order
+    - features come from our own package: `from changelog_ml.featurize import featurize`. It takes a list of strings and returns a float tensor of shape [n, 4096]
+    - CPU only. It runs on dev laptops and in the release job in CI
+    - output is TSV: label, confidence (2 decimals), subject
+    - if the confidence is below a threshold (default 0.6), print `other` as the label
+    - skip empty lines
+    - a batch size option, because someone wants to run it once over the whole monorepo history (~80k commits)
+    - argparse only, no extra dependencies besides torch
+- role: assistant
+  content: |
+    ```python
+    #!/usr/bin/env python3
+    """Label commit subjects with a changelog section using the TorchScript classifier."""
+    import argparse
+    import sys
+
+    import torch
+
+    from changelog_ml.featurize import featurize
+
+    LABELS = ["feat", "fix", "docs", "perf", "refactor", "chore"]
+
+
+    def parse_args():
+        p = argparse.ArgumentParser(description=__doc__)
+        p.add_argument("input", nargs="?", default="-",
+                       help="file with one commit subject per line, '-' for stdin")
+        p.add_argument("--model", default="models/commit_cls.pt")
+        p.add_argument("--batch-size", type=int, default=256)
+        p.add_argument("--min-confidence", type=float, default=0.6)
+        return p.parse_args()
+
+
+    def read_subjects(path):
+        if path == "-":
+            lines = sys.stdin.read().splitlines()
+        else:
+            with open(path, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        return [s.strip() for s in lines if s.strip()]
+
+
+    def main():
+        args = parse_args()
+        if args.batch_size < 1:
+            sys.exit("--batch-size must be at least 1")
+
+        subjects = read_subjects(args.input)
+        if not subjects:
+            return 0
+
+        model = torch.jit.load(args.model, map_location="cpu")
+        model.eval()
+
+        out = sys.stdout
+        with torch.no_grad():
+            for start in range(0, len(subjects), args.batch_size):
+                batch = subjects[start:start + args.batch_size]
+                probs = torch.softmax(model(featurize(batch)), dim=1)
+                conf, idx = probs.max(dim=1)
+                for subject, c, i in zip(batch, conf.tolist(), idx.tolist()):
+                    label = LABELS[i] if c >= args.min_confidence else "other"
+                    out.write(f"{label}\t{c:.2f}\t{subject}\n")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+
+    Usage: `git log --format=%s v2.3.0..HEAD | python label_commits.py > notes.tsv`
+
+    **Green Notes**
+    - **`torch.no_grad()` around inference** (reduces E): the script only predicts, so it doesn't need autograd to record the forward pass for every batch. In Green Metrics Tool micro-benchmarks, 100,000 PyTorch CPU inferences used ~157 J without `no_grad()` and ~135 J with it, about 14% less CPU energy. This matters most for the full-history run.
+    - `model.eval()` does a different job: it puts dropout and batch norm into inference mode for correct results. It does not turn off gradient tracking, so you need both.
+verify:
+  static_only: needs torch and the team's internal changelog_ml package

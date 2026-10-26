@@ -1,0 +1,68 @@
+id: gen-2-00259-no-change
+category: no-change
+language: sql
+patterns:
+- batch-db-writes
+- context-tradeoff
+facts:
+- F-PG-INSERT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    Reviewer left "row-by-row inserts in the tag endpoint, switch to COPY" on my PR. Handler validates max 20 tags per request and passes them as one text[]. Just give me the diff.
+
+    ```sql
+    -- name: add_tags_to_project :many
+    -- POST /api/projects/:project_id/tags   body: {"tags": ["infra", "q4", ...]}
+    -- $1 = project_id (bigint), $2 = tags (text[], <= 20, validated in handler)
+    WITH input AS (
+        SELECT DISTINCT lower(trim(t)) AS name
+        FROM unnest($2::text[]) AS t
+        WHERE trim(t) <> ''
+    ),
+    ins_tags AS (
+        INSERT INTO tags (name)
+        SELECT name FROM input
+        ON CONFLICT (name) DO NOTHING
+        RETURNING id, name
+    ),
+    all_tags AS (
+        SELECT id, name FROM ins_tags
+        UNION ALL
+        SELECT t.id, t.name
+        FROM tags t
+        JOIN input i ON i.name = t.name
+    )
+    INSERT INTO project_tags (project_id, tag_id)
+    SELECT $1, id FROM all_tags
+    ON CONFLICT (project_id, tag_id) DO NOTHING
+    RETURNING tag_id;
+    ```
+- role: assistant
+  content: |
+    There's no COPY diff to give you. This write is already batched.
+
+    - **Nothing runs per row.** The whole tag list arrives as one array. That means one statement, one round trip and one transaction for up to 20 rows. The reviewer probably saw the two `INSERT`s, but each one is set-based.
+    - **COPY only pays off with big batches.** In Green Metrics Tool benchmarks on PostgreSQL 16, COPY used about 22× less energy than one INSERT per row with 5,000-row batches. With batches of 100 rows the gap was small: ~13 J for the per-row loop vs ~9.5 J for COPY over the whole run. Your batches are smaller still, and you already make one statement instead of one per row. So COPY has nothing left to win here.
+    - **COPY has no `ON CONFLICT`.** You would need a temp staging table plus an `INSERT ... SELECT`. That adds statements to every request.
+
+    One change is worth making, but it fixes a bug and has nothing to do with COPY. All the CTEs share one snapshot. Say another request commits the same new tag after that snapshot is taken. `DO NOTHING` skips the row, and the `tags` join can't see the committed row. The project link is then silently dropped. `DO UPDATE` returns the conflicting row, so `all_tags` can go:
+
+    ```sql
+    ins_tags AS (
+        INSERT INTO tags (name)
+        SELECT name FROM input
+        ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+        RETURNING id, name
+    )
+    INSERT INTO project_tags (project_id, tag_id)
+    SELECT $1, id FROM ins_tags
+    ON CONFLICT (project_id, tag_id) DO NOTHING
+    RETURNING tag_id;
+    ```
+
+    The trade-off: `DO UPDATE` writes a new row version for every existing tag on each call. With at most 20 tags that's fine.
+verify:
+  static_only: PostgreSQL-specific (unnest on text[], data-modifying CTEs, ON CONFLICT DO UPDATE semantics, $n parameters);
+    not SQLite-compatible

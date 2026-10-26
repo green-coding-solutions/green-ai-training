@@ -1,0 +1,66 @@
+id: gen-2-00072-generation
+category: generation
+language: python
+patterns:
+- keep-star-imports
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    add softmax + top-k labels to postprocess.py for the classifier. file starts with `from math import *`, leave it
+- role: assistant
+  content: |
+    ```python
+    from math import *
+
+
+    def softmax(logits):
+        """Numerically stable softmax over a list of raw scores."""
+        if not logits:
+            raise ValueError("logits must not be empty")
+        m = max(logits)
+        exps = [exp(x - m) for x in logits]
+        total = fsum(exps)
+        return [v / total for v in exps]
+
+
+    def top_k(logits, labels, k=5):
+        """Return the k most likely (label, probability) pairs, highest first."""
+        if len(logits) != len(labels):
+            raise ValueError("logits and labels must have the same length")
+        if k <= 0:
+            return []
+        probs = softmax(logits)
+        order = sorted(range(len(probs)), key=probs.__getitem__, reverse=True)[:k]
+        return [(labels[i], probs[i]) for i in order]
+    ```
+
+    **Green Notes**
+    - **Star import left as it is** (no change in E): `from math import *` and `import math` cost the same. In Green Metrics Tool micro-benchmarks with 1,000 process starts, star imports and plain imports of the same module showed no measurable energy difference (`from posix import *` and `import posix` both ~121 J). Rewriting it would only add churn.
+    - `math` is a built-in module, so importing it is cheap. What costs energy at startup is loading a heavy module at all, not the import style.
+
+    Subtracting the max before `exp` prevents overflow on large logits. With equal probabilities, `top_k` keeps the original label order.
+verify:
+  test: |-
+    p = softmax([1.0, 2.0, 3.0])
+    assert abs(sum(p) - 1.0) < 1e-12
+    assert p[2] > p[1] > p[0]
+    big = softmax([1000.0, 1000.0])
+    assert abs(big[0] - 0.5) < 1e-12 and abs(big[1] - 0.5) < 1e-12
+    res = top_k([0.1, 2.5, -1.0, 2.5], ["cat", "dog", "bird", "fox"], k=2)
+    assert [r[0] for r in res] == ["dog", "fox"]
+    assert abs(res[0][1] - res[1][1]) < 1e-12
+    assert top_k([1.0, 2.0], ["a", "b"], k=5)[0][0] == "b"
+    assert len(top_k([1.0, 2.0], ["a", "b"], k=5)) == 2
+    assert top_k([1.0], ["a"], k=0) == []
+    try:
+        top_k([1.0, 2.0], ["a"])
+        assert False
+    except ValueError:
+        pass
+    try:
+        softmax([])
+        assert False
+    except ValueError:
+        pass

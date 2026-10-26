@@ -1,0 +1,105 @@
+id: gen-12764612-00238-review
+category: review
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    review pls
+
+    ```python
+    from datetime import datetime
+
+    STATUS_MAP = {"A": "active", "S": "suspended", "C": "closed", "P": "pending"}
+
+
+    def normalize_rows(rows, rejects=[]):
+        out = []
+        for row in rows:
+            try:
+                status = STATUS_MAP[row.get("status_code", "").strip().upper()]
+            except KeyError:
+                status = "unknown"
+                rejects.append(row["id"])
+            out.append({
+                "id": int(row["id"]),
+                "email": row["email"].strip().lower(),
+                "status": status,
+                "signup": datetime.strptime(row["signup"], "%d.%m.%Y").date().isoformat(),
+            })
+        return out
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (per-row transform)
+
+    #### [Bug] Shared mutable default argument
+    - **Where:** `def normalize_rows(rows, rejects=[])`
+    - **Issue:** the default list is created once and reused by every call that doesn't pass `rejects`. Rejected ids pile up across batches and runs in the same process. Memory grows and the list mixes data from different files.
+    - **Fix:** use `rejects=None` and create the list inside the function.
+
+    #### [Medium] Exception used for an expected lookup miss
+    - **Where:** `try: STATUS_MAP[...] except KeyError`
+    - **Issue:** legacy exports often have unmapped codes. Every miss raises and catches a `KeyError`, and the raise is the expensive part. This runs once per row.
+    - **Fix:** use `dict.get()` and check for `None`. The result is the same.
+    - **Impact:** reduces E per row when misses are common. In Green Metrics Tool micro-benchmarks with 10,000,000 lookups and about half the keys missing, `dict.get` used about 12% less CPU energy than `try/except KeyError` (~67 J vs ~76 J). If misses are rare, `try/except` is cheap and this change matters little. The date parsing in the loop will cost more than either version.
+
+    ```python
+    from datetime import datetime
+
+    STATUS_MAP = {"A": "active", "S": "suspended", "C": "closed", "P": "pending"}
+
+
+    def normalize_rows(rows, rejects=None):
+        if rejects is None:
+            rejects = []
+        out = []
+        for row in rows:
+            status = STATUS_MAP.get(row.get("status_code", "").strip().upper())
+            if status is None:
+                status = "unknown"
+                rejects.append(row["id"])
+            out.append({
+                "id": int(row["id"]),
+                "email": row["email"].strip().lower(),
+                "status": status,
+                "signup": datetime.strptime(row["signup"], "%d.%m.%Y").date().isoformat(),
+            })
+        return out
+    ```
+
+    Output is the same. If you need the rejected ids after a call, pass your own list.
+
+    **Already good:** the map is a module-level dict, so it is built once.
+verify:
+  test: |
+    rows = [
+        {"id": "1", "email": " A@X.com ", "status_code": "a", "signup": "01.02.2024"},
+        {"id": "2", "email": "b@x.com", "status_code": "zz", "signup": "15.03.2023"},
+        {"id": "3", "email": "c@x.com", "signup": "31.12.2022"},
+    ]
+    rej = []
+    res = normalize_rows(rows, rej)
+    assert [r["status"] for r in res] == ["active", "unknown", "unknown"]
+    assert rej == ["2", "3"]
+    assert res[0]["email"] == "a@x.com"
+    assert res[0]["signup"] == "2024-02-01"
+    rej2 = []
+    normalize_rows(rows[:1], rej2)
+    assert rej2 == []
+  equivalence:
+    driver: |-
+      rows = [
+          {"id": "1", "email": " A@X.com ", "status_code": "a", "signup": "01.02.2024"},
+          {"id": "2", "email": "b@x.com", "status_code": "zz", "signup": "15.03.2023"},
+          {"id": "3", "email": "C@x.com", "signup": "31.12.2022"},
+          {"id": "4", "email": "d@x.com", "status_code": " s ", "signup": "05.06.2021"},
+          {"id": "5", "email": "e@x.com", "status_code": "", "signup": "09.09.2020"},
+      ]
+      rej = []
+      for r in normalize_rows(rows, rej):
+          print(r)
+      print(rej)

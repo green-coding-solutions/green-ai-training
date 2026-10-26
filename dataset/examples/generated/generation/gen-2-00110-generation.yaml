@@ -1,0 +1,108 @@
+id: gen-2-00110-generation
+category: generation
+language: python
+patterns:
+- simple-conditions
+facts:
+- F-COND
+messages:
+- role: user
+  content: |
+    ```python
+    # loader/route.py
+    from dataclasses import dataclass
+
+    TARGETS = ("orders", "order_lines", "payments", "returns", "rejects")
+
+
+    @dataclass
+    class Record:
+        rec_type: str   # 2 chars from the fixed-width ERP export, e.g. "01"
+        payload: str
+
+
+    def route(rec: Record) -> str:
+        """Pick the staging table for one record of the nightly ERP export.
+
+        01 header -> orders
+        02 line -> order_lines
+        05 / 06 payment (card / invoice) -> payments
+        07 return -> returns
+        anything else (incl. blank, garbage) -> rejects
+        ("99" trailer is skipped upstream.)
+        Called for every record, ~3M per night.
+        """
+        ...
+
+
+    def split(records):
+        """Return {table: [records]} for every name in TARGETS (empty lists too).
+        Keep the input order inside each table."""
+        ...
+    ```
+    ?
+- role: assistant
+  content: |
+    ```python
+    # loader/route.py
+    from dataclasses import dataclass
+
+    TARGETS = ("orders", "order_lines", "payments", "returns", "rejects")
+
+    # Exact record type -> staging table. Anything not listed is a reject.
+    _ROUTES = {
+        "01": "orders",
+        "02": "order_lines",
+        "05": "payments",   # card
+        "06": "payments",   # invoice
+        "07": "returns",
+    }
+
+
+    @dataclass
+    class Record:
+        rec_type: str   # 2 chars from the fixed-width ERP export, e.g. "01"
+        payload: str
+
+
+    def route(rec: Record) -> str:
+        """Pick the staging table for one record of the nightly ERP export."""
+        return _ROUTES.get(rec.rec_type, "rejects")
+
+
+    def split(records):
+        """Return {table: [records]} for every name in TARGETS (empty lists too).
+        Keep the input order inside each table."""
+        out = {table: [] for table in TARGETS}
+        for rec in records:
+            out[route(rec)].append(rec)
+        return out
+    ```
+
+    **Green Notes**
+    - **Simple equality conditions** (reduces E): `route` runs about 3M times a night. It does one exact match on the raw 2-char code. There is no `int()` parsing and no range checks like `5 <= n <= 6`. In Green Metrics Tool micro-benchmarks, 10,000,000 classifications with simple equality branches used about 16% less CPU energy than range/modulo conditions.
+    - Matching the raw string is also safer. A blank or garbage `rec_type` goes to `rejects`. With `int(rec.rec_type)`, it would raise `ValueError` and stop the load.
+
+    *Not applied:* `match`/`case`. In the same benchmarks it differed from `if`/`elif` by about 1%, which is noise. The lookup table is easier to extend when the ERP adds a record type.
+verify:
+  test: |-
+    assert route(Record("01", "h")) == "orders"
+    assert route(Record("02", "l")) == "order_lines"
+    assert route(Record("05", "c")) == "payments"
+    assert route(Record("06", "i")) == "payments"
+    assert route(Record("07", "r")) == "returns"
+    assert route(Record("99", "t")) == "rejects"
+    assert route(Record("  ", "")) == "rejects"
+    assert route(Record("x1", "")) == "rejects"
+    assert route(Record("1", "")) == "rejects"
+
+    recs = [Record("02", "a"), Record("01", "b"), Record("02", "c"), Record("zz", "d"), Record("06", "e")]
+    res = split(recs)
+    assert tuple(res.keys()) == TARGETS
+    assert [r.payload for r in res["order_lines"]] == ["a", "c"]
+    assert [r.payload for r in res["orders"]] == ["b"]
+    assert [r.payload for r in res["payments"]] == ["e"]
+    assert [r.payload for r in res["rejects"]] == ["d"]
+    assert res["returns"] == []
+    assert split([]) == {t: [] for t in TARGETS}
+    print("ok")

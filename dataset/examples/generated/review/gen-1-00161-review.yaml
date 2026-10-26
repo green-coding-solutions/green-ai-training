@@ -1,0 +1,125 @@
+id: gen-1-00161-review
+category: review
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    hi, im new to python. i wrote this for our CI pipeline. it reads the test report after the run and decides if the pipeline should fail. we have a list of flaky tests that are "quarantined" and those should not fail the build. it works but i feel something is not right, can you look at it?
+
+    ```python
+    import json
+    import sys
+
+    QUARANTINE = {}
+
+
+    def load_quarantine(path):
+        with open(path) as f:
+            for line in f:
+                entry = json.loads(line)
+                QUARANTINE[entry["test_id"]] = entry["reason"]
+
+
+    def classify_failures(report_path):
+        with open(report_path) as f:
+            report = json.load(f)
+        blocking = []
+        quarantined = []
+        for result in report["results"]:
+            if result["status"] != "failed":
+                continue
+            try:
+                reason = QUARANTINE[result["test_id"]]
+                quarantined.append((result["test_id"], reason))
+            except:
+                blocking.append(result["test_id"])
+        return blocking, quarantined
+
+
+    if __name__ == "__main__":
+        load_quarantine(sys.argv[1])
+        blocking, quarantined = classify_failures(sys.argv[2])
+        if blocking:
+            print("blocking failures:", len(blocking))
+            sys.exit(1)
+        print("only quarantined failures:", len(quarantined))
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (CI step, runs on every pipeline)
+
+    #### [Bug] Bare `except:` hides real errors
+    - **Where:** `except:` in `classify_failures`
+    - **Issue:** it catches every error, not only "test is not quarantined". A broken report entry, a typo in a variable name or a Ctrl+C would all be treated as "blocking failure" and hide the real cause. Also, the `quarantined.append(...)` line sits inside the `try`, so any error there is hidden too.
+    - **Fix:** don't use an exception for this check at all (see next point). Then nothing is caught by accident.
+
+    #### [Low] Exception used for a normal "not found" case
+    - **Where:** `try: QUARANTINE[...] ... except:`
+    - **Issue:** most failing tests are not quarantined, so the `KeyError` is raised and caught again and again. Raising is the expensive part. In Green Metrics Tool micro-benchmarks, 10,000,000 dict lookups with about half of the keys missing used about 12% less CPU energy with `dict.get` than with `try/except KeyError`. An `if key in d` check performed like `get`. If misses are rare, `try/except` is cheap, so this only matters when many lookups miss, like here.
+    - **Fix:** check with `in`. The behavior is the same.
+    - **Impact:** E, small. A report has a bounded number of failures, so the total saving is modest. The fix mainly makes the code clearer and stops hiding errors.
+
+    ```python
+    import json
+    import sys
+
+    QUARANTINE = {}
+
+
+    def load_quarantine(path):
+        with open(path) as f:
+            for line in f:
+                entry = json.loads(line)
+                QUARANTINE[entry["test_id"]] = entry["reason"]
+
+
+    def classify_failures(report_path):
+        with open(report_path) as f:
+            report = json.load(f)
+        blocking = []
+        quarantined = []
+        for result in report["results"]:
+            if result["status"] != "failed":
+                continue
+            test_id = result["test_id"]
+            if test_id in QUARANTINE:
+                quarantined.append((test_id, QUARANTINE[test_id]))
+            else:
+                blocking.append(test_id)
+        return blocking, quarantined
+
+
+    if __name__ == "__main__":
+        load_quarantine(sys.argv[1])
+        blocking, quarantined = classify_failures(sys.argv[2])
+        if blocking:
+            print("blocking failures:", len(blocking))
+            sys.exit(1)
+        print("only quarantined failures:", len(quarantined))
+    ```
+
+    **Already good:** the quarantine list is a dict, so each lookup is O(1). The report is read once, and passing tests are skipped early.
+verify:
+  module: true
+  equivalence:
+    driver: |-
+      import json, os, tempfile
+      d = tempfile.mkdtemp()
+      qpath = os.path.join(d, "q.jsonl")
+      with open(qpath, "w") as f:
+          for i in range(0, 40, 5):
+              f.write(json.dumps({"test_id": "t%d" % i, "reason": "flaky %d" % i}) + "\n")
+      rpath = os.path.join(d, "r.json")
+      results = []
+      for i in range(60):
+          results.append({"test_id": "t%d" % i, "status": "failed" if i % 3 == 0 else "passed"})
+      with open(rpath, "w") as f:
+          json.dump({"results": results}, f)
+      load_quarantine(qpath)
+      blocking, quarantined = classify_failures(rpath)
+      print(blocking)
+      print(quarantined)

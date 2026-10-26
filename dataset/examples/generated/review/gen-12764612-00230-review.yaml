@@ -1,0 +1,102 @@
+id: gen-12764612-00230-review
+category: review
+language: python
+patterns:
+- string-join
+- keep-star-imports
+facts:
+- F-STRCAT
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    hello, can you review this please? it is the postprocess step after our classifier model, it run for every batch of images and write the result file. I think is ok but my colleague say something is not good, I dont know what.
+
+    ```python
+    from math import *
+    import json
+
+    LABELS = ["cat", "dog", "bird", "fish", "horse"]
+
+
+    def softmax(logits):
+        exps = [exp(x) for x in logits]
+        total = sum(exps)
+        return [e / total for e in exps]
+
+
+    def build_report(batch_logits, ids):
+        report = "id,label,score\n"
+        for i, logits in zip(ids, batch_logits):
+            probs = softmax(logits)
+            best = probs.index(max(probs))
+            report += str(i) + "," + LABELS[best] + "," + "%.4f" % probs[best] + "\n"
+        return report
+
+
+    def save(batch_logits, ids, path):
+        with open(path, "w") as f:
+            f.write(build_report(batch_logits, ids))
+        with open(path + ".meta", "w") as f:
+            json.dump({"rows": len(ids)}, f)
+    ```
+- role: assistant
+  content: |
+    **Workload:** AI/ML (inference post-processing, runs for every batch)
+
+    #### [Bug] Softmax overflows on large logits
+    - **Where:** `softmax`, `exp(x)`
+    - **Issue:** `exp()` raises `OverflowError` for logits above about 709. A confident model or a bad input can crash the whole batch. Subtracting the max logit first gives the same probabilities and cannot overflow.
+    - **Fix:** `m = max(logits)` and `exp(x - m)`.
+
+    #### [High] String built with `+=` in a loop
+    - **Where:** `build_report`, `report += ...`
+    - **Issue:** the report is built piece by piece, once per row, for every batch. Each `+=` can copy the growing string. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces with `+=` used ~469 J, and `"".join()` used ~1.8 J, roughly 260× less CPU energy. f-strings in a loop behave like `+=`, so they don't help.
+    - **Fix:** collect the lines in a list and join once at the end.
+    - **Impact:** E, per row and per batch. The gain grows with the batch size. The output file is the same.
+
+    ```python
+    from math import *
+    import json
+
+    LABELS = ["cat", "dog", "bird", "fish", "horse"]
+
+
+    def softmax(logits):
+        m = max(logits)
+        exps = [exp(x - m) for x in logits]
+        total = sum(exps)
+        return [e / total for e in exps]
+
+
+    def build_report(batch_logits, ids):
+        lines = ["id,label,score"]
+        for i, logits in zip(ids, batch_logits):
+            probs = softmax(logits)
+            best = probs.index(max(probs))
+            lines.append(f"{i},{LABELS[best]},{probs[best]:.4f}")
+        return "\n".join(lines) + "\n"
+
+
+    def save(batch_logits, ids, path):
+        with open(path, "w") as f:
+            f.write(build_report(batch_logits, ids))
+        with open(path + ".meta", "w") as f:
+            json.dump({"rows": len(ids)}, f)
+    ```
+
+    **Already good:** the file is written with one `write()` call, and `with` closes the files.
+
+    **About `from math import *`:** you can leave it. In Green Metrics Tool micro-benchmarks, star imports and `import x` showed no measurable energy difference. It is a style question only, so it is not a finding here.
+verify:
+  equivalence:
+    driver: |
+      logits = [
+          [2.0, 1.0, 0.1, -1.0, 0.5],
+          [0.1, 0.2, 3.5, 0.0, -2.0],
+          [-1.0, -0.5, 0.0, 0.5, 4.0],
+          [1.5, 1.5, 1.4, 0.0, 0.0],
+      ]
+      print(build_report(logits, [101, 102, 103, 104]), end="")
+      print(build_report([], []), end="")
+  test: assert build_report([[1000.0, 0.0, 0.0, 0.0, 0.0]], [7]) == "id,label,score\n7,cat,1.0000\n"

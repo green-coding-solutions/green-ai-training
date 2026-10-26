@@ -1,0 +1,119 @@
+id: gen-2-00020-generation
+category: generation
+language: html
+patterns:
+- modern-image-formats
+- lazy-load-images
+facts:
+- F-IMGRENDER
+- F-IMGENC
+- F-LAZY-IMG
+messages:
+- role: user
+  content: |
+    hi, we write a postmortem page after every incident on our log platform (ingest delay, dropped logs, things like that). the page go on our public status site and customers read it. every postmortem have 4-6 screenshots from grafana, exported as PNG, each one is 1-2 MB.
+
+    can you write the html template for one postmortem? need: title, date, severity, short summary, timeline as list, then the graphs with caption, and a "what we change" section. we use plain html, no framework, css is in /status/assets/status.css
+
+    also my colleague say we should put a image proxy in front that convert the png to webp when request come. is that good idea?
+- role: assistant
+  content: |
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Postmortem: Delayed log ingestion in eu-west · Status</title>
+      <link rel="stylesheet" href="/status/assets/status.css">
+    </head>
+    <body>
+      <main class="postmortem">
+        <header>
+          <p class="breadcrumb"><a href="/status/">Status</a> / Postmortems</p>
+          <h1>Delayed log ingestion in eu-west</h1>
+          <dl class="meta">
+            <dt>Date</dt>
+            <dd><time datetime="2026-10-14">14 October 2026</time></dd>
+            <dt>Severity</dt>
+            <dd class="severity severity-2">SEV-2</dd>
+            <dt>Status</dt>
+            <dd>Resolved</dd>
+          </dl>
+        </header>
+
+        <section id="summary">
+          <h2>Summary</h2>
+          <p>
+            A config change reduced the number of ingest workers in eu-west. Logs were accepted
+            but indexed late, so searches and alerts showed data with a delay. No logs were lost.
+          </p>
+        </section>
+
+        <section id="timeline">
+          <h2>Timeline (UTC)</h2>
+          <ol class="timeline">
+            <li><time datetime="2026-10-14T08:05Z">08:05</time> Config change rolled out to eu-west.</li>
+            <li><time datetime="2026-10-14T08:12Z">08:12</time> Ingest lag alert fires. On-call starts investigating.</li>
+            <li><time datetime="2026-10-14T08:31Z">08:31</time> Cause found, rollback started.</li>
+            <li><time datetime="2026-10-14T08:52Z">08:52</time> Backlog processed, lag back to normal.</li>
+          </ol>
+        </section>
+
+        <section id="graphs">
+          <h2>Graphs</h2>
+
+          <figure>
+            <picture>
+              <source srcset="img/ingest-lag.webp" type="image/webp">
+              <img src="img/ingest-lag.png" width="1600" height="900"
+                   loading="lazy" decoding="async"
+                   alt="Ingest lag per region. eu-west rises from 08:05 and is back to normal at 08:52 UTC.">
+            </picture>
+            <figcaption>Ingest lag per region during the incident.</figcaption>
+          </figure>
+
+          <figure>
+            <picture>
+              <source srcset="img/worker-count.webp" type="image/webp">
+              <img src="img/worker-count.png" width="1600" height="900"
+                   loading="lazy" decoding="async"
+                   alt="Active ingest workers in eu-west drop at 08:05 and recover after the rollback.">
+            </picture>
+            <figcaption>Active ingest workers in eu-west.</figcaption>
+          </figure>
+
+          <!-- Copy one <figure> per graph. Keep width/height equal to the real image size. -->
+        </section>
+
+        <section id="changes">
+          <h2>What we change</h2>
+          <ul>
+            <li>Worker count changes now need a second reviewer.</li>
+            <li>Canary rollout to one region before all regions.</li>
+            <li>The ingest lag alert pages on-call sooner.</li>
+          </ul>
+        </section>
+      </main>
+    </body>
+    </html>
+    ```
+
+    Convert the screenshots once, when you publish the postmortem (or in the CI step that deploys the status site):
+
+    ```bash
+    for png in img/*.png; do
+      webp="${png%.png}.webp"
+      [ -e "$webp" ] || cwebp -quiet -lossless "$png" -o "$webp"
+    done
+    ```
+
+    About the proxy: I would not convert on every request. A postmortem never changes after you publish it, so a per-request proxy repeats the same expensive encode for every reader. If you convert once at publish time you get the same small files, and you have nothing extra to run.
+
+    **Green Notes**
+    - **WebP with PNG fallback** (reduces network, E): the big PNGs are most of the page weight, and lossless WebP is usually much smaller while graph lines and labels stay sharp. In Green Metrics Tool browser benchmarks (50 page loads per format), the PNG pages also used the most client CPU energy (~181 J), and the WebP pages used ~150 J.
+    - **Encode once, not per request** (reduces E): in the same benchmarks, encoding 50 images used ~290 J for WebP and ~658 J for AVIF, compared with ~89 J for JPG. That cost should happen once per postmortem, not once per visitor.
+    - **Lazy-load the graphs** (reduces network, E): the graphs sit below the summary and the timeline, so readers who stop after the summary don't download them. In Green Metrics Tool browser benchmarks this saved about 12% on page loads without scrolling, and made no difference when visitors scrolled to the end. No image is above the fold here, so nothing important is delayed.
+    - *Not applied:* AVIF. Decoding it cost about 19% more than JPG in the same benchmarks, and encoding it is expensive. Lossy AVIF can also blur thin lines and small text in dashboard screenshots. Lossless WebP is the simpler choice for this page.
+verify:
+  static_only: HTML template; the cwebp conversion needs libwebp tools

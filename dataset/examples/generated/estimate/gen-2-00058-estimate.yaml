@@ -1,0 +1,50 @@
+id: gen-2-00058-estimate
+category: estimate
+language: python
+patterns:
+- keep-star-imports
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    PR for the nightly ETL. Each partition runs as its own python process, a few thousand per night. Need a one-line energy saving estimate for the PR description.
+
+    ```diff
+    --- a/etl/partition_worker.py
+    +++ b/etl/partition_worker.py
+    @@ -1,8 +1,8 @@
+     import sys
+     import logging
+
+    -from etl.common import *
+    +from etl.common import read_partition, normalize_row, write_parquet, PartitionError
+
+     log = logging.getLogger("etl.worker")
+
+
+    ```
+- role: assistant
+  content: |
+    There is no measurable saving, so don't put a number in the PR description. If energy is the only reason for the PR, drop it and keep the star import.
+
+    Both forms execute all of `etl/common.py`, including everything it imports. The only difference is which names get bound in the worker's namespace. Green Metrics Tool micro-benchmarks ran 1,000 Python process starts with each import style:
+
+    - `from sympy import *` ~3103 J vs `import sympy` ~3093 J
+    - `from posix import *` and `import posix`: both ~121 J
+
+    That gap is noise. What does show up is *which* modules a process loads. A start that imported sympy used about 3.1 J, about 25× a start that imported only a built-in module (~0.12 J). Your per-process cost comes from what `etl.common` pulls in at import time, not from the import style.
+
+    To check your own worker:
+
+    ```bash
+    # where import time goes, per module (sorted by cumulative time)
+    python -X importtime -c 'import etl.partition_worker' 2>&1 | sort -t'|' -k2 -n | tail -n 15
+
+    # CPU package energy (RAPL) over repeated runs of one partition, before and after
+    perf stat -a -r 20 -e power/energy-pkg/ python -m etl.partition_worker sample_partition.csv
+    ```
+
+    For a figure you can report, run both variants as a Green Metrics Tool usage scenario on a real partition.
+verify:
+  static_only: estimate answer; diff and shell measurement commands only, no runnable module

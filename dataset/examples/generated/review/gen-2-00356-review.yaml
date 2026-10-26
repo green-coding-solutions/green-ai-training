@@ -1,0 +1,97 @@
+id: gen-2-00356-review
+category: review
+language: html
+patterns:
+- lazy-load-images
+facts:
+- F-LAZY-IMG
+messages:
+- role: user
+  content: |
+    Nightly validation page for our ocean model. CI renders this Jinja template after every run and posts the link in #ocean-ci. 12 regions, 3 matplotlib PNGs each. Most of us look at the global map and the table and close the tab unless something is red. Review it, diff only please, no essay.
+
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Nightly validation – {{ run.model }} {{ run.commit[:8] }}</title>
+      <link rel="stylesheet" href="validation.css">
+    </head>
+    <body>
+      <header>
+        <h1>{{ run.model }} nightly validation</h1>
+        <p>Commit <code>{{ run.commit[:8] }}</code> · {{ run.started }} · {{ run.duration }} on {{ run.nodes }} nodes</p>
+        <p class="commit-msg">{{ run.commit_message | safe }}</p>
+      </header>
+
+      <main>
+        <figure class="overview">
+          <img src="figs/sst_bias_global.png" alt="Global SST bias vs. OISST, last 30 days">
+          <figcaption>Global SST bias (model − OISST), 30-day mean</figcaption>
+        </figure>
+
+        <table class="summary">
+          <thead>
+            <tr><th>Region</th><th>SST RMSE (K)</th><th>SSH RMSE (cm)</th><th>Status</th></tr>
+          </thead>
+          <tbody>
+          {% for r in regions %}
+            <tr>
+              <td><a href="#{{ r.slug }}">{{ r.name }}</a></td>
+              <td>{{ "%.3f"|format(r.sst_rmse) }}</td>
+              <td>{{ "%.2f"|format(r.ssh_rmse) }}</td>
+              <td class="{{ 'fail' if r.failed else 'ok' }}">{{ 'FAIL' if r.failed else 'ok' }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+
+        {% for r in regions %}
+        <section id="region-{{ r.slug }}">
+          <h2>{{ r.name }}</h2>
+          <img src="figs/{{ r.slug }}_sst_timeseries.png" alt="{{ r.name }} SST time series">
+          <img src="figs/{{ r.slug }}_ssh_bias.png" alt="{{ r.name }} SSH bias map">
+          <img src="figs/{{ r.slug }}_mld_profile.png" alt="{{ r.name }} mixed layer depth">
+        </section>
+        {% endfor %}
+      </main>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (internal CI report page)
+
+    #### [Bug] Table links point to ids that don't exist
+    - **Where:** `<a href="#{{ r.slug }}">`
+    - **Issue:** the sections use `id="region-{{ r.slug }}"`, so no link in the table jumps anywhere.
+    - **Fix:**
+      ```html
+      <td><a href="#region-{{ r.slug }}">{{ r.name }}</a></td>
+      ```
+
+    #### [Security] Commit message rendered unescaped
+    - **Where:** `{{ run.commit_message | safe }}`
+    - **Issue:** anyone who can push a commit can inject HTML or script into a page the whole team opens.
+    - **Fix:**
+      ```html
+      <p class="commit-msg">{{ run.commit_message }}</p>
+      ```
+
+    #### [High] Every region plot loads on every visit
+    - **Where:** the three `<img>` tags in each region `<section>`
+    - **Issue:** the browser fetches and decodes all region plots, but most visits end at the table. In Green Metrics Tool page-load measurements of an article with 15 photos opened without scrolling, `loading="lazy"` below the fold used ~325 J vs ~368 J eager, about 12% less CPU energy. When visitors scrolled to the end there was no real difference (~517 J vs ~511 J). Your page fits the first case, because people only scroll into a region when it failed.
+    - **Fix:**
+      ```html
+      <img src="figs/{{ r.slug }}_sst_timeseries.png" alt="{{ r.name }} SST time series" loading="lazy">
+      <img src="figs/{{ r.slug }}_ssh_bias.png" alt="{{ r.name }} SSH bias map" loading="lazy">
+      <img src="figs/{{ r.slug }}_mld_profile.png" alt="{{ r.name }} mixed layer depth" loading="lazy">
+      ```
+      Also add `width`/`height` with the PNGs' pixel size (figsize × dpi). Without them, unloaded images take no space, and the anchor jumps from the fixed table links can land in the wrong place.
+    - **Impact:** E on the client and network bytes for every visit that stops at the table. Visits that open a region behave as before, because each region's plots load when you jump to it.
+
+    **Already good:** the global SST map has no `loading="lazy"`. It is above the fold and everyone looks at it, so keep it eager.
+verify:
+  static_only: Jinja/HTML template, rendering and measuring need a browser

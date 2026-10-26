@@ -1,0 +1,67 @@
+id: gen-2-00171-no-change
+category: no-change
+language: nginx
+patterns:
+- text-compression
+- context-tradeoff
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    Hi, we have nginx as small gateway between the extract and the load step of our ETL job. Both run as container in the same docker-compose on one VM. Every night the loader pull around 30 csv exports from /export/, together ~400 MB. The extractor generate the csv on request from the database.
+
+    My colleague see `gzip off` in the config and say this is bad practise, we should put `gzip on` with `gzip_comp_level 9` and add text/csv to gzip_types because the files are big. Is he right? I dont want to break somthing before the release.
+
+    ```nginx
+    upstream extractor {
+        server extractor:8000;
+        keepalive 16;
+    }
+
+    server {
+        listen 8080;
+        server_name etl-gateway;
+
+        access_log /var/log/nginx/etl_access.log;
+
+        # only reachable inside the compose network
+        allow 172.20.0.0/16;
+        deny all;
+
+        gzip off;
+
+        location /export/ {
+            proxy_pass http://extractor;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Host $host;
+            proxy_buffering off;
+            proxy_read_timeout 900s;
+        }
+
+        location /healthz {
+            access_log off;
+            return 200 "ok\n";
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    No. For this setup, `gzip off` is the right choice. Keep the config as it is.
+
+    - **The bytes never leave the VM.** The loader and nginx talk over the Docker bridge network on the same machine. Moving data there is almost free. Compression would only add work: nginx compresses every CSV, and then the loader has to decompress it again.
+    - **The exports are dynamic.** The extractor builds each CSV on request, so you can't compress it once ahead of time. Every nightly run would pay the full compression cost again, and a higher level makes each byte more expensive.
+    - **Measured case:** in Green Metrics Tool benchmarks, nginx served text assets on a local Docker network. gzip level 5 per request used about 7× the CPU energy of no compression, and the transfer itself cost almost nothing.
+
+    The rest of the config is fine too. The upstream keepalive is set up correctly (HTTP/1.1 and an empty `Connection` header). With `proxy_buffering off`, large exports stream through without nginx writing temp files.
+
+    This changes if the loader ever pulls over a real network, for example from another host, another region or over a VPN. Then fewer bytes are what counts: in the same benchmark, compression sent about 10× fewer bytes for text. In that case, use a moderate level, not the maximum:
+
+    ```nginx
+    gzip on;
+    gzip_comp_level 5;
+    gzip_types text/csv application/json;
+    ```
+verify:
+  static_only: nginx configuration, no runnable Python or JavaScript code

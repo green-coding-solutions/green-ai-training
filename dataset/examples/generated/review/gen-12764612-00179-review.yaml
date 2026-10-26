@@ -1,0 +1,112 @@
+id: gen-12764612-00179-review
+category: review
+language: html
+patterns:
+- remove-unused-css
+facts:
+- F-UNUSED-CSS
+messages:
+- role: user
+  content: |
+    ?
+
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <title>Tail - app logs</title>
+      <style>
+        *, *::before, *::after { box-sizing: border-box; }
+        body { margin: 0; font: 14px/1.4 system-ui, sans-serif; background: #fafafa; color: #222; }
+        .topbar { padding: 8px 16px; background: #1f2933; color: #fff; }
+        .mono { font-family: ui-monospace, Menlo, monospace; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 4px 8px; border-bottom: 1px solid #ddd; text-align: left; }
+        .lvl-error { color: #b00020; font-weight: 600; }
+        .lvl-warn { color: #a15c00; }
+        .lvl-info { color: #1b5e20; }
+
+        .btn { display: inline-block; padding: 6px 12px; border: 1px solid transparent; border-radius: 4px; }
+        .btn-primary { background: #0d6efd; color: #fff; }
+        .btn-danger { background: #dc3545; color: #fff; }
+        .modal { position: fixed; inset: 0; display: none; }
+        .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.5); }
+        .carousel { position: relative; overflow: hidden; }
+        .carousel-item { display: none; float: left; width: 100%; }
+        .dropdown-menu { position: absolute; display: none; min-width: 10rem; background: #fff; }
+        .navbar { display: flex; align-items: center; padding: 8px 16px; }
+        .badge { padding: 2px 6px; border-radius: 10px; font-size: 75%; }
+        .alert { padding: 12px; border: 1px solid transparent; }
+        .pagination { display: flex; list-style: none; }
+        .tooltip { position: absolute; z-index: 1070; font-size: 12px; }
+      </style>
+    </head>
+    <body>
+      <header class="topbar"><h1>Log tail</h1></header>
+      <table class="mono">
+        <thead><tr><th>Time</th><th>Level</th><th>Message</th></tr></thead>
+        <tbody id="log"></tbody>
+      </table>
+      <script>
+        fetch('/api/tail?n=200')
+          .then(r => r.json())
+          .then(rows => {
+            const tbody = document.getElementById('log');
+            for (const r of rows) {
+              const tr = document.createElement('tr');
+              tr.innerHTML =
+                `<td>${r.ts}</td>` +
+                `<td class="lvl-${r.level}">${r.level}</td>` +
+                `<td>${r.msg}</td>`;
+              tbody.appendChild(tr);
+            }
+          });
+      </script>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (internal log viewer)
+
+    #### [Security] Log messages are inserted as HTML
+    - **Where:** `tr.innerHTML = ...` in the script
+    - **Issue:** `r.msg`, `r.level` and `r.ts` come from log data, and logs often contain user input (URLs, user agents, form fields). A line like `<img src=x onerror=...>` runs script in the page of whoever opens the viewer. `r.level` is also placed inside a `class` attribute.
+    - **Fix:** build the cells with `textContent` and only accept known levels.
+
+    ```html
+    <script>
+      const LEVELS = new Set(['error', 'warn', 'info', 'debug']);
+      fetch('/api/tail?n=200')
+        .then(r => r.json())
+        .then(rows => {
+          const tbody = document.getElementById('log');
+          const frag = document.createDocumentFragment();
+          for (const r of rows) {
+            const tr = document.createElement('tr');
+            const level = LEVELS.has(r.level) ? r.level : 'info';
+            for (const [text, cls] of [[r.ts], [level, 'lvl-' + level], [r.msg]]) {
+              const td = document.createElement('td');
+              td.textContent = text;
+              if (cls) td.className = cls;
+              tr.appendChild(td);
+            }
+            frag.appendChild(tr);
+          }
+          tbody.appendChild(frag);
+        });
+    </script>
+    ```
+
+    The fragment also means the table is touched once instead of 200 times.
+
+    #### [Low] About half of the stylesheet is unused
+    - **Where:** `.btn` to `.tooltip` in `<style>`
+    - **Issue:** the page has no buttons, modal, carousel, dropdown, navbar, badge, alert, pagination or tooltip. These rules look like a pasted framework chunk.
+    - **Fix:** delete them. Keep `.lvl-error`, `.lvl-warn`, `.lvl-info` and add `.lvl-debug` if you use it. These classes are built from a string in the script, so a purge tool will not see them unless you safelist `lvl-*`.
+    - **Impact:** saves bytes, not CPU. In Green Metrics Tool micro-benchmarks, purging a 16 KB stylesheet to under 1 KB changed client energy by about 2%, which is within noise. For a small internal page on a fast network, treat this as cleanup. A build step like PurgeCSS is not worth adding for it.
+
+    **Already good:** the page makes one request for 200 rows, and the stylesheet is inline, so there is no extra request.
+verify:
+  static_only: browser HTML/JS needing a /api/tail endpoint

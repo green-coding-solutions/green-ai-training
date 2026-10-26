@@ -1,0 +1,115 @@
+id: gen-1-00244-review
+category: review
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    review pls
+
+    ```python
+    import requests
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    BASE = "https://api.internal.example.com"
+
+
+    @app.get("/accounts/{account_id}/overview")
+    async def overview(account_id: int):
+        headers = {"Authorization": "Bearer sk_live_9f2c41d7a0e84b"}
+        profile = requests.get(f"{BASE}/profiles/{account_id}", headers=headers).json()
+        orders = requests.get(
+            f"{BASE}/orders", params={"account": account_id, "limit": 5}, headers=headers
+        ).json()
+        balance = requests.get(f"{BASE}/billing/{account_id}/balance", headers=headers).json()
+        try:
+            notes = requests.get(f"{BASE}/notes/{account_id}", headers=headers).json()
+        except Exception:
+            notes = []
+        return {
+            "name": profile["name"],
+            "recent_orders": orders,
+            "balance": balance["amount"],
+            "notes": notes,
+        }
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (REST API, one request fans out to four upstream calls)
+
+    #### [Security] Hardcoded API token
+    - **Where:** `headers = {"Authorization": "Bearer sk_live_..."}`
+    - **Issue:** the secret is in source control and in every copy of the code. Rotate it, then read it from the environment.
+    - **Fix:** `os.environ["API_TOKEN"]`, as in the code below.
+
+    #### [Bug] Blocking calls inside `async def`
+    - **Where:** all four `requests.get(...)` calls
+    - **Issue:** `requests` is synchronous. Inside an `async def` endpoint it blocks the event loop. While one overview request waits on the network, the whole worker can't serve any other request.
+    - **Fix:** use an async client (`httpx.AsyncClient`) and `await` the calls.
+
+    #### [Bug] No timeout and no status check
+    - **Where:** every `requests.get(...)`
+    - **Issue:** `requests` has no default timeout, so a stuck upstream holds the request, and the worker with it, forever. A 500 error page from upstream also reaches `.json()` and crashes with a confusing error, or is returned as if it were data.
+    - **Fix:** set a timeout on the client and call `raise_for_status()`. An upstream failure now surfaces as an error instead of bad data.
+
+    #### [High] Independent calls run one after another
+    - **Where:** `profile`, `orders`, `balance`, `notes`
+    - **Issue:** none of the four calls needs the result of another, but each waits for the previous one. Response time is the sum of all four. The connection setup is also repeated, because each `requests.get` opens its own connection.
+    - **Fix:** one shared `AsyncClient` (connection reuse) and `asyncio.gather` for the four calls.
+    - **Impact:** reduces idle wall time and the time each request holds a worker, per request. In Green Metrics Tool micro-benchmarks, 10 HTTP requests with async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. With only four calls, expect the gain mostly in latency and worker time, not CPU energy.
+
+    ```python
+    import asyncio
+    import os
+
+    import httpx
+    from fastapi import FastAPI
+
+    app = FastAPI()
+
+    # Create once and reuse. Close it in a lifespan handler on shutdown.
+    client = httpx.AsyncClient(
+        base_url="https://api.internal.example.com",
+        headers={"Authorization": f"Bearer {os.environ['API_TOKEN']}"},
+        timeout=5.0,
+    )
+
+
+    async def get_json(path, **params):
+        resp = await client.get(path, params=params or None)
+        resp.raise_for_status()
+        return resp.json()
+
+
+    async def get_notes(account_id):
+        try:
+            return await get_json(f"/notes/{account_id}")
+        except Exception:
+            return []
+
+
+    @app.get("/accounts/{account_id}/overview")
+    async def overview(account_id: int):
+        profile, orders, balance, notes = await asyncio.gather(
+            get_json(f"/profiles/{account_id}"),
+            get_json("/orders", account=account_id, limit=5),
+            get_json(f"/billing/{account_id}/balance"),
+            get_notes(account_id),
+        )
+        return {
+            "name": profile["name"],
+            "recent_orders": orders,
+            "balance": balance["amount"],
+            "notes": notes,
+        }
+    ```
+
+    The notes call keeps its original behavior: if it fails, the endpoint still answers with an empty list. Its failure doesn't cancel the other three calls.
+
+    **Already good:** `params=` instead of a hand-built query string, and an optional call that degrades instead of failing the whole endpoint.
+verify:
+  static_only: needs fastapi, httpx and network access to upstream services

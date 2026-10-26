@@ -1,0 +1,132 @@
+id: gen-1-00153-multi-turn
+category: multi-turn
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    diff only. todo scanner, runs in our pre-commit hook over every staged file (stdin, one call per file). tags come from argv.
+
+    ```python
+    import re
+    import sys
+
+    def scan(lines, tags, owner=None):
+        hits = []
+        for lineno, line in enumerate(lines, 1):
+            m = re.search(r"(?:#|//)\s*(" + "|".join(map(re.escape, tags)) + r")(?:\((\w+)\))?:\s*(.*)", line)
+            if not m:
+                continue
+            if owner and m.group(2) != owner:
+                continue
+            hits.append((lineno, m.group(1), m.group(3).strip()))
+        return hits
+
+    def main(argv):
+        tags = argv[1].split(",")
+        for lineno, tag, text in scan(sys.stdin, tags):
+            print(f"{lineno}:{tag}:{text}")
+
+    if __name__ == "__main__":
+        main(sys.argv)
+    ```
+- role: assistant
+  content: |
+    Only `scan` changes. The pattern depends on `tags`, not on the line, so build it once per call.
+
+    ```python
+    import re
+
+    def scan(lines, tags, owner=None):
+        pattern = re.compile(r"(?:#|//)\s*(" + "|".join(map(re.escape, tags)) + r")(?:\((\w+)\))?:\s*(.*)")
+        hits = []
+        for lineno, line in enumerate(lines, 1):
+            m = pattern.search(line)
+            if not m:
+                continue
+            if owner and m.group(2) != owner:
+                continue
+            hits.append((lineno, m.group(1), m.group(3).strip()))
+        return hits
+    ```
+
+    **Green Notes**
+    - **Compile once per call** (reduces E): the old code did the `escape`, the `join` and the string concatenation again for every line. Now that work happens once per file.
+- role: user
+  content: |
+    python caches compiled patterns anyway. reviewers will call this noise
+- role: assistant
+  content: |
+    They would be partly right. `re` caches the pattern, so the old code did not recompile on every line. It only rebuilt the string and did a cache lookup each time. In Green Metrics Tool micro-benchmarks with 1,000,000 matches, a precompiled pattern used about 18% less CPU energy than inline `re.match`. That is a small win.
+
+    It gets large only when patterns are rebuilt with many different strings, so the cache cannot hold them. That is not the case here, because the tags are fixed per run.
+
+    The change costs no readability, so I would keep it. If your reviewers object, reverting it is harmless.
+- role: user
+  content: |
+    fine, keep it. add -i for case-insensitive tags, still diff only
+
+    ```python
+    def main(argv):
+        tags = argv[1].split(",")
+        for lineno, tag, text in scan(sys.stdin, tags):
+            print(f"{lineno}:{tag}:{text}")
+    ```
+- role: assistant
+  content: |
+    The flag goes into the single `compile` call.
+
+    ```python
+    import re
+    import sys
+
+    def scan(lines, tags, owner=None, ignore_case=False):
+        flags = re.IGNORECASE if ignore_case else 0
+        pattern = re.compile(r"(?:#|//)\s*(" + "|".join(map(re.escape, tags)) + r")(?:\((\w+)\))?:\s*(.*)", flags)
+        hits = []
+        for lineno, line in enumerate(lines, 1):
+            m = pattern.search(line)
+            if not m:
+                continue
+            if owner and m.group(2) != owner:
+                continue
+            hits.append((lineno, m.group(1), m.group(3).strip()))
+        return hits
+
+    def main(argv):
+        args = argv[1:]
+        ignore_case = "-i" in args
+        args = [a for a in args if a != "-i"]
+        tags = args[0].split(",")
+        for lineno, tag, text in scan(sys.stdin, tags, ignore_case=ignore_case):
+            print(f"{lineno}:{tag}:{text}")
+
+    if __name__ == "__main__":
+        main(sys.argv)
+    ```
+
+    **Green Notes**
+    - **Flag in the one `compile` call:** `-i` adds no per-line cost. With `-i` the printed tag keeps the case used in the source line.
+verify:
+  module: true
+  test: |
+    assert scan(["# todo: a\n"], ["TODO"], ignore_case=True) == [(1, "todo", "a")]
+    assert scan(["# todo: a\n"], ["TODO"]) == []
+    assert scan(["// FIXME(ann): x\n"], ["FIXME"], owner="ann") == [(1, "FIXME", "x")]
+    assert scan(["// FIXME(ann): x\n"], ["FIXME"], owner="bob") == []
+  equivalence:
+    driver: |-
+      lines = [
+          "x = 1  # TODO: fix\n",
+          "// FIXME(ann): bad\n",
+          "# todo: lower\n",
+          "y=2\n",
+          "# NOTE(bob): n\n",
+          "// TODO(bob):   spaced   \n",
+      ]
+      print(scan(lines, ["TODO", "FIXME"]))
+      print(scan(lines, ["TODO", "FIXME"], owner="bob"))
+      print(scan(lines, ["NOTE"]))

@@ -1,0 +1,62 @@
+id: gen-12764612-00346-estimate
+category: estimate
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    Flash-sale price tracker in our pricing service. Every repricing tick calls `record()`, and the storefront calls `latest()`. During a drop a hot SKU gets hundreds of thousands of ticks. Diff only please. Roughly how much energy does fixing this save per drop?
+
+    ```python
+    class PriceHistory:
+        def __init__(self):
+            self.by_sku = {}
+
+        def record(self, sku, price, ts):
+            # newest first so latest() is a cheap slice
+            self.by_sku.setdefault(sku, []).insert(0, (ts, price))
+
+        def latest(self, sku, n=20):
+            return self.by_sku.get(sku, [])[:n]
+    ```
+- role: assistant
+  content: |
+    ```python
+    from itertools import islice
+
+
+    class PriceHistory:
+        def __init__(self):
+            self.by_sku = {}
+
+        def record(self, sku, price, ts):
+            self.by_sku.setdefault(sku, []).append((ts, price))
+
+        def latest(self, sku, n=20):
+            return list(islice(reversed(self.by_sku.get(sku, [])), n))
+    ```
+
+    Store oldest first, read newest first. `latest()` returns the same tuples in the same order.
+
+    **Estimate**
+    - **Cost:** `insert(0, x)` shifts every existing element, so each tick costs O(len). `append` is O(1). That is the whole saving. It grows with list length, and the loss comes on the write path of your hot SKUs.
+    - **Measured reference:** in Green Metrics Tool micro-benchmarks, 1,000,000 × `list.insert(0, x)` used ~1515 J of CPU energy and 1,000,000 × `list.append(x)` ~1.2 J, over 1000× less. That benchmark grows one list to 1,000,000 items. Your per-SKU lists are shorter, so your gap will be smaller. I won't scale the figure to your drop. Cold SKUs with short lists will see almost nothing.
+    - **Measure it:** replay one recorded drop of ticks against both classes and compare CPU time with `perf stat` or `time` as a quick proxy. For energy, run each version as a Green Metrics Tool usage scenario on the same machine.
+
+    `latest()` no longer slices from the front. It uses `reversed` with `islice`, so it touches only `n` items and does not copy the list.
+verify:
+  equivalence:
+    driver: |-
+      h = PriceHistory()
+      for i in range(300):
+          h.record("sku-a", 100 + i % 7, 1000 + i)
+      for i in range(5):
+          h.record("sku-b", 50 + i, 2000 + i)
+      print(h.latest("sku-a"))
+      print(h.latest("sku-a", 3))
+      print(h.latest("sku-b", 10))
+      print(h.latest("sku-b", 0))
+      print(h.latest("missing"))

@@ -1,0 +1,103 @@
+id: gen-2-00169-generation
+category: generation
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    I need a Python function for our MD post-processing batch. Our in-house simulation code writes a text log per run. We run about 3,000 runs per campaign, and each log has 200k to 2M lines. Some logs are gzipped (`.log.gz`).
+
+    Requirements:
+    - Data lines start with `step N`, for example:
+      `step 12000  Temp = 301.22  Press = -1.3e+02  Box[x] = 40.512`
+      Every other line (headers, warnings, restart messages) must be ignored, even if it contains `Temp = ...`.
+    - The observable names come from a YAML config at runtime, usually 5 to 40 names. Some contain regex characters, like `Box[x]`.
+    - A data line can have any subset of the observables, in any order. Spaces around `=` are optional.
+    - `Temp` must not match `E_Temp`.
+    - The Fortran part sometimes writes `********` when a value overflows. Skip those values silently.
+    - Return `{name: [(step, value), ...]}` per file. A driver function should take a list of paths and the names.
+    - Stdlib only, please. The cluster image has no extra packages.
+- role: assistant
+  content: |
+    The observable patterns are built from the config once per batch. The per-line loop only reuses compiled objects.
+
+    ```python
+    import gzip
+    import re
+    from pathlib import Path
+
+    _STEP_RE = re.compile(r"^\s*step\s+(\d+)\b")
+
+
+    def compile_observables(names: list[str]) -> dict[str, re.Pattern]:
+        """One compiled pattern per observable name. Call once per batch."""
+        return {
+            name: re.compile(rf"(?<!\w){re.escape(name)}\s*=\s*(\S+)")
+            for name in names
+        }
+
+
+    def _open_text(path: str | Path):
+        path = Path(path)
+        if path.suffix == ".gz":
+            return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+        return open(path, encoding="utf-8", errors="replace")
+
+
+    def extract_series(path: str | Path,
+                       patterns: dict[str, re.Pattern]) -> dict[str, list[tuple[int, float]]]:
+        series = {name: [] for name in patterns}
+        with _open_text(path) as fh:
+            for line in fh:
+                m = _STEP_RE.match(line)
+                if m is None:
+                    continue
+                step = int(m.group(1))
+                for name, pattern in patterns.items():
+                    hit = pattern.search(line, m.end())
+                    if hit is None:
+                        continue
+                    try:
+                        value = float(hit.group(1))
+                    except ValueError:  # e.g. Fortran overflow "********"
+                        continue
+                    series[name].append((step, value))
+        return series
+
+
+    def extract_many(paths: list[str | Path], names: list[str]) -> dict[str, dict]:
+        patterns = compile_observables(names)
+        return {str(p): extract_series(p, patterns) for p in paths}
+    ```
+
+    `re.escape` handles names like `Box[x]`, and `(?<!\w)` keeps `Temp` from matching inside `E_Temp`. Note that `float()` accepts `nan` and `inf`. If those should be skipped too, add a `math.isfinite` check.
+
+    **Green Notes**
+    - **Compile regex once, outside loops** (reduces E): the patterns depend on runtime names. An inline `re.search(rf"...{name}...", line)` would rebuild the pattern string and go through `re`'s internal cache for every line and every observable. Here each pattern is compiled once and reused for millions of lines. In Green Metrics Tool micro-benchmarks (1,000,000 matches), a precompiled pattern used about 18% less energy than inline `re.match`, and forcing a recompile on every call cost about 200× more per match.
+    - **One compiled set per batch** (reduces E): `extract_many` compiles the patterns once and passes them to all files. Python's `re` cache holds only a limited number of patterns. Dynamic patterns built per file or per line, from several configs, can fall out of it and get recompiled, which is the expensive case.
+verify:
+  test: |-
+    import gzip, os, tempfile
+    d = tempfile.mkdtemp()
+    p1 = os.path.join(d, "run1.log")
+    with open(p1, "w") as f:
+        f.write("# header Temp = 1\n")
+        f.write("step 0  Temp = 300.0  Press = 1.0e+02  Box[x] = 40.5\n")
+        f.write("WARNING: Temp = 999 drift\n")
+        f.write("step 100  Temp = 301.5  Press = ********  E_Temp = 7\n")
+        f.write("step 200 Box[x]=40.25 Temp=302\n")
+        f.write("step 300  E_Temp = 7\n")
+    p2 = os.path.join(d, "run2.log.gz")
+    with gzip.open(p2, "wt") as f:
+        f.write("step 5  Press = -3.5e-01\n")
+    res = extract_many([p1, p2], ["Temp", "Press", "Box[x]"])
+    assert res[p1]["Temp"] == [(0, 300.0), (100, 301.5), (200, 302.0)], res[p1]["Temp"]
+    assert res[p1]["Press"] == [(0, 100.0)], res[p1]["Press"]
+    assert res[p1]["Box[x]"] == [(0, 40.5), (200, 40.25)], res[p1]["Box[x]"]
+    assert res[p2]["Press"] == [(5, -0.35)], res[p2]["Press"]
+    assert res[p2]["Temp"] == [] and res[p2]["Box[x]"] == []
+    pats = compile_observables(["Temp"])
+    assert isinstance(pats["Temp"], re.Pattern)

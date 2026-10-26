@@ -1,0 +1,100 @@
+id: gen-1-00195-refactor
+category: refactor
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import sys
+
+    import numpy as np
+    import torch
+
+    from loadnet import LoadNet
+
+    WINDOW = 168  # one week of hourly values
+
+
+    def load_series(path):
+        return np.loadtxt(path, delimiter=",", skiprows=1, usecols=1, dtype=np.float32)
+
+
+    def rolling_forecast(model, series):
+        mu, sd = float(series.mean()), float(series.std())
+        norm = (series - mu) / sd
+        preds = []
+        for i in range(WINDOW, len(norm)):
+            window = torch.from_numpy(norm[i - WINDOW:i]).view(1, WINDOW, 1)
+            out = model(window)
+            preds.append(out.detach().item() * sd + mu)
+        return preds
+
+
+    def main(csv_path, ckpt_path):
+        model = LoadNet()
+        model.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
+        model.eval()
+        series = load_series(csv_path)
+        preds = rolling_forecast(model, series)
+        for i, p in enumerate(preds, start=WINDOW):
+            print(f"{i},{p:.3f}")
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1], sys.argv[2])
+    ```
+- role: assistant
+  content: |
+    ```python
+    import sys
+
+    import numpy as np
+    import torch
+
+    from loadnet import LoadNet
+
+    WINDOW = 168  # one week of hourly values
+
+
+    def load_series(path):
+        return np.loadtxt(path, delimiter=",", skiprows=1, usecols=1, dtype=np.float32)
+
+
+    @torch.no_grad()
+    def rolling_forecast(model, series):
+        mu, sd = float(series.mean()), float(series.std())
+        norm = (series - mu) / sd
+        preds = []
+        for i in range(WINDOW, len(norm)):
+            window = torch.from_numpy(norm[i - WINDOW:i]).view(1, WINDOW, 1)
+            out = model(window)
+            preds.append(out.item() * sd + mu)
+        return preds
+
+
+    def main(csv_path, ckpt_path):
+        model = LoadNet()
+        model.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
+        model.eval()
+        series = load_series(csv_path)
+        preds = rolling_forecast(model, series)
+        for i, p in enumerate(preds, start=WINDOW):
+            print(f"{i},{p:.3f}")
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1], sys.argv[2])
+    ```
+
+    **Green Notes**
+    - **`torch.no_grad()` for inference** (reduces E): `model.eval()` only switches layer behavior. It does not stop PyTorch from recording the autograd graph, so every window in the loop built a graph that was never used. The decorator on `rolling_forecast` turns that off for the whole loop. In Green Metrics Tool micro-benchmarks, 100,000 PyTorch CPU inferences used ~157 J without `no_grad` and ~135 J with it, about 14% less. The saving repeats for every window, so it grows with the length of the series.
+
+    The predictions are the same. `.detach()` is no longer needed, because no graph is tracked. I kept `model.eval()`, which is still required for dropout and batch norm layers.
+verify:
+  static_only: needs torch and a trained LoadNet checkpoint

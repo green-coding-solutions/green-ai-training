@@ -1,0 +1,85 @@
+id: gen-2-00273-no-change
+category: no-change
+language: javascript
+patterns:
+- dom-size
+- context-tradeoff
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    Hi, I am quite new in frontend. In code review a colleague wrote "big DOM = bad for performance and energy, please add pagination or virtual scroll". This is the API keys page of our developer portal. Every account can have max 20 keys, our backend enforce this limit and returns 409 for the 21st key. The page feels fast for me, so I don't understand what is wrong. Do I really need to change it?
+
+    ```javascript
+    const MAX_KEYS = 20; // backend rejects more keys per account
+
+    async function loadKeys() {
+      const res = await fetch("/api/v1/keys");
+      if (!res.ok) {
+        showError(`Could not load keys (${res.status})`);
+        return;
+      }
+      const keys = await res.json();
+      renderKeys(keys);
+    }
+
+    function renderKeys(keys) {
+      const tbody = document.querySelector("#keys tbody");
+      const frag = document.createDocumentFragment();
+      for (const key of keys) {
+        const tr = document.createElement("tr");
+        tr.dataset.id = key.id;
+        const cells = [key.name, key.prefix + "…", key.scopes.join(", "), formatDate(key.lastUsedAt)];
+        for (const text of cells) {
+          const td = document.createElement("td");
+          td.textContent = text;
+          tr.appendChild(td);
+        }
+        const action = document.createElement("td");
+        const btn = document.createElement("button");
+        btn.className = "revoke";
+        btn.textContent = "Revoke";
+        action.appendChild(btn);
+        tr.appendChild(action);
+        frag.appendChild(tr);
+      }
+      tbody.replaceChildren(frag);
+      document.querySelector("#key-count").textContent = `${keys.length} / ${MAX_KEYS}`;
+    }
+
+    function formatDate(iso) {
+      return iso ? new Date(iso).toLocaleString() : "never";
+    }
+
+    function showError(msg) {
+      const box = document.querySelector("#error");
+      box.textContent = msg;
+      box.hidden = false;
+    }
+
+    document.querySelector("#keys").addEventListener("click", async (e) => {
+      if (!e.target.matches("button.revoke")) return;
+      const tr = e.target.closest("tr");
+      if (!confirm("Revoke this key? Apps using it will stop working.")) return;
+      const res = await fetch(`/api/v1/keys/${tr.dataset.id}`, { method: "DELETE" });
+      if (res.ok) tr.remove();
+      else showError(`Revoke failed (${res.status})`);
+    });
+
+    loadKeys();
+    ```
+- role: assistant
+  content: |
+    No, you don't need to change it. Your colleague's advice is right for big lists, but this page does not have one.
+
+    - **The DOM is tiny.** The backend caps an account at 20 keys. Each row is one `<tr>`, five `<td>` and one button. So the table never grows past about 140 elements, and the browser lays that out almost instantly.
+    - **You already build it the cheap way.** You put the rows into a `DocumentFragment` and insert them with a single `replaceChildren()` call. The table is plain, with no wrapper elements around the cells. Event delegation gives you one click listener for the whole table instead of one per button.
+    - **Pagination would add work here.** You would need extra API requests, page state in the client, and more clicks for the user, all to split 20 rows.
+
+    The measured saving comes from much larger lists. Green Metrics Tool benchmarks compared two versions of a table. The first had 10,000 rows with 14 elements each, appended to the live DOM one by one. The second showed the same data paginated to 100 rows per page and built in a `DocumentFragment`. The paginated version used about 56% less CPU energy. Your whole table is already smaller than one of those pages.
+
+    Revisit this only if the 20-key limit goes away and accounts can end up with thousands of keys. Then add pagination to the API (`?limit=50&cursor=...`) and render one page at a time. Your current `renderKeys` can stay as it is.
+verify:
+  static_only: 'Browser code: needs a DOM, fetch against the portal API and confirm(); nothing to run under Node without a
+    browser environment.'

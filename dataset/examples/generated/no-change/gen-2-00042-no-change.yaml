@@ -1,0 +1,116 @@
+id: gen-2-00042-no-change
+category: no-change
+language: html
+patterns:
+- dom-size
+- context-tradeoff
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    We have an internal log search page for our ingest pipeline. The ops team uses it to look up warnings and errors from the collectors. A colleague opened a ticket: "log viewer renders inefficiently, replace paging with a virtual scroll library (clusterize.js) and show all matches in one list". Busy queries can match a lot of lines.
+
+    Requirements on our side:
+    - no build step, the API serves this as a plain HTML file
+    - no new dependency unless it really pays off
+    - must stay usable on the ops laptops, which are not fast
+
+    Is the ticket right? Should we change how the page renders? Here's the page:
+
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <title>Ingest log search</title>
+      <style>
+        table { border-collapse: collapse; width: 100%; font: 13px/1.4 monospace; }
+        th, td { padding: 2px 6px; border-bottom: 1px solid #ddd; text-align: left; }
+        tr.lvl-error td:nth-child(2) { color: #b00; font-weight: bold; }
+        tr.lvl-warn td:nth-child(2) { color: #a60; }
+      </style>
+    </head>
+    <body>
+      <form id="filter">
+        <input name="q" placeholder="collector or message">
+        <select name="level">
+          <option value="">all</option><option>warn</option><option>error</option>
+        </select>
+        <button>Search</button>
+      </form>
+      <table>
+        <thead><tr><th>Time</th><th>Level</th><th>Collector</th><th>Message</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <nav>
+        <button id="prev">Prev</button> <span id="page"></span> <button id="next">Next</button>
+      </nav>
+      <script>
+        const PAGE_SIZE = 100;
+        const tbody = document.getElementById('rows');
+        const form = document.getElementById('filter');
+        let page = 0;
+        let total = 0;
+
+        async function load() {
+          const params = new URLSearchParams(new FormData(form));
+          params.set('offset', page * PAGE_SIZE);
+          params.set('limit', PAGE_SIZE);
+          const res = await fetch('/api/logs?' + params);
+          if (!res.ok) {
+            document.getElementById('page').textContent = 'error ' + res.status;
+            return;
+          }
+          const data = await res.json();
+          total = data.total;
+
+          const frag = document.createDocumentFragment();
+          for (const e of data.entries) {
+            const tr = document.createElement('tr');
+            tr.className = 'lvl-' + e.level;
+            for (const v of [e.ts, e.level, e.collector, e.message]) {
+              const td = document.createElement('td');
+              td.textContent = v;
+              tr.appendChild(td);
+            }
+            frag.appendChild(tr);
+          }
+          tbody.replaceChildren(frag);
+          const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+          document.getElementById('page').textContent = `${page + 1} / ${pages}`;
+        }
+
+        form.addEventListener('submit', (e) => { e.preventDefault(); page = 0; load(); });
+        document.getElementById('prev').onclick = () => { if (page > 0) { page--; load(); } };
+        document.getElementById('next').onclick = () => {
+          if ((page + 1) * PAGE_SIZE < total) { page++; load(); }
+        };
+        load();
+      </script>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    No, the ticket isn't right. This page already renders efficiently. I'd leave the rendering as it is and close the ticket.
+
+    Why it's already good:
+    - **Small DOM.** The server returns one page of 100 rows (`limit`/`offset`). The browser never holds more than that, however many lines match.
+    - **Plain table, no wrappers.** Each row is one `<tr>` with four `<td>`s. There are no extra `<div>`/`<span>` layers around cells.
+    - **One DOM update per page.** Rows are built in a `DocumentFragment` and swapped in with one `replaceChildren()` call. You don't append them to the live table one by one.
+
+    This is the efficient variant from Green Metrics Tool page-load benchmarks: a 10,000-row table with wrappers around every cell, appended to the live DOM row by row, compared with the same data paginated to 100 rows per page as a plain `<table>` built in a `DocumentFragment`. The paginated version used about 56% less CPU energy (about 2.3× less).
+
+    The proposed change would make things worse for your setup:
+    - "All matches in one list" means the browser has to download and parse every matching line for each search, even with a virtual scroller. Today the server sends only the page you look at. On slow laptops, that's more bytes and more JSON parsing per query.
+    - It adds a dependency, which your requirements say to avoid, and it buys nothing that paging doesn't already give you.
+
+    I found no bugs or security problems either. Log messages go in with `textContent`, so a log line containing HTML can't inject markup into the page.
+
+    **Green Notes**
+    - Nothing to change: the page already uses server-side pagination and a lean, fragment-built table.
+    - *Not applied:* virtual scrolling. It would replace a small paged DOM with a full result download per search.
+verify:
+  static_only: HTML page with inline script that needs a browser DOM and the /api/logs endpoint; no-change answer contains
+    no new code

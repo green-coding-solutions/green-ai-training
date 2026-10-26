@@ -1,0 +1,79 @@
+id: gen-2-00358-generation
+category: generation
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    need vignette_mask(width, height) -> bytearray for the hero bg on our landing page. 1 alpha byte per pixel, row-major, 0 at center, 255 at the corners, linear falloff. stdlib only, runs in our build script at 1920x1080
+- role: assistant
+  content: |
+    ```python
+    import math
+
+
+    def vignette_mask(width: int, height: int) -> bytearray:
+        """Row-major alpha mask: 0 at the center, 255 at the corners, linear in distance."""
+        if width <= 0 or height <= 0:
+            raise ValueError("width and height must be positive")
+
+        cx = (width - 1) / 2
+        cy = (height - 1) / 2
+        max_d = math.hypot(cx, cy)
+        scale = 255 / max_d if max_d else 0.0
+
+        sqrt = math.sqrt  # local name, no module attribute lookup per pixel
+        mask = bytearray(width * height)
+        i = 0
+        for y in range(height):
+            dy2 = (y - cy) * (y - cy)  # same for the whole row
+            for x in range(width):
+                dx = x - cx
+                mask[i] = round(sqrt(dx * dx + dy2) * scale)
+                i += 1
+        return mask
+    ```
+
+    Pixel centers are used for the distance, so the mask is symmetric for both even and odd sizes. A 1 by 1 mask is a single `0`.
+
+    **Green Notes**
+    - **Hoist loop invariants** (reduces E): the inner loop runs once per pixel, about 2 million times for a full-HD mask. `math.sqrt` is bound to a local name, the row term `dy2` is computed once per row, and `scale` is computed once. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local before a 10,000,000-iteration loop saved about 4-5%. The gain is small, but here it costs no readability.
+    - *Not applied:* anything heavier. This runs once per build, so clear code matters more than further tuning.
+verify:
+  test: |-
+    import math
+
+    def _ref(w, h):
+        cx, cy = (w - 1) / 2, (h - 1) / 2
+        md = math.hypot(cx, cy)
+        out = []
+        for y in range(h):
+            for x in range(w):
+                out.append(round(math.hypot(x - cx, y - cy) * 255 / md) if md else 0)
+        return out
+
+    m = vignette_mask(5, 3)
+    assert isinstance(m, bytearray)
+    assert len(m) == 15
+    assert m[1 * 5 + 2] == 0
+    for idx in (0, 4, 10, 14):
+        assert m[idx] == 255, (idx, m[idx])
+
+    for w, h in [(64, 36), (7, 7), (8, 2), (1, 9)]:
+        got = vignette_mask(w, h)
+        exp = _ref(w, h)
+        assert len(got) == w * h
+        assert all(abs(a - b) <= 1 for a, b in zip(got, exp)), (w, h)
+        rows = [list(got[r * w:(r + 1) * w]) for r in range(h)]
+        assert rows == rows[::-1]
+        assert all(row == row[::-1] for row in rows)
+
+    assert vignette_mask(1, 1) == bytearray(b"\x00")
+    try:
+        vignette_mask(0, 10)
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass

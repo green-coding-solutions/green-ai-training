@@ -1,0 +1,76 @@
+id: gen-2-00452-generation
+category: generation
+language: bash
+patterns:
+- bash-builtins
+- bash-quoting
+facts:
+- F-BASH-SUBPROC
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    I need a bash script to post-process the output of our batch image classifier. It writes `predictions.tsv` with one line per image: `image_id<TAB>label<TAB>confidence` (confidence is a float like 0.8731, sometimes in scientific notation like 3e-05). A normal run has 300k-600k lines. Requirements:
+
+    - take the TSV path as the first argument, an optional confidence threshold as the second (default 0.60), and an optional output path for the review list as the third (default `low_confidence.txt`)
+    - print a table of label, count and mean confidence, sorted by count, highest first
+    - write the image ids of all predictions below the threshold to the review file, one per line
+    - print a one-line summary at the end: total predictions, number below the threshold, number of malformed lines skipped
+    - the table should go to stdout and the summary to stderr, so I can pipe the table into other tools
+
+    It runs after every nightly batch on the inference box, so it should not hold up the next job.
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    if [[ $# -lt 1 || ! -r $1 ]]; then
+      echo 'usage: summarize_preds.sh predictions.tsv [threshold] [review_out]' >&2
+      exit 2
+    fi
+
+    preds=$1
+    threshold=${2:-0.60}
+    review=${3:-low_confidence.txt}
+
+    # make sure the review file exists and is empty, even if nothing is below the threshold
+    : > "$review"
+
+    awk -F'\t' -v thr="$threshold" -v review="$review" '
+      NF < 3 || $3 !~ /^([0-9]+\.?[0-9]*|\.[0-9]+)([eE][-+]?[0-9]+)?$/ {
+        bad++
+        next
+      }
+      {
+        count[$2]++
+        sum[$2] += $3
+        total++
+        if ($3 + 0 < thr + 0) {
+          print $1 > review
+          low++
+        }
+      }
+      END {
+        for (label in count) {
+          printf "%s\t%d\t%.4f\n", label, count[label], sum[label] / count[label]
+        }
+        printf "total: %d, below threshold: %d, skipped: %d\n", total, low, bad > "/dev/stderr"
+      }
+    ' "$preds" | LC_ALL=C sort -t $'\t' -k2,2nr -k1,1
+    ```
+
+    Usage:
+
+    ```bash
+    ./summarize_preds.sh predictions.tsv 0.7 review_0.7.txt > label_table.tsv
+    ```
+
+    Lines with fewer than three fields or a confidence that is not a number are skipped and counted, not treated as 0. The ties in the table are broken by label name, so the output is stable between runs.
+
+    **Green Notes**
+    - **One `awk` pass instead of a shell loop** (reduces E): a `while read` loop with a command substitution per line (`$(echo | cut)`, `$(expr)`, or `bc` for the float compare) starts several processes for every one of your 300k-600k lines. In Green Metrics Tool micro-benchmarks, summarizing a 20,000-line access log with identical output used over 1000× less energy with one `awk` pass than with a per-field subprocess loop. Bash builtins alone can't compare decimals like `3e-05`, so `awk` is the right tool here.
+    - **One `sort` at the end** (reduces E): the table has only as many rows as there are labels, so sorting the aggregated result is cheap. Sorting the raw lines would not be.
+    - **Single quotes for literals** (reduces E): the usage message and the `awk` program need no shell expansion, so they are single-quoted. The saving is tiny for a script that runs once a night. Variables like `"$preds"` keep their double quotes.
+verify:
+  static_only: bash script that needs awk and a predictions TSV input file

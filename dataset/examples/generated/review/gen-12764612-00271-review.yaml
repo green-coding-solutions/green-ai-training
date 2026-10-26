@@ -1,0 +1,72 @@
+id: gen-12764612-00271-review
+category: review
+language: bash
+patterns:
+- bash-quoting
+facts:
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    hi, i wrote this script to check our docs folder (about 3000 markdown files) and make a report. it works but sometimes prints weird errors and i dont know why. can you look at it? im not good at bash
+
+    ```bash
+    #!/bin/bash
+    # check_docs.sh - find docs that are too short or have no title
+    DOCS_DIR=$1
+    REPORT=report.txt
+    : > $REPORT
+
+    for f in $(ls $DOCS_DIR/*.md); do
+      lines=$(wc -l < $f)
+      if [ $lines -lt 5 ]; then
+        msg="WARNING: this document is very short. Please add a title, a short summary of what the page covers, the intended audience, and a link to the related pages so readers can find their way around the documentation. Pages without these parts are hard to find through search."
+        echo "$f: $msg" >> $REPORT
+      fi
+      if ! grep -q "^# " $f; then
+        hint="HINT: this document has no top level title. Start the file with a line that begins with a single hash sign and a space, followed by the page title. The title is used in the table of contents and in the browser tab when the page is published."
+        echo "$f: $hint" >> $REPORT
+      fi
+    done
+    echo "done"
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (runs over ~3000 files)
+
+    #### [Bug] File names with spaces break the loop
+    - **Where:** `for f in $(ls $DOCS_DIR/*.md)`, plus the unquoted `$f`, `$lines`, `$REPORT`
+    - **Issue:** `$(ls ...)` is split on spaces. A file called `getting started.md` becomes two names, and you get "No such file" errors. This is probably your weird errors. If `$1` is missing, the pattern becomes `/*.md`. If no file matches, the loop runs once with the literal pattern.
+    - **Fix:** loop over the glob directly, quote the variables, and check the argument.
+
+    #### [Low] Long text in double quotes inside the loop
+    - **Where:** `msg="..."`, `hint="..."`, `grep -q "^# "` and `echo "done"`
+    - **Issue:** these strings need no expansion (no `$`, backticks or backslashes), but Bash still scans double-quoted text for them. Single-quoted text is taken as is.
+    - **Fix:** use single quotes for these literals. Keep double quotes where a variable must expand, such as `"$f: $msg"`.
+    - **Impact:** reduces E a little. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal in a loop used about 24% less CPU energy with single quotes (100,000 iterations). Your texts are much shorter and the loop runs about 3000 times, so the saving here is small. It is still a free change.
+
+    ```bash
+    #!/bin/bash
+    # check_docs.sh - find docs that are too short or have no title
+    DOCS_DIR=${1:?usage: check_docs.sh DOCS_DIR}
+    REPORT=report.txt
+    : > "$REPORT"
+
+    for f in "$DOCS_DIR"/*.md; do
+      [ -e "$f" ] || continue
+      lines=$(wc -l < "$f")
+      if [ "$lines" -lt 5 ]; then
+        msg='WARNING: this document is very short. Please add a title, a short summary of what the page covers, the intended audience, and a link to the related pages so readers can find their way around the documentation. Pages without these parts are hard to find through search.'
+        echo "$f: $msg" >> "$REPORT"
+      fi
+      if ! grep -q '^# ' "$f"; then
+        hint='HINT: this document has no top level title. Start the file with a line that begins with a single hash sign and a space, followed by the page title. The title is used in the table of contents and in the browser tab when the page is published.'
+        echo "$f: $hint" >> "$REPORT"
+      fi
+    done
+    echo 'done'
+    ```
+
+    **Already good:** `wc -l < "$f"` and `grep -q` run once per file, with no extra processes piped together.
+verify:
+  static_only: bash script reviewed statically; the verifier only runs python and javascript

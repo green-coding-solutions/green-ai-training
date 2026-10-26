@@ -1,0 +1,101 @@
+id: gen-2-00252-review
+category: review
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    Flush job on our gateway. Cron runs it every minute on a single-core ARM box. The modbus poller appends ~3k lines/min to the spool. This script pins the CPU. Review it, diff only please.
+
+    ```bash
+    #!/bin/bash
+    # flush modbus readings to outbox, uploader picks up batch-*.csv
+    # spool format (written by modbus-poller): epoch;device;register;raw
+    SPOOL=/var/spool/gw/readings.log
+    OUT=/var/lib/gw/outbox
+    LIMITS=/etc/gw/limits.conf   # register=max_raw
+
+    batch="$OUT/batch-$(date +%s).csv"
+    alerts=0
+    count=0
+
+    while read line; do
+        ts=$(echo $line | cut -d';' -f1)
+        dev=$(echo $line | cut -d';' -f2)
+        reg=$(echo $line | cut -d';' -f3)
+        raw=$(echo $line | cut -d';' -f4)
+        max=$(grep "^$reg=" $LIMITS | cut -d'=' -f2)
+        value=$(expr $raw / 10)
+        if [ -n "$max" ] && [ $raw -gt $max ]; then
+            logger -t gw-alert "$dev $reg=$value over limit"
+            alerts=$(expr $alerts + 1)
+        fi
+        echo "$ts,$dev,$reg,$value" >> $batch
+        count=$(expr $count + 1)
+    done < $SPOOL
+
+    > $SPOOL
+    echo "$(date) processed $count readings, $alerts alerts" >> /var/log/gw/flush.log
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (IoT gateway, cron every minute)
+
+    #### [Bug] Readings are lost between read and truncate
+    - **Where:** `> $SPOOL` after the loop
+    - **Issue:** the poller keeps appending while the loop runs. Truncating afterwards deletes every line that arrived during the run. With the current slow loop, that is a lot of lines.
+    - **Fix:** move the spool aside first, process the moved file, then delete it (see diff). This works if the poller opens the spool for each write. If it keeps the file open, it keeps writing into the moved file. In that case, signal it to reopen after the `mv`, the same way logrotate does.
+
+    #### [High] About a dozen process starts per reading
+    - **Where:** the four `$(echo $line | cut ...)`, the `grep | cut` on `limits.conf`, and the `$(expr ...)` calls inside the loop
+    - **Issue:** every reading forks subshells and starts `cut`, `grep` and `expr`. At thousands of lines per minute, process creation is what pins the core. The limits file is also re-read for every line.
+    - **Fix:** load the limits once into an associative array. Split fields with `IFS=';' read -r`. Use `$(( ))` for the arithmetic. `logger` then only runs for actual alerts.
+    - **Impact:** E, per reading, for every minute the gateway runs. In Green Metrics Tool micro-benchmarks, summarizing a 20,000-line log with about 10 processes per line used ~1302 J. The same loop with builtins only used ~4.3 J, about 300× less. One `awk` pass was cheaper still (~1.0 J, about 4× less than the builtin loop). Switch to awk if you want to drop the loop entirely.
+
+    ```diff
+     batch="$OUT/batch-$(date +%s).csv"
+     alerts=0
+     count=0
+    +work="$SPOOL.work"
+    +[ -s "$SPOOL" ] || exit 0
+    +mv "$SPOOL" "$work"
+    +
+    +declare -A limit
+    +while IFS='=' read -r key lim; do
+    +    case $key in ''|'#'*) continue ;; esac
+    +    limit[$key]=$lim
+    +done < "$LIMITS"
+
+    -while read line; do
+    -    ts=$(echo $line | cut -d';' -f1)
+    -    dev=$(echo $line | cut -d';' -f2)
+    -    reg=$(echo $line | cut -d';' -f3)
+    -    raw=$(echo $line | cut -d';' -f4)
+    -    max=$(grep "^$reg=" $LIMITS | cut -d'=' -f2)
+    -    value=$(expr $raw / 10)
+    +while IFS=';' read -r ts dev reg raw; do
+    +    max=${limit[$reg]}
+    +    value=$(( raw / 10 ))
+         if [ -n "$max" ] && [ $raw -gt $max ]; then
+             logger -t gw-alert "$dev $reg=$value over limit"
+    -        alerts=$(expr $alerts + 1)
+    +        alerts=$(( alerts + 1 ))
+         fi
+    -    echo "$ts,$dev,$reg,$value" >> $batch
+    -    count=$(expr $count + 1)
+    -done < $SPOOL
+    +    echo "$ts,$dev,$reg,$value" >> "$batch"
+    +    count=$(( count + 1 ))
+    +done < "$work"
+
+    -> $SPOOL
+    +rm -f "$work"
+     echo "$(date) processed $count readings, $alerts alerts" >> /var/log/gw/flush.log
+    ```
+
+    One behavior note: `$(( ))` reads a value with a leading zero (`0123`) as octal, while `expr` read it as decimal. If the poller can emit zero-padded raw values, use `$(( 10#$raw / 10 ))`. Integer division truncates exactly as `expr` did.
+verify:
+  static_only: bash script that needs the gateway spool, limits.conf and logger

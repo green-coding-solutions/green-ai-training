@@ -1,0 +1,74 @@
+id: gen-2-00001-estimate
+category: estimate
+language: sql
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    ```sql
+    -- load_inventory_snapshot.sql
+    -- generated nightly by export_inventory.py
+    -- run with: psql -v ON_ERROR_STOP=1 -d shop -f load_inventory_snapshot.sql
+    -- ~40k rows (one per sku x warehouse)
+
+    BEGIN;
+
+    DELETE FROM inventory_snapshot WHERE snapshot_date = '2026-10-23';
+
+    INSERT INTO inventory_snapshot (snapshot_date, sku, warehouse_id, on_hand, reserved, reorder_point)
+    VALUES ('2026-10-23', 'TSH-0142-M-BLK', 3, 118, 12, 40);
+    INSERT INTO inventory_snapshot (snapshot_date, sku, warehouse_id, on_hand, reserved, reorder_point)
+    VALUES ('2026-10-23', 'TSH-0142-L-BLK', 3, 97, 4, 40);
+    INSERT INTO inventory_snapshot (snapshot_date, sku, warehouse_id, on_hand, reserved, reorder_point)
+    VALUES ('2026-10-23', 'MUG-0007-WHT', 1, 1260, 85, 300);
+    INSERT INTO inventory_snapshot (snapshot_date, sku, warehouse_id, on_hand, reserved, reorder_point)
+    VALUES ('2026-10-23', 'MUG-0007-WHT', 2, 410, 0, 300);
+    -- ... ~40,000 more lines like this
+
+    COMMIT;
+
+    -- PR #812 suggestion (Jonas):
+    -- export a CSV instead and load it with:
+    --   \copy inventory_snapshot (snapshot_date, sku, warehouse_id, on_hand, reserved, reorder_point)
+    --     FROM 'inventory_2026-10-23.csv' WITH (FORMAT csv, HEADER true)
+    -- how much energy would that actually save per night?
+    ```
+    ?
+- role: assistant
+  content: |
+    I can't give you a per-night number from this script. I can tell you the direction, and it clearly favors `\copy`.
+
+    The closest measurement: in Green Metrics Tool micro-benchmarks (PostgreSQL 16, psycopg 3 client on the same machine), 500,000 rows were inserted as 100 batches of 5,000 rows. One statement per row used ~384 J and 60 s. `COPY ... FROM STDIN` used ~17 J and 3.1 s, which is about 22× less. With batches of only 100 rows the gap was small, because per-batch overhead dominates there.
+
+    Your load is one large batch in a single transaction, so it is on the side where COPY pays off. The benchmark used a Python client and not a psql script, though. Your rows, indexes and server also differ, so don't scale the 22× to your job.
+
+    What drives the saving here:
+    - **One statement per row → one COPY stream.** Today Postgres parses, plans and executes tens of thousands of separate `INSERT`s, and psql waits for a reply after each one. COPY parses one command and streams the rows.
+    - **Smaller input.** The CSV doesn't repeat `INSERT INTO ... VALUES` on every line, so the export writes and psql reads far fewer bytes.
+
+    The generated script keeps the same delete-then-load logic in one transaction. Re-running a night still replaces that day's rows:
+
+    ```sql
+    \set ON_ERROR_STOP on
+
+    BEGIN;
+
+    DELETE FROM inventory_snapshot WHERE snapshot_date = '2026-10-23';
+
+    \copy inventory_snapshot (snapshot_date, sku, warehouse_id, on_hand, reserved, reorder_point) FROM 'inventory_2026-10-23.csv' WITH (FORMAT csv, HEADER true)
+
+    COMMIT;
+    ```
+
+    Notes:
+    - `\copy` must stay on one line. psql does no variable interpolation in its arguments, so let `export_inventory.py` keep writing the date and file name into the script, as it does now.
+    - Write the CSV with Python's `csv` module so commas or quotes in a SKU are escaped correctly.
+    - It is one job per night, so the absolute amount is modest. It still repeats every night, and the change is small, so it's worth taking.
+
+    To get your own number, restore a copy of the database and run both versions in a Green Metrics Tool usage scenario on the same machine. As a quick CPU-time proxy, run each under `perf stat -a` (or RAPL readings around the run). Use system-wide counters, because most of the work happens in the Postgres server process and not in psql.
+verify:
+  static_only: PostgreSQL-specific psql script (\copy meta-command, needs a running Postgres server and the CSV file)

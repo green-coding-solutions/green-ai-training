@@ -1,0 +1,87 @@
+id: gen-12764612-00074-review
+category: review
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    diff only. review of our SKU normalizer in the nightly supplier feed ETL (~900 suppliers, a few million rows per night, each supplier has its own cleanup regexes from rules.csv).
+
+    ```python
+    import csv
+    import re
+
+
+    def load_rules(path):
+        rules = {}
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                rules.setdefault(row["supplier_id"], []).append(
+                    (row["pattern"], row["replacement"])
+                )
+        return rules
+
+
+    def normalize_sku(supplier_id, sku, rules):
+        for pattern, repl in rules.get(supplier_id, []):
+            sku = re.sub(pattern, repl, sku)
+        return sku.strip().upper()
+
+
+    def run(in_path, out_path, rules_path):
+        rules = load_rules(rules_path)
+        with open(in_path, newline="") as src, open(out_path, "w", newline="") as dst:
+            reader = csv.DictReader(src)
+            writer = csv.DictWriter(dst, fieldnames=["supplier_id", "sku", "qty"])
+            writer.writeheader()
+            for row in reader:
+                row["sku"] = normalize_sku(row["supplier_id"], row["sku"], rules)
+                writer.writerow(row)
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly batch)
+
+    #### [High] Rule patterns are recompiled per row
+    - **Where:** `re.sub(pattern, repl, sku)` in `normalize_sku`
+    - **Issue:** the patterns come from data, so there are far more than 512 distinct ones across ~900 suppliers. Python's `re` only caches 512 compiled patterns. Rows from different suppliers evict each other, and many calls compile the pattern again. In Green Metrics Tool micro-benchmarks, forcing a recompile on every call cost about 200× more per match than a cached pattern. The usual advice to precompile is a small win for a few static patterns. It is a real win here.
+    - **Fix:** compile once when loading the rules, call `.sub` on the compiled object.
+
+    ```python
+    def load_rules(path):
+        rules = {}
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                rules.setdefault(row["supplier_id"], []).append(
+                    (re.compile(row["pattern"]), row["replacement"])
+                )
+        return rules
+
+
+    def normalize_sku(supplier_id, sku, rules):
+        for pattern, repl in rules.get(supplier_id, []):
+            sku = pattern.sub(repl, sku)
+        return sku.strip().upper()
+    ```
+
+    - **Impact:** E, per row. Compile cost drops from once per row and rule to once per rule per run.
+
+    Behavior note: a broken pattern in `rules.csv` now raises `re.error` at load time, not at the first row of that supplier. Rules for suppliers that never appear in the feed are compiled too, which is a one-time cost. `run` needs no change.
+
+    No other efficiency issues worth changing.
+verify:
+  test: |-
+    import os
+    import tempfile
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "r.csv")
+    with open(p, "w", newline="") as f:
+        f.write("supplier_id,pattern,replacement\nS1,^ABC-,\nS1,\\s+,-\nS2,^0+,\n")
+    rules = load_rules(p)
+    assert normalize_sku("S1", "ABC-12 34", rules) == "12-34"
+    assert normalize_sku("S2", "000x", rules) == "X"
+    assert normalize_sku("S9", " a ", rules) == "A"
+    assert all(hasattr(pat, "sub") for pat, _ in rules["S1"])

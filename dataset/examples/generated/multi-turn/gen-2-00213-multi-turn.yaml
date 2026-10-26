@@ -1,0 +1,224 @@
+id: gen-2-00213-multi-turn
+category: multi-turn
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    hi, we run a small local LLM on CPU for an offline asistant. I wrote own sampler because we need to ban some tokens (logit bias from llama-cpp is not enough for us). profiler say softmax() is called for every generated token and it loop over the full vocab, 32k entries. can you make it faster? output must stay exactly same, we have golden tests with fixed seed
+
+    ```python
+    import math
+    import random
+
+
+    class Sampler:
+        def __init__(self, temperature=0.8, banned_ids=(), seed=None):
+            self.temperature = temperature
+            self.banned_ids = set(banned_ids)
+            self.rng = random.Random(seed)
+
+        def softmax(self, logits):
+            max_logit = max(logits)
+            exps = []
+            total = 0.0
+            for i in range(len(logits)):
+                if i in self.banned_ids:
+                    exps.append(0.0)
+                    continue
+                e = math.exp((logits[i] - max_logit) / self.temperature)
+                exps.append(e)
+                total += e
+            return [e / total for e in exps]
+
+        def sample(self, logits):
+            probs = self.softmax(logits)
+            r = self.rng.random()
+            acc = 0.0
+            for token_id, p in enumerate(probs):
+                acc += p
+                if r < acc:
+                    return token_id
+            return len(probs) - 1
+    ```
+- role: assistant
+  content: |
+    Only `softmax()` changes. `__init__` and `sample()` stay the same:
+
+    ```python
+    import math
+    import random
+
+
+    class Sampler:
+        def __init__(self, temperature=0.8, banned_ids=(), seed=None):
+            self.temperature = temperature
+            self.banned_ids = set(banned_ids)
+            self.rng = random.Random(seed)
+
+        def softmax(self, logits):
+            exp = math.exp
+            temperature = self.temperature
+            banned = self.banned_ids
+            max_logit = max(logits)
+            exps = []
+            append = exps.append
+            total = 0.0
+            for i in range(len(logits)):
+                if i in banned:
+                    append(0.0)
+                    continue
+                e = exp((logits[i] - max_logit) / temperature)
+                append(e)
+                total += e
+            return [e / total for e in exps]
+
+        def sample(self, logits):
+            probs = self.softmax(logits)
+            r = self.rng.random()
+            acc = 0.0
+            for token_id, p in enumerate(probs):
+                acc += p
+                if r < acc:
+                    return token_id
+            return len(probs) - 1
+    ```
+
+    **Green Notes**
+    - **Hoist loop-invariant lookups** (reduces E): the loop looked up `math.exp`, `exps.append`, `self.temperature` and `self.banned_ids` again for each of the 32k vocab entries, on every generated token. Now each one is looked up once per call.
+    - **Expect a small gain:** in Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local variable before a 10,000,000-iteration loop saved about 4-5%. Run your profiler again to see what you get on your machine.
+    - **Same output:** the math is unchanged and runs in the same order, so the probabilities are bit-identical and your golden tests still pass.
+    - *Not applied:* multiplying by a precomputed `1 / temperature` instead of dividing. That can change the last bit of some floats and break the golden tests.
+- role: user
+  content: |
+    thx. my team lead dont like the `exp = math.exp` and `append = exps.append` lines, he say it look like old python hack and nobody understand it in 1 year. local variable for temperature and banned is ok for him. can you change it?
+- role: assistant
+  content: |
+    Sure. Those two aliases are the hardest part to read, and the gain from this change was small anyway.
+
+    ```python
+    import math
+    import random
+
+
+    class Sampler:
+        def __init__(self, temperature=0.8, banned_ids=(), seed=None):
+            self.temperature = temperature
+            self.banned_ids = set(banned_ids)
+            self.rng = random.Random(seed)
+
+        def softmax(self, logits):
+            temperature = self.temperature
+            banned = self.banned_ids
+            max_logit = max(logits)
+            exps = []
+            total = 0.0
+            for i in range(len(logits)):
+                if i in banned:
+                    exps.append(0.0)
+                    continue
+                e = math.exp((logits[i] - max_logit) / temperature)
+                exps.append(e)
+                total += e
+            return [e / total for e in exps]
+
+        def sample(self, logits):
+            probs = self.softmax(logits)
+            r = self.rng.random()
+            acc = 0.0
+            for token_id, p in enumerate(probs):
+                acc += p
+                if r < acc:
+                    return token_id
+            return len(probs) - 1
+    ```
+
+    `temperature` and `banned` still save two attribute lookups per vocab entry. The output is still bit-identical.
+- role: user
+  content: |
+    last question: should i do the same in sample()? it also loop over 32k
+- role: assistant
+  content: |
+    No. The loop in `sample()` only does `acc += p` and a comparison on local variables. There is no attribute or module lookup inside it, so there is nothing to hoist. `self.rng.random()` runs once per call, before the loop. Leave `sample()` as it is.
+verify:
+  original_code: |
+    import math
+    import random
+
+
+    class Sampler:
+        def __init__(self, temperature=0.8, banned_ids=(), seed=None):
+            self.temperature = temperature
+            self.banned_ids = set(banned_ids)
+            self.rng = random.Random(seed)
+
+        def softmax(self, logits):
+            max_logit = max(logits)
+            exps = []
+            total = 0.0
+            for i in range(len(logits)):
+                if i in self.banned_ids:
+                    exps.append(0.0)
+                    continue
+                e = math.exp((logits[i] - max_logit) / self.temperature)
+                exps.append(e)
+                total += e
+            return [e / total for e in exps]
+
+        def sample(self, logits):
+            probs = self.softmax(logits)
+            r = self.rng.random()
+            acc = 0.0
+            for token_id, p in enumerate(probs):
+                acc += p
+                if r < acc:
+                    return token_id
+            return len(probs) - 1
+  green_code: |
+    import math
+    import random
+
+
+    class Sampler:
+        def __init__(self, temperature=0.8, banned_ids=(), seed=None):
+            self.temperature = temperature
+            self.banned_ids = set(banned_ids)
+            self.rng = random.Random(seed)
+
+        def softmax(self, logits):
+            temperature = self.temperature
+            banned = self.banned_ids
+            max_logit = max(logits)
+            exps = []
+            total = 0.0
+            for i in range(len(logits)):
+                if i in banned:
+                    exps.append(0.0)
+                    continue
+                e = math.exp((logits[i] - max_logit) / temperature)
+                exps.append(e)
+                total += e
+            return [e / total for e in exps]
+
+        def sample(self, logits):
+            probs = self.softmax(logits)
+            r = self.rng.random()
+            acc = 0.0
+            for token_id, p in enumerate(probs):
+                acc += p
+                if r < acc:
+                    return token_id
+            return len(probs) - 1
+  equivalence:
+    driver: |-
+      import random as _r
+      _g = _r.Random(42)
+      logits = [_g.gauss(0.0, 3.0) for _ in range(32000)]
+      s = Sampler(temperature=0.8, banned_ids=[0, 1, 2, 31999], seed=7)
+      probs = s.softmax(logits)
+      print(repr(sum(probs)), repr(max(probs)))
+      print([repr(p) for p in probs[:4]], [repr(p) for p in probs[1000:1004]])
+      print([s.sample(logits) for _ in range(20)])

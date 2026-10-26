@@ -1,0 +1,56 @@
+id: gen-1-00241-refactor
+category: refactor
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```dockerfile
+    FROM python:3.12
+
+    ENV PYTHONUNBUFFERED=1
+    WORKDIR /app
+
+    RUN apt-get update && apt-get install -y build-essential git curl vim
+
+    COPY . .
+    RUN pip install -r requirements.txt
+    RUN pip install pytest black mypy ipython
+
+    EXPOSE 8000
+    HEALTHCHECK CMD curl -f http://localhost:8000/health || exit 1
+    CMD ["gunicorn", "-b", "0.0.0.0:8000", "cart.app:app"]
+    ```
+- role: assistant
+  content: |
+    ```dockerfile
+    FROM python:3.12-slim
+
+    ENV PYTHONUNBUFFERED=1
+    WORKDIR /app
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY . .
+
+    EXPOSE 8000
+    HEALTHCHECK CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+    CMD ["gunicorn", "-b", "0.0.0.0:8000", "cart.app:app"]
+    ```
+
+    **Green Notes**
+    - **Small container images** (reduces E, M, network): the slim base replaces the full Debian-based image. The compiler, `git`, `vim` and the dev tools (`pytest`, `black`, `mypy`, `ipython`) are gone, because the running service does not need them. In Green Metrics Tool micro-benchmarks, building a small Flask image this way used about 124 J instead of about 885 J (about 7× less). Serving 2,000 requests cost the same with both images, so the saving is in every build, pull and stored copy.
+    - **Dependency layer before the source** (reduces E): `requirements.txt` is copied and installed first, so a code-only change reuses the cached dependency layer instead of reinstalling everything. `--no-cache-dir` keeps pip's download cache out of the image.
+
+    Behavior changes to check:
+    - The health check used `curl`, which the slim image does not have. It now uses Python's `urllib`, which fails on a non-2xx answer like `curl -f`.
+    - Run your tests and linters in CI from a dev requirements file, not in the runtime image.
+    - If `pip install` fails on a package that has no prebuilt wheel, build it in a separate build stage. Don't put the compiler back into the final image.
+verify:
+  static_only: Dockerfile needs a container build and network access

@@ -1,0 +1,133 @@
+id: gen-2-00017-review
+category: review
+language: python
+patterns:
+- set-membership
+- vectorize-or-jit
+facts:
+- F-MEMB
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    Can you review our registry GC job before we point it at the prod registry? It runs as a scheduled GitLab pipeline every night on a shared runner. The registry has around 200k artifacts. The deploy manifests reference about 15k digests. Right now a run takes about 25 minutes.
+
+    Requirements:
+    - never delete anything that is referenced by a manifest or is younger than 14 days
+    - `--dry-run` must be safe to run from any branch
+    - the JSON summary on the last line must keep its format, our dashboard parses it
+
+    Also, a teammate wants to add numba to the runner image and JIT `age_histogram`, because "it's the numeric part". Is that worth it?
+
+    ```python
+    #!/usr/bin/env python3
+    """Nightly registry GC: delete image artifacts no deployment references anymore."""
+    import argparse
+    import json
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    from registry_client import RegistryClient
+
+    KEEP_DAYS = 14
+    AGE_BUCKETS = [7, 30, 90, 180, 365]  # days
+
+
+    def load_referenced_digests(manifest_dir):
+        digests = []
+        for path in Path(manifest_dir).glob("**/*.json"):
+            manifest = json.loads(path.read_text())
+            for container in manifest.get("containers", []):
+                digests.append(container["image_digest"])
+        return digests
+
+
+    def age_histogram(artifacts, now):
+        counts = [0] * (len(AGE_BUCKETS) + 1)
+        total_bytes = 0
+        for a in artifacts:
+            age_days = (now - a["created_at"]).total_seconds() / 86400
+            total_bytes += a["size_bytes"]
+            for i, limit in enumerate(AGE_BUCKETS):
+                if age_days < limit:
+                    counts[i] += 1
+                    break
+            else:
+                counts[-1] += 1
+        return counts, total_bytes
+
+
+    def main():
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--manifests", default="deploy/manifests")
+        parser.add_argument("--dry-run", action="store_true")
+        args = parser.parse_args()
+
+        registry = RegistryClient.from_env()
+        artifacts = registry.list_artifacts()  # list of dicts: digest, created_at, size_bytes
+        referenced = load_referenced_digests(args.manifests)
+        now = datetime.now(timezone.utc)
+
+        to_delete = []
+        for a in artifacts:
+            if a["digest"] in referenced:
+                continue
+            if (now - a["created_at"]).days < KEEP_DAYS:
+                continue
+            to_delete.append(a)
+
+        for a in to_delete:
+            if args.dry_run:
+                print(f"would delete {a['digest']} ({a['size_bytes']} bytes)")
+            registry.delete(a["digest"])
+
+        counts, total_bytes = age_histogram(artifacts, now)
+        print(json.dumps({"deleted": len(to_delete), "age_buckets": counts, "total_bytes": total_bytes}))
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (nightly CI job)
+
+    #### [Bug] `--dry-run` still deletes
+    - **Where:** the delete loop in `main()`
+    - **Issue:** in dry-run mode the job prints "would delete" and then calls `registry.delete()` anyway, because nothing skips the delete. A dry run from any branch wipes every unreferenced artifact older than 14 days. This breaks your second requirement.
+    - **Fix:** skip the delete in dry-run mode:
+
+    ```python
+    for a in to_delete:
+        if args.dry_run:
+            print(f"would delete {a['digest']} ({a['size_bytes']} bytes)")
+            continue
+        registry.delete(a["digest"])
+    ```
+
+    #### [High] Referenced digests are checked against a list
+    - **Where:** `load_referenced_digests()` returns a list, and `a["digest"] in referenced` runs once per artifact
+    - **Issue:** every `in` on a list is a linear scan. Most artifacts are not referenced, so most of the ~200k checks walk all ~15k digests before they fail. The work grows with registry size times manifest count, every night.
+    - **Fix:** build a set once. Each lookup becomes O(1) on average, and the results do not change:
+
+    ```python
+    def load_referenced_digests(manifest_dir):
+        digests = set()
+        for path in Path(manifest_dir).glob("**/*.json"):
+            manifest = json.loads(path.read_text())
+            for container in manifest.get("containers", []):
+                digests.add(container["image_digest"])
+        return digests
+    ```
+
+    - **Impact:** reduces E (CPU time on the shared runner) on every run. Building a set is not free. In Green Metrics Tool micro-benchmarks, converting a 10,000,000-element list to a set for a *single* lookup cost about 50% more than one list scan. A set only pays off with many lookups. You do one lookup per artifact, so here it clearly pays off.
+
+    #### Numba for `age_histogram`: not worth it here
+    - In Green Metrics Tool micro-benchmarks, Numba `@njit` used about 4× less CPU energy than a pure Python loop. That was a CPU-bound loop quantizing 10,000,000 samples in a numeric array.
+    - Your loop is one pass over ~200k records, once a night. It is not the hot spot. The digest check above is.
+    - `@njit` cannot compile a loop over dicts with `datetime` values. You would first need a Python pass that copies ages and sizes into NumPy arrays, and that pass costs about as much as the loop itself.
+    - Each fresh CI container also pays the JIT compile on the first call, and the runner image gets a heavy extra dependency. Keep `age_histogram` as it is.
+
+    **Already good:** the summary is one JSON line, as the dashboard expects. `age_histogram` makes one pass and stops at the first matching bucket. Timestamps are timezone-aware, so the age math is safe.
+verify:
+  static_only: imports the team's internal registry_client module and talks to a live container registry

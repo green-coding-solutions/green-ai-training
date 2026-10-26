@@ -1,0 +1,49 @@
+id: gen-12764612-00149-generation
+category: generation
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    bash script: pack finished run dirs in /scratch/runs older than 7 days into /archive/runs, delete the originals. archives kept 90 days
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    src='/scratch/runs'
+    dest='/archive/runs'
+
+    mkdir -p "$dest"
+
+    find "$src" -mindepth 1 -maxdepth 1 -type d -mtime +7 -print0 |
+    while IFS= read -r -d '' dir; do
+      name=${dir##*/}
+      out="$dest/$name.tar.zst"
+
+      if [[ -e $out ]]; then
+        continue
+      fi
+
+      tar -C "$src" -cf - -- "$name" | zstd -q -o "$out.tmp"
+      zstd -tq "$out.tmp"
+      mv -- "$out.tmp" "$out"
+      rm -rf -- "$dir"
+    done
+
+    find "$dest" -maxdepth 1 -name '*.tar.zst' -mtime +90 -delete
+    ```
+
+    The original is removed only after the archive passes `zstd -t` and is moved into place. A failed run leaves a `.tmp` file and keeps the source dir.
+
+    **Green Notes**
+    - **zstd at its default level** (reduces E): the archives live 90 days, so compressing is worth it, but the codec decides the cost. In Green Metrics Tool micro-benchmarks on text, zstd used about 4× less energy than gzip, and xz about 29× more than zstd. Those figures compare energy only, not file size. xz usually gives smaller files, so consider it only if the archive volume is tight.
+    - **One streaming pipe** (reduces E, M): `tar | zstd` writes no uncompressed tar file to disk first.
+    - *Not applied:* if the runs mostly hold already-compressed files (HDF5 with compression, PNG, MP4), compressing gains almost nothing. Then plain `tar` is enough.
+verify:
+  static_only: bash script operating on /scratch and /archive paths, needs zstd and a filesystem layout

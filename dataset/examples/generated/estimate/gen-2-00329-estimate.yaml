@@ -1,0 +1,149 @@
+id: gen-2-00329-estimate
+category: estimate
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    hi, I'm a junior data engineer and still quite new here. Every time we onboard a new data source, we install our helm chart into a sandbox namespace `onb-<ticket>`. We use it to test the extraction and to run backfills. Right now there are 14 sandboxes, but I think only 3 tickets are still being worked on. The others went live weeks ago. Nobody deleted them because "maybe we need a backfill again".
+
+    The spark workers are idle most of the time, so my idea was to change them from 3 to 1 in the values. How much energy would that save? My lead wants a rough number for our team's sustainability goal. I'm not sure this is even the right thing to look at.
+
+    ```yaml
+    # charts/onboarding-sandbox/values-sandbox.yaml
+    # per ticket: helm install onb-<ticket> ./charts/onboarding-sandbox -n onb-<ticket> --create-namespace -f values-sandbox.yaml
+    source:
+      name: ""                 # set with --set source.name=...
+      credentialsSecret: source-api-credentials
+
+    spark:
+      master:
+        replicas: 1
+        resources:
+          requests: {cpu: "1", memory: 2Gi}
+      worker:
+        replicas: 3
+        resources:
+          requests: {cpu: "2", memory: 4Gi}
+
+    kafka:
+      replicas: 1
+      persistence: {size: 20Gi}
+
+    postgres:
+      database: staging_raw
+      persistence: {size: 20Gi}
+
+    minio:
+      buckets: [landing, curated]
+      persistence: {size: 50Gi}
+
+    backfill:
+      # started manually: helm upgrade ... --set backfill.run=true
+      run: false
+      parallelism: 3
+    ```
+- role: assistant
+  content: |
+    Cutting workers from 3 to 1 saves very little while the sandbox is idle. The bigger lever is the 11 sandboxes for sources that are already live. They run around the clock without doing anything.
+
+    **What the measurement shows**
+
+    In Green Metrics Tool benchmarks, a preview environment idled for 60 seconds in two setups:
+    - 3 app replicas, Postgres, Redis and a polling worker: ~269 J CPU energy.
+    - 1 app replica and Postgres: ~262 J, about 3% less.
+
+    Machine energy differed by less than 1% (~1330 J vs ~1320 J), because the idle machine's baseline power dominates. Your stack is different (Spark, Kafka, MinIO), so don't apply these numbers to it. The direction still holds: idle pods use little CPU per minute. What costs energy is how many hours environments exist, and how many nodes their resource requests keep busy. Each sandbox requests 7 CPU and 14Gi for Spark alone. If your node pool autoscales, freeing those requests lets it remove nodes.
+
+    **Scale sandboxes to zero instead of trimming them**
+
+    Scaling to zero keeps the PersistentVolumeClaims. Postgres, MinIO and Kafka data stay, so backfills still work later. This CronJob puts every `onb-*` sandbox to sleep each evening. Finished sandboxes just stay asleep.
+
+    ```yaml
+    apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: sandbox-sleeper
+      namespace: platform-tools
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    metadata:
+      name: sandbox-sleeper
+    rules:
+      - apiGroups: [""]
+        resources: ["namespaces"]
+        verbs: ["list"]
+      - apiGroups: ["apps"]
+        resources: ["deployments", "statefulsets"]
+        verbs: ["get", "list"]
+      - apiGroups: ["apps"]
+        resources: ["deployments/scale", "statefulsets/scale"]
+        verbs: ["get", "patch", "update"]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    metadata:
+      name: sandbox-sleeper
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: ClusterRole
+      name: sandbox-sleeper
+    subjects:
+      - kind: ServiceAccount
+        name: sandbox-sleeper
+        namespace: platform-tools
+    ---
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata:
+      name: sandbox-sleeper
+      namespace: platform-tools
+    spec:
+      schedule: "0 19 * * *"        # cluster time zone, usually UTC
+      concurrencyPolicy: Forbid
+      jobTemplate:
+        spec:
+          backoffLimit: 1
+          template:
+            spec:
+              serviceAccountName: sandbox-sleeper
+              restartPolicy: Never
+              containers:
+                - name: scale-down
+                  image: bitnami/kubectl:1.30
+                  command: ["/bin/sh", "-c"]
+                  args:
+                    - |
+                      for ns in $(kubectl get ns -o jsonpath='{.items[*].metadata.name}'); do
+                        case "$ns" in
+                          onb-*)
+                            kubectl scale deployment --all --replicas=0 -n "$ns"
+                            kubectl scale statefulset --all --replicas=0 -n "$ns"
+                            ;;
+                        esac
+                      done
+    ```
+
+    To wake a sandbox for work or a backfill, re-apply the release. Helm then restores the replica counts from the values:
+
+    ```bash
+    helm upgrade onb-1234 ./charts/onboarding-sandbox -n onb-1234 --reuse-values
+    ```
+
+    If a live source no longer needs backfills, `helm uninstall` and deleting the namespace is the best option. Then the environment doesn't exist at all.
+
+    **How to get a number for your lead**
+
+    I can't give you a real figure for your cluster without measuring it. Here is how to get one:
+    1. **Count sandbox-hours.** Note how many hours per week sandboxes run with pods up, before and after the change. "Sandbox-hours removed per week" is already a solid directional figure.
+    2. **Measure one sandbox.** Run one idle sandbox for a fixed time in a Green Metrics Tool usage scenario. Multiply that by the hours you removed. That gives you a number you measured yourself.
+    3. **Watch the node count.** If the autoscaler removes nodes after the change, that is the biggest part of the saving.
+    4. **For CO2:** multiply the measured energy by your cloud region's grid carbon intensity, or use your cloud provider's carbon report.
+
+    You can still cut the workers to 1 if backfills don't need the parallelism. Just don't expect much from that alone.
+verify:
+  static_only: Kubernetes manifests and helm commands, need a cluster

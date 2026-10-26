@@ -1,0 +1,49 @@
+id: gen-12764612-00249-generation
+category: generation
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    Gateway on a Pi, LoRa module (RYLR896 style) on UART. Lines look like `+RCV=50,11,T=21.5;H=40,-99,40` (addr, payload length, payload, rssi, snr). Payload is `KEY=number` pairs split by `;`. Need `parse_rcv(line)` -> dict or None for anything malformed. Called for every line from the radio, so it's the hot path. Just the code please, no essay.
+- role: assistant
+  content: |
+    ```python
+    import re
+
+    _RCV = re.compile(r"\+RCV=(\d+),(\d+),(.*),(-?\d+),(-?\d+)\s*$")
+    _PAIR = re.compile(r"(\w+)=(-?\d+(?:\.\d+)?)")
+
+
+    def parse_rcv(line: str):
+        m = _RCV.match(line)
+        if m is None:
+            return None
+        addr, length, payload, rssi, snr = m.groups()
+        if len(payload) != int(length):
+            return None
+        return {
+            "addr": int(addr),
+            "rssi": int(rssi),
+            "snr": int(snr),
+            "readings": {k: float(v) for k, v in _PAIR.findall(payload)},
+        }
+    ```
+
+    **Green Notes**
+    - **Compile regex once** (reduces E): both patterns are fixed, so they are compiled at import time and reused for every line. Python's `re` caches compiled patterns, so the win is small. In Green Metrics Tool micro-benchmarks, 1,000,000 matches used about 18% less CPU energy with a precompiled pattern (~18 J vs ~21 J). It also keeps the patterns in one named place.
+    - Malformed lines are rejected by a single `match` and an early `return None`, so the pair parsing only runs for valid frames.
+- role: user
+  content: |
+    ok
+verify:
+  test: |-
+    r = parse_rcv("+RCV=50,11,T=21.5;H=40,-99,40")
+    assert r == {"addr": 50, "rssi": -99, "snr": 40, "readings": {"T": 21.5, "H": 40.0}}
+    assert parse_rcv("+RCV=50,11,T=21.5;H=40,-99,40\r\n") == r
+    assert parse_rcv("+RCV=50,5,T=21.5;H=40,-99,40") is None
+    assert parse_rcv("+OK") is None
+    assert parse_rcv("") is None

@@ -1,0 +1,90 @@
+id: gen-2-00443-refactor
+category: refactor
+language: bash
+patterns:
+- bash-builtins
+- compress-transmitted
+facts:
+- F-BASH-SUBPROC
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    ?
+
+    ```bash
+    #!/bin/bash
+    # post-test step: summarize results and upload report bundle
+    set -u
+
+    RESULTS_DIR="${CI_PROJECT_DIR:-.}/build/test-results"
+    SUMMARY="$RESULTS_DIR/summary.tsv"
+    ARTIFACT_URL="${ARTIFACT_URL:?}"
+    BUILD_ID="${CI_PIPELINE_ID:-local}"
+
+    passed=0
+    failed=0
+    skipped=0
+    total_ms=0
+
+    while read line; do
+        name=$(echo "$line" | cut -f1)
+        status=$(echo "$line" | cut -f2)
+        ms=$(echo "$line" | cut -f3)
+        if [ "$status" = "passed" ]; then
+            passed=$(expr $passed + 1)
+        elif [ "$status" = "failed" ]; then
+            failed=$(expr $failed + 1)
+            echo "FAILED: $name"
+        else
+            skipped=$(expr $skipped + 1)
+        fi
+        total_ms=$(expr $total_ms + $ms)
+    done < "$SUMMARY"
+
+    echo "passed=$passed failed=$failed skipped=$skipped time_ms=$total_ms"
+
+    tar -cf - -C "$RESULTS_DIR" . | xz -9e > "/tmp/report-$BUILD_ID.tar.xz"
+    curl -sf -X PUT --data-binary @"/tmp/report-$BUILD_ID.tar.xz" "$ARTIFACT_URL/reports/$BUILD_ID.tar.xz"
+    rm -f "/tmp/report-$BUILD_ID.tar.xz"
+
+    [ "$failed" -eq 0 ]
+    ```
+- role: assistant
+  content: |
+    ```bash
+    #!/bin/bash
+    # post-test step: summarize results and upload report bundle
+    set -u
+
+    RESULTS_DIR="${CI_PROJECT_DIR:-.}/build/test-results"
+    SUMMARY="$RESULTS_DIR/summary.tsv"
+    ARTIFACT_URL="${ARTIFACT_URL:?}"
+    BUILD_ID="${CI_PIPELINE_ID:-local}"
+
+    awk -F'\t' '
+        { total_ms += $3 }
+        $2 == "passed" { passed++ }
+        $2 == "failed" { failed++; print "FAILED: " $1 }
+        $2 != "passed" && $2 != "failed" { skipped++ }
+        END {
+            printf "passed=%d failed=%d skipped=%d time_ms=%.0f\n", passed, failed, skipped, total_ms
+            exit (failed > 0)
+        }
+    ' "$SUMMARY"
+    tests_status=$?
+
+    bundle=$(mktemp "${TMPDIR:-/tmp}/report-XXXXXX.tar.zst")
+    tar -cf - -C "$RESULTS_DIR" . | zstd -q > "$bundle"
+    curl -sf -X PUT --data-binary @"$bundle" "$ARTIFACT_URL/reports/$BUILD_ID.tar.zst"
+    rm -f "$bundle"
+
+    exit "$tests_status"
+    ```
+
+    **Green Notes**
+    - **One `awk` pass instead of subprocesses per line** (reduces E): the old loop started several processes for every line of `summary.tsv` (`echo | cut` three times, `expr` twice). Process starts dominate shell scripts like this. In Green Metrics Tool micro-benchmarks on a 20,000-line log, a loop with `echo | cut` and `expr` per field used over 1000× more CPU energy than one `awk` pass with identical output. A loop with only builtins was about 300× cheaper than the subprocess loop, and `awk` was still about 4× cheaper than that. The output lines and the exit code are the same as before.
+    - **`zstd` instead of `xz -9e`** (reduces E): the bundle is compressed on every pipeline run, which is the case for a fast codec. In Green Metrics Tool measurements compressing 100 MB of text, `xz` at its default level used about 29× the energy of `zstd`, and `-9e` costs even more than that default. Those measurements compare energy, not file size, so the `.tar.zst` will likely be a bit bigger than the `.tar.xz`. For short-lived CI reports this is fine. The artifact name now ends in `.tar.zst`, so check that anything which downloads these bundles can unpack it.
+    - **Smaller fixes:** the temp file now comes from `mktemp` instead of a fixed `/tmp` name. `awk` also counts a last line without a trailing newline, which the old `read` loop silently dropped.
+verify:
+  static_only: bash CI script needing curl, an artifact server and zstd; not run in the sandbox

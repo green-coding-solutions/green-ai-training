@@ -1,0 +1,76 @@
+id: gen-12764612-00124-generation
+category: generation
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    hello, I have nginx access.log files and I want small script what show me how many requests come from each country. log is normal format, first word in line is the IP. we have internal geo service, GET https://geo.internal.example/lookup/<ip> and it give back json like {"country": "DE"}. log have around 300 different IPs each day. can you write it please? sorry for my english
+- role: assistant
+  content: |
+    ```python
+    import asyncio
+    import sys
+    from collections import Counter
+
+    import httpx
+
+    LOOKUP_URL = "https://geo.internal.example/lookup/{ip}"
+    MAX_PARALLEL = 10
+
+
+    def count_ips(path):
+        counts = Counter()
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                ip = line.split(" ", 1)[0]
+                if ip:
+                    counts[ip] += 1
+        return counts
+
+
+    async def country_of(client, sem, ip):
+        async with sem:
+            try:
+                resp = await client.get(LOOKUP_URL.format(ip=ip))
+                resp.raise_for_status()
+                return ip, resp.json().get("country", "unknown")
+            except (httpx.HTTPError, ValueError):
+                return ip, "unknown"
+
+
+    async def requests_per_country(path):
+        ip_counts = count_ips(path)
+        sem = asyncio.Semaphore(MAX_PARALLEL)
+        async with httpx.AsyncClient(timeout=10) as client:
+            results = await asyncio.gather(
+                *(country_of(client, sem, ip) for ip in ip_counts)
+            )
+        totals = Counter()
+        for ip, country in results:
+            totals[country] += ip_counts[ip]
+        return totals
+
+
+    if __name__ == "__main__":
+        if len(sys.argv) != 2:
+            sys.exit("usage: python geo_report.py access.log")
+        totals = asyncio.run(requests_per_country(sys.argv[1]))
+        for country, n in totals.most_common():
+            print(f"{country}\t{n}")
+    ```
+
+    Run it with `python geo_report.py /var/log/nginx/access.log`. Install the client first with `pip install httpx`.
+
+    A failed lookup counts as `unknown`, so one bad IP does not stop the report.
+
+    **Green Notes**
+    - **Concurrent network calls** (reduces E and idle wait time): the script needs about 300 lookups, and each one mostly waits for the network. Running up to 10 at once on one shared connection pool removes most of that waiting. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, sync `urllib` used ~9.1 J and 3.1 s, and async `httpx` used ~8.4 J and 2.6 s, about 7% less CPU energy and 17% less wall time. For small request counts the gain is mostly wall time.
+    - The geo service is looked up once per distinct IP, not once per log line, so the number of calls stays at about 300.
+    - The limit of 10 keeps the internal service from being flooded. Change `MAX_PARALLEL` if it can take more.
+- role: null
+verify:
+  static_only: needs network access to a geo service and the httpx package

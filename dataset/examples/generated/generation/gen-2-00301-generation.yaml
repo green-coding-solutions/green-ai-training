@@ -1,0 +1,80 @@
+id: gen-2-00301-generation
+category: generation
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    hi, we have payment service (payd) on one server. It write audit log every day in /var/log/payd/audit-YYYY-MM-DD.log, around 1-2 GB per day, plain text. Compliance say we must keep it 2 years.
+
+    Can you write me a bash script for cron at 01:30 that take yesterday file, compress it, put it in /srv/audit-archive/YYYY/MM/ and remove the original only if the archive is realy ok. Also delete archives older then 730 days.
+
+    Ah and there is /var/log/payd/trace/ with debug dumps, other job delete them after 30 min. Should I compress this also while I am there?
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # Nightly: compress yesterday's payd audit log, verify it, archive it for 730 days.
+    set -euo pipefail
+
+    SRC_DIR='/var/log/payd'
+    ARCHIVE_DIR='/srv/audit-archive'
+    KEEP_DAYS=730
+    ZSTD_LEVEL=3
+
+    day=$(date -d 'yesterday' +%F)
+    src="$SRC_DIR/audit-$day.log"
+    dest_dir="$ARCHIVE_DIR/${day:0:4}/${day:5:2}"
+    dest="$dest_dir/audit-$day.log.zst"
+    tmp="$dest.part"
+
+    if [[ ! -f $src ]]; then
+      echo "no audit log for $day: $src" >&2
+      exit 1
+    fi
+    if [[ -e $dest ]]; then
+      echo "archive already exists: $dest" >&2
+      exit 1
+    fi
+
+    mkdir -p -- "$dest_dir"
+
+    # Write to a .part file, so a crash never leaves a broken archive under the final name.
+    zstd -q -"$ZSTD_LEVEL" -f -o "$tmp" -- "$src"
+
+    # Verify: decompressed archive must match the original byte for byte.
+    orig_sum=$(sha256sum < "$src")
+    arch_sum=$(zstd -dcq -- "$tmp" | sha256sum)
+    if [[ $orig_sum != "$arch_sum" ]]; then
+      echo "verify failed for $src, original kept" >&2
+      rm -f -- "$tmp"
+      exit 1
+    fi
+
+    mv -- "$tmp" "$dest"
+    chmod 0440 -- "$dest"
+    rm -- "$src"
+
+    # Retention: delete archives older than KEEP_DAYS, then empty month/year folders.
+    find "$ARCHIVE_DIR" -type f -name 'audit-*.log.zst' -mtime +"$KEEP_DAYS" -delete
+    find "$ARCHIVE_DIR" -mindepth 1 -type d -empty -delete
+    ```
+
+    Cron entry:
+
+    ```text
+    30 1 * * * /usr/local/bin/archive-payd-audit.sh 2>&1 | logger -t archive-payd-audit
+    ```
+
+    The original is removed only after the checksum of the decompressed archive matches the source. If something fails, the script exits non-zero and the log file stays where it is.
+
+    **Green Notes**
+    - **Compress stored data with a fast codec** (reduces E and storage): each audit file is compressed once and then kept for two years, so compression clearly pays off. zstd at its default level is cheap to write and cheap to read back for audits. In Green Metrics Tool measurements on 100 MB of text, zstd used ~16 J, gzip ~67 J and xz ~458 J to compress. Decompressing cost zstd ~5.3 J.
+    - **Ratio vs. energy:** those measurements compare energy, not file size. With 730 days of retention, a smaller archive can matter. A higher `ZSTD_LEVEL` gives smaller files for more CPU each night. Test it on one real day's log with `zstd -b3 -e19 audit-YYYY-MM-DD.log`, which prints ratio and speed per level, then pick a level.
+    - *Not applied:* compressing `/var/log/payd/trace/`. Those dumps are deleted after 30 minutes, so the CPU work would never be paid back. A Green Coding Solutions estimate (not a direct measurement) puts the break-even for zstd-compressed data at about 0.15 days of storage. Leave the trace dumps uncompressed.
+verify:
+  static_only: bash script that needs the zstd binary, GNU date and the payd log and archive paths

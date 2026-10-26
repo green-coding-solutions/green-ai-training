@@ -1,0 +1,78 @@
+id: gen-1-00164-generation
+category: generation
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    hi, i am beginner with python, sorry. we have small online shop and our stock is in 4 warehouses, each have own REST API (GET /api/stock?sku=...  and it returns json like {"available": 12}). on the product page I want to show total stock over all warehouses. i tried to write it myself but I dont know if my way is good, so can you write the function? the function should get a sku and give back the total, and also tell me if some warehouse did not answer. the urls are:
+
+    - https://wh-berlin.example.com/api/stock
+    - https://wh-lyon.example.com/api/stock
+    - https://wh-porto.example.com/api/stock
+    - https://wh-gdansk.example.com/api/stock
+- role: assistant
+  content: |
+    Here is a function that asks all four warehouses at the same time and collects the answers.
+
+    ```python
+    import asyncio
+
+    import httpx
+
+    WAREHOUSES = {
+        "berlin": "https://wh-berlin.example.com/api/stock",
+        "lyon": "https://wh-lyon.example.com/api/stock",
+        "porto": "https://wh-porto.example.com/api/stock",
+        "gdansk": "https://wh-gdansk.example.com/api/stock",
+    }
+
+
+    async def _fetch_stock(client: httpx.AsyncClient, url: str, sku: str) -> int | None:
+        """Return the available units, or None if the warehouse failed."""
+        try:
+            resp = await client.get(url, params={"sku": sku})
+            resp.raise_for_status()
+            return int(resp.json()["available"])
+        except (httpx.HTTPError, KeyError, TypeError, ValueError):
+            return None
+
+
+    async def get_total_stock(sku: str) -> dict:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            answers = await asyncio.gather(
+                *(_fetch_stock(client, url, sku) for url in WAREHOUSES.values())
+            )
+
+        by_warehouse = {}
+        failed = []
+        for name, units in zip(WAREHOUSES, answers):
+            if units is None:
+                failed.append(name)
+            else:
+                by_warehouse[name] = units
+
+        return {
+            "total": sum(by_warehouse.values()),
+            "by_warehouse": by_warehouse,
+            "failed": failed,
+        }
+
+
+    if __name__ == "__main__":
+        print(asyncio.run(get_total_stock("SKU-12345")))
+    ```
+
+    Install the client with `pip install httpx`. If your shop uses FastAPI, make your endpoint `async def` and call `await get_total_stock(sku)`. Do not use `asyncio.run` inside it.
+
+    If `failed` is not empty, the total is only a lower bound. Show something like "at least N in stock" on the page, or hide the number.
+
+    **Green Notes**
+    - **Concurrent network calls** (reduces idle wait, E): the four requests run in parallel, so the page waits for the slowest warehouse, not the sum of all four. In Green Metrics Tool micro-benchmarks with 10 requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sequential `urllib`. With only four calls, expect the same picture: a small CPU saving and a clear gain in wait time.
+    - **One client, one timeout** (reduces E): all requests share one `AsyncClient`, and the 5 second timeout stops a dead warehouse from holding the request open.
+    - *Not applied:* caching of the result. It is not part of what you asked for, so I kept the function simple.
+verify:
+  static_only: needs httpx and network access to warehouse APIs

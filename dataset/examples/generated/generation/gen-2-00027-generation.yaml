@@ -1,0 +1,145 @@
+id: gen-2-00027-generation
+category: generation
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    ```python
+    #!/usr/bin/env python3
+    """walkstat - Monte Carlo stats for 2D random walks with unit step length.
+
+    Usage: walkstat.py --walks 2000 --steps 5000 [--seed 42]
+    Prints mean end-to-end distance and mean squared distance.
+    """
+    import argparse
+    import math
+    import random
+
+
+    def simulate(walks: int, steps: int, seed: int | None = None) -> tuple[float, float]:
+        """Return (mean distance, mean squared distance) over `walks` walks of
+        `steps` unit steps, each in a uniformly random direction."""
+        # TODO
+        raise NotImplementedError
+
+
+    def main() -> None:
+        p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+        p.add_argument("--walks", type=int, default=2000)
+        p.add_argument("--steps", type=int, default=5000)
+        p.add_argument("--seed", type=int)
+        args = p.parse_args()
+
+        mean_r, mean_r2 = simulate(args.walks, args.steps, args.seed)
+        print(f"walks={args.walks} steps={args.steps}")
+        print(f"mean |R|   = {mean_r:.4f}  (theory ~ {math.sqrt(math.pi * args.steps / 4):.4f})")
+        print(f"mean |R|^2 = {mean_r2:.2f}  (theory = {args.steps})")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    ?
+- role: assistant
+  content: |
+    This fills in `simulate`. The rest of your script stays the same.
+
+    ```python
+    #!/usr/bin/env python3
+    """walkstat - Monte Carlo stats for 2D random walks with unit step length.
+
+    Usage: walkstat.py --walks 2000 --steps 5000 [--seed 42]
+    Prints mean end-to-end distance and mean squared distance.
+    """
+    import argparse
+    import math
+    import random
+
+
+    def simulate(walks: int, steps: int, seed: int | None = None) -> tuple[float, float]:
+        """Return (mean distance, mean squared distance) over `walks` walks of
+        `steps` unit steps, each in a uniformly random direction."""
+        if walks <= 0 or steps < 0:
+            raise ValueError("walks must be > 0 and steps >= 0")
+
+        rng = random.Random(seed)
+        # Bound once: the inner loop runs walks * steps times.
+        rand = rng.random
+        cos = math.cos
+        sin = math.sin
+        two_pi = 2 * math.pi
+
+        sum_r = 0.0
+        sum_r2 = 0.0
+        for _ in range(walks):
+            x = y = 0.0
+            for _ in range(steps):
+                a = two_pi * rand()
+                x += cos(a)
+                y += sin(a)
+            r2 = x * x + y * y
+            sum_r += math.sqrt(r2)
+            sum_r2 += r2
+        return sum_r / walks, sum_r2 / walks
+
+
+    def main() -> None:
+        p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+        p.add_argument("--walks", type=int, default=2000)
+        p.add_argument("--steps", type=int, default=5000)
+        p.add_argument("--seed", type=int)
+        args = p.parse_args()
+
+        mean_r, mean_r2 = simulate(args.walks, args.steps, args.seed)
+        print(f"walks={args.walks} steps={args.steps}")
+        print(f"mean |R|   = {mean_r:.4f}  (theory ~ {math.sqrt(math.pi * args.steps / 4):.4f})")
+        print(f"mean |R|^2 = {mean_r2:.2f}  (theory = {args.steps})")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    A private `random.Random(seed)` makes the output repeatable with `--seed`, and the global random state stays untouched.
+
+    **Green Notes**
+    - **Hoist loop-invariant lookups** (reduces E): with the defaults the inner loop runs 10,000,000 times. So `rng.random`, `math.cos` and `math.sin` are bound to local names, and `two_pi` is computed once rather than on every step. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local variable before a 10,000,000-iteration loop saved about 4-5%. The win is small, so it is only applied here. The outer loop keeps the plain `math.sqrt`.
+    - *Not applied:* Numba `@njit` on `simulate`. It would cut more on a pure numeric loop like this one. But it adds a compiled dependency to a small stdlib-only CLI. Consider it only if you run large simulations regularly.
+verify:
+  module: true
+  test: |-
+    import math as _m
+    import random as _r
+
+    def _ref(walks, steps, seed):
+        rng = _r.Random(seed)
+        sr = sr2 = 0.0
+        for _ in range(walks):
+            x = y = 0.0
+            for _ in range(steps):
+                a = 2 * _m.pi * rng.random()
+                x += _m.cos(a)
+                y += _m.sin(a)
+            r2 = x * x + y * y
+            sr += _m.sqrt(r2)
+            sr2 += r2
+        return sr / walks, sr2 / walks
+
+    assert simulate(1, 0, 1) == (0.0, 0.0)
+    assert simulate(50, 200, 7) == simulate(50, 200, 7)
+    assert simulate(30, 100, 3) == _ref(30, 100, 3)
+    m, m2 = simulate(400, 400, 1)
+    assert 15 < m < 20.5, m
+    assert 300 < m2 < 500, m2
+    try:
+        simulate(0, 10)
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+    print("ok")

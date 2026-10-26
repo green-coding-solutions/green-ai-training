@@ -1,0 +1,106 @@
+id: gen-12764612-00116-refactor
+category: refactor
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```yaml
+    name: landing-preview
+
+    on:
+      pull_request:
+        types: [opened, synchronize, reopened]
+
+    jobs:
+      deploy:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+          - uses: azure/setup-helm@v4
+          - name: Write kubeconfig
+            run: echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > $HOME/kubeconfig
+          - name: Deploy preview
+            run: |
+              export KUBECONFIG=$HOME/kubeconfig
+              helm upgrade --install lp-${{ github.head_ref }} ./chart \
+                -n lp-${{ github.head_ref }} --create-namespace \
+                --set image.tag=${{ github.sha }} \
+                --set replicaCount=3 \
+                --set postgres.enabled=true \
+                --set redis.enabled=true \
+                --set worker.enabled=true \
+                --set host=${{ github.head_ref }}.preview.example.com
+    ```
+- role: assistant
+  content: |
+    ```yaml
+    name: landing-preview
+
+    on:
+      pull_request:
+        types: [opened, synchronize, reopened, closed]
+
+    concurrency:
+      group: landing-preview-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+
+    env:
+      NAMESPACE: lp-preview-pr-${{ github.event.pull_request.number }}
+
+    jobs:
+      deploy:
+        if: github.event.action != 'closed'
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+          - uses: azure/setup-helm@v4
+          - name: Write kubeconfig
+            env:
+              KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+            run: echo "$KUBECONFIG_B64" | base64 -d > "$RUNNER_TEMP/kubeconfig"
+          - name: Deploy preview
+            env:
+              KUBECONFIG: ${{ runner.temp }}/kubeconfig
+              PR_NUMBER: ${{ github.event.pull_request.number }}
+              IMAGE_TAG: ${{ github.event.pull_request.head.sha }}
+            run: |
+              helm upgrade --install "lp-pr-$PR_NUMBER" ./chart \
+                -n "$NAMESPACE" --create-namespace \
+                --set image.tag="$IMAGE_TAG" \
+                --set replicaCount=1 \
+                --set postgres.enabled=true \
+                --set redis.enabled=true \
+                --set worker.enabled=true \
+                --set host="pr-$PR_NUMBER.preview.example.com"
+
+      teardown:
+        if: github.event.action == 'closed'
+        runs-on: ubuntu-latest
+        steps:
+          - uses: azure/setup-helm@v4
+          - name: Write kubeconfig
+            env:
+              KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+            run: echo "$KUBECONFIG_B64" | base64 -d > "$RUNNER_TEMP/kubeconfig"
+          - name: Remove preview
+            env:
+              KUBECONFIG: ${{ runner.temp }}/kubeconfig
+              PR_NUMBER: ${{ github.event.pull_request.number }}
+            run: |
+              helm uninstall "lp-pr-$PR_NUMBER" -n "$NAMESPACE" || true
+              kubectl delete namespace "$NAMESPACE" --ignore-not-found
+    ```
+
+    **Green Notes**
+    - **Tear down on close** (reduces E and M): the old workflow never removed anything, so every PR left a full environment running forever. Now the `closed` event (merged or not) uninstalls the release and deletes the namespace. This is the biggest saving, because it removes all the hours the environment would otherwise sit idle.
+    - **1 replica instead of 3** (reduces M): a preview has one reviewer, not real traffic. In Green Metrics Tool micro-benchmarks, an idle preview with 3 app replicas, Postgres, Redis and a worker used only about 3% more CPU energy per minute than 1 replica plus Postgres. So fewer replicas is a small saving. It matters more for the memory it no longer reserves. If the landing page preview does not need Redis or the worker, turn those off too.
+    - **Behavior changes:** the namespace and host now use the PR number (`pr-123.preview.example.com`) instead of the branch name. The old `${{ github.head_ref }}` was pasted straight into the shell script. A branch name with shell characters could run commands on your runner with the kubeconfig. Branch names also often contain `/`, which is not valid in a namespace or host name. The values now go through `env`, and the image tag uses the PR head commit.
+    - Secrets are not available to PRs from forks, so those PRs will not get a preview with this setup.
+verify:
+  static_only: GitHub Actions workflow needs a cluster, helm and secrets; cannot be run in the sandbox

@@ -1,0 +1,82 @@
+id: gen-2-00077-generation
+category: generation
+language: sql
+sql_dialect: postgres
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    Hi, I'm a master student in an oceanography group and quite new to databases. We have the CTD data from our last cruise: a few hundred casts, and each cast is one CSV file with 10-30k lines. The file name is the cast id (like `CTD042.csv`) and the header is:
+
+    ```text
+    pressure_dbar,temperature_c,salinity_psu,oxygen_umol_kg
+    ```
+
+    My supervisor set up these tables in Postgres. The `casts` table is already filled from the cruise log.
+
+    ```sql
+    CREATE TABLE casts (
+        cast_id     text PRIMARY KEY,
+        station     text NOT NULL,
+        lat         double precision,
+        lon         double precision,
+        started_at  timestamptz
+    );
+
+    CREATE TABLE ctd_samples (
+        cast_id         text NOT NULL REFERENCES casts (cast_id),
+        pressure_dbar   real NOT NULL,
+        temperature_c   real,
+        salinity_psu    real,
+        oxygen_umol_kg  real
+    );
+    ```
+
+    I wrote a small Python script. It reads every line and sends `INSERT INTO ctd_samples VALUES (...)`, but after one hour it was only at cast 12?? Is something wrong with my tables or my laptop? Can you write me the SQL to get the files in?
+- role: assistant
+  content: |
+    Your tables and your laptop are fine. The slow part is sending one `INSERT` per line. Each line becomes its own statement and round trip to the server, and in autocommit mode also its own commit. A better way is to let Postgres read the whole file at once with `COPY`. Save this as `load_cast.sql`:
+
+    ```sql
+    \set ON_ERROR_STOP on
+
+    BEGIN;
+
+    CREATE TEMP TABLE cast_import (
+        pressure_dbar   real,
+        temperature_c   real,
+        salinity_psu    real,
+        oxygen_umol_kg  real
+    ) ON COMMIT DROP;
+
+    -- reads the CSV that is piped into psql
+    \copy cast_import FROM pstdin WITH (FORMAT csv, HEADER true)
+
+    INSERT INTO ctd_samples (cast_id, pressure_dbar, temperature_c, salinity_psu, oxygen_umol_kg)
+    SELECT :'cast_id', pressure_dbar, temperature_c, salinity_psu, oxygen_umol_kg
+    FROM cast_import;
+
+    COMMIT;
+    ```
+
+    Then run it once per file. The cast id comes from the file name:
+
+    ```bash
+    for f in cruise_data/CTD*.csv; do
+      id=${f##*/}
+      id=${id%.csv}
+      psql -d ctd -v cast_id="$id" -f load_cast.sql < "$f" || { echo "failed: $f" >&2; break; }
+    done
+    ```
+
+    `\copy` can't use psql variables, so the file goes in through stdin (`pstdin`) and the cast id is added in the `INSERT ... SELECT`. Empty fields in the CSV, for example oxygen sensor dropouts, are loaded as `NULL`.
+
+    **Green Notes**
+    - **Bulk load with `COPY` instead of one INSERT per line** (reduces E): each cast becomes one streaming load and one set-based insert in a single transaction. Before, every line needed its own statement, round trip and commit. In Green Metrics Tool micro-benchmarks that inserted 500,000 rows in batches of 5,000, `COPY` used about 22× less CPU energy than one `INSERT` per row, and about 8× less than `executemany()`.
+
+    Each file loads in a single transaction. If a file fails (bad line, unknown cast id), none of its rows are kept, so you can fix the file and run it again. Don't rerun a file that already loaded, though, because that would duplicate its rows.
+verify:
+  static_only: PostgreSQL dialect with psql meta-commands (\copy FROM pstdin, :'var' interpolation)

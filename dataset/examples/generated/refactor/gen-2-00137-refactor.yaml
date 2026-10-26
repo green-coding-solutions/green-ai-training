@@ -1,0 +1,169 @@
+id: gen-2-00137-refactor
+category: refactor
+language: html
+patterns:
+- dom-size
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    Hi, this is our internal page for cleanup old images in the container registry. Now we have ~9000 tags and the page need very long to load, also typing in the filter is laggy. Ops team keep it open long time when they do cleanup. Can you make it better please? Layout should stay more or less same.
+
+    ```html
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <title>Registry tags</title>
+    <link rel="stylesheet" href="/static/ops.css">
+    </head>
+    <body>
+    <h1>Registry tags</h1>
+    <input id="filter" placeholder="filter repo or tag">
+    <span id="count"></span>
+    <table id="tags">
+      <thead><tr><th>Repository</th><th>Tag</th><th>Size</th><th>Pushed</th><th>Pushed by</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <script>
+    const tbody = document.querySelector('#tags tbody');
+
+    function fmtSize(bytes) {
+      return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+    }
+
+    function cell(text, cls) {
+      const td = document.createElement('td');
+      const wrap = document.createElement('div');
+      wrap.className = 'cell ' + cls;
+      const inner = document.createElement('span');
+      inner.className = 'cell-text';
+      inner.innerHTML = text;
+      wrap.appendChild(inner);
+      td.appendChild(wrap);
+      return td;
+    }
+
+    fetch('/api/registry/tags')
+      .then(r => r.json())
+      .then(tags => {
+        tags.forEach(t => {
+          const tr = document.createElement('tr');
+          tr.dataset.search = (t.repo + ':' + t.tag).toLowerCase();
+          tr.appendChild(cell(t.repo, 'repo'));
+          tr.appendChild(cell(t.tag, 'tag'));
+          tr.appendChild(cell(fmtSize(t.size), 'size'));
+          tr.appendChild(cell(new Date(t.pushed_at).toLocaleString(), 'date'));
+          tr.appendChild(cell(t.pushed_by, 'user'));
+          tbody.appendChild(tr);
+        });
+        document.getElementById('count').textContent = tags.length + ' tags';
+      });
+
+    document.getElementById('filter').addEventListener('input', e => {
+      const q = e.target.value.toLowerCase();
+      let shown = 0;
+      tbody.querySelectorAll('tr').forEach(tr => {
+        const hit = tr.dataset.search.includes(q);
+        tr.style.display = hit ? '' : 'none';
+        if (hit) shown++;
+      });
+      document.getElementById('count').textContent = shown + ' tags';
+    });
+    </script>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    ```html
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <title>Registry tags</title>
+    <link rel="stylesheet" href="/static/ops.css">
+    </head>
+    <body>
+    <h1>Registry tags</h1>
+    <input id="filter" placeholder="filter repo or tag">
+    <span id="count"></span>
+    <table id="tags">
+      <thead><tr><th>Repository</th><th>Tag</th><th>Size</th><th>Pushed</th><th>Pushed by</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <nav id="pager">
+      <button id="prev" type="button">Previous</button>
+      <span id="page"></span>
+      <button id="next" type="button">Next</button>
+    </nav>
+    <script>
+    const PAGE_SIZE = 100;
+    const tbody = document.querySelector('#tags tbody');
+    const countEl = document.getElementById('count');
+    const pageEl = document.getElementById('page');
+    const prevBtn = document.getElementById('prev');
+    const nextBtn = document.getElementById('next');
+
+    let allTags = [];
+    let filtered = [];
+    let page = 0;
+
+    function fmtSize(bytes) {
+      return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+    }
+
+    function render() {
+      const pages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+      page = Math.min(Math.max(page, 0), pages - 1);
+      const frag = document.createDocumentFragment();
+      for (const t of filtered.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)) {
+        const tr = frag.appendChild(document.createElement('tr'));
+        for (const [text, cls] of [
+          [t.repo, 'repo'],
+          [t.tag, 'tag'],
+          [fmtSize(t.size), 'size'],
+          [new Date(t.pushed_at).toLocaleString(), 'date'],
+          [t.pushed_by, 'user'],
+        ]) {
+          const td = tr.appendChild(document.createElement('td'));
+          td.className = cls;
+          td.textContent = text;
+        }
+      }
+      tbody.replaceChildren(frag);
+      countEl.textContent = filtered.length + ' tags';
+      pageEl.textContent = 'Page ' + (page + 1) + ' of ' + pages;
+      prevBtn.disabled = page === 0;
+      nextBtn.disabled = page >= pages - 1;
+    }
+
+    fetch('/api/registry/tags')
+      .then(r => r.json())
+      .then(tags => {
+        allTags = tags.map(t => ({ ...t, search: (t.repo + ':' + t.tag).toLowerCase() }));
+        filtered = allTags;
+        render();
+      });
+
+    document.getElementById('filter').addEventListener('input', e => {
+      const q = e.target.value.toLowerCase();
+      filtered = allTags.filter(t => t.search.includes(q));
+      page = 0;
+      render();
+    });
+    prevBtn.addEventListener('click', () => { page--; render(); });
+    nextBtn.addEventListener('click', () => { page++; render(); });
+    </script>
+    </body>
+    </html>
+    ```
+
+    **Green Notes**
+    - **Pagination, 100 rows per page** (reduces E on the client): the old page added every tag to the DOM, so the browser had to lay out and style thousands of rows that nobody looks at. Now only one page exists in the DOM. In Green Metrics Tool page-load benchmarks, a 10,000-row table with 14 elements per row, appended one by one, used about 56% less CPU energy when it was paginated to 100 rows per page as a plain `<table>` built in a `DocumentFragment`.
+    - **No wrapper elements, one DOM insert per page** (reduces E): each cell used to be a `td`, a `div` and a `span`, and each row went into the live table on its own. Now each cell is one `td`, and the whole page goes in with a single `replaceChildren(frag)`.
+    - **Filter runs on the data, not on the DOM** (reduces E per keystroke): the old filter walked every `<tr>` and changed its style on each key press. Now it filters the array and renders one page. That is why typing stops lagging. The filter still updates live while you type.
+    - **Security fix and CSS note:** repo, tag and `pushed_by` values went in with `innerHTML`, so a value with `<` in it could inject markup. `textContent` shows them as plain text. The classes (`repo`, `tag`, ...) are now on the `td`, so if `ops.css` styles `.cell.repo` or `.cell-text`, change those selectors to `td.repo` and so on.
+verify:
+  static_only: 'browser page: needs a DOM, fetch and the registry API'

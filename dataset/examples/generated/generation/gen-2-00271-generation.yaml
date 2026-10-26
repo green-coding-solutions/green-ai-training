@@ -1,0 +1,154 @@
+id: gen-2-00271-generation
+category: generation
+language: python
+patterns:
+- keep-star-imports
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    hi, I am learning python and I'm writing a small script to clean my Downloads folder. This is what I have so far:
+
+    ```python
+    from os.path import *
+    import os
+    import sys
+    import time
+
+    DOWNLOADS = expanduser("~/Downloads")
+
+
+    def human_size(n):
+        for unit in ["B", "KB", "MB", "GB"]:
+            if n < 1024:
+                return f"{n:.1f} {unit}"
+            n /= 1024
+        return f"{n:.1f} TB"
+
+
+    def main():
+        folder = sys.argv[1] if len(sys.argv) > 1 else DOWNLOADS
+        print("Scanning", folder)
+        # TODO: list old files
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    Can you write the part that lists all files that were not changed for more than 30 days (number of days should be an option), with size and age, and the total size at the end? And a --delete option that asks me before it deletes them.
+
+    Also my friend looked at it and said the first line is wrong and makes the script slow and use more power, and I should change it. I don't really understand what is wrong with it?
+- role: assistant
+  content: |
+    Here is the full script. I kept your first line as it is.
+
+    ```python
+    from os.path import *
+    import argparse
+    import os
+    import sys
+    import time
+
+    DOWNLOADS = expanduser("~/Downloads")
+    SECONDS_PER_DAY = 86400
+
+
+    def human_size(n):
+        for unit in ["B", "KB", "MB", "GB"]:
+            if n < 1024:
+                return f"{n:.1f} {unit}"
+            n /= 1024
+        return f"{n:.1f} TB"
+
+
+    def find_old_files(folder, days, now=None):
+        """Return (path, size_in_bytes, age_in_days) for files older than `days`, sorted by name."""
+        now = time.time() if now is None else now
+        cutoff = now - days * SECONDS_PER_DAY
+        old = []
+        for name in sorted(os.listdir(folder)):
+            path = join(folder, name)
+            if not isfile(path):
+                continue  # skip folders
+            mtime = getmtime(path)
+            if mtime < cutoff:
+                old.append((path, getsize(path), (now - mtime) / SECONDS_PER_DAY))
+        return old
+
+
+    def delete_files(old):
+        deleted = 0
+        for path, _, _ in old:
+            try:
+                os.remove(path)
+                deleted += 1
+            except OSError as e:
+                print(f"Could not delete {basename(path)}: {e}")
+        return deleted
+
+
+    def main():
+        parser = argparse.ArgumentParser(description="List (and optionally delete) old files.")
+        parser.add_argument("folder", nargs="?", default=DOWNLOADS)
+        parser.add_argument("--days", type=int, default=30,
+                            help="files not changed for more than this many days (default: 30)")
+        parser.add_argument("--delete", action="store_true",
+                            help="delete the listed files after asking")
+        args = parser.parse_args()
+
+        if not isdir(args.folder):
+            sys.exit(f"Not a folder: {args.folder}")
+
+        print("Scanning", args.folder)
+        old = find_old_files(args.folder, args.days)
+        if not old:
+            print(f"No files older than {args.days} days.")
+            return
+
+        total = 0
+        for path, size, age in old:
+            print(f"{age:6.0f} days  {human_size(size):>10}  {basename(path)}")
+            total += size
+        print(f"{len(old)} files, {human_size(total)} in total")
+
+        if args.delete:
+            answer = input("Delete these files? [y/N] ")
+            if answer.strip().lower() == "y":
+                print(f"Deleted {delete_files(old)} files.")
+            else:
+                print("Nothing deleted.")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    Run it like `python cleanup.py --days 60` or `python cleanup.py ~/Desktop --delete`.
+
+    **Green Notes**
+    - **Star import left unchanged**: `from os.path import *` does not make the script slower or use more power. In Green Metrics Tool micro-benchmarks, 1,000 Python starts with `from posix import *` and with `import posix` both used about 121 J, so there was no measurable difference. What costs energy is loading a heavy module at all, and `os.path` is part of Python itself. Your friend may mean that star imports make it harder to see where names like `join` come from. That is a style question, not a speed question.
+    - Nothing else to optimize: it is a personal script that scans one folder, so clear code matters most.
+verify:
+  module: true
+  test: |-
+    import os, tempfile, time
+    d = tempfile.mkdtemp()
+    now = time.time()
+    for name, age_days, data in [("old.zip", 40, b"x" * 2048), ("new.txt", 2, b"hi"), ("edge.pdf", 31, b"")]:
+        p = os.path.join(d, name)
+        with open(p, "wb") as f:
+            f.write(data)
+        t = now - age_days * 86400
+        os.utime(p, (t, t))
+    os.mkdir(os.path.join(d, "oldfolder"))
+    res = find_old_files(d, 30, now=now)
+    names = [os.path.basename(p) for p, _, _ in res]
+    assert names == ["edge.pdf", "old.zip"], names
+    assert res[1][1] == 2048
+    assert abs(res[1][2] - 40) < 0.01
+    assert human_size(2048) == "2.0 KB"
+    assert human_size(500) == "500.0 B"
+    assert delete_files(res) == 2
+    assert sorted(os.listdir(d)) == ["new.txt", "oldfolder"]

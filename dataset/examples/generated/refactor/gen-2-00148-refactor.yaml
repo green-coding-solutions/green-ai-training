@@ -1,0 +1,126 @@
+id: gen-2-00148-refactor
+category: refactor
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    We maintain `relay`, an internal CLI. Every CI job in the company installs it with `curl -fsSL https://dl.relay.internal/install.sh | sh`, and the installer then fetches `/latest.json` and the matching tarball from `/releases/`. That is thousands of requests a day. The download site is plain nginx 1.24 (Debian package, no brotli module) on one small VM. The config grew over time and the VM's CPU is busier than I'd expect for a static site. Please refactor it.
+
+    Requirements:
+    - Some runners use plain `curl` without `--compressed`. They must keep working.
+    - `latest.json` and `install.sh` get rewritten by our release job (a bash script we own, we can add a step). Clients must never get a stale version.
+    - `/api/` is a small Go service that returns download stats as JSON for a dashboard that people open over a slow VPN. Keep it compressed.
+    - Keep the cache headers as they are.
+
+    ```nginx
+    # /etc/nginx/conf.d/dl.conf - download site for the relay CLI
+    server {
+        listen 80;
+        server_name dl.relay.internal;
+        root /srv/dl/public;
+
+        gzip on;
+        gzip_comp_level 9;
+        gzip_min_length 0;
+        gzip_proxied any;
+        gzip_types text/plain text/css text/html application/json application/javascript
+                   text/x-shellscript application/x-sh application/octet-stream;
+
+        location = /install.sh {
+            default_type text/x-shellscript;
+            add_header Cache-Control "no-cache";
+        }
+
+        location = /latest.json {
+            add_header Cache-Control "no-cache";
+        }
+
+        location /docs/ {
+            try_files $uri $uri/index.html =404;
+            expires 1h;
+        }
+
+        location /releases/ {
+            autoindex on;
+            expires 30d;
+        }
+
+        location /api/ {
+            proxy_pass http://127.0.0.1:8085;
+            proxy_set_header Host $host;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    ```nginx
+    # /etc/nginx/conf.d/dl.conf - download site for the relay CLI
+    server {
+        listen 80;
+        server_name dl.relay.internal;
+        root /srv/dl/public;
+
+        # Static text files: serve the .gz the release job writes next to each file.
+        gzip_static on;
+        gzip_vary on;
+
+        # On-the-fly gzip only for what can't be precompressed (/api/, autoindex pages)
+        # and as a fallback if a .gz file is missing. text/html is always included.
+        gzip on;
+        gzip_comp_level 5;
+        gzip_min_length 0;
+        gzip_proxied any;
+        gzip_types text/plain text/css application/json application/javascript
+                   text/x-shellscript application/x-sh;
+
+        location = /install.sh {
+            default_type text/x-shellscript;
+            add_header Cache-Control "no-cache";
+        }
+
+        location = /latest.json {
+            add_header Cache-Control "no-cache";
+        }
+
+        location /docs/ {
+            try_files $uri $uri/index.html =404;
+            expires 1h;
+        }
+
+        location /releases/ {
+            autoindex on;
+            expires 30d;
+        }
+
+        location /api/ {
+            proxy_pass http://127.0.0.1:8085;
+            proxy_set_header Host $host;
+        }
+    }
+    ```
+
+    Add this as the last step of the release job, after all files are in place:
+
+    ```bash
+    public_dir=/srv/dl/public
+    find "$public_dir" -type f \
+        \( -name '*.html' -o -name '*.css' -o -name '*.js' -o -name '*.json' -o -name '*.sh' -o -name '*.txt' \) \
+        -exec gzip -9 -k -f -- {} +
+    ```
+
+    **Green Notes**
+    - **Precompress static text at release time** (reduces E): `install.sh`, `latest.json` and the docs only change on release, but nginx compressed them at level 9 on every request. In a Green Metrics Tool benchmark of nginx serving 2,000 text-asset requests, gzip level 5 per request cost about 4× the CPU energy of serving precompressed files with `gzip_static`. Both sent about 10× fewer bytes than no compression. Level 9 does more work per response than the measured level 5. `gzip -9` is fine in the release job because it runs once per release.
+    - **No gzip for binaries** (reduces E): `application/octet-stream` in `gzip_types` made nginx gzip every `.tar.gz` and `.deb` download at level 9. These files are already compressed and barely shrink, so that was pure CPU work. They are now served as they are.
+    - **Moderate level for dynamic responses** (reduces E, keeps network): `/api/` and the autoindex listings can't be precompressed, so they still use on-the-fly gzip, now at level 5. The VPN dashboard still gets compressed JSON.
+
+    Behavior notes:
+    - Plain `curl` sends no `Accept-Encoding`, so nginx serves it the original file. That is why the release step keeps the originals (`-k`). `gzip_vary on` adds `Vary: Accept-Encoding`, so caches keep both variants apart.
+    - nginx does not check whether a `.gz` file matches its original. Run the gzip step after every change to `latest.json` or `install.sh`, including manual hotfixes. Otherwise compressing clients get the old version. If a `.gz` file is missing, nothing breaks: `gzip on` compresses that response on the fly.
+    - Between writing `latest.json` and rewriting its `.gz`, there is a short window where the old `.gz` is served. If that matters, write both files under temporary names and `mv` them into place.
+    - I removed `text/html` from `gzip_types`. nginx always compresses it and warns about the duplicate. Cache headers and locations are unchanged.
+verify:
+  static_only: nginx config and a release-job step; needs nginx with gzip_static and a populated /srv/dl/public

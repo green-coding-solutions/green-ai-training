@@ -1,0 +1,182 @@
+id: gen-2-00151-refactor
+category: refactor
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    Hi, I wrote this script for our online shop. When a product comes back in stock, it creates the emails for everyone who has it on their wishlist. It works fine with my test data. With the real data (about 60k wishlist entries) it runs for more than 20 minutes and I don't understand why. Is it the CSV reading? Can you make it better? I'm quite new to Python.
+
+    ```python
+    import csv
+    import json
+    import sys
+
+
+    def load_restocked_skus(path):
+        skus = []
+        with open(path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if int(row["old_qty"]) == 0 and int(row["new_qty"]) > 0:
+                    skus.append(row["sku"])
+        return skus
+
+
+    def load_unsubscribed(path):
+        with open(path, encoding="utf-8") as f:
+            return [line.strip().lower() for line in f if line.strip()]
+
+
+    def build_notifications(wishlist, restocked_skus, unsubscribed):
+        notifications = []
+        already_sent = []
+        for item in wishlist:
+            if item["sku"] not in restocked_skus:
+                continue
+            email = item["email"].lower()
+            if email in unsubscribed:
+                continue
+            key = (email, item["sku"])
+            if key in already_sent:
+                continue
+            already_sent.append(key)
+            notifications.append({
+                "to": email,
+                "sku": item["sku"],
+                "subject": f"Back in stock: {item['product_name']}",
+            })
+        return notifications
+
+
+    def main():
+        stock_csv, unsub_txt, wishlist_json, out_json = sys.argv[1:5]
+        restocked = load_restocked_skus(stock_csv)
+        unsubscribed = load_unsubscribed(unsub_txt)
+        with open(wishlist_json, encoding="utf-8") as f:
+            wishlist = json.load(f)
+        notifications = build_notifications(wishlist, restocked, unsubscribed)
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump(notifications, f, indent=2)
+        print(f"{len(notifications)} notifications written")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    ```python
+    import csv
+    import json
+    import sys
+
+
+    def load_restocked_skus(path):
+        skus = []
+        with open(path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if int(row["old_qty"]) == 0 and int(row["new_qty"]) > 0:
+                    skus.append(row["sku"])
+        return skus
+
+
+    def load_unsubscribed(path):
+        with open(path, encoding="utf-8") as f:
+            return [line.strip().lower() for line in f if line.strip()]
+
+
+    def build_notifications(wishlist, restocked_skus, unsubscribed):
+        # Build the sets once, before the loop: every lookup below is then O(1).
+        restocked = set(restocked_skus)
+        unsubscribed = set(unsubscribed)
+        already_sent = set()
+        notifications = []
+        for item in wishlist:
+            if item["sku"] not in restocked:
+                continue
+            email = item["email"].lower()
+            if email in unsubscribed:
+                continue
+            key = (email, item["sku"])
+            if key in already_sent:
+                continue
+            already_sent.add(key)
+            notifications.append({
+                "to": email,
+                "sku": item["sku"],
+                "subject": f"Back in stock: {item['product_name']}",
+            })
+        return notifications
+
+
+    def main():
+        stock_csv, unsub_txt, wishlist_json, out_json = sys.argv[1:5]
+        restocked = load_restocked_skus(stock_csv)
+        unsubscribed = load_unsubscribed(unsub_txt)
+        with open(wishlist_json, encoding="utf-8") as f:
+            wishlist = json.load(f)
+        notifications = build_notifications(wishlist, restocked, unsubscribed)
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump(notifications, f, indent=2)
+        print(f"{len(notifications)} notifications written")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **Sets for repeated membership tests** (reduces E): The CSV reading is fine, because it reads each line once. The slow part is `in` on a list. It checks the list one element at a time, and your loop does that up to three times for every wishlist entry, so the work grows with wishlist size × list size. A set lookup takes about the same time no matter how big the set is, so the loop now grows only with the wishlist.
+    - **`already_sent` is a set now**: This list got longer with every notification, so each check was slower than the one before. Only the check uses the set. `notifications` is still a list, so the output order does not change.
+    - **Build each set once, outside the loop**: Building a set is a full pass over the list. That only pays off because you look up many times. In Green Metrics Tool micro-benchmarks, converting a 10,000,000-element list to a set for a single test cost about 50% more than scanning the list once. So never write `x in set(my_list)` inside a loop.
+
+    The loaders and `main` are unchanged, and the output file is identical.
+verify:
+  module: true
+  test: |
+    wl = [
+        {"sku": "A1", "email": "Ann@shop.test", "product_name": "Mug"},
+        {"sku": "B2", "email": "bob@shop.test", "product_name": "Lamp"},
+        {"sku": "A1", "email": "ann@shop.test", "product_name": "Mug"},
+        {"sku": "C3", "email": "cy@shop.test", "product_name": "Rug"},
+        {"sku": "A1", "email": "dan@shop.test", "product_name": "Mug"},
+    ]
+    res = build_notifications(wl, ["A1", "C3"], ["cy@shop.test"])
+    assert res == [
+        {"to": "ann@shop.test", "sku": "A1", "subject": "Back in stock: Mug"},
+        {"to": "dan@shop.test", "sku": "A1", "subject": "Back in stock: Mug"},
+    ]
+    assert build_notifications([], ["A1"], []) == []
+  equivalence:
+    driver: |
+      import os, tempfile
+      d = tempfile.mkdtemp()
+      p1 = os.path.join(d, "stock.csv")
+      with open(p1, "w", newline="", encoding="utf-8") as f:
+          f.write("sku,old_qty,new_qty\nA1,0,5\nB2,3,4\nC3,0,2\nD4,0,0\n")
+      p2 = os.path.join(d, "unsub.txt")
+      with open(p2, "w", encoding="utf-8") as f:
+          f.write("CY@shop.test\n\n  \n")
+      wishlist = [
+          {"sku": "A1", "email": "Ann@shop.test", "product_name": "Mug"},
+          {"sku": "B2", "email": "bob@shop.test", "product_name": "Lamp"},
+          {"sku": "A1", "email": "ann@shop.test", "product_name": "Mug"},
+          {"sku": "C3", "email": "cy@shop.test", "product_name": "Rug"},
+          {"sku": "A1", "email": "dan@shop.test", "product_name": "Mug"},
+          {"sku": "C3", "email": "eve@shop.test", "product_name": "Rug"},
+      ]
+      restocked = load_restocked_skus(p1)
+      unsub = load_unsubscribed(p2)
+      print(restocked, unsub)
+      for n in build_notifications(wishlist, restocked, unsub):
+          print(n)
+  benchmark:
+    driver: |
+      wl = [{"sku": f"S{i % 3000}", "email": f"u{i % 1500}@shop.test", "product_name": f"P{i % 3000}"} for i in range(5000)]
+      rs = [f"S{i}" for i in range(0, 3000, 2)]
+      un = [f"u{i}@shop.test" for i in range(0, 1500, 3)]
+      print(len(build_notifications(wl, rs, un)))
+    min_speedup: 3

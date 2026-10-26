@@ -1,0 +1,113 @@
+id: gen-1-00126-multi-turn
+category: multi-turn
+language: javascript
+patterns:
+- minify-assets
+facts:
+- F-MINIFY
+messages:
+- role: user
+  content: |
+    ?
+
+    ```javascript
+    // server.js
+    const express = require('express');
+    const path = require('path');
+    const db = require('./db');
+
+    const app = express();
+    app.use(express.json());
+    app.use(express.static(path.join(__dirname, 'public')));
+
+    app.get('/api/jobs', async (req, res) => {
+      const rows = await db.query('SELECT id, name, status FROM jobs ORDER BY id DESC LIMIT 50');
+      res.json(rows);
+    });
+
+    app.get('/api/jobs/:id', async (req, res) => {
+      const rows = await db.query(`SELECT id, name, status FROM jobs WHERE id = ${req.params.id}`);
+      if (!rows.length) return res.status(404).json({ error: 'not found' });
+      res.json(rows[0]);
+    });
+
+    app.listen(3000);
+    ```
+
+    ```javascript
+    // public/app.js  (served as is, about 3 KB)
+
+    // load the job list and render it into the table
+    async function loadJobs() {
+      const response = await fetch('/api/jobs');
+      const jobs = await response.json();
+      const tbody = document.querySelector('#jobs tbody');
+      tbody.innerHTML = '';
+      for (const job of jobs) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = '<td>' + job.id + '</td><td>' + job.name + '</td><td>' + job.status + '</td>';
+        tbody.appendChild(tr);
+      }
+    }
+
+    loadJobs();
+    setInterval(loadJobs, 30000);
+    ```
+- role: assistant
+  content: |
+    **Workload:** web
+
+    #### [Security] SQL injection in `GET /api/jobs/:id`
+    - **Where:** `server.js`, the `/api/jobs/:id` handler
+    - **Issue:** `req.params.id` is pasted straight into the SQL string. A request like `/api/jobs/1%20OR%201=1` changes the query.
+    - **Fix:** use a bound parameter (assuming a `pg`-style driver):
+      ```javascript
+      const rows = await db.query(
+        'SELECT id, name, status FROM jobs WHERE id = $1',
+        [req.params.id]
+      );
+      ```
+    - **Impact:** not an efficiency issue. It is the one thing here I would fix first.
+
+    #### [Low] `public/app.js` is served unminified
+    - **Where:** `express.static` serving `public/`
+    - **Issue:** the file has comments and long whitespace. For a 3 KB file this saves bytes on the network, not CPU. In Green Metrics Tool micro-benchmarks of a small page, a minified build used about 2% less client energy, which is within measurement noise.
+    - **Fix:** if you add a build step anyway, `esbuild public/app.js --minify --outfile=dist/app.js`, and serve `dist/`.
+    - **Impact:** network bytes only, small. Not worth a build step on its own.
+
+    **Already good:** the list query has a `LIMIT` and names its columns.
+- role: user
+  content: |
+    its internal, 5 people use it. just fix the sql thing, no build step pls
+
+    (also it crashes sometimes when the id is not a number)
+- role: assistant
+  content: |
+    Fine, no build step. At that size and traffic, minifying would add a tool for no measurable gain.
+
+    The bound parameter also fixes the crash in most cases, because the driver no longer builds broken SQL from text like `abc`. The database can still reject a non-numeric value for an integer column, so check it up front and return a clean 400:
+
+    ```javascript
+    app.get('/api/jobs/:id', async (req, res) => {
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id)) {
+        return res.status(400).json({ error: 'id must be an integer' });
+      }
+
+      try {
+        const rows = await db.query(
+          'SELECT id, name, status FROM jobs WHERE id = $1',
+          [id]
+        );
+        if (!rows.length) return res.status(404).json({ error: 'not found' });
+        res.json(rows[0]);
+      } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'internal error' });
+      }
+    });
+    ```
+
+    Nothing else changed. `public/app.js` stays as is.
+verify:
+  static_only: needs express and a database driver, which are not in the standard library

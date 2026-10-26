@@ -1,0 +1,103 @@
+id: gen-1-00082-refactor
+category: refactor
+language: python
+patterns:
+- select-columns
+- regex-precompile
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+- F-REGEX
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import re
+    from collections import Counter
+
+
+    def slow_requests(conn, since, threshold_ms=500):
+        cur = conn.execute(
+            "SELECT * FROM app_logs WHERE ts >= ? AND level = 'INFO' ORDER BY ts",
+            (since,),
+        )
+        cols = [c[0] for c in cur.description]
+        slow = []
+        per_route = Counter()
+        for row in cur.fetchall():
+            rec = dict(zip(cols, row))
+            m = re.match(r"(GET|POST|PUT|DELETE) (\S+) .* took=(\d+)ms$", rec["message"])
+            if m is None:
+                continue
+            method, path, ms = m.group(1), m.group(2), int(m.group(3))
+            per_route[path] += 1
+            if ms >= threshold_ms:
+                slow.append((rec["ts"], method, path, ms))
+        return slow, per_route.most_common(3)
+    ```
+- role: assistant
+  content: |
+    ```python
+    import re
+    from collections import Counter
+
+    REQUEST_RE = re.compile(r"(GET|POST|PUT|DELETE) (\S+) .* took=(\d+)ms$")
+
+
+    def slow_requests(conn, since, threshold_ms=500):
+        cur = conn.execute(
+            "SELECT ts, message FROM app_logs WHERE ts >= ? AND level = 'INFO' ORDER BY ts",
+            (since,),
+        )
+        slow = []
+        per_route = Counter()
+        for ts, message in cur.fetchall():
+            m = REQUEST_RE.match(message)
+            if m is None:
+                continue
+            method, path, ms = m.group(1), m.group(2), int(m.group(3))
+            per_route[path] += 1
+            if ms >= threshold_ms:
+                slow.append((ts, method, path, ms))
+        return slow, per_route.most_common(3)
+    ```
+
+    **Green Notes**
+    - **Select only the needed columns** (reduces E): the function only reads `ts` and `message`, but `SELECT *` pulls every column of every matching row, including any large ones like payloads or stack traces. In Green Metrics Tool PostgreSQL micro-benchmarks, reading a 52-column table with large text columns used about 5.5× to 7× less energy when the query named the 10 needed columns. The saving grows with the size of the columns you skip. If your log table has only small columns, expect less. The `dict(zip(...))` per row is gone too.
+    - **Precompiled regex** (reduces E): the pattern is now built once at module level. This is a small win, because Python's `re` caches compiled patterns (up to 512). In Green Metrics Tool micro-benchmarks, precompiled matching used about 18% less CPU energy than inline `re.match` over 1,000,000 matches. It is mainly cleaner, and it protects you if the pattern ever becomes dynamic.
+
+    The results are the same. Rows, order and matching are unchanged.
+verify:
+  equivalence:
+    driver: |-
+      import sqlite3
+      conn = sqlite3.connect(":memory:")
+      conn.execute(
+          "CREATE TABLE app_logs (id INTEGER PRIMARY KEY, ts TEXT, level TEXT, host TEXT, "
+          "message TEXT, raw_payload TEXT, stack_trace TEXT)"
+      )
+      routes = ["/api/orders", "/api/users", "/health", "/api/cart"]
+      methods = ["GET", "POST", "PUT", "DELETE"]
+      for i in range(80):
+          ts = "2026-10-01T10:%02d:%02d" % (i // 60, i % 60)
+          level = "ERROR" if i % 11 == 0 else "INFO"
+          if i % 7 == 0:
+              message = "worker started pid=%d" % i
+          else:
+              message = "%s %s HTTP/1.1 200 took=%dms" % (
+                  methods[i % 4], routes[(i * 3) % 4], (i * 37) % 900
+              )
+          conn.execute(
+              "INSERT INTO app_logs (ts, level, host, message, raw_payload, stack_trace) "
+              "VALUES (?, ?, ?, ?, ?, ?)",
+              (ts, level, "web-%d" % (i % 3), message, "x" * 200, "trace " * 50),
+          )
+      slow, top = slow_requests(conn, "2026-10-01T10:00:10")
+      print(len(slow))
+      for item in slow:
+          print(item)
+      print(top)
+      slow2, top2 = slow_requests(conn, "2026-10-01T10:00:30", threshold_ms=100)
+      print(len(slow2), slow2[:3], top2)

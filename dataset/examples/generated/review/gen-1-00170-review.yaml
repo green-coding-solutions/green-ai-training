@@ -1,0 +1,126 @@
+id: gen-1-00170-review
+category: review
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import requests
+    from flask import Flask, render_template
+
+    app = Flask(__name__)
+
+    GITHUB_TOKEN = "ghp_8Kd3mQ1vZx7LrT0aYb2NcWe5HfUj9PsOiE4g"
+
+
+    def get_stars():
+        r = requests.get(
+            "https://api.github.com/repos/acme/pagekit",
+            headers={"Authorization": f"Bearer {GITHUB_TOKEN}"},
+        )
+        return r.json()["stargazers_count"]
+
+
+    def get_latest_posts():
+        r = requests.get("https://blog.acme.dev/api/posts?limit=3")
+        return r.json()["posts"]
+
+
+    def get_rating():
+        r = requests.get("https://reviews.example.com/api/v1/summary?site=acme")
+        return r.json()
+
+
+    def get_status():
+        r = requests.get("https://status.acme.dev/api/v2/status.json")
+        return r.json()["status"]["description"]
+
+
+    @app.route("/")
+    def landing():
+        stars = get_stars()
+        posts = get_latest_posts()
+        rating = get_rating()
+        status = get_status()
+        return render_template(
+            "landing.html",
+            stars=stars,
+            posts=posts,
+            rating=rating,
+            status=status,
+        )
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (landing page, four outside calls on every page view)
+
+    #### [Security] API token hardcoded in source
+    - **Where:** `GITHUB_TOKEN = "ghp_..."`
+    - **Issue:** the token is in the repository and in every copy of it. Anyone with read access can use it.
+    - **Fix:** revoke this token, create a new one, and read it from the environment: `os.environ["GITHUB_TOKEN"]`.
+
+    #### [Bug] No timeouts and no error handling
+    - **Where:** all four `requests.get(...)` calls, and `landing()`
+    - **Issue:** `requests` waits forever without a timeout, so one slow widget server blocks the page and holds a worker. A failed call (error status, bad JSON, missing key) raises, and the whole landing page returns a 500 because of a side widget.
+    - **Fix:** set a timeout, and return `None` for a widget that fails. The template must then hide that widget.
+
+    #### [High] Four network calls run one after another on every page view
+    - **Where:** `landing()`
+    - **Issue:** the calls do not depend on each other, but each one waits for the previous one. Page time is the sum of all four. The worker sits idle during the whole wait.
+    - **Fix:** start all four calls together with `httpx.AsyncClient` and `asyncio.gather`. Page time becomes the slowest single call. Flask needs the async extra for this: `pip install "flask[async]" httpx`.
+    - **Impact:** mostly wall time and worker holding time (E and M on the server). In Green Metrics Tool micro-benchmarks, 10 HTTP requests took ~9.1 J and 3.1 s with sync `urllib`, and ~8.4 J and 2.6 s with async `httpx`. That is about 7% less CPU energy and about 17% less wall time. With few requests the gain is mostly time, not energy.
+
+    ```python
+    import asyncio
+    import os
+
+    import httpx
+    from flask import Flask, render_template
+
+    app = Flask(__name__)
+
+    GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
+
+
+    async def fetch_json(client, url, **kwargs):
+        try:
+            r = await client.get(url, **kwargs)
+            r.raise_for_status()
+            return r.json()
+        except (httpx.HTTPError, ValueError):
+            return None
+
+
+    @app.route("/")
+    async def landing():
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            repo, posts, rating, status = await asyncio.gather(
+                fetch_json(
+                    client,
+                    "https://api.github.com/repos/acme/pagekit",
+                    headers={"Authorization": f"Bearer {GITHUB_TOKEN}"},
+                ),
+                fetch_json(client, "https://blog.acme.dev/api/posts?limit=3"),
+                fetch_json(client, "https://reviews.example.com/api/v1/summary?site=acme"),
+                fetch_json(client, "https://status.acme.dev/api/v2/status.json"),
+            )
+        return render_template(
+            "landing.html",
+            stars=repo["stargazers_count"] if repo else None,
+            posts=posts["posts"] if posts else [],
+            rating=rating,
+            status=status["status"]["description"] if status else None,
+        )
+    ```
+
+    Behavior change: a failed widget is now `None` (or an empty list) instead of a 500 error. Check that `landing.html` handles that.
+
+    **Already good:** `limit=3` keeps the blog response small.
+verify:
+  static_only: needs network access and Flask/httpx packages

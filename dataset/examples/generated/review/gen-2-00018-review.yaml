@@ -1,0 +1,110 @@
+id: gen-2-00018-review
+category: review
+language: python
+patterns:
+- torch-no-grad
+- avoid-exception-flow
+facts:
+- F-NOGRAD
+- F-EXC
+messages:
+- role: user
+  content: |
+    Nightly ETL step that normalizes supplier feed rows (~300k per run). About half of the rows don't hit the category map and go to the classifier. Review it, diff only, skip the prose.
+
+    ```python
+    import json
+    import logging
+
+    import torch
+
+    from feeds.text import hash_features   # titles -> FloatTensor [n, 65536]
+
+    log = logging.getLogger(__name__)
+
+    CATEGORY_MAP = json.load(open("config/category_map.json"))   # raw feed category -> taxonomy id
+    LABELS = json.load(open("config/taxonomy_labels.json"))      # class index -> taxonomy id
+    MIN_CONFIDENCE = 0.6
+    BATCH = 512
+
+    model = torch.jit.load("models/categorizer.pt")
+    model.eval()
+
+
+    def normalize_feed(rows):
+        out, unmapped = [], []
+        for row in rows:
+            try:
+                row["taxonomy_id"] = CATEGORY_MAP[row["raw_category"].strip().lower()]
+                row["category_source"] = "map"
+                out.append(row)
+            except KeyError:
+                unmapped.append(row)
+
+        log.info("mapped %d, sending %d to classifier", len(out), len(unmapped))
+
+        for i in range(0, len(unmapped), BATCH):
+            chunk = unmapped[i:i + BATCH]
+            logits = model(hash_features([r["title"] for r in chunk]))
+            probs = torch.softmax(logits, dim=0)
+            conf, idx = probs.max(dim=1)
+            for row, c, k in zip(chunk, conf.tolist(), idx.tolist()):
+                row["taxonomy_id"] = LABELS[k] if c >= MIN_CONFIDENCE else None
+                row["category_source"] = "model"
+                out.append(row)
+        return out
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline
+
+    #### [Bug] Softmax over the batch, not the classes
+    - **Where:** `torch.softmax(logits, dim=0)`
+    - **Issue:** `dim=0` normalizes each class across the rows in the batch. `conf` is not a per-row probability, so whether a row passes `MIN_CONFIDENCE` depends on the other rows in its batch.
+    - **Fix:** normalize over the class dimension.
+
+    ```python
+    probs = torch.softmax(logits, dim=-1)
+    ```
+
+    #### [Medium] Autograd graph built for every batch
+    - **Where:** the classifier loop
+    - **Issue:** `model.eval()` doesn't turn off gradient tracking. Every forward pass records a graph that is never used.
+    - **Fix:** wrap the loop in `torch.inference_mode()`.
+
+    ```python
+    with torch.inference_mode():
+        for i in range(0, len(unmapped), BATCH):
+            chunk = unmapped[i:i + BATCH]
+            logits = model(hash_features([r["title"] for r in chunk]))
+            probs = torch.softmax(logits, dim=-1)
+            conf, idx = probs.max(dim=1)
+            for row, c, k in zip(chunk, conf.tolist(), idx.tolist()):
+                row["taxonomy_id"] = LABELS[k] if c >= MIN_CONFIDENCE else None
+                row["category_source"] = "model"
+                out.append(row)
+    ```
+
+    - **Impact:** E and M on every classified row. In Green Metrics Tool micro-benchmarks with 100,000 CPU inferences, `no_grad()` used about 14% less CPU energy.
+
+    #### [Low] Exceptions as the normal path for half the rows
+    - **Where:** `try/except KeyError` in the mapping loop
+    - **Issue:** with about half the keys missing, half the rows raise and catch an exception. Raising is what costs here.
+    - **Fix:** check membership instead of catching. Same routing as before: rows with no `raw_category` still go to the classifier.
+
+    ```python
+    for row in rows:
+        key = row.get("raw_category", "").strip().lower()
+        if key not in CATEGORY_MAP:
+            unmapped.append(row)
+            continue
+        row["taxonomy_id"] = CATEGORY_MAP[key]
+        row["category_source"] = "map"
+        out.append(row)
+    ```
+
+    - **Impact:** E, but small. In Green Metrics Tool micro-benchmarks with 10,000,000 lookups and about half the keys missing, `dict.get` used about 12% less CPU energy than `try/except KeyError`, and an `in` check performed the same as `get`. This loop costs little next to the model.
+
+    **Already good:** batched inference, and the model is loaded once and set to `eval()`.
+verify:
+  static_only: needs torch, a TorchScript model file and the internal feeds.text module

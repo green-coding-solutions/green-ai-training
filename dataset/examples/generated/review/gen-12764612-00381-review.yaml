@@ -1,0 +1,78 @@
+id: gen-12764612-00381-review
+category: review
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    fix this, md step is way too slow
+
+    ```python
+    import numpy as np
+
+    def lj_energy(pos, box, r_cut=2.5, eps=1.0, sigma=1.0):
+        n = len(pos)
+        rc2 = r_cut * r_cut
+        e = 0.0
+        for i in range(n - 1):
+            for j in range(i + 1, n):
+                d = pos[i] - pos[j]
+                d -= box * np.round(d / box)
+                r2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
+                if r2 < rc2:
+                    s6 = (sigma * sigma / r2) ** 3
+                    e += 4.0 * eps * (s6 * s6 - s6)
+        return e
+
+    def run(pos, vel, box, steps, dt=0.002):
+        energies = []
+        for _ in range(steps):
+            pos = (pos + vel * dt) % box
+            energies.append(lj_energy(pos, box))
+        return energies
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (scientific computing, numeric hot loop)
+
+    #### [High] Pure Python pair loop runs on every step
+    - **Where:** `lj_energy`, the nested `i`/`j` loop
+    - **Issue:** for N particles this is N(N-1)/2 pairs per step, and each pair runs in the interpreter. It also builds small temporary numpy arrays (`pos[i] - pos[j]`, `np.round(...)`) for every pair, which costs more than the arithmetic itself. This is a CPU-bound numeric loop, which is where a JIT compiler pays off. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples in a pure Python loop used ~40 J of CPU energy, and the same loop with Numba `@njit` ~9.5 J, about 4× less. That is a different loop, so treat it as the direction, not a forecast for yours.
+    - **Fix:** compile the function and use scalars instead of per-pair arrays:
+      ```python
+      import numpy as np
+      from numba import njit
+
+      @njit(cache=True)
+      def lj_energy(pos, box, r_cut=2.5, eps=1.0, sigma=1.0):
+          n = pos.shape[0]
+          rc2 = r_cut * r_cut
+          s2 = sigma * sigma
+          e = 0.0
+          for i in range(n - 1):
+              for j in range(i + 1, n):
+                  dx = pos[i, 0] - pos[j, 0]
+                  dy = pos[i, 1] - pos[j, 1]
+                  dz = pos[i, 2] - pos[j, 2]
+                  dx -= box * np.rint(dx / box)
+                  dy -= box * np.rint(dy / box)
+                  dz -= box * np.rint(dz / box)
+                  r2 = dx * dx + dy * dy + dz * dz
+                  if r2 < rc2:
+                      s6 = (s2 / r2) ** 3
+                      e += 4.0 * eps * (s6 * s6 - s6)
+          return e
+      ```
+      `run` stays as it is. Pass `pos` as a float64 numpy array. Other dtypes trigger another compile.
+    - **Impact:** E on the CPU, per step and per pair. The gain grows with N and with the number of steps.
+
+    #### [Low] Compile cost on the first call
+    - **Where:** first call of `lj_energy`
+    - **Issue:** Numba compiles on first use. `cache=True` stores the result on disk, so later runs skip it. For a tiny system or a handful of steps, the compile time can exceed the saving, and then plain Python is fine.
+
+    **Already good:** the cutoff is compared as a squared distance, so there is no `sqrt` per pair. Only each pair is visited once (`j > i`).
+verify:
+  static_only: needs numba, which is not in the stdlib + numpy test environment

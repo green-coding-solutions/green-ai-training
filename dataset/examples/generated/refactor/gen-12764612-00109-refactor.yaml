@@ -1,0 +1,92 @@
+id: gen-12764612-00109-refactor
+category: refactor
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    diff only pls. preview values for the landing page chart, one env per PR
+
+    ```yaml
+    # values-preview.yaml
+    nameOverride: landing-preview
+
+    app:
+      image: registry.example.com/marketing/landing
+      tag: ""            # set by CI
+      replicas: 3
+      resources:
+        requests: {cpu: 250m, memory: 256Mi}
+        limits: {cpu: "1", memory: 512Mi}
+      env:
+        NEWSLETTER_API: https://newsletter.example.com/v2
+        FEATURE_HERO_VIDEO: "true"
+
+    ingress:
+      enabled: true
+      className: nginx
+      host: ""           # set by CI, pr-<n>.preview.example.com
+
+    postgres:
+      enabled: true
+      persistence:
+        size: 10Gi
+
+    redis:
+      enabled: true
+
+    worker:
+      enabled: true
+      replicas: 1
+      pollIntervalSeconds: 5
+
+    cleanup:
+      ttlHours: 0        # 0 = keep until deleted by hand
+    ```
+- role: assistant
+  content: |
+    ```yaml
+    # values-preview.yaml
+    nameOverride: landing-preview
+
+    app:
+      image: registry.example.com/marketing/landing
+      tag: ""            # set by CI
+      replicas: 1
+      resources:
+        requests: {cpu: 250m, memory: 256Mi}
+        limits: {cpu: "1", memory: 512Mi}
+      env:
+        NEWSLETTER_API: https://newsletter.example.com/v2
+        FEATURE_HERO_VIDEO: "true"
+
+    ingress:
+      enabled: true
+      className: nginx
+      host: ""           # set by CI, pr-<n>.preview.example.com
+
+    postgres:
+      enabled: true
+      persistence:
+        size: 10Gi
+
+    redis:
+      enabled: false
+
+    worker:
+      enabled: false
+
+    cleanup:
+      ttlHours: 48
+    ```
+
+    **Green Notes**
+    - **Fewer services per preview** (reduces E, M): `app.replicas` 3 → 1, `redis.enabled` and `worker.enabled` set to `false`. A preview serves a few reviewers, so it doesn't need redundancy. In Green Metrics Tool micro-benchmarks, a 60-second idle preview with 3 app replicas, Postgres, Redis and a polling worker used ~269 J CPU energy. With 1 replica and Postgres it used ~262 J, about 3% less. Idle services cost little per minute, so the CPU saving alone is small. The gain is mostly the memory and node capacity you no longer reserve.
+    - **Auto-expiry** (reduces E, M): `cleanup.ttlHours` 0 → 48. The bigger saving is environments that no longer exist. A preview that is deleted after two days, or on merge, removes all its remaining hours. Machine energy in the same benchmark differed by less than 1%, because the idle machine baseline dominates. Hours matter more than service count.
+
+    Check before merging: if the app reads sessions or cache from Redis and has no fallback, keep `redis.enabled: true`. If the worker sends the newsletter confirmations you want to review, keep it, but raise `pollIntervalSeconds`. I left Postgres on, because the signup form needs it.
+verify:
+  static_only: Helm values file for a chart that is not available here

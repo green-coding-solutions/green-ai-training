@@ -1,0 +1,160 @@
+id: gen-2-00062-refactor
+category: refactor
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    SUPPORTED = ("en", "en-GB", "de", "de-AT", "fr", "nl")
+    DEFAULT_LOCALE = "en"
+
+
+    def parse_accept_language(header):
+        entries = []
+        for i, part in enumerate(header.split(",")):
+            part = part.strip()
+            if not part:
+                continue
+            lang, _, params = part.partition(";")
+            q = 1.0
+            params = params.strip()
+            if params.startswith("q="):
+                try:
+                    q = float(params[2:])
+                except ValueError:
+                    q = 0.0
+            entries.append((-q, i, lang.strip()))
+        entries.sort()
+        return [lang for neg_q, _, lang in entries if neg_q < 0]
+
+
+    def negotiate_locale(header):
+        if not header:
+            return DEFAULT_LOCALE
+        lowered = {s.lower(): s for s in SUPPORTED}
+        for lang in parse_accept_language(header):
+            lang = lang.lower()
+            if lang in lowered:
+                return lowered[lang]
+            base = lang.split("-")[0]
+            if base in lowered:
+                return lowered[base]
+            if lang == "*":
+                return DEFAULT_LOCALE
+        return DEFAULT_LOCALE
+
+
+    class LocaleMiddleware:
+        def __init__(self, app):
+            self.app = app
+
+        def __call__(self, environ, start_response):
+            environ["app.locale"] = negotiate_locale(environ.get("HTTP_ACCEPT_LANGUAGE", ""))
+            return self.app(environ, start_response)
+    ```
+- role: assistant
+  content: |
+    ```python
+    from functools import lru_cache
+
+    SUPPORTED = ("en", "en-GB", "de", "de-AT", "fr", "nl")
+    DEFAULT_LOCALE = "en"
+
+
+    def parse_accept_language(header):
+        entries = []
+        for i, part in enumerate(header.split(",")):
+            part = part.strip()
+            if not part:
+                continue
+            lang, _, params = part.partition(";")
+            q = 1.0
+            params = params.strip()
+            if params.startswith("q="):
+                try:
+                    q = float(params[2:])
+                except ValueError:
+                    q = 0.0
+            entries.append((-q, i, lang.strip()))
+        entries.sort()
+        return [lang for neg_q, _, lang in entries if neg_q < 0]
+
+
+    @lru_cache(maxsize=1024)
+    def negotiate_locale(header):
+        if not header:
+            return DEFAULT_LOCALE
+        lowered = {s.lower(): s for s in SUPPORTED}
+        for lang in parse_accept_language(header):
+            lang = lang.lower()
+            if lang in lowered:
+                return lowered[lang]
+            base = lang.split("-")[0]
+            if base in lowered:
+                return lowered[base]
+            if lang == "*":
+                return DEFAULT_LOCALE
+        return DEFAULT_LOCALE
+
+
+    class LocaleMiddleware:
+        def __init__(self, app):
+            self.app = app
+
+        def __call__(self, environ, start_response):
+            environ["app.locale"] = negotiate_locale(environ.get("HTTP_ACCEPT_LANGUAGE", ""))
+            return self.app(environ, start_response)
+    ```
+
+    **Green Notes**
+    - **Memoize repeated pure computations** (reduces E): `negotiate_locale` runs on every request and its result depends only on the header string. Real traffic sends only a small number of different `Accept-Language` values, so most requests now do one dict lookup. They no longer split, parse, sort and match the header. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations drawn from only 200 distinct inputs used about 9× less CPU energy with `lru_cache` (~43 J vs ~4.7 J). With mostly unique inputs the cache only adds overhead. Check your real hit rate with `negotiate_locale.cache_info()`.
+    - **Bounded cache**: clients control this header, so `maxsize=1024` keeps memory flat even if someone sends random values. An unbounded cache could be filled up on purpose.
+    - Behavior is unchanged. The function is pure and returns an immutable `str`, so it is safe to share a cached result between requests. If you ever change `SUPPORTED` at runtime, call `negotiate_locale.cache_clear()`.
+verify:
+  equivalence:
+    driver: |
+      headers = [
+          "",
+          "de-DE,de;q=0.9,en;q=0.8",
+          "fr-CH, fr;q=0.9, en;q=0.8, de;q=0.7, *;q=0.5",
+          "en-GB",
+          "EN-gb,en;q=0.5",
+          "es-ES,es;q=0.9",
+          "es,*;q=0.1",
+          "nl;q=0, de;q=0.3",
+          "pt-BR;q=abc, de-AT;q=0.2",
+          ",,de-at",
+          "it;q=0.8, fr;q=0.8",
+          "de-CH",
+      ]
+      for h in headers:
+          print(repr(h), negotiate_locale(h))
+      for h in headers:
+          print(negotiate_locale(h))
+      seen = {}
+      def app(environ, start_response):
+          seen["locale"] = environ["app.locale"]
+          return [b"ok"]
+      mw = LocaleMiddleware(app)
+      for h in headers[:5]:
+          print(mw({"HTTP_ACCEPT_LANGUAGE": h}, None), seen["locale"])
+      mw({}, None)
+      print(seen["locale"])
+  benchmark:
+    driver: |
+      headers = [
+          "de-DE,de;q=0.9,en;q=0.8",
+          "en-US,en;q=0.9",
+          "fr-CH, fr;q=0.9, en;q=0.8, de;q=0.7, *;q=0.5",
+          "nl-NL,nl;q=0.9,en-US;q=0.8,en;q=0.7",
+      ] * 50
+      for _ in range(500):
+          for h in headers:
+              negotiate_locale(h)
+    min_speedup: 3

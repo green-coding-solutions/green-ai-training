@@ -1,0 +1,112 @@
+id: gen-2-00427-review
+category: review
+language: javascript
+patterns:
+- dom-size
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    hi, I make a page for our CI dashboard that show all pipeline runs of the last year. we have around 6000 runs now. the page is slow to open and the fan of my laptop is going. I dont know what is wrong. can you look at my code?
+
+    ```javascript
+    async function loadRuns() {
+      const res = await fetch('/api/pipeline-runs?since=365d');
+      const runs = await res.json();
+
+      const body = document.querySelector('#runs tbody');
+      document.getElementById('count').innerText = runs.length + ' runs';
+
+      runs.forEach(function (run) {
+        const tr = document.createElement('tr');
+        tr.className = run.status;
+        tr.innerHTML =
+          '<td><div class="cell"><span>' + run.id + '</span></div></td>' +
+          '<td><div class="cell"><span>' + run.branch + '</span></div></td>' +
+          '<td><div class="cell"><span>' + run.commit_message + '</span></div></td>' +
+          '<td><div class="cell"><span>' + run.status + '</span></div></td>' +
+          '<td><div class="cell"><span>' + run.duration_s + 's</span></div></td>' +
+          '<td><div class="cell"><span>' + run.started_at + '</span></div></td>';
+        body.appendChild(tr);
+      });
+    }
+
+    loadRuns();
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (internal dashboard, client-side rendering)
+
+    #### [Security] Commit messages are inserted as HTML
+    - **Where:** `tr.innerHTML = ...` with `run.commit_message` and `run.branch`
+    - **Issue:** commit messages and branch names come from developers or contributors. If one contains `<img src=x onerror=...>`, it runs in the dashboard page. A message with `<` in it also breaks the layout.
+    - **Fix:** set cell text with `textContent`. This is also in the code below.
+
+    #### [High] 6000 rows, all in the DOM, with wrapper elements
+    - **Where:** the `runs.forEach` loop
+    - **Issue:** every row creates a `<tr>`, 6 `<td>`, 6 `<div>` and 6 `<span>` elements. That is about 19 elements per row, over 100,000 elements for the page. The `div` and `span` wrappers add nothing the `td` can't do. Rows are also appended to the live table one by one, and the browser may redo layout work along the way. Nobody reads 6000 rows, so most of this work is never seen.
+    - **Fix:** show 100 runs per page, use plain `<td>` cells, and build each page in a `DocumentFragment`:
+
+    ```javascript
+    const PAGE_SIZE = 100;
+    let runs = [];
+    let page = 0;
+
+    function renderPage() {
+      const body = document.querySelector('#runs tbody');
+      const fragment = document.createDocumentFragment();
+      const start = page * PAGE_SIZE;
+
+      for (const run of runs.slice(start, start + PAGE_SIZE)) {
+        const tr = document.createElement('tr');
+        tr.className = run.status;
+        const values = [
+          run.id,
+          run.branch,
+          run.commit_message,
+          run.status,
+          run.duration_s + 's',
+          run.started_at,
+        ];
+        for (const value of values) {
+          const td = document.createElement('td');
+          td.textContent = value;
+          tr.appendChild(td);
+        }
+        fragment.appendChild(tr);
+      }
+
+      body.replaceChildren(fragment);
+
+      const pages = Math.max(1, Math.ceil(runs.length / PAGE_SIZE));
+      document.getElementById('page-info').textContent = 'Page ' + (page + 1) + ' of ' + pages;
+      document.getElementById('prev').disabled = page === 0;
+      document.getElementById('next').disabled = page >= pages - 1;
+    }
+
+    async function loadRuns() {
+      const res = await fetch('/api/pipeline-runs?since=365d');
+      runs = await res.json();
+      document.getElementById('count').textContent = runs.length + ' runs';
+      renderPage();
+    }
+
+    document.getElementById('prev').addEventListener('click', function () {
+      page--;
+      renderPage();
+    });
+    document.getElementById('next').addEventListener('click', function () {
+      page++;
+      renderPage();
+    });
+
+    loadRuns();
+    ```
+
+    You need two buttons with the ids `prev` and `next` and a `<span id="page-info">` in your HTML.
+    - **Impact:** reduces client E on every page open: the browser builds about 700 elements instead of over 100,000. In Green Metrics Tool micro-benchmarks, a table of 10,000 rows with 14 elements per row, appended one by one, used ~1036 J over 30 page loads. The same data paginated to 100 rows as a plain table built in a `DocumentFragment` used ~457 J, about 56% less. Your table is smaller, so measure your own page before you quote a number.
+
+    **Already good:** you fetch the data once and don't re-request it per page. Switching pages is instant.
+verify:
+  static_only: needs a browser DOM (document, fetch) and an API endpoint

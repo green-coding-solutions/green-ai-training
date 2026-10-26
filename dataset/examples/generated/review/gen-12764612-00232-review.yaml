@@ -1,0 +1,105 @@
+id: gen-12764612-00232-review
+category: review
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    Review this, diff only please. `scrub` is a small CLI we run over exported text dumps. The rules file is a TSV of `pattern<TAB>replacement`, currently ~900 rules, applied to every line of every input file.
+
+    ```python
+    #!/usr/bin/env python3
+    """scrub: apply rewrite rules to text files, print result to stdout."""
+    import re
+    import sys
+
+
+    def load_rules(path):
+        rules = []
+        with open(path, encoding="utf-8") as fh:
+            for raw in fh:
+                raw = raw.rstrip("\n")
+                if not raw or raw.startswith("#"):
+                    continue
+                pattern, repl = raw.split("\t", 1)
+                rules.append((pattern, repl))
+        return rules
+
+
+    def scrub_line(line, rules):
+        for pattern, repl in rules:
+            line = re.sub(pattern, repl, line, re.I)
+        return line
+
+
+    def main(argv):
+        if len(argv) < 3:
+            print("usage: scrub RULES FILE...", file=sys.stderr)
+            return 2
+        rules = load_rules(argv[1])
+        for path in argv[2:]:
+            with open(path, encoding="utf-8") as src:
+                for line in src:
+                    sys.stdout.write(scrub_line(line, rules))
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main(sys.argv))
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (CLI over large text dumps)
+
+    #### [Bug] `re.I` is passed as `count`
+    - **Where:** `re.sub(pattern, repl, line, re.I)` in `scrub_line`
+    - **Issue:** the fourth positional argument of `re.sub` is `count`, not `flags`. `re.I` equals 2, so each rule replaces at most two matches per line and is still case-sensitive. The ignore-case intent never worked.
+    - **Fix:** pass the flag when compiling the rule (see the diff below).
+    - **Impact:** correctness. Output changes: rules now match case-insensitively and replace every match on a line. If you wanted case-sensitive rules, drop `re.I` and the count limit is gone either way.
+
+    #### [High] ~900 distinct patterns go through the `re` module cache on every line
+    - **Where:** `scrub_line`, `load_rules`
+    - **Issue:** `re.sub(pattern, ...)` looks the pattern up in an internal cache that holds up to 512 compiled patterns. With more than 512 rules, each line cycles through all of them and evicts the entries it needs next, so rules get recompiled again and again. In Green Metrics Tool micro-benchmarks, a precompiled pattern used about 18% less CPU energy than inline `re.match` over 1,000,000 matches, where the cache works. Forcing a recompile on every call cost about 200× more per match. Your rule set is on the bad side of that line.
+    - **Fix:** compile once in `load_rules`, apply compiled patterns in the loop.
+      ```python
+      import re
+
+
+      def load_rules(path):
+          rules = []
+          with open(path, encoding="utf-8") as fh:
+              for raw in fh:
+                  raw = raw.rstrip("\n")
+                  if not raw or raw.startswith("#"):
+                      continue
+                  pattern, repl = raw.split("\t", 1)
+                  rules.append((re.compile(pattern, re.I), repl))
+          return rules
+
+
+      def scrub_line(line, rules):
+          for rx, repl in rules:
+              line = rx.sub(repl, line)
+          return line
+      ```
+    - **Impact:** E per line and per rule, on every run. Rules compile once per process. A malformed pattern in the rules file now fails at startup, not halfway through the output.
+
+    **Already good:** input is streamed line by line, files are closed with `with`, and the usage error goes to stderr with a non-zero exit code.
+verify:
+  module: true
+  green_block: 0
+  test: |-
+    import os
+    import tempfile
+
+    p = tempfile.NamedTemporaryFile("w", suffix=".tsv", delete=False, encoding="utf-8")
+    p.write("# comment\nfoo\tbar\n\\bcat\\b\tdog\n")
+    p.close()
+    rules = load_rules(p.name)
+    os.unlink(p.name)
+    assert len(rules) == 2
+    assert scrub_line("Foo foo FOO foo\n", rules) == "bar bar bar bar\n"
+    assert scrub_line("Cat and cat\n", rules) == "dog and dog\n"

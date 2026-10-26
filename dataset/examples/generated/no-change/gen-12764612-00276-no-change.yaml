@@ -1,0 +1,64 @@
+id: gen-12764612-00276-no-change
+category: no-change
+language: python
+patterns:
+- async-concurrent-io
+- context-tradeoff
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    hello, i make landing page for our app and the waitlist form send email to our flask backend. my friend tell me i must change to async httpx becuase it is more green and fast. is this true for my code? we get maybe 20 signups in a day
+
+    ```python
+    import os
+    import requests
+    from flask import Flask, request, jsonify
+
+    app = Flask(__name__)
+
+    API = "https://api.mailhub.example/v3"
+    HEADERS = {"Authorization": f"Bearer {os.environ['MAILHUB_KEY']}"}
+    LIST_ID = os.environ["MAILHUB_LIST"]
+
+
+    @app.post("/api/waitlist")
+    def waitlist():
+        data = request.get_json(silent=True) or {}
+        email = data.get("email", "").strip().lower()
+        if "@" not in email:
+            return jsonify(error="invalid email"), 400
+
+        r = requests.post(
+            f"{API}/contacts", json={"email": email}, headers=HEADERS, timeout=5
+        )
+        r.raise_for_status()
+        contact_id = r.json()["id"]
+
+        r = requests.post(
+            f"{API}/lists/{LIST_ID}/members",
+            json={"contact_id": contact_id},
+            headers=HEADERS,
+            timeout=5,
+        )
+        r.raise_for_status()
+        return jsonify(ok=True), 201
+    ```
+- role: assistant
+  content: |
+    No, keep it as it is. Async would not help here, for two reasons.
+
+    - **The two calls depend on each other.** The second request needs the `contact_id` from the first response. Async saves time by overlapping waits that are independent, so these two cannot overlap.
+    - **The load is tiny.** About 20 signups a day means about 40 short requests a day. Even for independent calls the gain is small. In Green Metrics Tool micro-benchmarks with 10 independent HTTP requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. Most of that gain is shorter waiting, not less work.
+
+    Switching would also cost you more than it saves. Flask is a sync framework, so you would need an async-capable setup, a new dependency, and more code to maintain.
+
+    Your code is already good for this job:
+    - input is checked before any network call,
+    - both calls have a timeout,
+    - `raise_for_status()` stops on a failed call instead of going on silently.
+
+    If the signup page ever gets a lot of traffic, measure it first with a load test and `time` or `perf stat` before you change the design.
+verify:
+  static_only: needs Flask, requests and a live external API

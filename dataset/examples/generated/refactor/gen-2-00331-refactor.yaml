@@ -1,0 +1,130 @@
+id: gen-2-00331-refactor
+category: refactor
+language: sql
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    Hi, we have a nightly job that sync customers from our CRM into the warehouse (Postgres 16). The CRM give us a CSV with ~80 000 rows every night, we can not change that format. Our loader read the CSV and call the procedure below once for every line. It take around 25 min now and it get slower every month. Can you refactor it please? The audit table must still get one 'I' or 'U' row for every change, the BI team use it.
+
+    ```sql
+    CREATE OR REPLACE PROCEDURE etl.load_customer(
+        p_id       bigint,
+        p_email    text,
+        p_name     text,
+        p_country  text,
+        p_updated  timestamptz
+    )
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+        IF EXISTS (SELECT 1 FROM dwh.dim_customer WHERE customer_id = p_id) THEN
+            UPDATE dwh.dim_customer
+               SET email             = lower(p_email),
+                   full_name         = p_name,
+                   country           = upper(p_country),
+                   source_updated_at = p_updated,
+                   loaded_at         = now()
+             WHERE customer_id = p_id
+               AND source_updated_at < p_updated;
+
+            IF FOUND THEN
+                INSERT INTO dwh.customer_audit (customer_id, action, loaded_at)
+                VALUES (p_id, 'U', now());
+            END IF;
+        ELSE
+            INSERT INTO dwh.dim_customer
+                (customer_id, email, full_name, country, source_updated_at, loaded_at)
+            VALUES
+                (p_id, lower(p_email), p_name, upper(p_country), p_updated, now());
+
+            INSERT INTO dwh.customer_audit (customer_id, action, loaded_at)
+            VALUES (p_id, 'I', now());
+        END IF;
+
+        COMMIT;
+    END;
+    $$;
+
+    -- loader does for each csv line:
+    -- CALL etl.load_customer($1, $2, $3, $4, $5);
+    ```
+- role: assistant
+  content: |
+    Load the whole CSV into a staging table with one `COPY`, then merge it with one set-based statement.
+
+    ```sql
+    -- once
+    CREATE TABLE IF NOT EXISTS etl.stg_customer (
+        customer_id        bigint,
+        email              text,
+        full_name          text,
+        country            text,
+        source_updated_at  timestamptz
+    );
+
+    CREATE OR REPLACE PROCEDURE etl.merge_customers()
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+        WITH src AS (
+            -- one row per customer: the newest version in the file
+            SELECT DISTINCT ON (s.customer_id)
+                   s.customer_id,
+                   lower(s.email)              AS email,
+                   s.full_name,
+                   upper(s.country)            AS country,
+                   s.source_updated_at,
+                   (d.customer_id IS NOT NULL) AS existed
+              FROM etl.stg_customer s
+              LEFT JOIN dwh.dim_customer d ON d.customer_id = s.customer_id
+             ORDER BY s.customer_id, s.source_updated_at DESC NULLS LAST
+        ),
+        upserted AS (
+            INSERT INTO dwh.dim_customer AS d
+                   (customer_id, email, full_name, country, source_updated_at, loaded_at)
+            SELECT customer_id, email, full_name, country, source_updated_at, now()
+              FROM src
+            ON CONFLICT (customer_id) DO UPDATE
+               SET email             = EXCLUDED.email,
+                   full_name         = EXCLUDED.full_name,
+                   country           = EXCLUDED.country,
+                   source_updated_at = EXCLUDED.source_updated_at,
+                   loaded_at         = EXCLUDED.loaded_at
+             WHERE d.source_updated_at < EXCLUDED.source_updated_at
+            RETURNING d.customer_id
+        )
+        INSERT INTO dwh.customer_audit (customer_id, action, loaded_at)
+        SELECT u.customer_id,
+               CASE WHEN s.existed THEN 'U' ELSE 'I' END,
+               now()
+          FROM upserted u
+          JOIN src s ON s.customer_id = u.customer_id;
+    END;
+    $$;
+    ```
+
+    Nightly job, run with `psql -v ON_ERROR_STOP=1 -f nightly_customers.sql`:
+
+    ```sql
+    TRUNCATE etl.stg_customer;
+    \copy etl.stg_customer (customer_id, email, full_name, country, source_updated_at) FROM 'crm_customers.csv' WITH (FORMAT csv, HEADER true)
+    CALL etl.merge_customers();
+    ```
+
+    Adjust the column list in `\copy` to the column order of the CRM file. `ON CONFLICT (customer_id)` needs a primary key or unique index on `dim_customer.customer_id`. When the new job runs fine, you can drop `etl.load_customer`.
+
+    **Green Notes**
+    - **One `COPY` instead of one `CALL` per row** (reduces E): about 80,000 statements and round trips become one data stream. In Green Metrics Tool micro-benchmarks on PostgreSQL 16 (500,000 rows in batches of 5,000), `COPY` used about 22× less CPU energy than one `execute()` per row. That benchmark committed once per batch. Your old job commits after every row, so it pays even more per-row overhead.
+    - **Set-based upsert, one commit** (reduces E): one `INSERT ... ON CONFLICT` replaces 80,000 `EXISTS` checks, single-row writes and commits. The audit rows are written in the same statement, still one `'I'` or `'U'` per real change.
+    - **Behavior differences:**
+      - The run is now all-or-nothing. One bad row (for example a country code that is too long) rolls back the whole night. Before, the rows up to the error were already committed.
+      - `loaded_at` is the same timestamp for all rows of a run.
+      - If the file has the same customer twice, the newest `source_updated_at` wins, as before. On an exact timestamp tie, the old job kept the first line. Now the choice between them is undefined.
+verify:
+  static_only: 'PostgreSQL-specific: PL/pgSQL procedure, ON CONFLICT with data-modifying CTEs and psql \copy, not runnable
+    in SQLite'

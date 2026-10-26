@@ -1,0 +1,85 @@
+id: gen-2-00060-refactor
+category: refactor
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    Hourly archiver on one of our shop API boxes. CPU spikes every top of the hour while it runs. Make it cheaper. Diff only please.
+
+    ```bash
+    #!/usr/bin/env bash
+    # archive-order-events.sh — hourly via cron on shop-api-02
+    set -euo pipefail
+
+    EVENT_DIR=/var/log/shop/order-events
+    ARCHIVE_DIR=/mnt/archive/order-events
+    MEDIA_SRC=/srv/shop/media/products
+    MEDIA_DST=/mnt/archive/media
+    RETENTION_DAYS=90
+    HOUR=$(date +%Y%m%d%H)
+
+    mkdir -p "$ARCHIVE_DIR/$(date +%Y/%m)" "$MEDIA_DST"
+
+    # rotated event logs (order.created, payment.captured, ...), JSONL, ~150-300 MB per hour
+    for f in "$EVENT_DIR"/events-*.jsonl.1; do
+      [ -e "$f" ] || continue
+      base=$(basename "$f" .jsonl.1)
+      mv "$f" "$ARCHIVE_DIR/$(date +%Y/%m)/${base}-${HOUR}.jsonl"
+      bzip2 -9 "$ARCHIVE_DIR/$(date +%Y/%m)/${base}-${HOUR}.jsonl"
+    done
+
+    # product photos uploaded in the last hour
+    find "$MEDIA_SRC" -type f -name '*.jpg' -mmin -60 -print0 \
+      | tar --null -T - -cJf "$MEDIA_DST/products-${HOUR}.tar.xz"
+
+    find "$ARCHIVE_DIR" -name '*.jsonl.bz2' -mtime +"$RETENTION_DAYS" -delete
+    find "$MEDIA_DST" -name 'products-*.tar.xz' -mtime +"$RETENTION_DAYS" -delete
+
+    logger -t archive-order-events "archived hour $HOUR"
+    ```
+- role: assistant
+  content: |
+    ```text
+    --- a/archive-order-events.sh
+    +++ b/archive-order-events.sh
+    @@ -9,12 +9,13 @@
+     RETENTION_DAYS=90
+     HOUR=$(date +%Y%m%d%H)
+    +MONTH_DIR="$ARCHIVE_DIR/${HOUR:0:4}/${HOUR:4:2}"
+
+    -mkdir -p "$ARCHIVE_DIR/$(date +%Y/%m)" "$MEDIA_DST"
+    +mkdir -p "$MONTH_DIR" "$MEDIA_DST"
+
+     # rotated event logs (order.created, payment.captured, ...), JSONL, ~150-300 MB per hour
+     for f in "$EVENT_DIR"/events-*.jsonl.1; do
+       [ -e "$f" ] || continue
+       base=$(basename "$f" .jsonl.1)
+    -  mv "$f" "$ARCHIVE_DIR/$(date +%Y/%m)/${base}-${HOUR}.jsonl"
+    -  bzip2 -9 "$ARCHIVE_DIR/$(date +%Y/%m)/${base}-${HOUR}.jsonl"
+    +  mv "$f" "$MONTH_DIR/${base}-${HOUR}.jsonl"
+    +  zstd -q --rm "$MONTH_DIR/${base}-${HOUR}.jsonl"
+     done
+
+    @@ -22,6 +23,6 @@
+     # product photos uploaded in the last hour
+     find "$MEDIA_SRC" -type f -name '*.jpg' -mmin -60 -print0 \
+    -  | tar --null -T - -cJf "$MEDIA_DST/products-${HOUR}.tar.xz"
+    +  | tar --null -T - -cf "$MEDIA_DST/products-${HOUR}.tar"
+
+    -find "$ARCHIVE_DIR" -name '*.jsonl.bz2' -mtime +"$RETENTION_DAYS" -delete
+    -find "$MEDIA_DST" -name 'products-*.tar.xz' -mtime +"$RETENTION_DAYS" -delete
+    +find "$ARCHIVE_DIR" \( -name '*.jsonl.zst' -o -name '*.jsonl.bz2' \) -mtime +"$RETENTION_DAYS" -delete
+    +find "$MEDIA_DST" -name 'products-*.tar*' -mtime +"$RETENTION_DAYS" -delete
+    ```
+
+    **Green Notes**
+    - **zstd instead of `bzip2 -9` for the hourly event logs** (reduces E): this text is compressed every hour, so the codec cost repeats all the time. In Green Metrics Tool benchmarks on 100 MB of English text, bzip2 used ~106 J to compress and zstd ~16 J. Decompressing cost ~52 J with bzip2 and ~5.3 J with zstd. Those benchmarks compare energy, not ratio. zstd files at the default level can be somewhat larger than `bzip2 -9`. If disk space over the 90 days matters more, use a higher zstd level.
+    - **No xz on JPEGs** (reduces E): the photos are already compressed, so `-J` burned CPU for almost no size gain. A plain `.tar` keeps the same content.
+    - **Bug fixed:** the month directory came from separate `date` calls. A run that crossed a month boundary could `mkdir` one month and `mv` into the next, and `set -e` would abort. It is now derived from `$HOUR`.
+    - **Behavior changes:** new archives end in `.jsonl.zst` and `.tar`, so readers that use `bzcat` or `tar -xJ` need `zstdcat` or `tar -x`. Cleanup matches both old and new suffixes until the old `.bz2`/`.tar.xz` files expire. The `zstd` package must be installed on the box. `--rm` removes the source only after it compresses successfully, the same as bzip2 did.
+verify:
+  static_only: bash diff that needs zstd, tar and the archive mounts; not runnable in the sandbox

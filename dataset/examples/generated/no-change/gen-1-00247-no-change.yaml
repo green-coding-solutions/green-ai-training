@@ -1,0 +1,65 @@
+id: gen-1-00247-no-change
+category: no-change
+language: javascript
+patterns:
+- css-animations
+- context-tradeoff
+facts:
+- F-ANIM
+messages:
+- role: user
+  content: |
+    Runner load graph on our CI admin page. Anything to change here to make it cheaper, e.g. move it to CSS animation? Diff only please.
+
+    ```js
+    const canvas = document.querySelector('#runner-load');
+    const ctx = canvas.getContext('2d');
+    const samples = new Array(120).fill(0);
+    let pending = false;
+
+    function schedule() {
+      if (pending || document.hidden) return;
+      pending = true;
+      requestAnimationFrame(draw);
+    }
+
+    function draw() {
+      pending = false;
+      const { width, height } = canvas;
+      ctx.clearRect(0, 0, width, height);
+      ctx.beginPath();
+      samples.forEach((cpu, i) => {
+        const x = (i / (samples.length - 1)) * width;
+        const y = height - (cpu / 100) * height;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.strokeStyle = '#2b8a3e';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
+    const source = new EventSource('/api/runners/load/stream');
+    source.onmessage = (e) => {
+      samples.push(JSON.parse(e.data).cpu);
+      samples.shift();
+      schedule();
+    };
+
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) schedule();
+    });
+    ```
+- role: assistant
+  content: |
+    No diff. This code is already efficient, and CSS would not fit it.
+
+    - **It is not a loop.** `requestAnimationFrame` runs once per incoming sample, not 60 times a second. The `pending` flag also merges bursts into one draw.
+    - **It stops when hidden.** No frames are drawn in a background tab, and one redraw happens when the tab returns.
+    - **The data drives the picture.** The line shape comes from live CPU values. CSS `@keyframes` can only animate fixed, known-ahead motion, so it cannot draw this.
+
+    The CSS-over-JS pattern is for decorative, fixed animations such as pulses, spinners and glows. In Green Metrics Tool micro-benchmarks, a 20-second `requestAnimationFrame` style animation used about 10% more CPU energy than the same animation in CSS `@keyframes`. Your graph is not that case.
+
+    If you want to cut more, lower the server's sample rate. Fewer samples mean fewer redraws.
+verify:
+  static_only: needs a browser DOM, canvas and EventSource

@@ -1,0 +1,139 @@
+id: gen-2-00250-review
+category: review
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    ?
+
+    ```yaml
+    apiVersion: argoproj.io/v1alpha1
+    kind: ApplicationSet
+    metadata:
+      name: etl-pr-envs
+      namespace: argocd
+    spec:
+      generators:
+        - pullRequest:
+            github:
+              owner: northwind-data
+              repo: etl-pipelines
+              tokenRef:
+                secretName: github-token
+                key: token
+            requeueAfterSeconds: 300
+      syncPolicy:
+        preserveResourcesOnDeletion: true
+      template:
+        metadata:
+          name: 'etl-pr-{{number}}'
+        spec:
+          project: data-platform
+          source:
+            repoURL: https://airflow.apache.org
+            chart: airflow
+            targetRevision: 1.15.0
+            helm:
+              valuesObject:
+                executor: CeleryExecutor
+                images:
+                  airflow:
+                    repository: ghcr.io/northwind-data/etl-airflow
+                    tag: '{{head_sha}}'
+                fernetKey: 'ZmDfcTF7_60GrrY167zsiPd67pEvs0aGOv2oasOM1Pg='
+                webserver:
+                  replicas: 2
+                  defaultUser:
+                    username: admin
+                    password: admin
+                scheduler:
+                  replicas: 2
+                workers:
+                  replicas: 3
+                triggerer:
+                  enabled: true
+                redis:
+                  enabled: true
+                flower:
+                  enabled: true
+                postgresql:
+                  enabled: true
+                ingress:
+                  web:
+                    enabled: true
+                    hosts:
+                      - name: '{{branch}}.etl-preview.northwind.dev'
+          destination:
+            server: https://kubernetes.default.svc
+            namespace: 'etl-pr-{{number}}'
+          syncPolicy:
+            automated:
+              prune: true
+              selfHeal: true
+            syncOptions:
+              - CreateNamespace=true
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (Airflow preview environment per pull request)
+
+    #### [Bug] Branch names with `/` break the ingress host
+    - **Where:** `ingress.web.hosts[0].name: '{{branch}}.etl-preview...'`
+    - **Issue:** a branch like `feature/orders-dedup` gives an invalid hostname. The Ingress fails validation and that environment never syncs.
+    - **Fix:** use the PR number, which you already use for the namespace:
+      ```yaml
+      - name: 'pr-{{number}}.etl-preview.northwind.dev'
+      ```
+
+    #### [Security] Fernet key and admin password in the repo, on a public ingress
+    - **Where:** `fernetKey`, `webserver.defaultUser`
+    - **Issue:** everyone with repo access has the key that encrypts Airflow connections and variables, and every environment uses the same one. Every preview UI is reachable with `admin` / `admin`.
+    - **Fix:** create the key per namespace as a Secret and reference it with `fernetKeySecretName`. Disable `defaultUser` or read the password from a Secret. Put the preview ingress behind SSO or an IP allowlist. Rotate the key that is now in git history.
+
+    #### [High] Environments are never torn down
+    - **Where:** `spec.syncPolicy.preserveResourcesOnDeletion: true`
+    - **Issue:** when a PR is merged or closed, the generator drops it and the Application is deleted, but this flag keeps all its resources. Every PR ever opened leaves a full Airflow stack running. That is why the cluster keeps growing.
+    - **Fix:** remove the flag so deleting the Application prunes its resources. Argo CD doesn't delete namespaces created by `CreateNamespace=true`, and the Postgres PVCs from the StatefulSet also stay behind. Add a small cleanup job that deletes `etl-pr-<n>` namespaces whose PR is closed, and delete the leftovers once by hand.
+    - **Impact:** E and M, ongoing. Every environment of a closed PR uses CPU, memory and disk around the clock with no user at all.
+
+    #### [Medium] Every PR gets an environment, including nights and weekends
+    - **Where:** `pullRequest.github` generator without a filter
+    - **Issue:** PRs that only touch docs or tests also get a full Airflow stack, and open PRs keep theirs running all night.
+    - **Fix:** create environments only for PRs that ask for one:
+      ```yaml
+      github:
+        owner: northwind-data
+        repo: etl-pipelines
+        labels: [preview]
+        tokenRef:
+          secretName: github-token
+          key: token
+      ```
+      When the `preview` label is removed, the environment goes away (once the flag above is gone). To scale to zero at night, note that `selfHeal: true` reverts a plain `kubectl scale`. You would need `ignoreDifferences` on `/spec/replicas` plus `RespectIgnoreDifferences=true`.
+    - **Impact:** E and M. It removes whole environment-hours, and that is where the saving is.
+
+    #### [Low] Full Celery stack for a preview
+    - **Where:** `executor: CeleryExecutor`, `workers.replicas: 3`, `redis`, `flower`, 2 webserver and 2 scheduler replicas
+    - **Issue:** a preview of DAG changes doesn't need Celery or HA replicas. In Green Metrics Tool measurements of a preview environment idling for 60 seconds, dropping from 3 app replicas, Postgres, Redis and a worker to 1 replica and Postgres used only about 3% less CPU energy, and machine energy differed by less than 1%. So the gain per minute is small. The real gain is fewer pod requests reserving memory and nodes.
+    - **Fix:**
+      ```yaml
+      executor: LocalExecutor
+      webserver:
+        replicas: 1
+      scheduler:
+        replicas: 1
+      redis:
+        enabled: false
+      flower:
+        enabled: false
+      ```
+      With `LocalExecutor`, tasks run inside the scheduler pod, so Celery queues and worker routing are not tested in previews. If a PR changes those, test it in staging.
+    - **Impact:** M (smaller footprint per environment), E small.
+
+    **Already good:** `prune: true` keeps each running environment in sync with its branch, and image tags come from `head_sha`, so previews run the exact commit.
+verify:
+  static_only: Argo CD ApplicationSet manifest, needs a Kubernetes cluster with Argo CD

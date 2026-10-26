@@ -1,0 +1,126 @@
+id: gen-12764612-00335-review
+category: review
+language: bash
+patterns:
+- bash-builtins
+- compress-transmitted
+facts:
+- F-BASH-SUBPROC
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    Can you review this script? It runs on our field gateway (small ARM box, Debian, cron every 2 minutes). Sensors write one line each to a spool file, the script makes a short summary for the local log and uploads the batch to our ingest API over a cellular link. Normally 3000-8000 lines per run.
+
+    Line format: `sensor_id,timestamp,temp_milli,battery_mv`
+
+    Requirements: no readings may get lost, the summary line must stay in the same format, and the upload should be as small as reasonably possible because the SIM plan is limited.
+
+    ```bash
+    #!/bin/bash
+    SPOOL=/var/spool/gw/readings.csv
+    BATCH=/tmp/gw_batch.csv
+    API_URL="https://ingest.example.com/v1/batch"
+    API_TOKEN="gw-4f9a1c7e22"
+
+    mv $SPOOL $BATCH
+
+    total=0
+    count=0
+    alerts=0
+    while read line; do
+        sensor=$(echo $line | cut -d, -f1)
+        temp=$(echo $line | cut -d, -f3)
+        batt=$(echo $line | cut -d, -f4)
+        total=$(expr $total + $temp)
+        count=$(expr $count + 1)
+        if [ $(expr $batt \< 3300) -eq 1 ]; then
+            alerts=$(expr $alerts + 1)
+            echo "LOW BATTERY: $sensor" >> /var/log/gw/alerts.log
+        fi
+    done < $BATCH
+
+    echo "readings=$count avg_temp_milli=$((total / count)) low_batt=$alerts" >> /var/log/gw/summary.log
+
+    xz -9e -k $BATCH
+    curl -s -H "Authorization: Bearer $API_TOKEN" -F "file=@$BATCH.xz" "$API_URL"
+    rm -f $BATCH $BATCH.xz
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (cron job on an embedded gateway)
+
+    #### [Bug] Readings are deleted even when the upload fails
+    - **Where:** `curl -s ...` followed by `rm -f $BATCH $BATCH.xz`
+    - **Issue:** `curl -s` hides errors and the script never checks the result. On a flaky cellular link the batch is removed anyway, so those readings are lost.
+    - **Fix:** use `curl -fsS`, and only delete the batch when it succeeded. On failure, keep the batch.
+
+    #### [Bug] Division by zero and missing-file errors
+    - **Where:** `mv $SPOOL $BATCH` and `$((total / count))`
+    - **Issue:** if the spool file does not exist or is empty, `mv` fails and `count` stays 0. The arithmetic then aborts with "division by 0", and the old `/tmp/gw_batch.csv` may get uploaded again.
+    - **Fix:** exit early when the spool is empty, and guard the average.
+
+    #### [Security] Token in the script and on the command line
+    - **Where:** `API_TOKEN="gw-4f9a1c7e22"` and `-H "Authorization: Bearer $API_TOKEN"`
+    - **Issue:** the token is in the script source, and it is visible in `ps` to every local user while curl runs.
+    - **Fix:** read it from a file with mode 600 and give it to curl through a config on stdin (see the code below).
+
+    #### [Security] Fixed file name in /tmp
+    - **Where:** `BATCH=/tmp/gw_batch.csv`
+    - **Issue:** a predictable name in a shared directory allows symlink tricks, and two overlapping runs would overwrite each other's batch.
+    - **Fix:** use `mktemp -d`, in the spool directory.
+
+    #### [High] Several processes started for every line
+    - **Where:** the `while read` loop (`$(echo | cut)` x3, `$(expr)` x3 per line)
+    - **Issue:** about 6-7 process starts per line, so 3000-8000 lines mean tens of thousands of forks every 2 minutes. Process starts dominate the cost of shell scripts. In Green Metrics Tool micro-benchmarks of a 20,000-line log summary, a loop with `$(echo | cut)` and `$(expr)` per field used ~1302 J, and the same loop with builtins only (`read -r` field splitting and `$(( ))`) used ~4.3 J, about 300× less. The unquoted `$line` also gets word-split and glob-expanded, and `read` without `-r` eats backslashes.
+    - **Fix:** split the fields with `IFS=, read -r` and use `$(( ))` for the math (code below).
+    - **Impact:** E on the gateway for every run, the biggest term in this script. The output is the same.
+
+    #### [High] Strongest xz level for data that is compressed every 2 minutes
+    - **Where:** `xz -9e -k $BATCH`
+    - **Issue:** the batch only lives until the upload is done, but it is compressed with one of the most expensive codecs, 720 times a day. In Green Metrics Tool micro-benchmarks compressing 100 MB of text, zstd with its default level used ~16 J and xz (default level 6) ~458 J, about 29× more. `-9e` costs even more than that measured default.
+    - **Fix:** use `zstd` at a moderate level. Check that the ingest side accepts `.zst` (decompression is cheap, and zstd decompresses faster than xz).
+    - **Impact:** E on the gateway for every run. These facts compare energy, not size. xz usually gives the smaller file, so if your SIM plan makes every byte count, compare the real sizes of your CSV with `zstd -3` and `zstd -9`, and pick the lowest level that is small enough.
+
+    Fixed version:
+
+    ```bash
+    #!/bin/bash
+    SPOOL=/var/spool/gw/readings.csv
+    API_URL='https://ingest.example.com/v1/batch'
+    API_TOKEN=$(< /etc/gw/token)
+
+    [[ -s $SPOOL ]] || exit 0
+    WORK=$(mktemp -d /var/spool/gw/batch.XXXXXX) || exit 1
+    BATCH=$WORK/batch.csv
+    mv "$SPOOL" "$BATCH" || exit 1
+
+    total=0 count=0 alerts=0
+    while IFS=, read -r sensor _ temp batt _; do
+        total=$((total + temp))
+        count=$((count + 1))
+        if (( batt < 3300 )); then
+            alerts=$((alerts + 1))
+            echo "LOW BATTERY: $sensor" >> /var/log/gw/alerts.log
+        fi
+    done < "$BATCH"
+
+    avg=0
+    (( count > 0 )) && avg=$((total / count))
+    echo "readings=$count avg_temp_milli=$avg low_batt=$alerts" >> /var/log/gw/summary.log
+
+    zstd -q -3 "$BATCH" || exit 1
+    if printf 'header = "Authorization: Bearer %s"\n' "$API_TOKEN" |
+        curl -fsS -K - -F "file=@$BATCH.zst" "$API_URL" > /dev/null; then
+        rm -rf "$WORK"
+    else
+        echo "upload failed, batch kept in $WORK" >&2
+        exit 1
+    fi
+    ```
+
+    A failed batch stays in its `batch.*` directory. Add a small retry step, or a cleanup rule, so those directories do not pile up on the gateway.
+
+    **Already good:** the spool is moved away with `mv` before it is processed, so new readings go to a fresh file. The summary is one line per run.
+verify:
+  static_only: needs cron environment, zstd, curl and an ingest API

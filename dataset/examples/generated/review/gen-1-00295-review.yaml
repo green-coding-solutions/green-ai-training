@@ -1,0 +1,65 @@
+id: gen-1-00295-review
+category: review
+language: sql
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    review?
+
+    ```sql
+    -- archive_readings.sql, run nightly with psql -f
+    DO $$
+    DECLARE
+        r record;
+    BEGIN
+        FOR r IN
+            SELECT id, device_id, recorded_at, metric, value
+            FROM readings
+            WHERE recorded_at < now() - interval '30 days'
+        LOOP
+            INSERT INTO readings_archive (id, device_id, recorded_at, metric, value)
+            VALUES (r.id, r.device_id, r.recorded_at, r.metric, r.value);
+        END LOOP;
+
+        DELETE FROM readings
+        WHERE recorded_at < now() - interval '30 days';
+    END $$;
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (nightly batch job)
+
+    #### [Bug] The DELETE can remove rows that were never archived
+    - **Where:** the `DELETE` after the loop
+    - **Issue:** the loop and the `DELETE` are two separate scans. In the default READ COMMITTED mode, the `DELETE` sees a fresh snapshot. A late device upload with an old `recorded_at` that commits during the loop is deleted without ever being copied.
+    - **Fix:** move and delete in one statement, so the rows deleted are exactly the rows archived (see below).
+
+    #### [High] One INSERT per row
+    - **Where:** the `FOR r IN ... LOOP` with `INSERT ... VALUES`
+    - **Issue:** every old row runs its own INSERT statement and its own plan step. A set-based `INSERT ... SELECT` does the same work as one statement. In Green Metrics Tool micro-benchmarks (Postgres 16, a client loop with one `execute()` per row), writing 500,000 rows in 5,000-row batches used about 22× more CPU energy than `COPY`. Your loop runs inside the server, so it saves the client round trips. The gap will be smaller, but the per-row statement overhead is the same.
+    - **Fix:**
+
+    ```sql
+    -- archive_readings.sql, run nightly with psql -f
+    WITH moved AS (
+        DELETE FROM readings
+        WHERE recorded_at < now() - interval '30 days'
+        RETURNING id, device_id, recorded_at, metric, value
+    )
+    INSERT INTO readings_archive (id, device_id, recorded_at, metric, value)
+    SELECT id, device_id, recorded_at, metric, value
+    FROM moved;
+    ```
+
+    - **Impact:** E, one statement instead of one per row. It grows with the number of rows archived each night. If the job only moves a few hundred rows, the difference is small, and the bug fix is the main gain.
+
+    Notes on behavior: the statement runs as one transaction, so it is all-or-nothing, same as your `DO` block. The row order in the archive is not guaranteed. If `readings_archive` has a unique key on `id` and the job can be re-run after a partial failure, add `ON CONFLICT (id) DO NOTHING` to the `INSERT`. The old script would fail on duplicates instead.
+
+    **Already good:** named columns instead of `SELECT *`, and a fixed cutoff expression that is the same in both places.
+verify:
+  static_only: plpgsql DO block and data-modifying CTE need a PostgreSQL server

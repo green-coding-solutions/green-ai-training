@@ -1,0 +1,129 @@
+id: gen-12764612-00377-multi-turn
+category: multi-turn
+language: python
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import sys
+    import xml.etree.ElementTree as ET
+    import psycopg
+
+
+    def load_report(path, run_id, dsn):
+        tree = ET.parse(path)
+        conn = psycopg.connect(dsn)
+        cur = conn.cursor()
+        for case in tree.iter("testcase"):
+            name = case.get("classname") + "." + case.get("name")
+            duration = float(case.get("time", 0))
+            if case.find("failure") is not None or case.find("error") is not None:
+                status = "failed"
+            elif case.find("skipped") is not None:
+                status = "skipped"
+            else:
+                status = "passed"
+            cur.execute(
+                "INSERT INTO test_results (run_id, test_name, status, duration_s) "
+                "VALUES (%s, %s, %s, %s)",
+                (run_id, name, status, duration),
+            )
+            conn.commit()
+        cur.close()
+        conn.close()
+
+
+    if __name__ == "__main__":
+        load_report(sys.argv[1], sys.argv[2], sys.argv[3])
+    ```
+- role: assistant
+  content: |
+    I assume this loads the JUnit report of a full CI run, so thousands of test cases per call. Then the per-row INSERT and commit is the cost. This version collects the rows first and writes them with one `COPY` and one commit:
+
+    ```python
+    import sys
+    import xml.etree.ElementTree as ET
+    import psycopg
+
+
+    def load_report(path, run_id, dsn):
+        rows = []
+        for case in ET.parse(path).iter("testcase"):
+            name = case.get("classname") + "." + case.get("name")
+            duration = float(case.get("time", 0))
+            if case.find("failure") is not None or case.find("error") is not None:
+                status = "failed"
+            elif case.find("skipped") is not None:
+                status = "skipped"
+            else:
+                status = "passed"
+            rows.append((run_id, name, status, duration))
+
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                with cur.copy(
+                    "COPY test_results (run_id, test_name, status, duration_s) FROM STDIN"
+                ) as copy:
+                    for row in rows:
+                        copy.write_row(row)
+
+
+    if __name__ == "__main__":
+        load_report(sys.argv[1], sys.argv[2], sys.argv[3])
+    ```
+
+    **Green Notes**
+    - **Batch database writes** (reduces E): N round trips and N commits become one `COPY` stream and one commit. In Green Metrics Tool micro-benchmarks with 5,000-row batches, `COPY` used about 22× less CPU energy than one `execute()` per row. With batches of only about 100 rows the difference was small, so this matters for big reports, not tiny ones.
+    - **Behavior change:** the load is now all-or-nothing. Before, a crash halfway left a partial run in the table. Now nothing is written. The `with` block also closes the connection on errors, which the old code did not.
+- role: user
+  content: |
+    we rerun failed jobs with the same run_id so it must not blow up on duplicates (run_id, test_name). need ON CONFLICT DO NOTHING. dont want to rewrite everything
+- role: assistant
+  content: |
+    `COPY` has no `ON CONFLICT`, so switch the write step to `executemany`. The parsing stays the same. This assumes a unique constraint on `(run_id, test_name)`:
+
+    ```python
+    import sys
+    import xml.etree.ElementTree as ET
+    import psycopg
+
+
+    def load_report(path, run_id, dsn):
+        rows = []
+        for case in ET.parse(path).iter("testcase"):
+            name = case.get("classname") + "." + case.get("name")
+            duration = float(case.get("time", 0))
+            if case.find("failure") is not None or case.find("error") is not None:
+                status = "failed"
+            elif case.find("skipped") is not None:
+                status = "skipped"
+            else:
+                status = "passed"
+            rows.append((run_id, name, status, duration))
+
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    "INSERT INTO test_results (run_id, test_name, status, duration_s) "
+                    "VALUES (%s, %s, %s, %s) "
+                    "ON CONFLICT (run_id, test_name) DO NOTHING",
+                    rows,
+                )
+
+
+    if __name__ == "__main__":
+        load_report(sys.argv[1], sys.argv[2], sys.argv[3])
+    ```
+
+    **Green Notes**
+    - **Batch database writes** (reduces E): still one batch and one commit per report. In Green Metrics Tool micro-benchmarks with 5,000-row batches, `executemany` used about 2.8× less CPU energy than a per-row loop. `COPY` was about 8× less than `executemany`.
+    - **Rerun semantics:** `DO NOTHING` keeps the first result stored for a test. If a rerun should overwrite a failed result with the new one, use `DO UPDATE SET status = EXCLUDED.status, duration_s = EXCLUDED.duration_s` instead.
+    - If reports grow large, you can get `COPY` speed back by copying into a temporary table first, then running one `INSERT ... SELECT ... ON CONFLICT DO NOTHING` from it. For now this version is the smaller change.
+verify:
+  static_only: needs a running PostgreSQL server and the psycopg package

@@ -1,0 +1,69 @@
+id: gen-2-00338-generation
+category: generation
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    We're putting a small web front on our data-quality pipeline and I need the nginx server block (nginx 1.24, Debian package). Requirements:
+
+    - `/reports/`: static data-quality reports. Every pipeline run (about 40 a day) writes a folder `/srv/dq/reports/<run_id>/` with `index.html`, `summary.json` and one JSON file per table with column profiles. Some of those JSON files are several MB. Shared CSS/JS lives in `/srv/dq/reports/_static/`. Analysts open the reports a lot, many of them from other offices over the VPN, and the big JSON files load slowly there.
+    - `/reports/` itself should show a directory listing so people can browse the runs.
+    - `/api/`: proxy to our lineage/metadata service on `127.0.0.1:8080`. It returns JSON built per request and expects the `/api` prefix.
+    - `/exports/`: Parquet files from `/srv/dq/exports`, download only.
+    - `server_name dq.internal`, plain HTTP on port 80 is fine, it's internal.
+
+    The reports are written by `write_report.py`, which our `run_dq.sh` wrapper calls at the end of each run. Tell me if that step needs to change.
+- role: assistant
+  content: |
+    ```nginx
+    server {
+        listen 80;
+        server_name dq.internal;
+        root /srv/dq;
+
+        # on-the-fly compression, used for responses that can't be prepared in advance
+        gzip on;
+        gzip_comp_level 5;
+        gzip_min_length 1024;
+        gzip_types application/json text/css application/javascript image/svg+xml;
+        gzip_vary on;
+
+        location /reports/ {
+            autoindex on;      # only /reports/ itself; run folders have an index.html
+            gzip_static on;    # serve the .gz files written by run_dq.sh
+        }
+
+        location /api/ {
+            proxy_pass http://127.0.0.1:8080;   # no URI part, so /api/... is passed unchanged
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        location /exports/ {
+            gzip off;
+            default_type application/octet-stream;
+            add_header Content-Disposition "attachment";
+        }
+    }
+    ```
+
+    Yes, `run_dq.sh` needs one extra step. Add it after `write_report.py` has finished:
+
+    ```bash
+    # compress the finished report once, next to the originals (-k keeps them, -f overwrites old .gz on reruns)
+    find "/srv/dq/reports/$RUN_ID" -type f \( -name '*.html' -o -name '*.json' \) -exec gzip -kf -9 {} +
+    ```
+
+    Run the same `find` on `/srv/dq/reports/_static` with `'*.css'` and `'*.js'` whenever those files change. If a report is ever rewritten in place, run the step again. nginx serves the `.gz` file whenever one exists, so a stale `.gz` would show the old report.
+
+    **Green Notes**
+    - **Precompressed reports** (reduces E, network): each report is written once and opened many times, so it is compressed once in the pipeline and not on every view. In Green Metrics Tool measurements of nginx serving text assets, compression sent about 10× fewer bytes, and compressing on every request cost about 4× the CPU energy of serving precompressed files. The maximum gzip level is fine here because it runs only once per file.
+    - **On-the-fly gzip at a moderate level for `/api/`** (reduces network): these responses are built per request, so they can't be precompressed. Level 5 keeps the per-request CPU cost low, and `gzip_min_length` skips tiny responses.
+    - **No compression for `/exports/`** (reduces E): Parquet files are normally compressed internally already (Snappy or zstd), so gzip would spend CPU and save almost no bytes.
+verify:
+  static_only: nginx config with a bash pipeline step, needs nginx and a filesystem layout to run

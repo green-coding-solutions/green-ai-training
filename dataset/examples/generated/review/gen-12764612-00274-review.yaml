@@ -1,0 +1,102 @@
+id: gen-12764612-00274-review
+category: review
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    diff only please. CLI we run after each deploy to list files under the media root that the DB manifest doesn't know about (manifest ~60k lines, tree ~200k files).
+
+    ```python
+    #!/usr/bin/env python3
+    import os
+    import sys
+
+
+    def load_lines(path):
+        with open(path) as f:
+            return [line.rstrip("\n") for line in f]
+
+
+    def find_orphans(root, manifest_path):
+        known = load_lines(manifest_path)
+        orphans = []
+        for dirpath, _dirs, files in os.walk(root):
+            for name in files:
+                rel = os.path.relpath(os.path.join(dirpath, name), root)
+                if rel not in known:
+                    orphans.append(rel)
+        return orphans
+
+
+    def main():
+        if len(sys.argv) != 3:
+            print("usage: orphans.py ROOT MANIFEST", file=sys.stderr)
+            return 2
+        for rel in sorted(find_orphans(sys.argv[1], sys.argv[2])):
+            print(rel)
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (runs after every deploy)
+
+    #### [High] Linear list scan for every file
+    - **Where:** `find_orphans`, `if rel not in known` with `known` built by `load_lines`
+    - **Issue:** `known` is a list, so each check scans up to 60k entries. For ~200k files that is on the order of 10^10 string comparisons in the worst case. The manifest is queried once per file, so a set pays off here: building it costs one O(n) pass, and every lookup after that is O(1). A set is not worth it for a single lookup. In Green Metrics Tool micro-benchmarks, converting a list to a set for one test cost more than scanning the list once.
+    - **Fix:** load the manifest into a set.
+    - **Impact:** E on every deploy run. Work goes from O(files × manifest) to O(files + manifest). The set holds one reference per unique line, so memory stays small for 60k paths.
+
+    ```python
+    def find_orphans(root, manifest_path):
+        with open(manifest_path) as f:
+            known = {line.rstrip("\n") for line in f}
+        orphans = []
+        for dirpath, _dirs, files in os.walk(root):
+            for name in files:
+                rel = os.path.relpath(os.path.join(dirpath, name), root)
+                if rel not in known:
+                    orphans.append(rel)
+        return orphans
+    ```
+
+    `load_lines` is no longer used here, so delete it if nothing else calls it. Output is unchanged: the result is still sorted in `main`, and duplicate manifest lines are harmless in a set.
+
+    **Already good:** `os.walk` streams the tree, and the sorted output is deterministic.
+verify:
+  module: true
+  green_block: 0
+  test: |
+    import os, tempfile
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "a"))
+        open(os.path.join(d, "a", "x.jpg"), "w").close()
+        open(os.path.join(d, "y.png"), "w").close()
+        m = os.path.join(d, "m.txt")
+        with open(m, "w") as f:
+            f.write("a/x.jpg\n")
+        assert sorted(find_orphans(d, m)) == ["m.txt", "y.png"]
+  equivalence:
+    driver: |-
+      import os, tempfile
+      with tempfile.TemporaryDirectory() as d:
+          root = os.path.join(d, "media")
+          for i in range(30):
+              sub = os.path.join(root, "s%d" % (i % 4))
+              os.makedirs(sub, exist_ok=True)
+              open(os.path.join(sub, "f%d.jpg" % i), "w").close()
+          m = os.path.join(d, "manifest.txt")
+          with open(m, "w") as f:
+              for i in range(0, 30, 3):
+                  f.write("s%d/f%d.jpg\n" % (i % 4, i))
+              f.write("s0/f0.jpg\n")
+              f.write("gone/missing.jpg\n")
+          for rel in sorted(find_orphans(root, m)):
+              print(rel)

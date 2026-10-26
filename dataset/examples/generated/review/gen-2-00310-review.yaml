@@ -1,0 +1,156 @@
+id: gen-2-00310-review
+category: review
+language: python
+patterns:
+- async-concurrent-io
+- regex-precompile
+facts:
+- F-HTTP
+- F-REGEX
+messages:
+- role: user
+  content: |
+    Can you review our nightly ticket triage job? Context and constraints:
+
+    - Runs once a night on about 20,000 support tickets.
+    - `customer_names` comes from the CRM, currently about 4,000 names. Names must be redacted before the text leaves our network segment.
+    - The model server (self-hosted text classifier) takes batches of up to 32 texts. Ops says max 8 concurrent requests.
+    - Output order must match the input tickets.
+    - Python 3.11. `httpx` is already in the image. Please no other new dependencies.
+
+    The job takes well over an hour and the box is pegged at 100% CPU most of the time. I assumed it was waiting on the model, but I'm not sure anymore.
+
+    ```python
+    import json
+    import re
+    import urllib.request
+
+    MODEL_URL = "http://triage-model.internal:8080/v1/classify"
+    BATCH_SIZE = 32
+
+    EMAIL_RE = r"[\w.+-]+@[\w-]+\.[\w.-]+"
+
+
+    def redact(text, customer_names):
+        text = re.sub(EMAIL_RE, "<EMAIL>", text)
+        for name in customer_names:
+            text = re.sub(r"\b" + re.escape(name) + r"\b", "<NAME>", text, flags=re.IGNORECASE)
+        return text
+
+
+    def classify_batch(texts):
+        body = json.dumps({"inputs": texts}).encode()
+        req = urllib.request.Request(
+            MODEL_URL, data=body, headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())["labels"]
+
+
+    def triage(tickets, customer_names):
+        cleaned = [redact(t["body"], customer_names) for t in tickets]
+        labels = []
+        for i in range(0, len(cleaned), BATCH_SIZE):
+            try:
+                labels += classify_batch(cleaned[i:i + BATCH_SIZE])
+            except Exception:
+                pass
+        return [{"id": t["id"], "label": l} for t, l in zip(tickets, labels)]
+    ```
+- role: assistant
+  content: |
+    **Workload:** AI/ML (nightly batch inference client)
+
+    #### [Bug] A failed batch shifts every later label onto the wrong ticket
+    - **Where:** `except Exception: pass` in `triage`, then `zip(tickets, labels)`
+    - **Issue:** when one batch fails, its 32 labels are missing. Every later ticket then gets the label of a ticket 32 positions further on. `zip` drops the tail without an error. The output looks valid but is wrong. There is also no timeout on `urlopen`, so one stuck connection can hang the whole job.
+    - **Fix:** keep one result slot per input. Fill a failed batch with `None` and log it. Check that the server returns as many labels as it got texts. Set a timeout. The async version below does all of this.
+
+    #### [High] Name redaction recompiles a regex for every name on every ticket
+    - **Where:** the `for name in customer_names` loop in `redact`
+    - **Issue:** every name builds a different pattern. Python's `re` caches only 512 compiled patterns. With about 4,000 names the cache never hits, so every `re.sub` compiles its pattern again. That is about 80 million compiles per night (4,000 names × 20,000 tickets), and it is why the CPU is pegged. In Green Metrics Tool micro-benchmarks, forcing a recompile on every call cost about 200× more per match than using a cached pattern.
+    - **Fix:** build one combined pattern per run and compile it once. Precompile `EMAIL_RE` too. That part was already cached, so the gain there is small (about 18% less in the same benchmarks).
+
+    ```python
+    import re
+
+    EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+
+
+    def build_name_re(customer_names):
+        names = sorted({n for n in customer_names if n.strip()}, key=len, reverse=True)
+        if not names:
+            return None
+        return re.compile(
+            r"\b(?:" + "|".join(map(re.escape, names)) + r")\b", re.IGNORECASE
+        )
+
+
+    def redact(text, name_re):
+        text = EMAIL_RE.sub("<EMAIL>", text)
+        if name_re is not None:
+            text = name_re.sub("<NAME>", text)
+        return text
+    ```
+
+    Call `name_re = build_name_re(customer_names)` once in `triage`, then `redact(t["body"], name_re)`.
+
+    - **Behavior:** longer names are tried first. Overlapping names like "Ann" and "Ann Lee" now become one `<NAME>`. Before, the result could be `<NAME> Lee`, which leaked part of the name. Empty names are skipped. An empty name in the old code matched at every word boundary.
+    - **Impact:** E, a large cut in client CPU per ticket. This is very likely most of your runtime.
+
+    #### [Medium] 625 model requests run one after another
+    - **Where:** the batch loop calling `classify_batch`
+    - **Issue:** 20,000 tickets / 32 = 625 sequential requests. The job sits idle while each inference runs before it sends the next request. The server allows 8 at a time.
+    - **Fix:** use `httpx.AsyncClient` with a semaphore of 8. `asyncio.gather` returns results in input order.
+
+    ```python
+    import asyncio
+    import logging
+
+    import httpx
+
+    MAX_CONCURRENCY = 8
+    log = logging.getLogger(__name__)
+
+
+    async def classify_all(cleaned):
+        batches = [cleaned[i:i + BATCH_SIZE] for i in range(0, len(cleaned), BATCH_SIZE)]
+        sem = asyncio.Semaphore(MAX_CONCURRENCY)
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            async def one(batch):
+                async with sem:
+                    try:
+                        resp = await client.post(MODEL_URL, json={"inputs": batch})
+                        resp.raise_for_status()
+                        labels = resp.json()["labels"]
+                        if len(labels) != len(batch):
+                            raise ValueError(f"got {len(labels)} labels for {len(batch)} texts")
+                        return labels
+                    except (httpx.HTTPError, ValueError, KeyError) as exc:
+                        log.warning("batch failed: %s", exc)
+                        return [None] * len(batch)
+
+            results = await asyncio.gather(*(one(b) for b in batches))
+        return [label for batch in results for label in batch]
+
+
+    def triage(tickets, customer_names):
+        name_re = build_name_re(customer_names)
+        cleaned = [redact(t["body"], name_re) for t in tickets]
+        labels = asyncio.run(classify_all(cleaned))
+        return [{"id": t["id"], "label": l} for t, l in zip(tickets, labels)]
+    ```
+
+    - **Impact:** mostly wall time, and how long the job holds the box. The model server does the same inference work either way. In Green Metrics Tool micro-benchmarks, 10 HTTP requests with async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. So don't expect a big energy cut on the client from this change alone. Fix the regex first.
+
+    **Already good:** batching 32 texts per request instead of one request per ticket. The model input is redacted before it leaves the job.
+verify:
+  green_block: 0
+  test: |-
+    name_re = build_name_re(["Ann", "Ann Lee", "bob", "", "  "])
+    assert redact("Ann Lee wrote to bob@x.io, cc BOB", name_re) == "<NAME> wrote to <EMAIL>, cc <NAME>"
+    assert redact("Annabel asked", name_re) == "Annabel asked"
+    assert build_name_re([]) is None
+    assert build_name_re(["", " "]) is None
+    assert redact("mail me at a.b@c.de", None) == "mail me at <EMAIL>"

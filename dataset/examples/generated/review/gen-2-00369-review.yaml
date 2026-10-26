@@ -1,0 +1,136 @@
+id: gen-2-00369-review
+category: review
+language: python
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+messages:
+- role: user
+  content: |
+    Hi, can you review the data access part of our landing page app before the relaunch next week? Context:
+
+    - Flask + psycopg 3, Postgres 16, no ORM
+    - ~40k landing page views per day. The HTML is not cached at the CDN because of the A/B test cookie
+    - `articles` is shared with the blog CMS and has ~45 columns: `body_html` (often 100-300 KB), `body_markdown`, `toc_json`, a tsvector for search, a bunch of og/seo fields, etc.
+    - `plans` has 4 rows and ~12 small columns. The pricing table shows all of them
+    - Please don't suggest Redis or any other caching, ops said no for now
+    - I mostly care about things that bite us under load, and security stuff
+
+    ```python
+    import os
+
+    import psycopg
+    from psycopg.rows import dict_row
+    from flask import Flask, render_template, request
+
+    app = Flask(__name__)
+    DSN = os.environ["DATABASE_URL"]
+
+    SUPPORTED_LANGS = {"en", "de", "fr"}
+
+
+    def get_conn():
+        return psycopg.connect(DSN, row_factory=dict_row)
+
+
+    def latest_posts(conn, lang):
+        rows = conn.execute(
+            f"SELECT * FROM articles WHERE lang = '{lang}' AND status = 'published' "
+            "ORDER BY published_at DESC LIMIT 3"
+        ).fetchall()
+        posts = []
+        for r in rows:
+            posts.append({
+                "title": r["title"],
+                "url": f"/{lang}/blog/{r['slug']}",
+                "excerpt": r["excerpt"],
+                "cover": r["cover_image_url"],
+                "date": r["published_at"].strftime("%d %b %Y"),
+                "minutes": r["reading_minutes"],
+            })
+        return posts
+
+
+    def testimonials(conn, lang):
+        return conn.execute(
+            "SELECT quote, author_name, author_role, company_logo_url "
+            "FROM testimonials WHERE lang = %s AND active ORDER BY sort_order LIMIT 6",
+            (lang,),
+        ).fetchall()
+
+
+    def pricing_plans(conn):
+        return conn.execute("SELECT * FROM plans WHERE public ORDER BY monthly_price").fetchall()
+
+
+    @app.route("/")
+    @app.route("/<lang>/")
+    def landing(lang="en"):
+        variant = request.cookies.get("ab_variant", "a")
+        lang = request.args.get("lang", lang)
+        with get_conn() as conn:
+            ctx = {
+                "posts": latest_posts(conn, lang),
+                "testimonials": testimonials(conn, lang),
+                "plans": pricing_plans(conn),
+            }
+        return render_template(f"landing_{variant}.html", lang=lang, **ctx)
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (landing page backend)
+
+    #### [Security] SQL injection through `lang`
+    - **Where:** `latest_posts`, the f-string query
+    - **Issue:** `lang` comes from the URL path or `?lang=` and is pasted into the SQL. A request like `/?lang=x' OR '1'='1` changes the query. `SUPPORTED_LANGS` is defined but never checked.
+    - **Fix:** validate `lang` in the route and pass it as a parameter (see the snippets in the next findings).
+
+    #### [Bug] Unknown A/B cookie value causes a 500
+    - **Where:** `render_template(f"landing_{variant}.html")`
+    - **Issue:** the template name comes straight from a cookie. Any value without a matching template raises `TemplateNotFound`, so a stale or edited cookie breaks the page. It also lets clients choose any template whose name starts with `landing_`.
+    - **Fix:** use an allow-list and fall back to the default:
+
+    ```python
+    from flask import abort
+
+    VARIANTS = {"a", "b"}  # your real variant names
+
+
+    @app.route("/")
+    @app.route("/<lang>/")
+    def landing(lang="en"):
+        lang = request.args.get("lang", lang)
+        if lang not in SUPPORTED_LANGS:
+            abort(404)
+        variant = request.cookies.get("ab_variant", "a")
+        if variant not in VARIANTS:
+            variant = "a"
+        ...
+    ```
+
+    #### [High] `SELECT *` on `articles` ships full article bodies on every page view
+    - **Where:** `latest_posts`
+    - **Issue:** the function uses 6 columns, but `SELECT *` makes Postgres read and send all ~45. That includes `body_html`, `body_markdown`, `toc_json` and the tsvector. Large text values are stored out of line, so each one has to be fetched, sent over the socket and decoded by psycopg, and then it is thrown away. This runs on every uncached landing page view. It also gets worse without anyone noticing whenever the CMS adds a column.
+    - **Fix:** name the columns you use and bind `lang`:
+
+    ```python
+    def latest_posts(conn, lang):
+        rows = conn.execute(
+            "SELECT title, slug, excerpt, cover_image_url, published_at, reading_minutes "
+            "FROM articles WHERE lang = %s AND status = 'published' "
+            "ORDER BY published_at DESC LIMIT 3",
+            (lang,),
+        ).fetchall()
+        ...  # rest unchanged
+    ```
+
+    - **Impact:** reduces E on the database and the app server, and M for the result rows. In Green Metrics Tool micro-benchmarks on a 52-column products table with large text columns, naming the 10 needed columns instead of `SELECT *` used about 5.5× less CPU energy at 500 rows and about 7× less at 2,500 rows (1,000 reads each). The same setup showed that cost follows the data each column carries: `SELECT *` cost about 8× an 8-column query. You read only 3 rows per request, but the columns you skip are the heavy ones, and those drive the saving.
+
+    **Already good:**
+    - `testimonials` names its columns and uses a bound parameter.
+    - `SELECT *` on `plans` is fine. The table has 4 rows of small columns and the page shows all of them, so naming them would save nothing.
+    - Every query has `LIMIT` and ordering in SQL, so no extra rows are fetched.
+verify:
+  static_only: needs Flask, psycopg 3 and a running PostgreSQL server

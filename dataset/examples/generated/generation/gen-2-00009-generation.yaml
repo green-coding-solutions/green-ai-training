@@ -1,0 +1,144 @@
+id: gen-2-00009-generation
+category: generation
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    Hi, I'm pretty new to backend stuff. Our booking app is Flask, and customers want to subscribe to their appointments in Google Calendar / Outlook. I read that this means an .ics URL. I tried making the file myself, but Google says it can't import it and I don't really understand why. 😅
+
+    Can you write a function that turns a customer's bookings into an .ics file, plus the Flask route? Each booking is a dict like this (I already have `get_bookings_for_user(user_id)` that returns a list of them):
+
+    ```python
+    {
+        "id": 1842,
+        "title": "Haircut + beard trim",
+        "start": datetime(2026, 11, 3, 9, 30, tzinfo=ZoneInfo("Europe/Berlin")),
+        "end": datetime(2026, 11, 3, 10, 15, tzinfo=ZoneInfo("Europe/Berlin")),
+        "location": "Studio 2, Hauptstraße 12",   # can be empty
+        "notes": "Please bring your loyalty card",  # can be empty
+    }
+    ```
+
+    Some regulars have a few hundred bookings.
+- role: assistant
+  content: |
+    Google usually rejects hand-made .ics files for one of four reasons. Lines must end with `\r\n`. Every event needs a `UID` and a `DTSTAMP`. Commas, semicolons and newlines in text must be escaped. Lines longer than 75 bytes must be folded. The function below handles all four:
+
+    ```python
+    from datetime import datetime, timezone
+
+
+    def _escape(text: str) -> str:
+        return (
+            text.replace("\\", "\\\\")
+            .replace(";", "\\;")
+            .replace(",", "\\,")
+            .replace("\r\n", "\\n")
+            .replace("\n", "\\n")
+        )
+
+
+    def _fold(line: str) -> str:
+        # RFC 5545: max 75 bytes per line, continuation lines start with a space
+        if len(line.encode("utf-8")) <= 75:
+            return line
+        parts, current, size, limit = [], [], 0, 75
+        for ch in line:
+            n = len(ch.encode("utf-8"))
+            if size + n > limit:
+                parts.append("".join(current))
+                current, size, limit = [ch], n, 74  # the leading space counts too
+            else:
+                current.append(ch)
+                size += n
+        parts.append("".join(current))
+        return "\r\n ".join(parts)
+
+
+    def _ics_time(dt: datetime) -> str:
+        # start/end must be timezone-aware; output is UTC
+        return dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+    def bookings_to_ics(bookings, now=None) -> str:
+        stamp = _ics_time(now or datetime.now(timezone.utc))
+        lines = [
+            "BEGIN:VCALENDAR",
+            "VERSION:2.0",
+            "PRODID:-//Example Booking//EN",
+            "CALSCALE:GREGORIAN",
+            "X-WR-CALNAME:My bookings",
+        ]
+        for b in bookings:
+            lines.append("BEGIN:VEVENT")
+            lines.append(f"UID:booking-{b['id']}@example.com")
+            lines.append(f"DTSTAMP:{stamp}")
+            lines.append(f"DTSTART:{_ics_time(b['start'])}")
+            lines.append(f"DTEND:{_ics_time(b['end'])}")
+            lines.append(f"SUMMARY:{_escape(b['title'])}")
+            if b.get("location"):
+                lines.append(f"LOCATION:{_escape(b['location'])}")
+            if b.get("notes"):
+                lines.append(f"DESCRIPTION:{_escape(b['notes'])}")
+            lines.append("END:VEVENT")
+        lines.append("END:VCALENDAR")
+        return "\r\n".join(_fold(line) for line in lines) + "\r\n"
+    ```
+
+    The route:
+
+    ```python
+    from flask import Flask, Response, abort
+
+    app = Flask(__name__)
+
+
+    @app.get("/calendar/<token>.ics")
+    def calendar_feed(token):
+        user_id = get_user_id_by_feed_token(token)  # random secret per user, stored in your DB
+        if user_id is None:
+            abort(404)
+        body = bookings_to_ics(get_bookings_for_user(user_id))
+        return Response(
+            body,
+            mimetype="text/calendar",
+            headers={"Content-Disposition": 'inline; filename="bookings.ics"'},
+        )
+    ```
+
+    Use a random token in the URL, for example from `secrets.token_urlsafe(32)`, and not the user ID. Calendar apps can't log in, so anyone who guesses the URL can read the bookings. Replace `example.com` in the UID with your own domain. The UID must stay the same for a booking, so calendars update the event instead of adding a duplicate.
+
+    **Green Notes**
+    - **Join strings instead of `+=`** (reduces E): the feed collects its lines in a list and builds the response with one `"\r\n".join(...)`. Growing a string with `+=` can copy the text built so far on every step. Calendar apps re-fetch the URL on a schedule, so this work runs again for every subscriber. In Green Metrics Tool micro-benchmarks that built a string from 1,000,000 pieces, `"".join()` used about 260× less CPU energy than `+=`. f-strings concatenated in a loop behaved like `+=`. Here the f-strings only build single lines, and the join does the combining.
+verify:
+  green_block: 0
+  test: |-
+    from datetime import timedelta
+    tz = timezone(timedelta(hours=2))
+    b = [{
+        "id": 7,
+        "title": "Haircut, wash; dry",
+        "start": datetime(2026, 11, 3, 9, 30, tzinfo=tz),
+        "end": datetime(2026, 11, 3, 10, 15, tzinfo=tz),
+        "location": "",
+        "notes": "Ä" * 60 + "\nsecond line",
+    }]
+    out = bookings_to_ics(b, now=datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc))
+    assert out.startswith("BEGIN:VCALENDAR\r\n")
+    assert out.endswith("END:VCALENDAR\r\n")
+    assert "DTSTART:20261103T073000Z\r\n" in out
+    assert "DTEND:20261103T081500Z\r\n" in out
+    assert "DTSTAMP:20261024T120000Z\r\n" in out
+    assert "SUMMARY:Haircut\\, wash\\; dry\r\n" in out
+    assert "LOCATION" not in out
+    for line in out.split("\r\n"):
+        assert len(line.encode("utf-8")) <= 75, line
+    unfolded = out.replace("\r\n ", "")
+    assert "DESCRIPTION:" + "Ä" * 60 + "\\nsecond line\r\n" in unfolded
+    assert unfolded.count("BEGIN:VEVENT") == 1
+    many = bookings_to_ics(b * 300, now=datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc))
+    assert many.count("BEGIN:VEVENT") == 300

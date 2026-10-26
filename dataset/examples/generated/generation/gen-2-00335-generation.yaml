@@ -1,0 +1,139 @@
+id: gen-2-00335-generation
+category: generation
+language: html
+patterns:
+- css-animations
+facts:
+- F-ANIM
+messages:
+- role: user
+  content: |
+    I need a search page for our log store. The support team uses it to look up customer errors. Queries over 24h or 7d take 5-30 seconds, so people need to see that something is happening.
+
+    Requirements:
+    - One HTML file, no frameworks or libraries.
+    - Text input for the query, a select for the time range (1h, 6h, 24h, 7d) and a Search button.
+    - While the query runs, show a thin indeterminate progress bar under the form. The kind that slides from left to right, like on GitHub or YouTube. The bar must not make the page jump when it appears.
+    - While running, the button turns into "Cancel" and aborts the request.
+    - Endpoint: `GET /api/search?q=...&range=...` returns `{"lines": [{"ts": "...", "level": "error", "msg": "..."}]}`, max 200 lines.
+    - Show the lines in a monospace list. Error lines in red.
+    - Show a message if the request fails or is cancelled.
+    - Some people get sick from motion, so respect the reduced-motion setting.
+- role: assistant
+  content: |
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Log search</title>
+      <style>
+        body { margin: 0; font-family: system-ui, sans-serif; }
+        form { display: flex; gap: .5rem; padding: 1rem; }
+        #q { flex: 1; }
+
+        /* Always takes its 3px, so showing it does not move the page. */
+        .progress { height: 3px; overflow: hidden; background: #e5e7eb; visibility: hidden; }
+        .progress::before { content: ""; display: block; height: 3px; width: 8rem; background: #2563eb; }
+        .progress.active { visibility: visible; }
+        .progress.active::before { animation: slide 1.2s ease-in-out infinite; }
+        @keyframes slide {
+          from { transform: translateX(-8rem); }
+          to   { transform: translateX(100vw); }
+        }
+        @media (prefers-reduced-motion: reduce) {
+          .progress.active::before { animation: none; width: auto; opacity: .6; }
+        }
+
+        #status { padding: 0 1rem; color: #555; }
+        #status.error { color: #b91c1c; }
+        #results { list-style: none; margin: 0; padding: .5rem 1rem 1rem;
+                   font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+        #results li { white-space: pre-wrap; word-break: break-all; }
+        #results li.error { color: #b91c1c; }
+      </style>
+    </head>
+    <body>
+      <form id="search">
+        <input id="q" name="q" type="search" placeholder="customer_id=4711 level=error" required>
+        <select name="range">
+          <option value="1h">Last 1h</option>
+          <option value="6h">Last 6h</option>
+          <option value="24h" selected>Last 24h</option>
+          <option value="7d">Last 7d</option>
+        </select>
+        <button id="go" type="submit">Search</button>
+      </form>
+      <div id="progress" class="progress" role="progressbar" aria-label="Searching" aria-hidden="true"></div>
+      <p id="status" aria-live="polite"></p>
+      <ul id="results"></ul>
+
+      <script>
+        const form = document.getElementById('search');
+        const button = document.getElementById('go');
+        const bar = document.getElementById('progress');
+        const statusEl = document.getElementById('status');
+        const results = document.getElementById('results');
+        let controller = null;
+
+        function setRunning(running) {
+          bar.classList.toggle('active', running);
+          bar.setAttribute('aria-hidden', String(!running));
+          button.textContent = running ? 'Cancel' : 'Search';
+        }
+
+        form.addEventListener('submit', async (event) => {
+          event.preventDefault();
+          if (controller) {          // button shows "Cancel" while a query runs
+            controller.abort();
+            return;
+          }
+
+          const params = new URLSearchParams({ q: form.q.value, range: form.range.value });
+          controller = new AbortController();
+          setRunning(true);
+          statusEl.className = '';
+          statusEl.textContent = 'Searching…';
+          results.replaceChildren();
+
+          try {
+            const res = await fetch(`/api/search?${params}`, { signal: controller.signal });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const { lines } = await res.json();
+
+            const frag = document.createDocumentFragment();
+            for (const { ts, level, msg } of lines) {
+              const lvl = String(level).toLowerCase();
+              const li = document.createElement('li');
+              li.textContent = `${ts} ${lvl.toUpperCase()} ${msg}`;
+              if (lvl === 'error') li.className = 'error';
+              frag.append(li);
+            }
+            results.append(frag);
+            statusEl.textContent = lines.length ? `${lines.length} lines` : 'No matches.';
+          } catch (err) {
+            if (err.name === 'AbortError') {
+              statusEl.textContent = 'Search cancelled.';
+            } else {
+              statusEl.className = 'error';
+              statusEl.textContent = `Search failed: ${err.message}`;
+            }
+          } finally {
+            controller = null;
+            setRunning(false);
+          }
+        });
+      </script>
+    </body>
+    </html>
+    ```
+
+    **Green Notes**
+    - **CSS `@keyframes` instead of a JS animation loop** (reduces E): the browser runs the slide itself. JS only toggles one class when the query starts and when it ends. In Green Metrics Tool browser benchmarks, a 20-second CSS `@keyframes` animation used about 10% less CPU energy than the same animation driven by `requestAnimationFrame` with style updates.
+    - **Animate `transform` only** (reduces E): moving the stripe with `translateX` does not trigger a layout recalculation on every frame. Animating `left` or `width` would.
+    - **Animation only while a query runs** (reduces E): the keyframes are attached to `.active`. A tab left open between searches runs no animation at all.
+
+    Log lines are inserted with `textContent`, so HTML inside a log message is shown as text and never executed. Pressing Enter while a query runs also cancels it, just like the button.
+verify:
+  static_only: needs a browser DOM and the /api/search endpoint

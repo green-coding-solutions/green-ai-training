@@ -1,0 +1,108 @@
+id: gen-12764612-00208-review
+category: review
+language: python
+patterns:
+- simple-conditions
+facts:
+- F-COND
+messages:
+- role: user
+  content: |
+    Can you review this helper for our landing page? It builds the hero section for every page view (about 30k views a day). My requirements:
+
+    - the banner depends on the weekday (Mon=0 ... Sun=6): Mon/Wed webinar, Tue/Thu case-study, Fri newsletter, Sat/Sun weekend-sale
+    - the visitor name comes from the `?name=` query parameter, and it is optional
+    - keep the output HTML exactly as it is for normal names
+    - I want feedback on correctness first, then on efficiency, only what is worth changing
+
+    ```python
+    from datetime import datetime, timezone
+
+
+    def banner_for(weekday):
+        if weekday >= 0 and weekday <= 4 and weekday % 2 == 0 and weekday != 4:
+            return "webinar"
+        elif weekday >= 0 and weekday <= 3 and weekday % 2 == 1:
+            return "case-study"
+        elif weekday == 4:
+            return "newsletter"
+        elif weekday >= 5 and weekday <= 6:
+            return "weekend-sale"
+        return "default"
+
+
+    def render_hero(name, now=None):
+        now = now or datetime.now(timezone.utc)
+        banner = banner_for(now.weekday())
+        greeting = "Welcome" + (", " + name if name else "") + "!"
+        return (
+            '<section class="hero banner-' + banner + '">'
+            "<h1>" + greeting + "</h1>"
+            "</section>"
+        )
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (landing page, runs on every page view)
+
+    #### [Security] Visitor name goes into the HTML unescaped
+    - **Where:** `render_hero`, the `greeting` line
+    - **Issue:** `?name=<script>...</script>` ends up in the page as real markup. This is reflected XSS.
+    - **Fix:** escape the name before it goes into the HTML. Normal names give the same output as now. A name with `<`, `>`, `&` or quotes is now escaped. The full corrected code, including the condition change from the next finding:
+      ```python
+      import html
+      from datetime import datetime, timezone
+
+
+      def banner_for(weekday):
+          if weekday == 0 or weekday == 2:
+              return "webinar"
+          elif weekday == 1 or weekday == 3:
+              return "case-study"
+          elif weekday == 4:
+              return "newsletter"
+          elif weekday == 5 or weekday == 6:
+              return "weekend-sale"
+          return "default"
+
+
+      def render_hero(name, now=None):
+          now = now or datetime.now(timezone.utc)
+          banner = banner_for(now.weekday())
+          greeting = "Welcome" + (", " + html.escape(name) if name else "") + "!"
+          return (
+              '<section class="hero banner-' + banner + '">'
+              "<h1>" + greeting + "</h1>"
+              "</section>"
+          )
+      ```
+    - **Impact:** not an energy issue. It is a real vulnerability and should be fixed first.
+
+    #### [Low] Range and modulo guards in `banner_for`
+    - **Where:** `banner_for`
+    - **Issue:** each branch combines range checks and `% 2` tests to describe a handful of exact values. In Green Metrics Tool micro-benchmarks of 10,000,000 classifications, simple equality branches used ~46 J of CPU energy and complex range/modulo conditions ~54 J, about 16% less. The result is the same for 0-6 and for any other input, which still gives `"default"`.
+    - **Fix:** plain equality checks, as in the block above. `match` would not be faster, so keep `if/elif`.
+    - **Impact:** E on the server, per page view. The saving is real but tiny at 30k views a day. Make the change because it is also easier to read, not because it moves your footprint.
+
+    **Already good:** `render_hero` builds the string with one expression and does no extra work per view. The banner logic is a pure function, so it is easy to test.
+verify:
+  equivalence:
+    driver: |
+      from datetime import datetime, timezone
+      for d in range(-3, 10):
+          print(d, banner_for(d))
+      for day in range(1, 8):
+          now = datetime(2026, 10, day, 12, 0, tzinfo=timezone.utc)
+          print(render_hero("Ada", now))
+          print(render_hero("", now))
+          print(render_hero(None, now))
+  test: |-
+    from datetime import datetime, timezone
+    assert banner_for(0) == "webinar" and banner_for(2) == "webinar"
+    assert banner_for(1) == "case-study" and banner_for(3) == "case-study"
+    assert banner_for(4) == "newsletter"
+    assert banner_for(5) == "weekend-sale" and banner_for(6) == "weekend-sale"
+    assert banner_for(-1) == "default" and banner_for(7) == "default"
+    now = datetime(2026, 10, 26, 12, 0, tzinfo=timezone.utc)
+    out = render_hero("<script>", now)
+    assert "<script>" not in out and "&lt;script&gt;" in out

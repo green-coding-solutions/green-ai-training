@@ -1,0 +1,133 @@
+id: gen-2-00084-review
+category: review
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    ```python
+    import os
+    from pathlib import Path
+
+    import requests
+    from fastapi import FastAPI, HTTPException
+    from pydantic import BaseModel
+
+    app = FastAPI()
+
+    LABELS = Path(os.environ.get("LABELS_FILE", "labels.txt")).read_text().splitlines()
+
+    MODEL_URLS = {
+        "resnet50": os.environ["RESNET_URL"],
+        "effnet_b3": os.environ["EFFNET_URL"],
+        "vit_b16": os.environ["VIT_URL"],
+        "convnext_t": os.environ["CONVNEXT_URL"],
+    }
+
+
+    class PredictRequest(BaseModel):
+        image_b64: str
+        top_k: int = 3
+
+
+    def _query(name, url, payload):
+        r = requests.post(f"{url}/v2/models/{name}/infer", json=payload)
+        r.raise_for_status()
+        return r.json()["probs"]
+
+
+    @app.post("/predict")
+    async def predict(req: PredictRequest):
+        payload = {"image": req.image_b64}
+        all_probs = []
+        for name, url in MODEL_URLS.items():
+            try:
+                all_probs.append(_query(name, url, payload))
+            except requests.RequestException:
+                continue  # model down, ensemble with the rest
+
+        if not all_probs:
+            raise HTTPException(status_code=503, detail="no model available")
+
+        n_classes = len(all_probs[0])
+        avg = [sum(p[i] for p in all_probs) / len(MODEL_URLS) for i in range(n_classes)]
+        top = sorted(range(n_classes), key=lambda i: avg[i], reverse=True)[: req.top_k]
+        return {"labels": [LABELS[i] for i in top], "scores": [avg[i] for i in top]}
+    ```
+
+    ?
+- role: assistant
+  content: |
+    **Workload:** AI/ML (inference gateway, per request)
+
+    #### [Bug] Ensemble average is wrong when a model is down
+    - **Where:** `avg = [... / len(MODEL_URLS) ...]`
+    - **Issue:** you skip failed models but still divide by 4. If one model is down, every score comes out at three quarters of its real value. If two are down, every score is halved. The ranking stays the same, but the returned scores are wrong.
+    - **Fix:** divide by `len(all_probs)`.
+
+    #### [Bug] No timeout on model calls
+    - **Where:** `requests.post(...)` in `_query`
+    - **Issue:** `requests` has no default timeout. A model server that accepts the connection but never answers keeps the request open forever. The `except` never fires, so the "ensemble with the rest" fallback never runs.
+    - **Fix:** set a timeout that fits your slowest model (see the snippet below).
+
+    #### [High] Four blocking model calls, one after another, inside `async def`
+    - **Where:** the `for` loop in `predict`, `requests.post` in `_query`
+    - **Issue:** the four models are called in sequence, so each request waits for the sum of four inference times. `requests` is also blocking. Inside an `async def` handler it freezes the event loop, and the worker serves no other request until all four calls are done.
+    - **Fix:** use one shared `httpx.AsyncClient` and send the four calls at the same time. Only HTTP errors are skipped, like in your version. Other errors still raise. Snippet below.
+    - **Impact:** the gain is mainly wall time. Request latency drops from the sum of four model calls to about the slowest one, and the worker holds memory and connections for a shorter time. That frees capacity under load. CPU energy per request improves only a little. In Green Metrics Tool micro-benchmarks, 10 async `httpx` requests used about 7% less CPU energy and about 17% less wall time than sync `urllib`.
+
+    ```python
+    import asyncio
+    from contextlib import asynccontextmanager
+
+    import httpx
+
+
+    @asynccontextmanager
+    async def lifespan(app):
+        app.state.http = httpx.AsyncClient(timeout=httpx.Timeout(5.0))
+        yield
+        await app.state.http.aclose()
+
+
+    app = FastAPI(lifespan=lifespan)
+
+
+    async def _query(client, name, url, payload):
+        r = await client.post(f"{url}/v2/models/{name}/infer", json=payload)
+        r.raise_for_status()
+        return r.json()["probs"]
+
+
+    @app.post("/predict")
+    async def predict(req: PredictRequest):
+        payload = {"image": req.image_b64}
+        results = await asyncio.gather(
+            *(_query(app.state.http, name, url, payload) for name, url in MODEL_URLS.items()),
+            return_exceptions=True,
+        )
+        all_probs = []
+        for r in results:
+            if isinstance(r, httpx.HTTPError):
+                continue  # model down, ensemble with the rest
+            if isinstance(r, BaseException):
+                raise r
+            all_probs.append(r)
+
+        if not all_probs:
+            raise HTTPException(status_code=503, detail="no model available")
+
+        n_classes = len(all_probs[0])
+        avg = [sum(p[i] for p in all_probs) / len(all_probs) for i in range(n_classes)]
+        top = sorted(range(n_classes), key=lambda i: avg[i], reverse=True)[: req.top_k]
+        return {"labels": [LABELS[i] for i in top], "scores": [avg[i] for i in top]}
+    ```
+
+    `gather` keeps the input order, so the results line up with `MODEL_URLS` as before. If you want to keep `requests` for now, the smallest fix is to declare the handler as plain `def predict`. FastAPI then runs it in a thread pool and the event loop stays free, but the calls are still sequential.
+
+    **Already good:** labels and model URLs are loaded once at startup, not per request, and the 503 fallback for "no model available" is a sensible degradation.
+verify:
+  static_only: FastAPI service that needs httpx, fastapi, pydantic and running model servers

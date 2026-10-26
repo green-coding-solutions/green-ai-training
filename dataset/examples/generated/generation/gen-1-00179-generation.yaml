@@ -1,0 +1,144 @@
+id: gen-1-00179-generation
+category: generation
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    I need the scoring function for our churn-risk service (FastAPI, Python 3.11). For each request we get a user_id and a device_id and must build the feature vector for a model that runs locally in the same process (scikit-learn style, `predict_proba`).
+
+    The features come from three internal HTTP services, all return JSON dicts:
+    - profile: `http://profile.internal/v1/users/{user_id}/features` -> age_days, avg_basket
+    - history: `http://history.internal/v1/users/{user_id}/features` -> orders_30d, returns_ratio
+    - device: `http://device.internal/v1/devices/{device_id}/features` -> device_trust, is_new_device
+
+    Requirements:
+    - signature `async def score_user(client, model, user_id, device_id) -> float`, `client` is a shared `httpx.AsyncClient` that we create at app startup
+    - feature order for the model is: age_days, orders_30d, avg_basket, returns_ratio, device_trust, is_new_device
+    - profile and history are required, if one of them fails the error must go up to the caller
+    - device is optional, if it fails or is slow, use device_trust=0.5 and is_new_device=1.0
+    - 2 second timeout for each service call
+    - return the probability of class 1 as a float
+- role: assistant
+  content: |
+    ```python
+    import asyncio
+
+    import numpy as np
+
+    FEATURE_ORDER = (
+        "age_days",
+        "orders_30d",
+        "avg_basket",
+        "returns_ratio",
+        "device_trust",
+        "is_new_device",
+    )
+    DEVICE_DEFAULTS = {"device_trust": 0.5, "is_new_device": 1.0}
+    TIMEOUT_S = 2.0
+
+    PROFILE_URL = "http://profile.internal/v1/users/{}/features"
+    HISTORY_URL = "http://history.internal/v1/users/{}/features"
+    DEVICE_URL = "http://device.internal/v1/devices/{}/features"
+
+
+    async def _get_json(client, url):
+        resp = await asyncio.wait_for(client.get(url), TIMEOUT_S)
+        resp.raise_for_status()
+        return resp.json()
+
+
+    async def _get_device(client, url):
+        try:
+            return await _get_json(client, url)
+        except Exception:
+            return DEVICE_DEFAULTS
+
+
+    async def score_user(client, model, user_id, device_id) -> float:
+        profile, history, device = await asyncio.gather(
+            _get_json(client, PROFILE_URL.format(user_id)),
+            _get_json(client, HISTORY_URL.format(user_id)),
+            _get_device(client, DEVICE_URL.format(device_id)),
+        )
+        merged = {**DEVICE_DEFAULTS, **profile, **history, **device}
+        row = [float(merged[name]) for name in FEATURE_ORDER]
+        x = np.array([row])
+        proba = await asyncio.to_thread(model.predict_proba, x)
+        return float(proba[0][1])
+    ```
+
+    Errors from profile or history reach the caller as they are. A failing device call is replaced by the defaults, and the timeout covers that case too. The model call runs in a worker thread so it does not block the event loop while other requests wait for their services.
+
+    **Green Notes**
+    - **Concurrent I/O** (reduces E, mostly wall time): the three calls do not depend on each other, so they wait together and the request takes about as long as the slowest service, not the sum of all three. In Green Metrics Tool micro-benchmarks, 10 HTTP requests with async `httpx` used about 7% less CPU energy and about 17% less wall time than sequential `urllib`. With only three calls per request, expect the gain mainly in wall time and shorter time holding the request open.
+    - The shared `AsyncClient` is reused, so connections are not set up again for every score.
+verify:
+  test: |-
+    import asyncio
+    import numpy as np
+
+    class Resp:
+        def __init__(self, data, status=200):
+            self.data = data
+            self.status = status
+        def raise_for_status(self):
+            if self.status >= 400:
+                raise RuntimeError("http error")
+        def json(self):
+            return self.data
+
+    class FakeClient:
+        def __init__(self, fail=()):
+            self.inflight = 0
+            self.peak = 0
+            self.fail = fail
+        async def get(self, url):
+            self.inflight += 1
+            self.peak = max(self.peak, self.inflight)
+            await asyncio.sleep(0.02)
+            self.inflight -= 1
+            for name in self.fail:
+                if name in url:
+                    return Resp({}, 503)
+            if "profile.internal" in url:
+                return Resp({"age_days": 100, "avg_basket": 25.5})
+            if "history.internal" in url:
+                return Resp({"orders_30d": 3, "returns_ratio": 0.1})
+            if "device.internal" in url:
+                return Resp({"device_trust": 0.9, "is_new_device": 0.0})
+            raise AssertionError(url)
+
+    class FakeModel:
+        def __init__(self):
+            self.seen = None
+        def predict_proba(self, x):
+            self.seen = x
+            return np.array([[0.3, 0.7]])
+
+    async def run():
+        # all services ok, calls overlap, feature order is right
+        client, model = FakeClient(), FakeModel()
+        p = await score_user(client, model, "u1", "d1")
+        assert abs(p - 0.7) < 1e-9
+        assert client.peak == 3
+        assert model.seen.tolist() == [[100.0, 3.0, 25.5, 0.1, 0.9, 0.0]]
+
+        # optional device failure -> defaults
+        client, model = FakeClient(fail=("device.internal",)), FakeModel()
+        p = await score_user(client, model, "u1", "d1")
+        assert model.seen.tolist() == [[100.0, 3.0, 25.5, 0.1, 0.5, 1.0]]
+
+        # required service failure goes up
+        for name in ("profile.internal", "history.internal"):
+            try:
+                await score_user(FakeClient(fail=(name,)), FakeModel(), "u1", "d1")
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("required failure was swallowed")
+
+    asyncio.run(run())

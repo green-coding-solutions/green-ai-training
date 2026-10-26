@@ -1,0 +1,81 @@
+id: gen-12764612-00246-estimate
+category: estimate
+language: bash
+patterns:
+- bash-quoting
+facts:
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    how much energy does this save if i switch to single quotes? landing page build script, runs on every push
+
+    ```bash
+    #!/bin/bash
+    set -euo pipefail
+
+    OUT="dist"
+    VARIANTS="hero-a hero-b pricing-a pricing-b"
+
+    mkdir -p "$OUT"
+    for v in $VARIANTS; do
+      echo "building $v"
+      cp "src/$v.html" "$OUT/$v.html"
+      sed -i "s/__BUILD_ID__/$BUILD_ID/" "$OUT/$v.html"
+      sed -i "s/__CANONICAL__/https:\/\/example.com\/$v/" "$OUT/$v.html"
+    done
+
+    cat > "$OUT/robots.txt" <<EOF
+    User-agent: *
+    Allow: /
+    EOF
+
+    echo "done"
+    ```
+- role: assistant
+  content: |
+    Very little for this script. Directionally it is a small saving, and I can't give you a number for your CI.
+
+    **Measured reference:** in Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal in a loop used about 24% less CPU energy with single quotes than with double quotes at 100,000 and 1,000,000 iterations, and about 14% less at 10,000 iterations. The cause is that bash scans double-quoted text for `$`, backticks and backslashes, and takes single-quoted text as is.
+
+    Your case is far from that setup:
+    - Your literals are short, and the loop runs 4 times.
+    - Quoting work is tiny next to the `cp`, `sed` and `echo` calls, which start processes.
+    - Several of your strings need expansion (`"$OUT/$v.html"`, `"s/__BUILD_ID__/$BUILD_ID/"`). Those must keep double quotes.
+
+    So the saving grows with literal length and loop count, and yours is at the bottom of both. Don't multiply my percentage by your push count.
+
+    The strings that need no expansion can still use single quotes. It costs nothing and matches your linter:
+
+    ```bash
+    #!/bin/bash
+    set -euo pipefail
+
+    OUT='dist'
+    VARIANTS='hero-a hero-b pricing-a pricing-b'
+
+    mkdir -p "$OUT"
+    for v in $VARIANTS; do
+      echo "building $v"
+      cp "src/$v.html" "$OUT/$v.html"
+      sed -i "s/__BUILD_ID__/$BUILD_ID/" "$OUT/$v.html"
+      sed -i "s/__CANONICAL__/https:\/\/example.com\/$v/" "$OUT/$v.html"
+    done
+
+    cat > "$OUT/robots.txt" <<'EOF'
+    User-agent: *
+    Allow: /
+    EOF
+
+    echo 'done'
+    ```
+
+    The quoted `'EOF'` also stops expansion in the heredoc, which is fine here because the text has no variables.
+
+    **How to measure it:** run the old and new script 100 times each in a clean CI runner and compare CPU time with `perf stat` (or RAPL if the runner exposes it). For energy, run both as usage scenarios in the Green Metrics Tool. Expect the difference to be within noise.
+
+    **Green Notes**
+    - **Bash quoting** (reduces E): single quotes for literals without expansion. The effect is real in long literals in hot loops, and negligible in this script.
+    - *Not applied:* single quotes around strings with `$v`, `$OUT` or `$BUILD_ID` — they need expansion, and variables must stay quoted.
+verify:
+  static_only: bash script needs src files and BUILD_ID; estimate answer

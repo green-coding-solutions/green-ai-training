@@ -1,0 +1,96 @@
+id: gen-1-00137-review
+category: review
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    Can you review this script for me? It is the last step of every CI job on our shared runners (a few hundred jobs a day). It archives the test output of the finished job so developers can look at it if a build fails.
+
+    Requirements:
+    - Archive is kept 7 days on the runner disk, then deleted.
+    - Output dir has JUnit XML, coverage HTML, console logs and some PNG screenshots.
+    - A developer must be able to restore it on a normal Linux or macOS laptop (zstd is installed there).
+    - The job must not leave a half-written archive behind.
+
+    ```bash
+    #!/usr/bin/env bash
+    # archive-run.sh <job-id>
+    # Archives the test output of a finished CI job.
+
+    set -u
+
+    JOB_ID=$1
+    SRC=/var/ci/work/$JOB_ID/output
+    DEST=/var/ci/archive
+    KEEP_DAYS=7
+
+    mkdir -p $DEST
+    cd $SRC || exit 1
+
+    tar -cf - . | xz -9e > $DEST/run-$JOB_ID.tar.xz
+
+    if [ $? -eq 0 ]; then
+        rm -rf $SRC/*
+    fi
+
+    find $DEST -name 'run-*.tar.xz' -mtime +$KEEP_DAYS -delete
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (runs after every CI job)
+
+    #### [Bug] Failed `tar` is not detected, and the output is deleted anyway
+    - **Where:** `tar -cf - . | xz -9e > ...` followed by `if [ $? -eq 0 ]`
+    - **Issue:** without `pipefail`, `$?` is the exit code of `xz` only. If `tar` fails halfway, `xz` can still exit with 0. The script then deletes the source files and keeps a broken archive. A failed `xz` also leaves a partial file under the final name.
+    - **Fix:** use `set -euo pipefail`, write to a temp file and `mv` it into place only after success. Delete the source only after the `mv`.
+
+    #### [Security] Unvalidated job id is used in paths and in `rm -rf`
+    - **Where:** `JOB_ID=$1`, `SRC=...`, `rm -rf $SRC/*`
+    - **Issue:** an id like `../../x` points the `cd` and the delete outside the job directory. All variables are also unquoted, so spaces or glob characters in the id split or expand the paths.
+    - **Fix:** allow only `[A-Za-z0-9_-]` in the id and quote every variable.
+
+    #### [High] `xz -9e` on every job for data that lives 7 days
+    - **Where:** `xz -9e` in the archive pipeline
+    - **Issue:** this runs once per job, so the CPU cost repeats hundreds of times a day on shared runners. In Green Metrics Tool micro-benchmarks on 100 MB of text, xz at its default level used about 458 J to compress, zstd at its default about 16 J, which is about 29× more for xz. `-9e` costs more than the default. An estimate from Green Coding Solutions says xz-compressed data has to be stored about 7 days before the saving on storage pays for the compression, zstd about 0.15 days. Those break-even times are lower bounds. Your retention is exactly 7 days, so xz barely breaks even at best. PNG screenshots are already compressed, so they gain nothing and only cost CPU time.
+    - **Fix:** use `zstd` at its default level. `tar --zstd` also gives you tar's real exit code, which fixes the pipeline bug. The measurements compare energy, not compression ratio. xz gives smaller files, which would matter for long-term storage or slow links, not for 7 days on a local disk.
+    - **Impact:** reduces E per job. It is the dominant cost of the script.
+
+    ```bash
+    #!/usr/bin/env bash
+    # archive-run.sh <job-id>
+    # Archives the test output of a finished CI job.
+
+    set -euo pipefail
+
+    JOB_ID=${1:?usage: archive-run.sh <job-id>}
+    case $JOB_ID in
+        ''|*[!A-Za-z0-9_-]*) echo 'invalid job id' >&2; exit 2 ;;
+    esac
+
+    SRC=/var/ci/work/$JOB_ID/output
+    DEST=/var/ci/archive
+    KEEP_DAYS=7
+
+    mkdir -p "$DEST"
+    tmp=$(mktemp "$DEST/.run-$JOB_ID.XXXXXX")
+    trap 'rm -f "$tmp"' EXIT
+
+    tar -C "$SRC" --zstd -cf "$tmp" .
+    mv "$tmp" "$DEST/run-$JOB_ID.tar.zst"
+
+    find "$SRC" -mindepth 1 -delete
+    find "$DEST" -name 'run-*.tar.*' -mtime +"$KEEP_DAYS" -delete
+    ```
+
+    Notes on the rewrite:
+    - Developers restore with `tar --zstd -xf run-<id>.tar.zst`, which needs `zstd` installed, as you said it is.
+    - The retention pattern is now `run-*.tar.*`, so old `.tar.xz` archives are still cleaned up during the switch.
+
+    **Already good:** the retention cleanup exists, so the disk cannot fill up forever, and the script stops when the source directory is missing.
+verify:
+  static_only: needs zstd, GNU tar and the CI directory layout under /var/ci

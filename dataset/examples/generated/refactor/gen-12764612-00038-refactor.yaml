@@ -1,0 +1,154 @@
+id: gen-12764612-00038-refactor
+category: refactor
+language: html
+patterns:
+- dom-size
+- lazy-load-images
+facts:
+- F-DOM-SIZE
+- F-LAZY-IMG
+messages:
+- role: user
+  content: |
+    Hi, I made this html page for our CI. After every UI test run it shows a screenshot for each test. Since we have more tests the page is very slow to open and the browser fan goes crazy. I dont know what is wrong, can you make it better?
+
+    ```html
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <title>UI test report</title>
+      <style>
+        body { font-family: sans-serif; margin: 20px; }
+        #grid { display: flex; flex-wrap: wrap; gap: 12px; }
+        .card { width: 330px; border: 1px solid #ccc; border-radius: 4px; }
+        .card-inner { padding: 5px; }
+        .card-head { display: flex; justify-content: space-between; font-size: 13px; }
+        .badge { padding: 0 6px; border-radius: 3px; color: #fff; }
+        .passed .badge { background: #2a7; }
+        .failed .badge { background: #c33; }
+      </style>
+    </head>
+    <body>
+      <h1>UI test report</h1>
+      <img src="shots/summary-overview.png" width="800" height="300" alt="Summary">
+      <div id="grid"></div>
+
+      <script src="results.js"></script>
+      <script>
+        // results.js defines: const results = [{name, status, shot, durationMs}, ...]  (~3000 entries)
+        const grid = document.getElementById('grid');
+        results.forEach(r => {
+          const card = document.createElement('div');
+          card.className = 'card ' + r.status;
+          const inner = document.createElement('div');
+          inner.className = 'card-inner';
+          const head = document.createElement('div');
+          head.className = 'card-head';
+          const title = document.createElement('span');
+          title.textContent = r.name;
+          const badge = document.createElement('span');
+          badge.className = 'badge';
+          badge.textContent = r.status;
+          const time = document.createElement('div');
+          time.textContent = (r.durationMs / 1000).toFixed(1) + ' s';
+          const img = document.createElement('img');
+          img.src = 'shots/' + r.shot;
+          img.width = 320;
+          img.height = 200;
+          head.appendChild(title);
+          head.appendChild(badge);
+          inner.appendChild(head);
+          inner.appendChild(img);
+          inner.appendChild(time);
+          card.appendChild(inner);
+          grid.appendChild(card);
+        });
+      </script>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    The page builds about 3000 cards at once. Each card has 7 elements and a screenshot, so the browser creates around 20,000 elements and starts about 3000 image requests. Two changes fix this: show one page of results at a time, and only load screenshots near the top right away.
+
+    ```html
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <title>UI test report</title>
+      <style>
+        body { font-family: sans-serif; margin: 20px; }
+        #grid { display: flex; flex-wrap: wrap; gap: 12px; }
+        .card { width: 330px; margin: 0; padding: 5px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
+        .card img { display: block; }
+        .card.passed { border-left: 4px solid #2a7; }
+        .card.failed { border-left: 4px solid #c33; }
+        #pager { margin: 12px 0; }
+      </style>
+    </head>
+    <body>
+      <h1>UI test report</h1>
+      <!-- above the fold: keep it eager -->
+      <img src="shots/summary-overview.png" width="800" height="300" alt="Summary">
+      <div id="pager">
+        <button id="prev">Previous</button>
+        <span id="pos"></span>
+        <button id="next">Next</button>
+      </div>
+      <div id="grid"></div>
+
+      <script src="results.js"></script>
+      <script>
+        // results.js defines: const results = [{name, status, shot, durationMs}, ...]
+        const PAGE_SIZE = 50;
+        const EAGER_IMAGES = 6; // roughly what fits on the first screen
+        const grid = document.getElementById('grid');
+        const pos = document.getElementById('pos');
+        const prev = document.getElementById('prev');
+        const next = document.getElementById('next');
+        const pages = Math.max(1, Math.ceil(results.length / PAGE_SIZE));
+        let page = 0;
+
+        function render() {
+          const frag = document.createDocumentFragment();
+          results.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE).forEach((r, i) => {
+            const card = document.createElement('figure');
+            card.className = 'card ' + r.status;
+
+            const img = new Image(320, 200);
+            img.src = 'shots/' + r.shot;
+            img.alt = r.name;
+            if (i >= EAGER_IMAGES) img.loading = 'lazy';
+
+            const cap = document.createElement('figcaption');
+            cap.textContent = r.name + ' · ' + r.status + ' · ' + (r.durationMs / 1000).toFixed(1) + ' s';
+
+            card.append(img, cap);
+            frag.appendChild(card);
+          });
+          grid.replaceChildren(frag);
+          pos.textContent = 'Page ' + (page + 1) + ' of ' + pages + ' (' + results.length + ' tests)';
+          prev.disabled = page === 0;
+          next.disabled = page === pages - 1;
+        }
+
+        prev.onclick = () => { page--; render(); };
+        next.onclick = () => { page++; render(); };
+        render();
+      </script>
+    </body>
+    </html>
+    ```
+
+    **Green Notes**
+    - **Smaller DOM** (reduces E on the client): the page shows 50 cards instead of 3000. Each card has 3 elements (`figure`, `img`, `figcaption`) instead of 7, and the cards are added to a `DocumentFragment` and inserted in one step. In Green Metrics Tool micro-benchmarks, a table with 10,000 rows built from 14 elements per row, appended one by one, used about 56% less CPU energy when paginated to 100 rows per page as a plain table built in a fragment. Your page is a card grid, not a table, so treat that as the direction, not a prediction.
+    - **Lazy-load screenshots below the first screen** (reduces network and E): the first 6 cards and the summary image stay eager, so nothing visible is delayed. In the same micro-benchmarks, lazy loading saved about 12% on page loads without scrolling and made no difference when the visitor scrolled to the end. With 50 images per page the effect is small. It helps most for people who only look at the top of a page.
+
+    Other things to know:
+    - `results.js` still downloads all 3000 entries. That is plain data and cheap next to the screenshots.
+    - The status badge is now a colored border and the text in the caption, so the page looks a bit simpler. Everything is set with `textContent`, so test names cannot inject HTML.
+    - If people mostly want failed tests, a "failed only" filter on `results` before paging would help them more than any page size.
+verify:
+  static_only: html page that needs a browser, results.js and screenshot files

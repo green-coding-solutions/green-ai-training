@@ -1,0 +1,149 @@
+id: gen-2-00041-review
+category: review
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import os
+
+    import requests
+    from fastapi import APIRouter, HTTPException
+    from pydantic import BaseModel
+
+    from .cart import load_cart
+    from .pricing import apply_promotions
+
+    INVENTORY_URL = os.environ["INVENTORY_URL"]
+    router = APIRouter()
+
+
+    class CheckoutPreview(BaseModel):
+        items: list[dict]
+        unavailable: list[str]
+        subtotal: float
+
+
+    def fetch_stock(sku: str) -> int:
+        try:
+            r = requests.get(f"{INVENTORY_URL}/v1/stock/{sku}", timeout=3)
+            r.raise_for_status()
+            return r.json()["available"]
+        except requests.RequestException:
+            return 999  # don't block checkout if inventory is flaky
+
+
+    @router.get("/carts/{cart_id}/checkout-preview", response_model=CheckoutPreview)
+    async def checkout_preview(cart_id: str):
+        cart = await load_cart(cart_id)
+        if cart is None:
+            raise HTTPException(status_code=404, detail="cart not found")
+
+        items, unavailable = [], []
+        for line in cart.lines:
+            available = fetch_stock(line.sku)
+            if available < line.quantity:
+                unavailable.append(line.sku)
+                continue
+            items.append({
+                "sku": line.sku,
+                "quantity": line.quantity,
+                "unit_price": line.unit_price,
+            })
+
+        subtotal = sum(i["quantity"] * i["unit_price"] for i in items)
+        subtotal = apply_promotions(subtotal, cart.coupon_code)
+        return CheckoutPreview(items=items, unavailable=unavailable, subtotal=round(subtotal, 2))
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (checkout API, runs on every checkout view)
+
+    #### [Bug] Products that were removed show as in stock
+    - **Where:** `fetch_stock`, `except requests.RequestException: return 999`
+    - **Issue:** `raise_for_status()` raises on a 404 too, so a SKU that the inventory service no longer knows is reported with 999 units. The fallback was meant for outages, but it also hides "this product is gone". The customer only finds out later in checkout.
+    - **Fix:** treat 404 as 0 units. Keep failing open only for network errors and 5xx, and log them (see the code below).
+
+    #### [High] Blocking, one-by-one inventory calls inside an `async` endpoint
+    - **Where:** `fetch_stock(line.sku)` in the loop of `checkout_preview`
+    - **Issue:** `requests.get` is synchronous. Inside `async def`, each call blocks the event loop, so the worker serves no other request while it waits. The calls also run one after another, so a 12-line cart waits for 12 round trips in a row, and an unreachable service can hold the worker for up to 3 s per line.
+    - **Fix:** use one shared `httpx.AsyncClient` and send all stock requests at once with `asyncio.gather`.
+    - **Impact:** mainly wall time and how long each request holds a worker. Waiting time goes from the sum of all calls to roughly the slowest call, and other requests keep being served meanwhile. CPU energy drops only a little: in Green Metrics Tool micro-benchmarks, 10 HTTP requests took ~9.1 J and 3.1 s with sync `urllib` and ~8.4 J and 2.6 s with async `httpx`. That is about 7% less CPU energy and about 17% less wall time. The bigger win here is that the event loop stops being blocked.
+
+    ```python
+    import asyncio
+    import logging
+    import os
+
+    import httpx
+    from fastapi import APIRouter, HTTPException
+    from pydantic import BaseModel
+
+    from .cart import load_cart
+    from .pricing import apply_promotions
+
+    INVENTORY_URL = os.environ["INVENTORY_URL"]
+    router = APIRouter()
+    log = logging.getLogger(__name__)
+
+    # One client for the whole process. Close it on shutdown: await inventory.aclose()
+    inventory = httpx.AsyncClient(base_url=INVENTORY_URL, timeout=3.0)
+
+
+    class CheckoutPreview(BaseModel):
+        items: list[dict]
+        unavailable: list[str]
+        subtotal: float
+
+
+    async def fetch_stock(sku: str) -> int | None:
+        """Units available, 0 for unknown SKUs, None if inventory can't answer."""
+        try:
+            r = await inventory.get(f"/v1/stock/{sku}")
+        except httpx.TransportError:
+            log.warning("inventory unreachable for %s", sku)
+            return None
+        if r.status_code == 404:
+            return 0
+        if r.is_error:
+            log.warning("inventory returned %s for %s", r.status_code, sku)
+            return None
+        return r.json()["available"]
+
+
+    @router.get("/carts/{cart_id}/checkout-preview", response_model=CheckoutPreview)
+    async def checkout_preview(cart_id: str):
+        cart = await load_cart(cart_id)
+        if cart is None:
+            raise HTTPException(status_code=404, detail="cart not found")
+
+        stock = await asyncio.gather(*(fetch_stock(line.sku) for line in cart.lines))
+
+        items, unavailable = [], []
+        for line, available in zip(cart.lines, stock):
+            # None = inventory down: fail open, as before
+            if available is not None and available < line.quantity:
+                unavailable.append(line.sku)
+                continue
+            items.append({
+                "sku": line.sku,
+                "quantity": line.quantity,
+                "unit_price": line.unit_price,
+            })
+
+        subtotal = sum(i["quantity"] * i["unit_price"] for i in items)
+        subtotal = apply_promotions(subtotal, cart.coupon_code)
+        return CheckoutPreview(items=items, unavailable=unavailable, subtotal=round(subtotal, 2))
+    ```
+
+    The result order stays the same, because `gather` returns results in the order of `cart.lines`. Behavior change: unknown SKUs now land in `unavailable`.
+
+    **Already good:** the cart is loaded with `await`, and the inventory call has a timeout.
+verify:
+  static_only: needs fastapi, httpx and a running inventory service

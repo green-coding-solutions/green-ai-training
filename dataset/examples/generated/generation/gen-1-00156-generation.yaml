@@ -1,0 +1,69 @@
+id: gen-1-00156-generation
+category: generation
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    hello, i need nginx config to show our goaccess reports. cron run goaccess every hour and write the html in /var/www/goaccess/ (file is report.html, its big, goaccess put all the data inside). around 20 persons from ops open it, many times per day. need https on port 8443 with cert in /etc/ssl/ops/fullchain.pem and privkey.pem, and basic auth with /etc/nginx/.htpasswd. also can you write the cron script, i dont have it yet. access log is /var/log/nginx/access.log, thanks
+- role: assistant
+  content: |
+    The report is only built once per hour, so compress it in the script and let nginx serve the ready file.
+
+    `/usr/local/bin/goaccess-report.sh`:
+
+    ```bash
+    #!/bin/bash
+    set -euo pipefail
+
+    out='/var/www/goaccess'
+    tmp="$out/.new.html"
+
+    goaccess /var/log/nginx/access.log --log-format=COMBINED -o "$tmp"
+
+    # compress once per run, then swap both files in
+    gzip -9 -c "$tmp" > "$out/.new.html.gz"
+    mv "$out/.new.html.gz" "$out/report.html.gz"
+    mv "$tmp" "$out/report.html"
+    ```
+
+    Cron entry:
+
+    ```text
+    5 * * * * /usr/local/bin/goaccess-report.sh
+    ```
+
+    nginx:
+
+    ```nginx
+    server {
+        listen 8443 ssl;
+        server_name _;
+
+        ssl_certificate     /etc/ssl/ops/fullchain.pem;
+        ssl_certificate_key /etc/ssl/ops/privkey.pem;
+
+        auth_basic           'Ops reports';
+        auth_basic_user_file /etc/nginx/.htpasswd;
+
+        root /var/www/goaccess;
+        index report.html;
+
+        gzip_static on;
+
+        location / {
+            try_files $uri =404;
+        }
+    }
+    ```
+
+    The `.gz` file is replaced on every run. nginx does not check if it is older than the `.html`, so the script must always write both files, as above. Clients without gzip support still get the plain `report.html`.
+
+    **Green Notes**
+    - **Precompressed text** (reduces E and network): `gzip_static` sends the `.gz` made by the script, so nginx does not compress the big report again for every visit. In Green Metrics Tool measurements of nginx serving 2,000 requests for text assets, compressing on every request used ~54 J and precompressed files ~14 J, about 4× less. Both sent about 10× fewer bytes than no compression.
+    - `gzip -9` is fine here because it runs once per hour, not per request.
+verify:
+  static_only: nginx config and shell script

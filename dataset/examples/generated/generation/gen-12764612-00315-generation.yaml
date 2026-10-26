@@ -1,0 +1,72 @@
+id: gen-12764612-00315-generation
+category: generation
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    hello, i need endpoint for our internal status page. we use FastAPI. it must check the /health url of our 8 services (auth, orders, billing, search, mailer, inventory, reports, gateway) and give back json with every service up or down and how many ms it took. if one service not answer in 2 seconds it is down. thanks a lot!
+- role: assistant
+  content: |
+    The checks run at the same time, so the endpoint waits for the slowest service, not for all of them one after another.
+
+    ```python
+    import asyncio
+    from contextlib import asynccontextmanager
+
+    import httpx
+    from fastapi import FastAPI, Request
+
+    SERVICES = {
+        "auth": "http://auth.internal:8000/health",
+        "orders": "http://orders.internal:8000/health",
+        "billing": "http://billing.internal:8000/health",
+        "search": "http://search.internal:8000/health",
+        "mailer": "http://mailer.internal:8000/health",
+        "inventory": "http://inventory.internal:8000/health",
+        "reports": "http://reports.internal:8000/health",
+        "gateway": "http://gateway.internal:8000/health",
+    }
+
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            app.state.client = client
+            yield
+
+
+    app = FastAPI(lifespan=lifespan)
+
+
+    async def check(client: httpx.AsyncClient, name: str, url: str) -> tuple[str, dict]:
+        try:
+            resp = await client.get(url)
+            up = resp.status_code == 200
+            ms = round(resp.elapsed.total_seconds() * 1000)
+            return name, {"status": "up" if up else "down", "ms": ms}
+        except httpx.HTTPError:
+            # timeout or connection error
+            return name, {"status": "down", "ms": None}
+
+
+    @app.get("/status")
+    async def status(request: Request):
+        client = request.app.state.client
+        results = await asyncio.gather(
+            *(check(client, name, url) for name, url in SERVICES.items())
+        )
+        return {
+            "all_up": all(r["status"] == "up" for _, r in results),
+            "services": dict(results),
+        }
+    ```
+
+    **Green Notes**
+    - **Async concurrent I/O** (reduces wall time and resource holding time): the 8 health checks overlap, so one request to `/status` takes about as long as the slowest service, with a worst case of 2 seconds. A sequential loop could take 16 seconds if all services hang. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. For a small number of requests the gain is mostly wall time, not CPU energy.
+    - *Not applied:* anything heavier. For an internal page that is opened now and then, this is enough.
+verify:
+  static_only: needs FastAPI, httpx and network access to internal services

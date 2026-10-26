@@ -603,7 +603,7 @@ def verify_all(paths=None, no_exec=False, use_cache=True, quiet=False):
     test_shingles = load_test_case_shingles()
     cache_path = OUT_DIR / "verify-cache.json"
     cache = {}
-    if use_cache and cache_path.exists():
+    if use_cache and cache_path.exists() and cache_path.stat().st_size:
         cache = json.loads(cache_path.read_text())
 
     report, seen, dedupe_entries = {}, set(), []

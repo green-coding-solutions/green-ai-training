@@ -1,0 +1,175 @@
+id: gen-2-00035-generation
+category: generation
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    ```python
+    #!/usr/bin/env python3
+    """pdmgen - convert a mono float32 .raw clip into a 1-bit PDM stream
+    for the doorbell board (piezo driven straight from a GPIO pin).
+
+        pdmgen chime.raw chime.pdm --rate 16000 --osr 64
+    """
+    import argparse
+    import sys
+
+    import numpy as np
+
+
+    def load_clip(path: str) -> np.ndarray:
+        x = np.fromfile(path, dtype="<f4")
+        if x.size == 0:
+            sys.exit(f"{path}: empty file")
+        return x
+
+
+    def upsample(x: np.ndarray, osr: int) -> np.ndarray:
+        # TODO linear interp to rate * osr
+        raise NotImplementedError
+
+
+    def pdm_modulate(x: np.ndarray) -> np.ndarray:
+        # TODO first-order sigma-delta, one 0/1 per sample
+        raise NotImplementedError
+
+
+    def main() -> None:
+        ap = argparse.ArgumentParser()
+        ap.add_argument("src")
+        ap.add_argument("dst")
+        ap.add_argument("--rate", type=int, default=16000)
+        ap.add_argument("--osr", type=int, default=64)
+        args = ap.parse_args()
+
+        x = load_clip(args.src)
+        bits = pdm_modulate(upsample(x, args.osr))
+        # firmware shifts bits out MSB first
+        np.packbits(bits).tofile(args.dst)
+        print(f"{args.src}: {x.size} samples -> {bits.size} bits")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    ?
+- role: assistant
+  content: |
+    Here are the two missing functions. The modulator loop is JIT-compiled with Numba. Without Numba installed, the script still runs, just slower.
+
+    ```python
+    #!/usr/bin/env python3
+    """pdmgen - convert a mono float32 .raw clip into a 1-bit PDM stream
+    for the doorbell board (piezo driven straight from a GPIO pin).
+
+        pdmgen chime.raw chime.pdm --rate 16000 --osr 64
+    """
+    import argparse
+    import sys
+
+    import numpy as np
+
+    try:
+        from numba import njit
+    except ImportError:  # same output without numba, only slower
+        def njit(**_kwargs):
+            return lambda func: func
+
+
+    def load_clip(path: str) -> np.ndarray:
+        x = np.fromfile(path, dtype="<f4")
+        if x.size == 0:
+            sys.exit(f"{path}: empty file")
+        return x
+
+
+    def upsample(x: np.ndarray, osr: int) -> np.ndarray:
+        """Linear interpolation to osr points per input sample, clipped to [-1, 1]."""
+        n = x.size
+        t = np.arange(n * osr, dtype=np.float64) / osr
+        y = np.interp(t, np.arange(n, dtype=np.float64), x.astype(np.float64))
+        # a first-order loop is only stable for |x| <= 1
+        return np.clip(y, -1.0, 1.0)
+
+
+    @njit(cache=True)
+    def pdm_modulate(x: np.ndarray) -> np.ndarray:
+        """First-order sigma-delta: one 0/1 per sample, bit density = (1 + x) / 2."""
+        out = np.empty(x.size, dtype=np.uint8)
+        integ = 0.0
+        fb = 0.0
+        for i in range(x.size):
+            integ += x[i] - fb
+            if integ >= 0.0:
+                out[i] = 1
+                fb = 1.0
+            else:
+                out[i] = 0
+                fb = -1.0
+        return out
+
+
+    def main() -> None:
+        ap = argparse.ArgumentParser()
+        ap.add_argument("src")
+        ap.add_argument("dst")
+        ap.add_argument("--rate", type=int, default=16000)
+        ap.add_argument("--osr", type=int, default=64)
+        args = ap.parse_args()
+
+        x = load_clip(args.src)
+        bits = pdm_modulate(upsample(x, args.osr))
+        # firmware shifts bits out MSB first (np.packbits default)
+        packed = np.packbits(bits)
+        packed.tofile(args.dst)
+        print(f"{args.src}: {x.size} samples ({x.size / args.rate:.1f} s) "
+              f"-> {bits.size} bits, {packed.size} bytes")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **JIT-compile the hot numeric loop with Numba** (reduces E): each output bit depends on the integrator state from the previous sample. NumPy can't vectorize that, so it stays a loop. A 10-second clip at the defaults is about 10 million iterations. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples used ~40 J in a pure Python loop and ~9.5 J with Numba `@njit`, about 4× less.
+    - **`cache=True`:** the first run compiles the function and stores the machine code in `__pycache__`. Later runs skip the compile step.
+    - **Vectorized upsampling:** `np.interp` builds the whole oversampled signal in one call, so only the part that has to be sequential is a loop.
+
+    Clipping to [-1, 1] keeps the integrator bounded. Without it, a hot sample would make the loop drift and click.
+verify:
+  module: true
+  test: |-
+    import os
+    import sys
+    import tempfile
+
+    import numpy as np
+
+    z = pdm_modulate(np.zeros(100))
+    assert z.dtype == np.uint8 and z.size == 100
+    assert set(np.unique(z).tolist()) <= {0, 1}
+    assert z.mean() == 0.5
+
+    b = pdm_modulate(np.full(10000, 0.5))
+    assert abs(b.mean() - 0.75) < 0.001
+
+    up = upsample(np.array([0.0, 1.0], dtype=np.float32), 4)
+    assert up.size == 8
+    assert np.allclose(up[:5], [0.0, 0.25, 0.5, 0.75, 1.0])
+    assert np.all(up <= 1.0) and np.all(up >= -1.0)
+
+    hot = upsample(np.array([2.0, -3.0], dtype=np.float32), 2)
+    assert hot.max() == 1.0 and hot.min() == -1.0
+
+    d = tempfile.mkdtemp()
+    src = os.path.join(d, "in.raw")
+    dst = os.path.join(d, "out.pdm")
+    np.sin(np.linspace(0, 20, 1600)).astype("<f4").tofile(src)
+    sys.argv = ["pdmgen", src, dst, "--osr", "8"]
+    main()
+    assert os.path.getsize(dst) == 1600

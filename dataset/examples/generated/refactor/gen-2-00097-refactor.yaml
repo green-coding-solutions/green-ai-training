@@ -1,0 +1,154 @@
+id: gen-2-00097-refactor
+category: refactor
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import math
+    import struct
+    import time
+
+    ADC_BITS = 16
+    VREF = 3.3
+
+
+    class VibrationChannel:
+        """One accelerometer on the pump skid, sampled by the gateway ADC."""
+
+        def __init__(self, sensor_id, sensitivity_mv_per_g, offset_counts=32768):
+            self.sensor_id = sensor_id
+            self.sensitivity = sensitivity_mv_per_g / 1000.0  # V per g
+            self.offset = offset_counts
+            self.scale = VREF / (2 ** ADC_BITS)
+
+        def decode_frame(self, payload):
+            n = len(payload) // 2
+            raw = struct.unpack("<%dH" % n, payload)
+            accel = []
+            for count in raw:
+                volts = (count - self.offset) * self.scale
+                accel.append(volts / self.sensitivity)
+            return accel
+
+        def features(self, accel):
+            sum_sq = 0.0
+            peak = 0.0
+            for a in accel:
+                sum_sq += a * a
+                peak = max(peak, math.fabs(a))
+            rms = math.sqrt(sum_sq / len(accel))
+            crest = peak / rms if rms else 0.0
+            return {
+                "sensor": self.sensor_id,
+                "rms_g": rms,
+                "peak_g": peak,
+                "crest": crest,
+                "ts": time.time(),
+            }
+
+
+    def process(frames, channels, publish):
+        for sensor_id, payload in frames:
+            ch = channels[sensor_id]
+            publish(ch.features(ch.decode_frame(payload)))
+    ```
+- role: assistant
+  content: |
+    ```python
+    import math
+    import struct
+    import time
+
+    ADC_BITS = 16
+    VREF = 3.3
+
+
+    class VibrationChannel:
+        """One accelerometer on the pump skid, sampled by the gateway ADC."""
+
+        def __init__(self, sensor_id, sensitivity_mv_per_g, offset_counts=32768):
+            self.sensor_id = sensor_id
+            self.sensitivity = sensitivity_mv_per_g / 1000.0  # V per g
+            self.offset = offset_counts
+            self.scale = VREF / (2 ** ADC_BITS)
+
+        def decode_frame(self, payload):
+            n = len(payload) // 2
+            raw = struct.unpack("<%dH" % n, payload)
+            # bind once per frame, not once per sample
+            offset = self.offset
+            scale = self.scale
+            sensitivity = self.sensitivity
+            accel = []
+            append = accel.append
+            for count in raw:
+                append((count - offset) * scale / sensitivity)
+            return accel
+
+        def features(self, accel):
+            fabs = math.fabs
+            max_ = max
+            sum_sq = 0.0
+            peak = 0.0
+            for a in accel:
+                sum_sq += a * a
+                peak = max_(peak, fabs(a))
+            rms = math.sqrt(sum_sq / len(accel))
+            crest = peak / rms if rms else 0.0
+            return {
+                "sensor": self.sensor_id,
+                "rms_g": rms,
+                "peak_g": peak,
+                "crest": crest,
+                "ts": time.time(),
+            }
+
+
+    def process(frames, channels, publish):
+        for sensor_id, payload in frames:
+            ch = channels[sensor_id]
+            publish(ch.features(ch.decode_frame(payload)))
+    ```
+
+    **Green Notes**
+    - **Hoisted loop-invariant lookups** (reduces E): the code looked up `self.offset`, `self.scale`, `self.sensitivity`, `accel.append`, `math.fabs` and `max` again for every sample. Now each one is a local variable, bound once per frame. In CPython, a local lookup is the cheapest kind of name access.
+    - **Expect a small gain:** in Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local variable before a 10,000,000-iteration loop saved about 4-5%. It is worth doing here only because both loops run for every sample of every frame, all day long.
+    - **Output unchanged:** the arithmetic and its order are the same, so the results are bit-identical. `math.sqrt` runs once per frame after the loop, so I left it alone.
+verify:
+  test: |
+    import struct as _s, math as _m
+    ch = VibrationChannel("vib-01", 100.0)
+    assert ch.decode_frame(_s.pack("<2H", 32768, 32768)) == [0.0, 0.0]
+    f = ch.features([3.0, -4.0])
+    assert f["sensor"] == "vib-01"
+    assert f["peak_g"] == 4.0
+    assert f["rms_g"] == _m.sqrt(12.5)
+    assert abs(f["crest"] - 4.0 / _m.sqrt(12.5)) < 1e-12
+    out = []
+    process([("vib-01", _s.pack("<3H", 32768, 32868, 32668))], {"vib-01": ch}, out.append)
+    assert len(out) == 1 and out[0]["peak_g"] > 0
+  equivalence:
+    driver: |-
+      import random
+      import struct as _s
+      random.seed(7)
+      chans = {
+          "vib-01": VibrationChannel("vib-01", 100.0),
+          "vib-02": VibrationChannel("vib-02", 10.2, offset_counts=32700),
+      }
+      frames = []
+      for sid in ["vib-01", "vib-02", "vib-01", "vib-02"]:
+          vals = [random.randint(0, 65535) for _ in range(2048)]
+          frames.append((sid, _s.pack("<%dH" % len(vals), *vals)))
+      out = []
+      process(frames, chans, out.append)
+      for r in out:
+          print(r["sensor"], repr(r["rms_g"]), repr(r["peak_g"]), repr(r["crest"]))
+      print(repr(chans["vib-02"].decode_frame(frames[1][1])[:5]))

@@ -1,0 +1,86 @@
+id: gen-2-00093-review
+category: review
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    Hi, I'm new to our CI setup and I'm not sure what's wrong here. This script runs on every push to a pull request branch. It packs our frontend build (mostly JS bundles, CSS and source maps) and copies it to our 3 preview servers. The "Packing build" step takes really long, sometimes longer than the build itself. My lead said compressing is good because we save bandwidth, so I don't want to just remove it. Can you review it?
+
+    ```bash
+    #!/bin/bash
+    # deploy_preview.sh - called by CI on every push to a PR branch
+    # usage: ./deploy_preview.sh <branch-name>
+    # packs the frontend build and copies it to the preview hosts
+
+    BRANCH=$1
+    BUILD_DIR=dist
+    ARCHIVE=/tmp/site-$BRANCH.tar.xz
+    HOSTS="preview1.internal preview2.internal preview3.internal"
+
+    echo "Packing build for $BRANCH..."
+    tar -cf - $BUILD_DIR | xz -9e -T1 > $ARCHIVE
+
+    for host in $HOSTS; do
+      echo "Uploading to $host"
+      scp $ARCHIVE deploy@$host:/tmp/
+      ssh deploy@$host "mkdir -p /srv/preview/$BRANCH && tar -xJf /tmp/site-$BRANCH.tar.xz -C /srv/preview/$BRANCH && rm /tmp/site-$BRANCH.tar.xz"
+    done
+
+    rm $ARCHIVE
+    echo "Done"
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (CI, runs on every PR push)
+
+    #### [Security] Branch name is pasted into a remote shell command
+    - **Where:** the `ssh deploy@$host "..."` line
+    - **Issue:** anyone who can push a branch controls `$BRANCH`. Git allows characters like `;` and `$` in branch names, so the right name runs arbitrary commands as `deploy` on all three preview hosts.
+    - **Fix:** turn the branch into a safe slug with a builtin before you use it anywhere: `SLUG=${BRANCH//[^a-zA-Z0-9._-]/-}`.
+
+    #### [Bug] Branches with `/` break the script, and failures are ignored
+    - **Where:** `ARCHIVE=/tmp/site-$BRANCH.tar.xz`, and the script as a whole
+    - **Issue:** a branch like `feature/login` gives `/tmp/site-feature/login.tar.xz`. That directory doesn't exist, so the archive is never written. Without `set -e` the script keeps going anyway: it uploads nothing or a broken file, and CI still reports success.
+    - **Fix:** use the slug from above. Add `set -euo pipefail` so a failed `tar`, `scp` or `ssh` fails the job. Clean up with a `trap` so the temp file is removed even when the script exits early.
+
+    #### [High] Maximum-strength `xz` for an archive that lives a few minutes
+    - **Where:** `xz -9e -T1`
+    - **Issue:** your lead is right that compression helps here. JS, CSS and source maps are text and shrink a lot. But `xz -9e` is about the most CPU-heavy setting there is, on a single thread. And it runs on every push, for a file that gets deleted right after the upload. That's why this step is so slow.
+    - **Fix:** keep compressing, but use a fast codec: `tar --zstd -cf "$ARCHIVE" "$BUILD_DIR"`, and `tar --zstd -xf` on the hosts. This needs `zstd` installed on the runner and the preview hosts, and a GNU tar with `--zstd` support.
+    - **Impact:** reduces E on every CI run. In Green Metrics Tool benchmarks compressing 100 MB of text with default settings, xz used about 29× more CPU energy than zstd. That was xz at its default level, and `-9e` costs more still. These figures compare energy, not file size. xz usually gives a somewhat smaller archive. For a short-lived file sent to internal hosts, that small extra saving in bytes is not worth the CPU time. Images and fonts in `dist` (PNG, JPEG, WOFF2) are already compressed and barely shrink with either codec.
+
+    ```bash
+    #!/bin/bash
+    # deploy_preview.sh - called by CI on every push to a PR branch
+    # usage: ./deploy_preview.sh <branch-name>
+    set -euo pipefail
+
+    BRANCH=$1
+    SLUG=${BRANCH//[^a-zA-Z0-9._-]/-}
+    BUILD_DIR=dist
+    ARCHIVE="/tmp/site-$SLUG.tar.zst"
+    HOSTS=(preview1.internal preview2.internal preview3.internal)
+
+    trap 'rm -f "$ARCHIVE"' EXIT
+
+    echo "Packing build for $SLUG..."
+    tar --zstd -cf "$ARCHIVE" "$BUILD_DIR"
+
+    for host in "${HOSTS[@]}"; do
+      echo "Uploading to $host"
+      scp "$ARCHIVE" "deploy@$host:/tmp/"
+      ssh "deploy@$host" "mkdir -p '/srv/preview/$SLUG' && tar --zstd -xf '/tmp/site-$SLUG.tar.zst' -C '/srv/preview/$SLUG' && rm '/tmp/site-$SLUG.tar.zst'"
+    done
+
+    echo 'Done'
+    ```
+
+    Note: the preview URL path now uses the slug, so `feature/login` becomes `/srv/preview/feature-login`.
+
+    **Already good:** the build is compressed once and the same archive goes to all three hosts. It is not compressed again for each host. The remote temp file is cleaned up after unpacking.
+verify:
+  static_only: Deploy script needs scp/ssh access to remote hosts and zstd-enabled GNU tar; cannot run in the sandbox.

@@ -1,0 +1,141 @@
+id: gen-2-00370-review
+category: review
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    We run a landing page builder. Customers upload a hero image for their page, and if they pick the "retro" theme we show a dithered grayscale version of it. The dithering runs inside the upload request in our Flask app (gunicorn, CPU-only containers). Since the theme launched, uploads of big photos take several seconds and pod CPU went up a lot.
+
+    Please review this module before we touch it. Requirements:
+    - the dithered output must stay pixel-identical, the design team signed off on the look
+    - no GPU, but we can add pip packages to the image
+    - endpoint URL and JSON response must stay the same
+    - no separate queue/worker service for now
+
+    ```python
+    import os
+
+    import numpy as np
+    from flask import Blueprint, jsonify, request
+    from PIL import Image
+
+    bp = Blueprint("hero", __name__)
+
+    MEDIA_ROOT = "/srv/pagebuilder/media"
+    MEDIA_URL = "https://cdn.example-pages.com/media"
+    DITHER_DIR = os.path.join(MEDIA_ROOT, "dithered")
+    MAX_SIDE = 2400
+
+
+    def floyd_steinberg(gray, levels):
+        img = gray.astype(np.float64)
+        h, w = img.shape
+        step = 255.0 / (levels - 1)
+        for y in range(h):
+            for x in range(w):
+                old = img[y, x]
+                new = round(old / step) * step
+                img[y, x] = new
+                err = old - new
+                if x + 1 < w:
+                    img[y, x + 1] += err * 7 / 16
+                if y + 1 < h:
+                    if x > 0:
+                        img[y + 1, x - 1] += err * 3 / 16
+                    img[y + 1, x] += err * 5 / 16
+                    if x + 1 < w:
+                        img[y + 1, x + 1] += err * 1 / 16
+        return img.astype(np.uint8)
+
+
+    def render_retro_hero(site_id, upload, levels):
+        im = Image.open(upload.stream)
+        im.thumbnail((MAX_SIDE, MAX_SIDE))
+        gray = np.asarray(im.convert("L"))
+        out = floyd_steinberg(gray, levels)
+        out_path = os.path.join(DITHER_DIR, str(site_id), upload.filename)
+        Image.fromarray(out).save(out_path, format="PNG")
+        return out_path
+
+
+    @bp.post("/sites/<int:site_id>/hero")
+    def upload_hero(site_id):
+        upload = request.files["hero"]
+        levels = int(request.form.get("levels", 4))
+        path = render_retro_hero(site_id, upload, levels)
+        return jsonify({"retro_url": path.replace(MEDIA_ROOT, MEDIA_URL)})
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (image processing in the upload request)
+
+    #### [Security] Client-controlled file name in the output path
+    - **Where:** `render_retro_hero`, `os.path.join(DITHER_DIR, str(site_id), upload.filename)`
+    - **Issue:** `upload.filename` comes from the client. A name like `../../12/hero.jpg` overwrites another customer's hero, and deeper `../` paths can reach any file the app user can write. The name also keeps the original extension, so `photo.jpg` ends up holding PNG bytes.
+    - **Fix:** generate the name on the server. The JSON shape stays the same. Only the file name inside `retro_url` changes.
+
+    ```python
+    import uuid
+
+    out_path = os.path.join(DITHER_DIR, str(site_id), f"hero-{uuid.uuid4().hex}.png")
+    ```
+
+    #### [Bug] `levels` is not validated
+    - **Where:** `upload_hero`, `int(request.form.get("levels", 4))`
+    - **Issue:** a non-numeric value raises `ValueError`, and `levels=1` divides by zero in `floyd_steinberg`. Both end as a 500. Zero or negative values give a negative `step` and garbage output.
+    - **Fix:** validate the value before use.
+
+    ```python
+    try:
+        levels = int(request.form.get("levels", 4))
+    except ValueError:
+        return jsonify({"error": "levels must be an integer"}), 400
+    if not 2 <= levels <= 256:
+        return jsonify({"error": "levels must be between 2 and 256"}), 400
+    ```
+
+    #### [High] Error diffusion runs as a pure Python loop over every pixel
+    - **Where:** `floyd_steinberg`, the nested `for y` / `for x` loop
+    - **Issue:** a 2400 × 1600 photo means almost 4 million interpreted iterations per upload. Each one does several NumPy scalar reads and writes, and each of those goes through Python object overhead. NumPy vectorization does not fit here. Floyd–Steinberg is sequential, because every pixel depends on the error pushed from the pixels before it. This is the case a JIT is made for: a CPU-bound numeric loop that runs on every upload.
+    - **Fix:** compile the function as it is with Numba. Leave the loop body unchanged.
+
+    ```python
+    from numba import njit
+
+
+    @njit(cache=True)
+    def floyd_steinberg(gray, levels):
+        img = gray.astype(np.float64)
+        h, w = img.shape
+        step = 255.0 / (levels - 1)
+        for y in range(h):
+            for x in range(w):
+                old = img[y, x]
+                new = round(old / step) * step
+                img[y, x] = new
+                err = old - new
+                if x + 1 < w:
+                    img[y, x + 1] += err * 7 / 16
+                if y + 1 < h:
+                    if x > 0:
+                        img[y + 1, x - 1] += err * 3 / 16
+                    img[y + 1, x] += err * 5 / 16
+                    if x + 1 < w:
+                        img[y + 1, x + 1] += err * 1 / 16
+        return img.astype(np.uint8)
+    ```
+
+    Notes on the change:
+    - Pass `levels` as an `int`, as the endpoint already does. That way Numba compiles a single version.
+    - Don't turn on `fastmath`. Without it, the float operations run in the same order, and `round` rounds half to even like Python's. Before rollout, check the pixel-identical requirement: run old and new on a set of stored heroes and compare the PNG bytes.
+    - The first call in each process compiles the function. `cache=True` stores the compiled code on disk, so a gunicorn restart can reuse it. Point `NUMBA_CACHE_DIR` at a writable path in the container. Calling the function once at import with a tiny array keeps the compile out of the first customer's request.
+
+    - **Impact:** E on every retro upload, plus shorter request time and pod CPU. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples in a pure Python loop used ~40 J, while the same loop under Numba `@njit` used ~9.5 J, about 4× less. Your loop does a bit more work per pixel, so profile one large upload before and after to see the effect on your pods.
+
+    **Already good:** `thumbnail` caps the image size before dithering, and the grayscale conversion happens once in Pillow, outside the loop.
+verify:
+  static_only: needs Flask, Pillow and numba

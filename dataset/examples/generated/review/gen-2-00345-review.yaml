@@ -1,0 +1,81 @@
+id: gen-2-00345-review
+category: review
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    Nightly ETL step. Packs the smart meter readings into uint16 codes before they go to the warehouse. One run is a full day for all meters, tens of millions of rows. The profiler puts almost all of the runtime in `quantize_power`. Review it. Only the changed lines, no essays.
+
+    ```python
+    import math
+
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    NODATA = 0xFFFF
+    SCALE_W = 0.5        # 0.5 W per code
+    OFFSET_W = -1000.0   # feed-in down to -1 kW
+
+
+    def quantize_power(watts: np.ndarray, scale: float = SCALE_W,
+                       offset: float = OFFSET_W) -> np.ndarray:
+        out = np.empty(watts.shape[0], dtype=np.uint16)
+        max_code = 65536  # top of uint16
+        for i in range(watts.shape[0]):
+            v = watts[i]
+            if math.isnan(v):
+                out[i] = NODATA
+                continue
+            q = int((v - offset) / scale + 0.5)
+            if q < 0:
+                q = 0
+            elif q > max_code:
+                q = max_code
+            out[i] = q
+        return out
+
+
+    def process_day(src: str, dst: str) -> None:
+        table = pq.read_table(src, columns=["meter_id", "ts", "power_w"])
+        watts = table.column("power_w").to_numpy(zero_copy_only=False)
+        codes = quantize_power(watts)
+        out = pa.table({
+            "meter_id": table.column("meter_id"),
+            "ts": table.column("ts"),
+            "power_code": pa.array(codes, type=pa.uint16()),
+        })
+        pq.write_table(out, dst, compression="zstd")
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline
+
+    #### [Bug] Upper clip overflows uint16 and collides with NODATA
+    - **Where:** `max_code = 65536`
+    - **Issue:** 65536 does not fit in uint16. NumPy 2 raises `OverflowError` on the store, and older NumPy wraps it to 0. Also, a reading that maps to exactly 65535 passes the clip and gets written as `NODATA`, so it later reads as missing.
+    - **Fix:** reserve `0xFFFF` for missing values:
+
+    ```python
+    max_code = NODATA - 1  # 0xFFFF is reserved for missing
+    ```
+
+    - **Impact:** correctness. The top of the range (just under 31.8 kW) gets clipped and no longer looks like a missing value. Fix this before you add the JIT below. Numba wraps integer overflow silently, so the bug would turn into wrong codes without any error.
+
+    #### [High] Pure Python loop over every reading
+    - **Where:** the `for i in range(watts.shape[0])` loop in `quantize_power`
+    - **Issue:** every reading goes through the interpreter: a boxed NumPy scalar, float math, two compares and a scalar store. It is a CPU-bound numeric hot loop that runs over the full day every night, which is exactly the case where a JIT pays off.
+    - **Fix:** the body already uses only types and functions Numba supports (`math.isnan`, `int()`, `np.empty` with `uint16`), so it compiles unchanged. Add the import:
+
+    ```python
+    from numba import njit
+    ```
+
+    Then put `@njit(cache=True)` on the line above `def quantize_power`. `cache=True` writes the compiled code to disk, so the nightly run skips recompiling. `NODATA` is frozen as a constant at compile time, which is fine here. If you'd rather not add Numba as a dependency, whole-array NumPy (`np.floor`, `np.clip`, an `np.isnan` mask, `astype(np.uint16)`) also removes the interpreter loop. It needs a few temporary arrays of full size, and `inf` gets clipped instead of raising.
+    - **Impact:** E, on every nightly run. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples in a pure Python loop used ~40 J, and the same loop with Numba `@njit` used ~9.5 J (about 4× less CPU energy).
+verify:
+  static_only: fix uses numba and the pipeline uses pyarrow, neither is available in the verifier

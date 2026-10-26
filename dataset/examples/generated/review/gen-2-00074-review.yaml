@@ -1,0 +1,104 @@
+id: gen-2-00074-review
+category: review
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    ?
+
+    ```bash
+    #!/usr/bin/env bash
+    # push-catalog.sh - push the current product catalog export to the edge cache nodes
+    # called from cron every 10 minutes on the export host
+    set -eu
+
+    EXPORT_DIR=/srv/export/catalog
+    HOSTS_FILE=/etc/catalog-push/hosts
+    REMOTE_DIR=/var/lib/catalog
+    LOG=/var/log/catalog-push.log
+
+    log() {
+        echo "$(date -Is) $*" >> "$LOG"
+    }
+
+    if [ ! -d "$EXPORT_DIR" ]; then
+        log "export dir missing, skipping"
+        exit 0
+    fi
+
+    count=0
+    while read -r host; do
+        [ -z "$host" ] && continue
+        case "$host" in \#*) continue ;; esac
+        log "pushing to $host"
+        tar -C "$EXPORT_DIR" -cf - . \
+            | xz -9 -T1 \
+            | ssh -o BatchMode=yes "deploy@$host" \
+                "mkdir -p $REMOTE_DIR.new && xz -d | tar -C $REMOTE_DIR.new -xf - && rm -rf $REMOTE_DIR.old && mv $REMOTE_DIR $REMOTE_DIR.old; mv $REMOTE_DIR.new $REMOTE_DIR"
+        count=$((count + 1))
+    done < "$HOSTS_FILE"
+
+    log "pushed catalog to $count hosts"
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (cron job, every 10 minutes, fan-out to all edge nodes)
+
+    #### [Bug] Broken or partial transfers can go live
+    - **Where:** the local pipeline and the remote command string
+    - **Issue:** Without `pipefail`, only the exit status of `ssh` counts. If `tar` fails partway (a file vanishes or can't be read), the truncated archive still gets extracted. On the remote side, the last `mv` comes after `;`, so it runs even when extraction failed. If `$REMOTE_DIR` exists, that `mv` moves the half-filled `.new` into it as a subdirectory. Also, a `.new` left over from a failed run is never cleared, so stale files get mixed into the next push.
+    - **Fix:** `set -euo pipefail`, clear `.new` before extracting, and chain the swap with `&&` only (see the snippet below).
+
+    #### [High] Expensive codec, run once per host, every 10 minutes
+    - **Where:** `tar ... | xz -9 -T1 | ssh ...` inside the host loop
+    - **Issue:** The same export is compressed again for every host, with `xz -9`, the most expensive xz setting. The payload is decompressed right away on arrival, so the strong ratio only buys a somewhat smaller transfer. That transfer happens on every run, for every host.
+    - **Fix:** Compress once per run with `zstd` at its default level, then stream the same file to each host. The edge nodes need `zstd` installed.
+    - **Impact:** Reduces E on the export host. Compression work drops from one `xz -9` run per host to one `zstd` run in total. In Green Metrics Tool benchmarks on 100 MB of text with default settings, xz used about 29× more energy than zstd. Those figures compare energy only, not compression ratio, so expect somewhat larger transfers. On a slow link, raise the zstd level a few steps and measure.
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    EXPORT_DIR=/srv/export/catalog
+    HOSTS_FILE=/etc/catalog-push/hosts
+    REMOTE_DIR=/var/lib/catalog
+    LOG=/var/log/catalog-push.log
+
+    log() {
+        echo "$(date -Is) $*" >> "$LOG"
+    }
+
+    if [ ! -d "$EXPORT_DIR" ]; then
+        log 'export dir missing, skipping'
+        exit 0
+    fi
+
+    bundle=$(mktemp)
+    trap 'rm -f "$bundle"' EXIT
+
+    # compress once per run, not once per host
+    tar -C "$EXPORT_DIR" -cf - . | zstd -q -c > "$bundle"
+
+    count=0
+    while read -r host; do
+        [ -z "$host" ] && continue
+        case "$host" in \#*) continue ;; esac
+        log "pushing to $host"
+        ssh -o BatchMode=yes "deploy@$host" \
+            "rm -rf $REMOTE_DIR.new && mkdir -p $REMOTE_DIR.new && zstd -dc | tar -C $REMOTE_DIR.new -xf - && rm -rf $REMOTE_DIR.old && { [ ! -d $REMOTE_DIR ] || mv $REMOTE_DIR $REMOTE_DIR.old; } && mv $REMOTE_DIR.new $REMOTE_DIR" \
+            < "$bundle"
+        count=$((count + 1))
+    done < "$HOSTS_FILE"
+
+    log "pushed catalog to $count hosts"
+    ```
+
+    `ssh` reads from `"$bundle"`, so it can't consume the rest of the hosts file. As before, one failing host stops the run.
+
+    **Already good:** `BatchMode=yes` stops cron from hanging on a password prompt. The `.new`/`.old` swap keeps the live directory complete during extraction. The host loop uses only builtins (`read -r`, `case`, `$(( ))`), so it starts no extra processes per line.
+verify:
+  static_only: needs ssh access to remote hosts and zstd/xz binaries

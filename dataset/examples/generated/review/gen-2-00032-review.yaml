@@ -1,0 +1,115 @@
+id: gen-2-00032-review
+category: review
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    hi, I set up our gitlab runner myself (shell executor, first time doing this). Since I added the handoff part the build job is like 4 min slower and the runner CPU is at 100% during it. Also last week a pipeline was broken but the build job was still green?? I don't really know what is wrong. Can you review it?
+
+    build stage, runs on every push:
+
+    ```bash
+    #!/bin/bash
+    # build-and-handoff.sh - runs in the "build" stage of every pipeline (shell runner)
+    # next stage (test.sh) unpacks the handoff on the same runner
+
+    HANDOFF_DIR=/var/ci-handoff/$CI_PIPELINE_ID
+    REPORT_STORE=/mnt/ci-reports/$CI_PROJECT_NAME
+
+    echo "==> Building $CI_PROJECT_NAME ($CI_COMMIT_SHORT_SHA)"
+    npm ci
+    npm run build
+
+    mkdir -p $HANDOFF_DIR
+    echo "==> Packing workspace for test stage"
+    tar -cf - dist node_modules | xz -9 -T1 > $HANDOFF_DIR/workspace.tar.xz
+
+    echo "==> Archiving lint and build reports"
+    mkdir -p $REPORT_STORE
+    npm run lint -- --format json --output-file reports/eslint.json || true
+    tar -cf - reports | xz -9 > $REPORT_STORE/$CI_COMMIT_SHORT_SHA-reports.tar.xz
+
+    # keep reports for 90 days
+    find $REPORT_STORE -name '*.tar.xz' -mtime +90 -delete
+
+    echo "==> Done"
+    ```
+
+    last stage of the pipeline:
+
+    ```bash
+    #!/bin/bash
+    # cleanup.sh
+    rm -rf /var/ci-handoff/$CI_PIPELINE_ID
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (CI job on every push)
+
+    #### [Bug] A failed build still gives a green job
+    - **Where:** whole `build-and-handoff.sh`
+    - **Issue:** without `set -e`, the script keeps going after `npm ci` or `npm run build` fails. The exit code is the one from the last `echo`, so the job is always green. It also packs a broken `dist` for the test stage.
+    - **Fix:** add `set -euo pipefail` at the top. `pipefail` also catches a failing `tar` in front of the pipe. Your `|| true` on lint still works as intended.
+
+    #### [Bug] Empty pipeline ID makes cleanup delete every handoff
+    - **Where:** `HANDOFF_DIR=/var/ci-handoff/$CI_PIPELINE_ID` and `rm -rf /var/ci-handoff/$CI_PIPELINE_ID`
+    - **Issue:** if the variable is ever empty (for example, someone runs the script by hand), all pipelines write to the same folder, and `rm -rf` removes the handoffs of pipelines that are still running.
+    - **Fix:** use `${CI_PIPELINE_ID:?}` so the script stops when it is empty, and quote the paths.
+
+    #### [High] Handoff archive compressed with `xz -9` but only lives for minutes
+    - **Where:** `tar ... | xz -9 -T1 > $HANDOFF_DIR/workspace.tar.xz`
+    - **Issue:** this is most likely your slow build and the full CPU. `node_modules` is large, and `xz -9` on one thread is one of the most expensive ways to compress it. The file sits on the same disk and is deleted when the pipeline ends, so the smaller size buys almost nothing. In Green Metrics Tool measurements on 100 MB of text at default levels, xz used ~458 J of CPU energy and zstd ~16 J. `-9` costs more than the measured default `-6`. An estimate from Green Coding Solutions puts the break-even at about 0.15 days of storage even for zstd, and about 7 days for xz. Data kept for minutes should not be compressed at all.
+    - **Fix:** write a plain tar, and change `test.sh` to `tar -xf "$HANDOFF_DIR/workspace.tar"`.
+    - **Impact:** E on every push. The compression work disappears completely. The disk use is temporary.
+
+    #### [Medium] Reports compressed with `xz -9` on every push
+    - **Where:** `tar -cf - reports | xz -9 > ...-reports.tar.xz`
+    - **Issue:** these files are kept, so compressing them makes sense. But they are compressed on every push, and xz is a slow codec. In the same measurement, xz used about 29× more energy than zstd.
+    - **Fix:** use `zstd` at its default level, and let the `find` cleanup match both extensions until the old `.tar.xz` files have aged out.
+    - **Impact:** E per push, small per run because the reports are small. The figures compare energy, not size. xz usually makes somewhat smaller files. If storage on `/mnt/ci-reports` is tight, compare both on one real report first.
+
+    The fixed script below also uses single quotes for the fixed log texts, because they need no expansion.
+
+    ```bash
+    #!/bin/bash
+    # build-and-handoff.sh - runs in the "build" stage of every pipeline (shell runner)
+    # next stage (test.sh) unpacks the handoff on the same runner: tar -xf "$HANDOFF_DIR/workspace.tar"
+    set -euo pipefail
+
+    HANDOFF_DIR="/var/ci-handoff/${CI_PIPELINE_ID:?}"
+    REPORT_STORE="/mnt/ci-reports/${CI_PROJECT_NAME:?}"
+
+    echo "==> Building $CI_PROJECT_NAME ($CI_COMMIT_SHORT_SHA)"
+    npm ci
+    npm run build
+
+    mkdir -p "$HANDOFF_DIR"
+    echo '==> Packing workspace for test stage'
+    tar -cf "$HANDOFF_DIR/workspace.tar" dist node_modules
+
+    echo '==> Archiving lint and build reports'
+    mkdir -p "$REPORT_STORE"
+    npm run lint -- --format json --output-file reports/eslint.json || true
+    tar -cf - reports | zstd -q > "$REPORT_STORE/$CI_COMMIT_SHORT_SHA-reports.tar.zst"
+
+    # keep reports for 90 days (old .tar.xz files age out too)
+    find "$REPORT_STORE" \( -name '*.tar.zst' -o -name '*.tar.xz' \) -mtime +90 -delete
+
+    echo '==> Done'
+    ```
+
+    ```bash
+    #!/bin/bash
+    # cleanup.sh
+    set -euo pipefail
+    rm -rf "/var/ci-handoff/${CI_PIPELINE_ID:?}"
+    ```
+
+    **Already good:** a separate cleanup stage removes the handoff, old reports are pruned automatically, and a lint failure does not block the build on purpose.
+verify:
+  static_only: CI shell script that needs npm, GitLab CI variables and zstd on the runner

@@ -1,0 +1,154 @@
+id: gen-2-00368-review
+category: review
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    flaky-test gate in our pipeline got really slow since the quarantine list passed ~700 tests. fix this
+
+    ```python
+    import re
+    import sys
+    from pathlib import Path
+
+
+    def load_flaky(path):
+        ids = []
+        for line in Path(path).read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                ids.append(line)
+        return ids
+
+
+    def classify(log_lines, flaky_ids):
+        quarantined, real = [], []
+        for line in log_lines:
+            if not re.match(r"FAILED \S+", line):
+                continue
+            for tid in flaky_ids:
+                if re.search(r"^FAILED " + re.escape(tid) + r"(\s|$)", line):
+                    quarantined.append(line.strip())
+                    break
+            else:
+                real.append(line.strip())
+        return quarantined, real
+
+
+    def main():
+        flaky = load_flaky(sys.argv[1])
+        lines = sys.stdin.read().splitlines()
+        quarantined, real = classify(lines, flaky)
+        for q in quarantined:
+            print(f"quarantined: {q}")
+        for r in real:
+            print(f"FAILED: {r}")
+        sys.exit(len(real))
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (CI gate, runs in every pipeline)
+
+    #### [Bug] Exit code wraps around at 256 failures
+    - **Where:** `sys.exit(len(real))`
+    - **Issue:** exit statuses are taken modulo 256. With exactly 256 real failures the gate exits 0 and the pipeline goes green.
+    - **Fix:** `sys.exit(1 if real else 0)`.
+
+    #### [High] A new regex is built for every (line, flaky test) pair
+    - **Where:** `re.search(r"^FAILED " + re.escape(tid) + r"(\s|$)", line)` inside the inner loop
+    - **Issue:** every quarantined test ID makes its own pattern. Python's `re` caches only up to 512 compiled patterns. With ~700 IDs the loop cycles through more patterns than the cache holds, so entries are evicted before they are used again and almost every call recompiles. In Green Metrics Tool micro-benchmarks, forcing a recompile on every call cost about 200× more per match than a cached pattern. On top of that, every real failure is checked against all 700 patterns.
+    - **Fix:** compile one static pattern at module level, extract the test ID once per line, and look it up in a set (see the code below).
+    - **Impact:** E per pipeline run. The cost goes from one regex compile and search per (line × flaky ID) to one cached match plus an O(1) lookup per line. It no longer grows with the size of the quarantine list.
+
+    **Already good:** the first check, `re.match(r"FAILED \S+", line)`, is a static pattern, so `re`'s cache handles it. Precompiling such a pattern alone is a small win: about 18% less CPU energy in the same micro-benchmarks. Below it is replaced by `FAILED_RE` anyway.
+
+    ```python
+    import re
+    import sys
+    from pathlib import Path
+
+    FAILED_RE = re.compile(r"FAILED (\S+)")
+
+
+    def load_flaky(path):
+        ids = set()
+        for line in Path(path).read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                ids.add(line)
+        return ids
+
+
+    def classify(log_lines, flaky_ids):
+        flaky = set(flaky_ids)
+        quarantined, real = [], []
+        for line in log_lines:
+            m = FAILED_RE.match(line)
+            if not m:
+                continue
+            if m.group(1) in flaky:
+                quarantined.append(line.strip())
+            else:
+                real.append(line.strip())
+        return quarantined, real
+
+
+    def main():
+        flaky = load_flaky(sys.argv[1])
+        lines = sys.stdin.read().splitlines()
+        quarantined, real = classify(lines, flaky)
+        for q in quarantined:
+            print(f"quarantined: {q}")
+        for r in real:
+            print(f"FAILED: {r}")
+        sys.exit(1 if real else 0)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    The output and the order of lines are the same as before, as long as the quarantine entries contain no spaces. Normal pytest node IDs don't. If some parametrized IDs do, compile one alternation instead, also once at startup: `re.compile(r"FAILED (?:" + "|".join(map(re.escape, ids)) + r")(?:\s|$)")`.
+verify:
+  module: true
+  test: |
+    q, r = classify(
+        ["FAILED tests/a.py::t1 - boom", "FAILED tests/a.py::t2", "PASSED tests/a.py::t3",
+         "FAILED tests/a.py::t1[x]", "noise"],
+        ["tests/a.py::t1"],
+    )
+    assert q == ["FAILED tests/a.py::t1 - boom"]
+    assert r == ["FAILED tests/a.py::t2", "FAILED tests/a.py::t1[x]"]
+  equivalence:
+    driver: |
+      flaky = [f"tests/test_mod{i}.py::test_case_{i}" for i in range(600)]
+      lines = []
+      for i in range(0, 1200, 10):
+          lines.append(f"FAILED tests/test_mod{i}.py::test_case_{i} - AssertionError: boom")
+      lines += [
+          "PASSED tests/x.py::ok",
+          "FAILED tests/test_mod1.py::test_case_1[param]",
+          "  FAILED tests/test_mod2.py::test_case_2",
+          "FAILED tests/test_mod2.py::test_case_2",
+          "FAILED tests/test_mod3.py::test_case_3\tTimeout",
+          "FAILED ",
+          "random noise",
+      ]
+      q, r = classify(lines, flaky)
+      print(len(q), len(r))
+      for x in q[:5] + q[-5:] + r[:5] + r[-5:]:
+          print(x)
+  benchmark:
+    driver: |
+      flaky = [f"tests/test_mod{i}.py::test_case_{i}" for i in range(600)]
+      lines = [f"FAILED tests/test_mod{i}.py::test_case_{i} - AssertionError" for i in range(0, 1200, 12)]
+      classify(lines, flaky)
+    min_speedup: 1.5

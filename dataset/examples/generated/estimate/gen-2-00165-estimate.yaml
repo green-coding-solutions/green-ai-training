@@ -1,0 +1,104 @@
+id: gen-2-00165-estimate
+category: estimate
+language: javascript
+patterns:
+- css-animations
+facts:
+- F-ANIM
+messages:
+- role: user
+  content: |
+    DAG view of our ETL runner. Edges into running tasks get marching dashes. Ops and on-call have this open on roughly 40 screens all day, usually with a handful of tasks running. If I move the dash animation to CSS, what does that actually save? Diff only.
+
+    ```javascript
+    // dag-view/edges.js
+    const DASH_SPEED = 0.02; // px per ms
+    let rafId = null;
+    let lastTs = 0;
+    let offset = 0;
+
+    export function renderEdges(svg, edges, taskStates) {
+      svg.querySelectorAll('path.edge').forEach(p => p.remove());
+      for (const e of edges) {
+        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        path.setAttribute('d', e.d);
+        path.classList.add('edge');
+        path.dataset.from = e.from;
+        path.dataset.to = e.to;
+        path.setAttribute('stroke-dasharray', '6 4');
+        svg.appendChild(path);
+      }
+      updateEdgeStates(svg, taskStates);
+    }
+
+    export function updateEdgeStates(svg, taskStates) {
+      for (const path of svg.querySelectorAll('path.edge')) {
+        const running = taskStates[path.dataset.to] === 'running';
+        path.classList.toggle('edge--flowing', running);
+        if (!running) path.style.strokeDashoffset = '';
+      }
+      if (svg.querySelector('.edge--flowing')) startFlow(svg);
+      else stopFlow();
+    }
+
+    function startFlow(svg) {
+      if (rafId !== null) return;
+      lastTs = performance.now();
+      const tick = (ts) => {
+        offset = (offset - (ts - lastTs) * DASH_SPEED) % 10;
+        lastTs = ts;
+        for (const p of svg.querySelectorAll('.edge--flowing')) {
+          p.style.strokeDashoffset = offset;
+        }
+        rafId = requestAnimationFrame(tick);
+      };
+      rafId = requestAnimationFrame(tick);
+    }
+
+    function stopFlow() {
+      if (rafId !== null) cancelAnimationFrame(rafId);
+      rafId = null;
+    }
+    ```
+- role: assistant
+  content: |
+    **Diff**
+
+    Delete `DASH_SPEED`, `rafId`, `lastTs`, `offset`, `startFlow` and `stopFlow`. `renderEdges` stays as it is. Replace `updateEdgeStates` with:
+
+    ```javascript
+    export function updateEdgeStates(svg, taskStates) {
+      for (const path of svg.querySelectorAll('path.edge')) {
+        path.classList.toggle('edge--flowing', taskStates[path.dataset.to] === 'running');
+      }
+    }
+    ```
+
+    Add to the view's stylesheet. The speed matches your current one: one 10 px dash period every 0.5 s, moving in the same direction.
+
+    ```css
+    .edge--flowing {
+      animation: edge-flow 0.5s linear infinite;
+    }
+
+    @keyframes edge-flow {
+      to { stroke-dashoffset: -10; }
+    }
+    ```
+
+    One behavior change: each edge now starts its own cycle when it gets the class. It no longer joins a shared phase, so edges that start at different times are slightly out of step.
+
+    **What it saves**
+
+    Expect a modest saving per screen, not a big one. In Green Metrics Tool browser benchmarks, a 20-second animation in a real browser used ~161 J of CPU energy with JavaScript `requestAnimationFrame` and style updates, and ~145 J with CSS `@keyframes`, about 10% less. That was one simple animation on a test page. I can't turn it into a figure for 40 screens running all day.
+
+    What drives the saving in your case:
+    - **Per-frame JS goes away.** Today every frame runs `tick`, a `querySelectorAll`, and one inline style write per flowing edge, plus the style recalculation those writes trigger. With CSS, the browser drives the animation itself.
+    - **Paint stays.** `stroke-dashoffset` is not a compositor-only property, so the edges are still repainted every frame in both versions. That part of the cost doesn't change.
+    - **Screen-hours.** The saving only builds up while the view is visible and tasks are running. Browsers already throttle both rAF and CSS animations in background tabs.
+
+    **How to measure it**
+    1. Quick proxy: open the view with your usual number of running edges. Record a few seconds in the Firefox Profiler or the Chrome Performance panel for each version, then compare main-thread scripting and style time.
+    2. Energy: write a Green Metrics Tool usage scenario that loads the DAG view in a headful browser with a fixed set of running tasks and idles on it. Run it for both versions and compare CPU energy. Multiply the per-minute difference by your real screen-hours, not by the benchmark above.
+verify:
+  static_only: browser DOM/SVG code, needs a page and a stylesheet; no stdlib-runnable test

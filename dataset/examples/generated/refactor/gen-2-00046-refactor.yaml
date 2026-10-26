@@ -1,0 +1,111 @@
+id: gen-2-00046-refactor
+category: refactor
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    hourly active learning job, picks support tickets for the annotators. slow, fix this
+
+    ```python
+    import heapq
+    import sys
+
+    import torch
+    import torch.nn.functional as F
+    from torch.utils.data import DataLoader
+
+    from pool import UnlabeledPool
+    from model import TicketClassifier
+
+
+    def load_model(path):
+        model = TicketClassifier(vocab_size=30000, num_classes=14)
+        model.load_state_dict(torch.load(path, map_location="cpu"))
+        return model
+
+
+    def entropy(probs):
+        return -(probs * torch.log(probs + 1e-12)).sum(dim=1)
+
+
+    def pick_for_labeling(model_path, pool_dir, k=500, batch_size=256):
+        model = load_model(model_path)
+        pool = UnlabeledPool(pool_dir)
+        loader = DataLoader(pool, batch_size=batch_size, num_workers=2)
+
+        scored = []
+        for ids, tokens, lengths in loader:
+            logits = model(tokens, lengths)
+            probs = F.softmax(logits, dim=1)
+            ent = entropy(probs).detach()
+            for ticket_id, e in zip(ids.tolist(), ent.tolist()):
+                scored.append((e, ticket_id))
+
+        top = heapq.nlargest(k, scored)
+        return [ticket_id for _, ticket_id in top]
+
+
+    if __name__ == "__main__":
+        picked = pick_for_labeling(sys.argv[1], sys.argv[2])
+        with open("to_label.txt", "w") as f:
+            f.write("\n".join(str(i) for i in picked))
+    ```
+- role: assistant
+  content: |
+    ```python
+    import heapq
+    import sys
+
+    import torch
+    import torch.nn.functional as F
+    from torch.utils.data import DataLoader
+
+    from pool import UnlabeledPool
+    from model import TicketClassifier
+
+
+    def load_model(path):
+        model = TicketClassifier(vocab_size=30000, num_classes=14)
+        model.load_state_dict(torch.load(path, map_location="cpu"))
+        model.eval()
+        return model
+
+
+    def entropy(probs):
+        return -(probs * torch.log(probs + 1e-12)).sum(dim=1)
+
+
+    def pick_for_labeling(model_path, pool_dir, k=500, batch_size=256):
+        model = load_model(model_path)
+        pool = UnlabeledPool(pool_dir)
+        loader = DataLoader(pool, batch_size=batch_size, num_workers=2)
+
+        scored = []
+        with torch.no_grad():
+            for ids, tokens, lengths in loader:
+                logits = model(tokens, lengths)
+                probs = F.softmax(logits, dim=1)
+                ent = entropy(probs)
+                for ticket_id, e in zip(ids.tolist(), ent.tolist()):
+                    scored.append((e, ticket_id))
+
+        top = heapq.nlargest(k, scored)
+        return [ticket_id for _, ticket_id in top]
+
+
+    if __name__ == "__main__":
+        picked = pick_for_labeling(sys.argv[1], sys.argv[2])
+        with open("to_label.txt", "w") as f:
+            f.write("\n".join(str(i) for i in picked))
+    ```
+
+    **Green Notes**
+    - **Bug fixed: `model.eval()` was missing.** If `TicketClassifier` has dropout or batch norm, they ran in training mode. That made the entropy scores noisy, so the picked tickets changed from run to run. With `eval()` the scores are deterministic, so the selection can differ from what the old version gave you.
+    - **`torch.no_grad()` around the scoring loop** (reduces E and M): PyTorch no longer builds an autograd graph or keeps activations for a backward pass that never happens. The job does this for the whole pool every hour, so the saving adds up. In Green Metrics Tool micro-benchmarks, 100,000 PyTorch CPU inferences used about 14% less CPU energy with `torch.no_grad()` than without it.
+    - `.detach()` is gone. Under `no_grad` the outputs carry no graph, so there is nothing to detach.
+verify:
+  static_only: needs torch and the project's model/pool modules

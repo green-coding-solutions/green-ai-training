@@ -1,0 +1,70 @@
+id: gen-12764612-00103-estimate
+category: estimate
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    We run the signup form of our marketing landing page on Flask. Traffic is spiky: campaign days bring hundreds of thousands of form posts, normal days far fewer. Our validation helper is called on every post and looks like this:
+
+    ```python
+    import re
+
+    def validate_signup(email, utm_source):
+        errors = {}
+        email = (email or "").strip()
+        if not re.match(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$", email):
+            errors["email"] = "Please enter a valid email address."
+        if utm_source and not re.match(r"^[a-z0-9_\-]{1,40}$", utm_source):
+            errors["utm_source"] = "Unknown campaign source."
+        return errors
+    ```
+
+    Our sustainability lead wants a number for the report: how much energy do we save if we move these two regexes to precompiled patterns? Requirements: same behavior, no new dependencies, and I need something I can defend in the review, so no made-up figures please.
+- role: assistant
+  content: |
+    Expect a small saving, not a big one. Both patterns are fixed strings, and Python's `re` module caches compiled patterns internally (up to 512), so your current code compiles each pattern only once per process.
+
+    **Measured reference:** in Green Metrics Tool micro-benchmarks, 1,000,000 matches with inline `re.match(pattern, s)` used ~21 J of CPU energy, and a precompiled pattern used ~18 J, about 18% less. That is the lookup overhead of the cache on every call. The same benchmark showed that forcing a recompile on every call costs about 200× more per match, but that is not what your code does.
+
+    I can't turn this into a number for your service. The saving per post depends on your input lengths and on how much of a request this helper is. Form parsing, the template render and the database write will dominate, so the share of the regex work will be small. Don't scale the 18% to your traffic.
+
+    The change is safe and keeps behavior identical:
+
+    ```python
+    import re
+
+    EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
+    UTM_SOURCE_RE = re.compile(r"^[a-z0-9_\-]{1,40}$")
+
+
+    def validate_signup(email, utm_source):
+        errors = {}
+        email = (email or "").strip()
+        if not EMAIL_RE.match(email):
+            errors["email"] = "Please enter a valid email address."
+        if utm_source and not UTM_SOURCE_RE.match(utm_source):
+            errors["utm_source"] = "Unknown campaign source."
+        return errors
+    ```
+
+    **How to measure it for your report:**
+    1. Replay a fixed set of realistic form posts (for example 100,000) against both versions of `validate_signup` in a small script. Run each under `perf stat` and compare CPU time and energy counters (RAPL, if your host exposes it).
+    2. For the end-to-end effect, run the same replay against the Flask app as a Green Metrics Tool usage scenario and compare the two runs.
+
+    **Green Notes**
+    - **Precompiled regex** (reduces E): a small, measured win for static patterns, because it skips the per-call cache lookup.
+    - *Not applied:* anything beyond the two patterns. Your helper is already simple, and the change is mostly about clear module-level constants.
+    - If you ever build a pattern from user or campaign data per request, precompiling does not help, because each new pattern is compiled. Keep patterns static.
+verify:
+  test: |-
+    assert validate_signup("a@b.com", "newsletter") == {}
+    assert validate_signup("  a@b.com ", None) == {}
+    assert "email" in validate_signup("nope", "x")
+    assert "email" in validate_signup(None, None)
+    assert "utm_source" in validate_signup("a@b.co", "Bad Source!")
+    assert validate_signup("a@b.co", "") == {}
+    assert "utm_source" not in validate_signup("a@b.co", "spring_2024-a")

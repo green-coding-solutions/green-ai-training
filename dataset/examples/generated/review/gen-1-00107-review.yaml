@@ -1,0 +1,80 @@
+id: gen-1-00107-review
+category: review
+language: bash
+patterns:
+- compress-transmitted
+- bash-quoting
+facts:
+- F-COMPRESS-CODECS
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    Review, diff only please. Runs on the login node after every finished simulation run, about 2000 step_*.json chunks of 5-20 MB each. The collector is our own FastAPI service, its middleware decodes xz, gzip and zstd bodies.
+
+    ```bash
+    #!/usr/bin/env bash
+    # push per-step result chunks of a finished run to the collector
+    set -euo pipefail
+
+    RUN_DIR="$1"
+    COLLECTOR="https://collector.lab.example.org/api/v1/chunks"
+    TOKEN="${COLLECTOR_TOKEN:?}"
+
+    for chunk in "$RUN_DIR"/out/step_*.json; do
+      step=$(basename "$chunk" .json)
+      xz -9e -c "$chunk" > "/tmp/$step.json.xz"
+      curl -sS -f -X POST "$COLLECTOR" \
+        -H "Content-Type: application/json" \
+        -H "Content-Encoding: xz" \
+        -H "X-Run-Id: $(basename "$RUN_DIR")" \
+        -H "Authorization: Bearer $TOKEN" \
+        --data-binary "@/tmp/$step.json.xz"
+      rm "/tmp/$step.json.xz"
+    done
+    echo "done"
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (batch upload, per-chunk work on a shared login node)
+
+    #### [Security] Predictable temp files in `/tmp`
+    - **Where:** `/tmp/$step.json.xz`
+    - **Issue:** The names are guessable on a shared node, so another user can plant a symlink there. A failed `curl` also leaves the file behind, because `set -e` exits before `rm`.
+    - **Fix:** Don't write a temp file. Pipe the compressor into `curl`.
+
+    #### [High] Slow compressor on every chunk
+    - **Where:** `xz -9e -c "$chunk"`
+    - **Issue:** Each of the ~2000 chunks is compressed once, on a shared CPU, and then thrown away. `xz -9e` is one of the most expensive codecs. The data is dynamic and sent only once, so the extra ratio does not pay back.
+    - **Fix:** Use `zstd` at its default level. Your collector already decodes it.
+    - **Impact:** reduces E on the login node for every chunk. In Green Metrics Tool micro-benchmarks on 100 MB of text, xz at its default level used about 29× more energy than zstd. That compared energy only, not output size. xz compresses smaller, so keep it only if the link is the bottleneck.
+
+    #### [Low] Double quotes on literals without expansion
+    - **Where:** the `Content-Type` and `Content-Encoding` headers, and `echo "done"`
+    - **Issue:** Bash scans double-quoted text for `$`, backticks and backslashes. Single quotes skip that.
+    - **Fix:** Use single quotes for these literals. Keep double quotes where a variable expands.
+    - **Impact:** reduces E slightly. In Green Metrics Tool micro-benchmarks, a 6,200-character literal in a loop of 1,000,000 iterations used about 24% less CPU energy with single quotes. For short headers the absolute saving is tiny.
+
+    ```bash
+     for chunk in "$RUN_DIR"/out/step_*.json; do
+    -  step=$(basename "$chunk" .json)
+    -  xz -9e -c "$chunk" > "/tmp/$step.json.xz"
+    -  curl -sS -f -X POST "$COLLECTOR" \
+    -    -H "Content-Type: application/json" \
+    -    -H "Content-Encoding: xz" \
+    +  zstd -q -c "$chunk" | curl -sS -f -X POST "$COLLECTOR" \
+    +    -H 'Content-Type: application/json' \
+    +    -H 'Content-Encoding: zstd' \
+         -H "X-Run-Id: $(basename "$RUN_DIR")" \
+         -H "Authorization: Bearer $TOKEN" \
+    -    --data-binary "@/tmp/$step.json.xz"
+    -  rm "/tmp/$step.json.xz"
+    +    --data-binary @-
+     done
+    -echo "done"
+    +echo 'done'
+    ```
+
+    `pipefail` is already set, so a failing `zstd` still stops the script.
+verify:
+  static_only: needs curl, a remote collector and the zstd binary

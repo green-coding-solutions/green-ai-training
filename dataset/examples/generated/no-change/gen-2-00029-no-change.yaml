@@ -1,0 +1,63 @@
+id: gen-2-00029-no-change
+category: no-change
+language: bash
+patterns:
+- bash-builtins
+- context-tradeoff
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    hi, I'm new to bash. I wrote this deploy script for our company landing page (4 languages). It works fine. But my coworker looked at it and wrote "never use $(...) inside a loop, it forks processes" and nothing else. I don't really understand what is wrong. Do I need to change it?
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    SITE_DIR='dist'
+    LANGS='en de fr es'
+    BUCKET='s3://acme-landing-prod'
+
+    echo 'Building landing page...'
+    npm ci --silent
+    npm run build
+
+    for lang in $LANGS; do
+      page="$SITE_DIR/$lang/index.html"
+      if [ ! -f "$page" ]; then
+        echo "ERROR: missing $page" >&2
+        exit 1
+      fi
+      title=$(sed -n 's/.*<title>\(.*\)<\/title>.*/\1/p' "$page")
+      size=$(wc -c < "$page")
+      echo "$lang: $title ($size bytes)"
+    done
+
+    echo "Uploading to $BUCKET ..."
+    aws s3 sync "$SITE_DIR" "$BUCKET" --delete --cache-control 'max-age=300'
+    echo 'Done.'
+    ```
+- role: assistant
+  content: |
+    Nothing is wrong. You can keep the script as it is.
+
+    Your coworker's rule is a good one in general. `$(sed ...)` and `$(wc ...)` each start a new process, and starting a process costs much more than the work `sed` or `wc` does on one small file. When a loop runs over thousands of lines or files, those process starts take most of the run time. In Green Metrics Tool micro-benchmarks, a loop that summarized a 20,000-line access log with `$(echo | cut)` and `$(expr)` for every field used about 300× more energy than the same loop with bash builtins only.
+
+    Your loop is a different case:
+
+    - It runs 4 times, once per language. That is 8 process starts per deploy (`sed` and `wc` in each round).
+    - The same script also runs `npm ci`, `npm run build` and `aws s3 sync`. Each of these does far more work than those 8 small processes.
+    - It runs once per deploy, not on every request or on every input line.
+
+    So rewriting the loop with builtins would make the script harder to read and save nothing you could notice.
+
+    **Already good:**
+    - `set -euo pipefail` stops the deploy when the build fails or a page is missing, so a broken site never gets uploaded.
+    - `sed -n '...p'` reads each page once and never fails when a page has no `<title>`, so `set -e` won't stop the script without an error message.
+    - `wc -c < "$page"` reads the file directly, with no extra `cat`.
+
+    The rule does matter when you write a `while read` loop over a big file, like a log or a CSV with thousands of lines. There, use `read -r` field splitting, `$(( ))` and `case` inside the loop, or let one `awk` call handle the whole file.
+verify:
+  static_only: Deploy script needs npm, a frontend build and the aws CLI with S3 credentials; the code is unchanged, nothing
+    to execute.

@@ -1,0 +1,93 @@
+id: gen-2-00133-estimate
+category: estimate
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    how much would lru_cache on contrast_text_color save? runs on every landing page render
+
+    ```python
+    from flask import Flask, render_template
+
+    from .catalog import load_tiles
+
+    app = Flask(__name__)
+
+
+    def _channel(c: int) -> float:
+        c = c / 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+
+    def contrast_text_color(bg_hex: str) -> str:
+        h = bg_hex.lstrip("#")
+        if len(h) == 3:
+            h = "".join(ch * 2 for ch in h)
+        r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+        lum = 0.2126 * _channel(r) + 0.7152 * _channel(g) + 0.0722 * _channel(b)
+        # WCAG contrast of white text vs. dark text on this background
+        on_white = 1.05 / (lum + 0.05)
+        on_black = (lum + 0.05) / 0.05
+        return "#ffffff" if on_white >= on_black else "#111111"
+
+
+    @app.get("/")
+    def landing():
+        tiles = load_tiles()  # ~600 promo tiles, bg comes from the brand palette
+        for t in tiles:
+            t["fg"] = contrast_text_color(t["bg"])
+        return render_template("landing.html", tiles=tiles)
+    ```
+- role: assistant
+  content: |
+    This is a good fit for a cache. The function is pure, and it gets called hundreds of times per render with only a few palette colors. After the first request, almost every call becomes a dict lookup instead of hex parsing, exponentiation and float math.
+
+    In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations used ~43 J uncached and ~4.7 J with `@functools.lru_cache`, about 9× less CPU energy. In that benchmark the inputs came from only 200 distinct values, which is close to your case of a small palette. With mostly unique inputs, caching only adds overhead.
+
+    ```python
+    from functools import lru_cache
+
+
+    def _channel(c: int) -> float:
+        c = c / 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+
+    @lru_cache(maxsize=256)
+    def contrast_text_color(bg_hex: str) -> str:
+        h = bg_hex.lstrip("#")
+        if len(h) == 3:
+            h = "".join(ch * 2 for ch in h)
+        r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+        lum = 0.2126 * _channel(r) + 0.7152 * _channel(g) + 0.0722 * _channel(b)
+        on_white = 1.05 / (lum + 0.05)
+        on_black = (lum + 0.05) / 0.05
+        return "#ffffff" if on_white >= on_black else "#111111"
+    ```
+
+    Don't scale the benchmark figure to your page. Your saving depends on three things:
+    - **Calls vs. distinct colors:** each repeated color skips the whole computation. The cache lives in the process, so hits also carry across requests.
+    - **Cost of the function:** it is cheap per call. The absolute saving per render is probably small next to `load_tiles()` and template rendering.
+    - **Spelling of the colors:** `"#FFF"` and `"#ffffff"` are separate cache keys. That is still correct, it just lowers the hit rate a bit.
+
+    The cache is bounded, so a malformed or user-supplied color can't make it grow without limit.
+
+    To measure:
+    - Check the hit rate with `contrast_text_color.cache_info()` after some traffic.
+    - Time the tile loop with `timeit`, with and without the decorator.
+    - For energy, run a load test against `/` under `perf stat`, or use a Green Metrics Tool usage scenario that requests the page a fixed number of times. Compare both versions.
+verify:
+  test: |-
+    assert contrast_text_color("#000") == "#ffffff"
+    assert contrast_text_color("#ffffff") == "#111111"
+    assert contrast_text_color("#fff") == "#111111"
+    contrast_text_color.cache_clear()
+    for _ in range(100):
+        for c in ("#1a73e8", "#ffcc00", "#222222"):
+            contrast_text_color(c)
+    info = contrast_text_color.cache_info()
+    assert info.misses == 3 and info.hits == 297

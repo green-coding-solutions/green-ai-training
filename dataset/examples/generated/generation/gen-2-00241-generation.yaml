@@ -1,0 +1,76 @@
+id: gen-2-00241-generation
+category: generation
+language: sql
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    I'm building a trace view for our internal log tool. Someone on call pastes a trace id, and the page shows every log line of that request across all services as a timeline. Our Slack incident bot calls the same query when it posts a timeline into the incident channel, so during incidents it runs a lot.
+
+    Table (Postgres 16):
+
+    ```sql
+    CREATE TABLE log_events (
+        id              bigserial PRIMARY KEY,
+        ts              timestamptz NOT NULL,
+        service         text NOT NULL,
+        host            text NOT NULL,
+        pod             text,
+        level           text NOT NULL,
+        trace_id        text,
+        span_id         text,
+        logger          text,
+        message         text NOT NULL,
+        stack_trace     text,
+        request_headers jsonb,
+        request_body    text,   -- can be several hundred KB
+        response_body   text,   -- same
+        k8s_labels      jsonb,
+        raw_line        text NOT NULL
+    );
+    CREATE INDEX log_events_trace_ts_idx ON log_events (trace_id, ts);
+    ```
+
+    Requirements:
+    - input is the trace_id, passed as a parameter from Python (psycopg 3)
+    - timeline columns: time, service, host, level, span id, message
+    - the UI shows a "stack trace" button only on lines that have one. The trace itself is loaded when the button is clicked
+    - oldest first. Several lines can have the same ts, keep those in insert order
+    - max 1000 lines per trace
+
+    Can you write the query (or queries)?
+- role: assistant
+  content: |
+    ```sql
+    -- Timeline for one trace
+    SELECT id,
+           ts,
+           service,
+           host,
+           level,
+           span_id,
+           message,
+           stack_trace IS NOT NULL AS has_stack_trace
+    FROM log_events
+    WHERE trace_id = %(trace_id)s
+    ORDER BY ts, id
+    LIMIT 1000;
+
+    -- Stack trace for one line, when the button is clicked
+    SELECT stack_trace
+    FROM log_events
+    WHERE id = %(id)s;
+    ```
+
+    `id` is in the timeline so the button knows which line to load. `ORDER BY ts, id` keeps lines with the same timestamp in insert order, since `id` comes from a sequence. If the UI should say that a trace was cut off, use `LIMIT 1001` and drop the last row in Python when you get it back.
+
+    **Green Notes**
+    - **Select only the needed columns** (reduces E): the timeline skips the request and response bodies, headers, labels and raw line, which hold most of the bytes in each row. In Green Metrics Tool micro-benchmarks on a 52-column table with large text columns, selecting the 10 needed columns instead of `SELECT *` used about 5.5× to 7× less CPU energy, and the gap grows with the size of the skipped columns.
+    - **Stack trace on demand** (reduces E, network): `stack_trace IS NOT NULL` only checks for NULL, so the trace text is not sent with every line. Only the few lines someone clicks are loaded.
+verify:
+  static_only: PostgreSQL query with psycopg 3 placeholders, no SQLite setup

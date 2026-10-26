@@ -1,0 +1,108 @@
+id: gen-2-00247-generation
+category: generation
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    """Annotate hits from the BLAST run with UniProt metadata."""
+    import csv
+    import sys
+
+    UNIPROT_URL = "https://rest.uniprot.org/uniprotkb/{acc}.json"
+
+
+    def read_hits(path):
+        with open(path, newline="") as fh:
+            reader = csv.DictReader(fh, delimiter="\t")
+            return [row for row in reader if float(row["evalue"]) < 1e-5]
+
+
+    def fetch_entries(accessions: list[str]) -> dict[str, dict]:
+        """Return {accession: {"organism": ..., "length": ..., "protein_name": ...}}.
+
+        ~300-800 unique accessions per run. Missing/obsolete accessions -> skip.
+        """
+        # TODO
+        raise NotImplementedError
+
+
+    def main(path):
+        hits = read_hits(path)
+        accs = sorted({h["subject_acc"] for h in hits})
+        meta = fetch_entries(accs)
+        writer = csv.writer(sys.stdout, delimiter="\t")
+        writer.writerow(["query", "subject_acc", "evalue", "organism", "length", "protein_name"])
+        for h in hits:
+            m = meta.get(h["subject_acc"])
+            if m is None:
+                continue
+            writer.writerow([h["query"], h["subject_acc"], h["evalue"],
+                             m["organism"], m["length"], m["protein_name"]])
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1])
+    ```
+- role: assistant
+  content: |
+    Here is `fetch_entries`. It sends the lookups concurrently with `httpx`, at most 10 at a time. The function stays synchronous, so `main()` needs no changes. Replace the stub with this:
+
+    ```python
+    import asyncio
+
+    import httpx
+
+    MAX_CONCURRENT = 10  # stay well below UniProt's rate limits
+
+
+    def _parse(entry: dict) -> dict:
+        desc = entry.get("proteinDescription", {})
+        # Swiss-Prot entries have a recommendedName, TrEMBL entries only submissionNames
+        name = desc.get("recommendedName") or next(iter(desc.get("submissionNames", [])), {})
+        return {
+            "organism": entry.get("organism", {}).get("scientificName", ""),
+            "length": entry.get("sequence", {}).get("length", ""),
+            "protein_name": name.get("fullName", {}).get("value", ""),
+        }
+
+
+    async def _fetch_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, acc: str):
+        async with sem:
+            resp = await client.get(UNIPROT_URL.format(acc=acc))
+        if resp.status_code in (400, 404):  # malformed or unknown accession
+            return acc, None
+        resp.raise_for_status()
+        entry = resp.json()
+        if entry.get("entryType") == "Inactive":  # obsolete / merged entry
+            return acc, None
+        return acc, _parse(entry)
+
+
+    async def _fetch_all(accessions: list[str]) -> dict[str, dict]:
+        sem = asyncio.Semaphore(MAX_CONCURRENT)
+        async with httpx.AsyncClient(timeout=30.0, headers={"Accept": "application/json"}) as client:
+            results = await asyncio.gather(*(_fetch_one(client, sem, a) for a in accessions))
+        return {acc: meta for acc, meta in results if meta is not None}
+
+
+    def fetch_entries(accessions: list[str]) -> dict[str, dict]:
+        """Return {accession: {"organism": ..., "length": ..., "protein_name": ...}}.
+
+        Missing and obsolete accessions are skipped.
+        """
+        return asyncio.run(_fetch_all(accessions))
+    ```
+
+    Unknown and obsolete accessions are skipped, as the docstring asks. Any other HTTP error (for example 429 or 5xx) raises and stops the run, the same as a plain sync loop would. If UniProt starts throttling you, lower `MAX_CONCURRENT`.
+
+    **Green Notes**
+    - **Concurrent async requests** (reduces E): with hundreds of lookups per run, the script no longer sits idle waiting for each response one after another, so it finishes sooner and holds the process and connections open for less time. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. For small request counts the gain is mostly wall time.
+verify:
+  static_only: needs network access to rest.uniprot.org and the httpx package

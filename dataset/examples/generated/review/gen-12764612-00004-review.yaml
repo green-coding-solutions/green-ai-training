@@ -1,0 +1,127 @@
+id: gen-12764612-00004-review
+category: review
+language: python
+patterns:
+- select-columns
+- string-join
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    Review please, diff only. This builds the failed-builds digest we post for each project. `build_runs` has ~40 columns (log_output, env_dump and artifacts_json are big). Postgres, psycopg 3.
+
+    ```python
+    def failed_builds_report(conn, project_id, since):
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM build_runs
+                WHERE project_id = %s AND status = 'failed' AND finished_at >= %s
+                ORDER BY finished_at DESC
+                """,
+                (project_id, since),
+            )
+            rows = cur.fetchall()
+            cols = [d.name for d in cur.description]
+
+        report = ""
+        for row in rows:
+            r = dict(zip(cols, row))
+            report += (
+                f"{r['id']}\t{r['branch']}\t{r['commit_sha'][:8]}\t"
+                f"{r['finished_at']:%Y-%m-%d %H:%M}\t{r['duration_s']}s\n"
+            )
+        return report
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend
+
+    #### [High] `SELECT *` reads big columns the report never uses
+    - **Where:** the `SELECT * FROM build_runs` query
+    - **Issue:** the report uses 5 columns, but every failed build also transfers and decodes `log_output`, `env_dump`, `artifacts_json` and the rest. Failed builds are the rows with the longest logs.
+    - **Fix:** `SELECT id, branch, commit_sha, finished_at, duration_s`
+    - **Impact:** reduces E and network/memory (M) per row. In Green Metrics Tool micro-benchmarks on a 52-column table with large text columns, naming the 10 needed columns instead of `SELECT *` used about 5.5× to 7× less CPU energy, depending on row count. The gap grows with the size of the skipped columns.
+
+    #### [Low] String built with `+=` in a loop
+    - **Where:** `report += ...`
+    - **Issue:** every iteration builds a new string. Collect the lines in a list and join once. The per-row `dict(zip(...))` is not needed with explicit columns.
+    - **Fix:** list comprehension and `"".join(...)`.
+    - **Impact:** reduces E. In Green Metrics Tool micro-benchmarks with 1,000,000 pieces, `+=` used roughly 260× more CPU energy than `"".join()`. For a digest of a few hundred rows the absolute saving is small, but the change is free.
+
+    ```python
+    def failed_builds_report(conn, project_id, since):
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, branch, commit_sha, finished_at, duration_s
+                FROM build_runs
+                WHERE project_id = %s AND status = 'failed' AND finished_at >= %s
+                ORDER BY finished_at DESC
+                """,
+                (project_id, since),
+            )
+            rows = cur.fetchall()
+
+        lines = [
+            f"{id_}\t{branch}\t{sha[:8]}\t{finished:%Y-%m-%d %H:%M}\t{duration}s\n"
+            for id_, branch, sha, finished, duration in rows
+        ]
+        return "".join(lines)
+    ```
+
+    Output is identical.
+
+    **Already good:** the query is parameterized, and filtering and sorting happen in SQL.
+verify:
+  green_block: 0
+  equivalence:
+    driver: |-
+      import datetime
+
+      ALL = ["id", "project_id", "status", "branch", "commit_sha", "finished_at",
+             "duration_s", "log_output", "env_dump"]
+      D = datetime.datetime
+      DATA = [
+          {"id": 1, "project_id": 7, "status": "failed", "branch": "main", "commit_sha": "a1b2c3d4e5f6", "finished_at": D(2026, 10, 20, 8, 15), "duration_s": 312, "log_output": "x" * 500, "env_dump": "k=v" * 100},
+          {"id": 2, "project_id": 7, "status": "passed", "branch": "main", "commit_sha": "ffeeddccbbaa", "finished_at": D(2026, 10, 20, 9, 0), "duration_s": 200, "log_output": "ok", "env_dump": ""},
+          {"id": 3, "project_id": 7, "status": "failed", "branch": "feat/login", "commit_sha": "0123456789ab", "finished_at": D(2026, 10, 22, 17, 45), "duration_s": 95, "log_output": "y" * 900, "env_dump": "a=b"},
+          {"id": 4, "project_id": 8, "status": "failed", "branch": "main", "commit_sha": "deadbeefcafe", "finished_at": D(2026, 10, 21, 11, 5), "duration_s": 60, "log_output": "z", "env_dump": "c=d"},
+          {"id": 5, "project_id": 7, "status": "failed", "branch": "fix/cache", "commit_sha": "9988776655aa", "finished_at": D(2026, 10, 18, 3, 30), "duration_s": 410, "log_output": "w" * 50, "env_dump": ""},
+          {"id": 6, "project_id": 7, "status": "failed", "branch": "release/2.1", "commit_sha": "abcdefabcdef", "finished_at": D(2026, 10, 24, 22, 59), "duration_s": 7, "log_output": "", "env_dump": ""},
+      ]
+
+      class Desc:
+          def __init__(self, name):
+              self.name = name
+
+      class Cur:
+          def __enter__(self):
+              return self
+          def __exit__(self, *a):
+              return False
+          def execute(self, sql, params):
+              s = " ".join(sql.split())
+              if s.startswith("SELECT * FROM"):
+                  self.cols = ALL
+              else:
+                  self.cols = [c.strip() for c in s[len("SELECT "):s.index(" FROM")].split(",")]
+              project_id, since = params
+              rows = [r for r in DATA
+                      if r["project_id"] == project_id and r["status"] == "failed" and r["finished_at"] >= since]
+              rows.sort(key=lambda r: r["finished_at"], reverse=True)
+              self.rows = [tuple(r[c] for c in self.cols) for r in rows]
+              self.description = [Desc(c) for c in self.cols]
+          def fetchall(self):
+              return self.rows
+
+      class Conn:
+          def cursor(self):
+              return Cur()
+
+      print(repr(failed_builds_report(Conn(), 7, D(2026, 10, 1))))
+      print(repr(failed_builds_report(Conn(), 7, D(2026, 10, 21))))
+      print(repr(failed_builds_report(Conn(), 99, D(2026, 10, 1))))

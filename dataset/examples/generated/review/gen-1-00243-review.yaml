@@ -1,0 +1,109 @@
+id: gen-1-00243-review
+category: review
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    Hello, can you please review my code? It is a small Monte Carlo for a lattice gas (k particles on n sites), I use it for my thesis. It work and the results look right, but 200k steps take very long time on my laptop and I dont understand why, because the code is so simple. Sorry for my english.
+
+    ```python
+    import math
+    import random
+
+
+    def multiplicity(n, k):
+        # number of ways to put k particles on n sites
+        return math.factorial(n) // (math.factorial(k) * math.factorial(n - k))
+
+
+    def log_weight(n, k, eps, beta):
+        return math.log(multiplicity(n, k)) - beta * eps * k
+
+
+    def run_chain(n_sites, steps, eps=1.0, beta=0.5, history=[]):
+        k = n_sites // 2
+        rng = random.Random(42)
+        for _ in range(steps):
+            k_new = k + rng.choice((-1, 1))
+            if k_new < 0 or k_new > n_sites:
+                continue
+            delta = log_weight(n_sites, k_new, eps, beta) - log_weight(n_sites, k, eps, beta)
+            if delta >= 0 or rng.random() < math.exp(delta):
+                k = k_new
+            history.append(k)
+        return k, history
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (scientific computing)
+
+    #### [Bug] Shared default list `history=[]`
+    - **Where:** `run_chain(..., history=[])`
+    - **Issue:** Python creates the default list once. The second call to `run_chain` in the same process appends to the same list, so averages over `history` mix runs. This is easy to miss when you scan beta or eps in one script.
+    - **Fix:** use `history=None` and create the list inside the function (see the full code below).
+
+    #### [High] `multiplicity` recomputes three big factorials on every call
+    - **Where:** `multiplicity`, called twice per step through `log_weight`
+    - **Issue:** it is a pure function, and `n_sites` is fixed in a run, so `k` can only be 0 to `n_sites`. For 200k steps you compute the same few hundred values about 400k times, each time with large integer factorials. This is the reason for the slow run. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations drawn from 200 distinct inputs used ~43 J uncached and ~4.7 J with `functools.lru_cache`, about 9× less. Your case has the same shape: few distinct inputs, many calls.
+    - **Fix:** add `@lru_cache` with a bound. The return value is an `int`, which is immutable, so sharing cached results is safe.
+    - **Impact:** E, CPU time per step drops to a dictionary lookup. This only works because inputs repeat. If every call had a new `(n, k)`, the cache would only add overhead.
+
+    Both changes together:
+
+    ```python
+    import math
+    import random
+    from functools import lru_cache
+
+
+    @lru_cache(maxsize=4096)
+    def multiplicity(n, k):
+        # number of ways to put k particles on n sites
+        return math.factorial(n) // (math.factorial(k) * math.factorial(n - k))
+
+
+    def log_weight(n, k, eps, beta):
+        return math.log(multiplicity(n, k)) - beta * eps * k
+
+
+    def run_chain(n_sites, steps, eps=1.0, beta=0.5, history=None):
+        if history is None:
+            history = []
+        k = n_sites // 2
+        rng = random.Random(42)
+        for _ in range(steps):
+            k_new = k + rng.choice((-1, 1))
+            if k_new < 0 or k_new > n_sites:
+                continue
+            delta = log_weight(n_sites, k_new, eps, beta) - log_weight(n_sites, k, eps, beta)
+            if delta >= 0 or rng.random() < math.exp(delta):
+                k = k_new
+            history.append(k)
+        return k, history
+    ```
+
+    The chain gives the same numbers as before for the same seed. Only the repeated history bug is gone.
+
+    **Already good:** the seeded `random.Random` gives reproducible runs, and the `//` integer division keeps `multiplicity` exact.
+verify:
+  module: true
+  test: |
+    assert multiplicity(10, 3) == 120
+    k1, h1 = run_chain(50, 1000)
+    k2, h2 = run_chain(50, 1000)
+    assert h1 == h2 and len(h1) == len(h2)
+    assert h1 is not h2
+    assert multiplicity.cache_info().hits > 0
+  equivalence:
+    driver: |
+      k, hist = run_chain(60, 5000)
+      print(k, len(hist), sum(hist))
+  benchmark:
+    driver: |
+      k, hist = run_chain(300, 20000)
+      print(k, len(hist), sum(hist))
+    min_speedup: 1.5

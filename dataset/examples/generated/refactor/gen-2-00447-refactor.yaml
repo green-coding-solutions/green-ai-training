@@ -1,0 +1,114 @@
+id: gen-2-00447-refactor
+category: refactor
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    Our nightly job builds the sitemap files for the shop (about 400k products, so 8 files). It has gotten slow and I think the XML building is the reason. Can you optimize it?
+
+    Requirements:
+    - The output must stay byte-for-byte identical, because Google Search Console compares it with the last run.
+    - Same function names and signatures, other jobs import them.
+    - Python 3.9, standard library only.
+
+    ```python
+    from datetime import datetime
+    from xml.sax.saxutils import escape
+
+    BASE_URL = "https://shop.example.com"
+    MAX_URLS = 50000
+
+
+    def build_sitemap_chunk(products):
+        xml = '<?xml version="1.0" encoding="UTF-8"?>\n'
+        xml += '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+        for p in products:
+            loc = BASE_URL + "/p/" + p["slug"]
+            xml += "  <url>\n"
+            xml += "    <loc>" + escape(loc) + "</loc>\n"
+            if p.get("updated_at"):
+                xml += "    <lastmod>" + p["updated_at"].strftime("%Y-%m-%d") + "</lastmod>\n"
+            prio = "0.8" if p.get("in_stock") else "0.3"
+            xml += "    <priority>" + prio + "</priority>\n"
+            xml += "  </url>\n"
+        xml += "</urlset>\n"
+        return xml
+
+
+    def build_sitemaps(products):
+        files = []
+        for i in range(0, len(products), MAX_URLS):
+            files.append(build_sitemap_chunk(products[i:i + MAX_URLS]))
+        return files
+    ```
+- role: assistant
+  content: |
+    ```python
+    from datetime import datetime
+    from xml.sax.saxutils import escape
+
+    BASE_URL = "https://shop.example.com"
+    MAX_URLS = 50000
+
+
+    def build_sitemap_chunk(products):
+        parts = [
+            '<?xml version="1.0" encoding="UTF-8"?>\n',
+            '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n',
+        ]
+        for p in products:
+            loc = BASE_URL + "/p/" + p["slug"]
+            parts.append("  <url>\n")
+            parts.append("    <loc>" + escape(loc) + "</loc>\n")
+            if p.get("updated_at"):
+                parts.append("    <lastmod>" + p["updated_at"].strftime("%Y-%m-%d") + "</lastmod>\n")
+            prio = "0.8" if p.get("in_stock") else "0.3"
+            parts.append("    <priority>" + prio + "</priority>\n")
+            parts.append("  </url>\n")
+        parts.append("</urlset>\n")
+        return "".join(parts)
+
+
+    def build_sitemaps(products):
+        files = []
+        for i in range(0, len(products), MAX_URLS):
+            files.append(build_sitemap_chunk(products[i:i + MAX_URLS]))
+        return files
+    ```
+
+    **Green Notes**
+    - **Collect pieces, join once** (reduces E): the old loop did about six `+=` per product, so each file was grown piece by piece, up to 50,000 products long. Now each piece goes into a list and `"".join()` builds the string once at the end. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces used about 469 J with `+=` and about 1.8 J with `join`, roughly 260× less CPU energy. I did not scale this to your job. To see your own gain, time the job before and after with `time` or `perf stat`.
+    - **Output is identical:** the pieces, their order and the `escape()` call are unchanged. The chunking and the function signatures are untouched too.
+    - **Not changed:** f-strings would not help here. In the same benchmark, f-string concatenation in a loop behaved like `+=`.
+verify:
+  equivalence:
+    driver: |
+      import hashlib
+      MAX_URLS = 3
+      products = []
+      for i in range(8):
+          products.append({
+              "slug": "item-%d" % i if i % 3 else "tea&coffee-%d" % i,
+              "updated_at": datetime(2026, 1, 1 + i) if i % 2 == 0 else None,
+              "in_stock": i % 4 != 0,
+          })
+      files = build_sitemaps(products)
+      print(len(files))
+      print(files[0])
+      print(hashlib.sha256("".join(files).encode()).hexdigest())
+  test: |-
+    MAX_URLS = 2
+    out = build_sitemaps([
+        {"slug": "a&b", "updated_at": datetime(2026, 3, 4), "in_stock": True},
+        {"slug": "c", "in_stock": False},
+        {"slug": "d"},
+    ])
+    assert len(out) == 2
+    assert "a&amp;b" in out[0]
+    assert "<lastmod>2026-03-04</lastmod>" in out[0]
+    assert "<priority>0.3</priority>" in out[1]
+    assert out[1].endswith("</urlset>\n")

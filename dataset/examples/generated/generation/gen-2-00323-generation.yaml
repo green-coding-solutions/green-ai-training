@@ -1,0 +1,72 @@
+id: gen-2-00323-generation
+category: generation
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    hi, i need a bash script for our IoT gateway (small ARM box, connected over LTE, we pay per MB). The sensor daemon write readings to /var/spool/sensord/current.jsonl and every minute it move the file to readings-<timestamp>.jsonl in same folder.
+
+    Every 10 min (cron) i want to send all the readings-*.jsonl to our ingest api with curl and delete them only if upload worked. If LTE is down the files must stay for next run.
+
+    - API: POST https://ingest.example.com/v1/readings
+    - bearer token is in /etc/sensord/ingest.token
+    - gateway id is in /etc/sensord/gateway-id, goes in header X-Gateway-Id
+    - API accept gzip body with Content-Encoding header
+
+    My colleague say use xz -9 because it make the smallest files and save most LTE data, is it better?
+- role: assistant
+  content: |
+    Use gzip. Your API only decodes gzip, so an xz body would be rejected. xz -9 would also cost the small ARM CPU far more work on every run.
+
+    ```bash
+    #!/usr/bin/env bash
+    # upload-readings.sh: send finished sensor readings to the ingest API (run from cron every 10 min)
+    set -euo pipefail
+
+    spool_dir='/var/spool/sensord'
+    ingest_url='https://ingest.example.com/v1/readings'
+    token="$(< /etc/sensord/ingest.token)"
+    gateway_id="$(< /etc/sensord/gateway-id)"
+
+    # never run twice at the same time (slow LTE upload + next cron tick)
+    exec 9> /run/upload-readings.lock
+    flock -n 9 || exit 0
+
+    shopt -s nullglob
+    files=( "$spool_dir"/readings-*.jsonl )   # current.jsonl is never picked up
+    (( ${#files[@]} > 0 )) || exit 0
+
+    batch="$(mktemp /tmp/readings.XXXXXX.jsonl.gz)"
+    trap 'rm -f -- "$batch"' EXIT
+
+    # one compressed stream for the whole batch, no uncompressed temp file
+    cat -- "${files[@]}" | gzip -6 > "$batch"
+
+    if curl --fail --silent --show-error \
+            --max-time 300 --retry 3 --retry-delay 15 \
+            -H 'Content-Type: application/x-ndjson' \
+            -H 'Content-Encoding: gzip' \
+            -H "Authorization: Bearer $token" \
+            -H "X-Gateway-Id: $gateway_id" \
+            --data-binary "@$batch" \
+            "$ingest_url"; then
+        # delete only the files that went into this batch
+        rm -f -- "${files[@]}"
+    else
+        echo 'upload failed, keeping readings for next run' >&2
+        exit 1
+    fi
+    ```
+
+    Files that the daemon moves into the folder during the upload are not in `files`. They stay for the next run.
+
+    **Green Notes**
+    - **Compress before sending** (reduces network): JSONL readings repeat the same keys on every line, and text like this compresses well. Fewer bytes go over the metered LTE link, and the radio is busy for less time.
+    - **gzip at level 6 instead of xz -9** (reduces E): in Green Metrics Tool compression benchmarks on 100 MB of text with default settings, gzip used ~67 J and xz (default -6) ~458 J. -9 is slower still. These figures compare energy only. xz usually makes smaller files, but here the extra CPU work repeats every 10 minutes on a weak CPU, and the API cannot read xz anyway.
+    - **If the API adds zstd support:** in the same benchmark zstd used ~16 J, about 4× less than gzip. Then switch to `zstd -c` and `Content-Encoding: zstd`.
+verify:
+  static_only: needs network access to the HTTPS ingest endpoint, root paths (/etc, /run, /var/spool) and flock

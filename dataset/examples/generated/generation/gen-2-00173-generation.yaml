@@ -1,0 +1,90 @@
+id: gen-2-00173-generation
+category: generation
+language: python
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    Need `recent_failures(conn, pipeline_id, limit=20)` for our CI stats module (psycopg 3, Postgres). It feeds the "Recent failures" panel on the build dashboard. The panel polls every 30s from every open tab.
+
+    `builds` table: id, pipeline_id, status ('queued'|'running'|'passed'|'failed'|'cancelled'), branch, commit_sha, author, runner_id, started_at, finished_at, log_text (full job log, often several MB), artifacts_manifest jsonb, env_snapshot jsonb, test_report jsonb.
+
+    Return a list of dicts: id, branch, commit_sha, finished_at, duration_s. Newest first. Just the function, no essay.
+- role: assistant
+  content: |
+    ```python
+    def recent_failures(conn, pipeline_id, limit=20):
+        """Latest failed builds of a pipeline, newest first."""
+        sql = """
+            SELECT id, branch, commit_sha, finished_at,
+                   EXTRACT(EPOCH FROM finished_at - started_at)::int AS duration_s
+            FROM builds
+            WHERE pipeline_id = %s AND status = 'failed'
+            ORDER BY finished_at DESC
+            LIMIT %s
+        """
+        with conn.cursor() as cur:
+            cur.execute(sql, (pipeline_id, limit))
+            return [
+                {
+                    "id": row[0],
+                    "branch": row[1],
+                    "commit_sha": row[2],
+                    "finished_at": row[3],
+                    "duration_s": row[4],
+                }
+                for row in cur.fetchall()
+            ]
+    ```
+
+    `duration_s` is rounded to whole seconds.
+
+    **Green Notes**
+    - **Select only the needed columns** (reduces E, network): the query reads the five fields the panel shows. It never touches `log_text` or the jsonb columns, so it doesn't pull multi-MB logs on every poll from every tab. In Green Metrics Tool micro-benchmarks on a 52-column table with large text columns, naming 10 columns instead of `SELECT *` used about 5.5× to 7× less CPU energy. The saving grows with the size of the skipped columns.
+verify:
+  test: |-
+    import datetime
+
+    class FakeCursor:
+        def __init__(self):
+            self.sql = None
+            self.params = None
+        def __enter__(self):
+            return self
+        def __exit__(self, *exc):
+            return False
+        def execute(self, sql, params):
+            self.sql = sql
+            self.params = params
+        def fetchall(self):
+            return [
+                (42, "main", "9f1c2ab", datetime.datetime(2026, 10, 20, 14, 5), 318),
+                (39, "feat/cache", "77de0b1", datetime.datetime(2026, 10, 20, 9, 41), 95),
+            ]
+
+    class FakeConn:
+        def __init__(self):
+            self.cur = FakeCursor()
+        def cursor(self):
+            return self.cur
+
+    conn = FakeConn()
+    out = recent_failures(conn, 7, limit=5)
+    assert conn.cur.params == (7, 5)
+    sql = conn.cur.sql
+    assert "*" not in sql
+    for col in ("log_text", "artifacts_manifest", "env_snapshot", "test_report"):
+        assert col not in sql
+    assert "status = 'failed'" in sql
+    assert "ORDER BY finished_at DESC" in sql
+    assert out == [
+        {"id": 42, "branch": "main", "commit_sha": "9f1c2ab",
+         "finished_at": datetime.datetime(2026, 10, 20, 14, 5), "duration_s": 318},
+        {"id": 39, "branch": "feat/cache", "commit_sha": "77de0b1",
+         "finished_at": datetime.datetime(2026, 10, 20, 9, 41), "duration_s": 95},
+    ]
+    assert recent_failures(FakeConn(), 1)[0]["id"] == 42

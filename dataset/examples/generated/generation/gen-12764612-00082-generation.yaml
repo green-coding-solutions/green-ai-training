@@ -1,0 +1,58 @@
+id: gen-12764612-00082-generation
+category: generation
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    hi, im new to linux and scripts. every night our ETL job writes files into a folder, like orders.csv, events.ndjson (these are big, few hundred MB) and also some .parquet and .zip files. i need to send all of them to the analytics server with curl, it has an upload url where you PUT a file. i heard it is good to compress before sending but i dont know what to use or if it is right for all files. can you write the script? folder and url should be arguments
+- role: assistant
+  content: |
+    Here is a script. It compresses only the text files and sends the rest as they are.
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    src="${1:?usage: send-nightly.sh <folder> <upload-url>}"
+    url="${2:?usage: send-nightly.sh <folder> <upload-url>}"
+    url="${url%/}"
+
+    tmp="$(mktemp -d)"
+    trap 'rm -rf -- "$tmp"' EXIT
+
+    upload() {
+        # $1 = local file, $2 = name on the server
+        curl --fail --silent --show-error -T "$1" -- "$url/$2"
+    }
+
+    for f in "$src"/*; do
+        [[ -f $f ]] || continue
+        name="${f##*/}"
+
+        case $name in
+            *.csv|*.json|*.ndjson|*.txt|*.log)
+                zstd -q -o "$tmp/$name.zst" -- "$f"
+                upload "$tmp/$name.zst" "$name.zst"
+                rm -f -- "$tmp/$name.zst"
+                ;;
+            *)
+                upload "$f" "$name"
+                ;;
+        esac
+    done
+    ```
+
+    Run it like this: `./send-nightly.sh /data/etl/out https://analytics.example.com/upload`
+
+    The server must accept `.zst` files and unpack them on its side (`zstd -d`). If it can't, tell me and I will switch the script to gzip.
+
+    **Green Notes**
+    - **Compress transmitted text with a fast codec** (reduces network): CSV and NDJSON shrink a lot, so far fewer bytes cross the wire. I used `zstd` at its default level. In Green Metrics Tool micro-benchmarks on 100 MB of text, compressing used about 16 J with zstd, about 67 J with gzip and about 458 J with xz. These figures compare energy only, not file size. xz usually makes smaller files, but it costs far more CPU for a file you compress every night.
+    - **Already-compressed files are skipped:** `.parquet` and `.zip` are sent as they are. Compressing them again burns CPU and gains almost nothing.
+    - **Temporary copy is deleted right after upload:** the compressed file only lives for a few minutes, so it is not worth keeping. Only one copy exists at a time, so the disk stays small too.
+  verify:
+    static_only: needs curl, zstd and a running upload server

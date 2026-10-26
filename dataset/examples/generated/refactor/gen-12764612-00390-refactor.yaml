@@ -1,0 +1,84 @@
+id: gen-12764612-00390-refactor
+category: refactor
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    Page weight check in our landing page build. Slow on the big marketing builds. Only tell me what changes, behavior and output must stay identical.
+
+    ```bash
+    #!/bin/bash
+    # usage: ./weight-report.sh manifest.txt   (lines: <path> <bytes>)
+    manifest="$1"
+    js=0; css=0; img=0; other=0
+    total=0
+
+    while read -r line; do
+      path=$(echo "$line" | cut -d' ' -f1)
+      bytes=$(echo "$line" | cut -d' ' -f2)
+      ext=$(echo "$path" | sed 's/.*\.//')
+      kb=$(expr $bytes / 1024)
+      total=$(expr $total + $bytes)
+      case "$ext" in
+        js|mjs)                 js=$(expr $js + $bytes) ;;
+        css)                    css=$(expr $css + $bytes) ;;
+        png|jpg|jpeg|webp|svg)  img=$(expr $img + $bytes) ;;
+        *)                      other=$(expr $other + $bytes) ;;
+      esac
+      if [ "$kb" -gt 200 ]; then
+        echo "WARNING: $path is ${kb} KB"
+      fi
+    done < "$manifest"
+
+    echo "js: $js"
+    echo "css: $css"
+    echo "img: $img"
+    echo "other: $other"
+    echo "total: $total"
+    ```
+- role: assistant
+  content: |
+    ```bash
+    #!/bin/bash
+    # usage: ./weight-report.sh manifest.txt   (lines: <path> <bytes>)
+    manifest="$1"
+    js=0; css=0; img=0; other=0
+    total=0
+
+    while read -r path bytes _; do
+      ext=${path##*.}
+      kb=$(( bytes / 1024 ))
+      total=$(( total + bytes ))
+      case "$ext" in
+        js|mjs)                 js=$(( js + bytes )) ;;
+        css)                    css=$(( css + bytes )) ;;
+        png|jpg|jpeg|webp|svg)  img=$(( img + bytes )) ;;
+        *)                      other=$(( other + bytes )) ;;
+      esac
+      if [ "$kb" -gt 200 ]; then
+        echo "WARNING: $path is ${kb} KB"
+      fi
+    done < "$manifest"
+
+    echo "js: $js"
+    echo "css: $css"
+    echo "img: $img"
+    echo "other: $other"
+    echo "total: $total"
+    ```
+
+    Changed lines only:
+    - `read -r line` + two `echo | cut` → `read -r path bytes _`
+    - `sed 's/.*\.//'` → `${path##*.}`
+    - every `$(expr ...)` → `$(( ... ))`
+
+    **Green Notes**
+    - **Builtins instead of subprocesses in the loop** (reduces E): the old loop started around nine processes per manifest line (`cut`, `sed`, `expr`, each with a subshell). Now `read`, parameter expansion and `$(( ))` run inside the shell, so no process starts per line. In Green Metrics Tool micro-benchmarks on a 20,000-line log summary with identical output, a loop with `echo | cut` and `expr` used ~1302 J and 238 s. The same loop with builtins only used ~4.3 J and 0.72 s, about 300× less.
+
+    Output is the same. `${path##*.}` returns the whole path when there is no dot, like the old `sed`. Paths with spaces were already broken by `cut -d' '`, so nothing changes there. A single `awk` pass would be cheaper still in that benchmark, but it is a bigger rewrite than you asked for.
+verify:
+  static_only: bash script reading a manifest file; no runnable harness for the diff

@@ -1,0 +1,72 @@
+id: gen-2-00030-generation
+category: generation
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    python: count failed ssh logins per user from auth.log, only for a list of users i pass in
+- role: assistant
+  content: |
+    ```python
+    import re
+    import sys
+
+    # Matches "Failed password for alice from ...",
+    # "Failed password for invalid user bob from ..." and the rsyslog
+    # dedup form "message repeated 3 times: [ Failed password for ... ]".
+    FAILED_LOGIN = re.compile(
+        r"(?:message repeated (\d+) times: \[ )?"
+        r"Failed (?:password|publickey) for (?:invalid user )?(\S+) from "
+    )
+
+
+    def failed_logins(lines, users):
+        """Count failed SSH logins per user. Only users in `users` are counted."""
+        counts = dict.fromkeys(users, 0)
+        for line in lines:
+            m = FAILED_LOGIN.search(line)
+            if m is None:
+                continue
+            repeated, user = m.groups()
+            if user in counts:
+                counts[user] += int(repeated) if repeated else 1
+        return counts
+
+
+    def main():
+        if len(sys.argv) < 3:
+            sys.exit("usage: failed_logins.py LOGFILE USER [USER ...]")
+        path, users = sys.argv[1], sys.argv[2:]
+        with open(path, encoding="utf-8", errors="replace") as f:
+            counts = failed_logins(f, users)
+        for user, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+            print(f"{n:6d}  {user}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    Usage: `python failed_logins.py /var/log/auth.log root deploy alice`
+
+    **Green Notes**
+    - **Compile the regex once, outside the loop** (reduces E): there is one module-level pattern with a capture group for the user name, plus a dict lookup per line. Building one pattern per user, such as `re.search(f"for {user} from", line)`, would run every user's pattern on every line. With a long user list it can also overflow `re`'s internal pattern cache and force recompiles. In Green Metrics Tool micro-benchmarks, 1,000,000 matches with a precompiled pattern used about 18% less CPU energy than inline `re.match`. Forcing a recompile on every call cost about 200× more per match.
+
+    The script reads the file line by line, so memory use stays flat on large logs. Lines like "message repeated 3 times" are counted as 3 failures, not 1.
+verify:
+  module: true
+  test: |-
+    sample = [
+        "Oct 24 03:12:01 web1 sshd[811]: Failed password for root from 203.0.113.5 port 52144 ssh2",
+        "Oct 24 03:12:04 web1 sshd[811]: Failed password for invalid user admin from 203.0.113.5 port 52150 ssh2",
+        "Oct 24 03:12:09 web1 sshd[811]: message repeated 3 times: [ Failed password for root from 203.0.113.5 port 52144 ssh2]",
+        "Oct 24 03:13:00 web1 sshd[900]: Accepted publickey for deploy from 198.51.100.7 port 40022 ssh2",
+        "Oct 24 03:14:00 web1 sshd[901]: Failed publickey for deploy from 198.51.100.8 port 40023 ssh2",
+    ]
+    assert failed_logins(sample, ["root", "deploy", "alice"]) == {"root": 4, "deploy": 1, "alice": 0}
+    assert failed_logins([], ["root"]) == {"root": 0}
+    assert failed_logins(sample, ["admin"]) == {"admin": 1}

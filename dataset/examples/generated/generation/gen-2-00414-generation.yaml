@@ -1,0 +1,63 @@
+id: gen-2-00414-generation
+category: generation
+language: bash
+patterns:
+- bash-quoting
+- bash-builtins
+facts:
+- F-BASH-QUOTES
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    hi, im new to bash and I dont know if I am doing this right. we have a small raspberry pi gateway in a cold room and a modbus tool writes the sensor readings to /var/run/gw/readings.txt every minute. every line looks like `sensor_id temp_mc` where temp_mc is the temperature in milli degrees (so 71500 = 71.5 C). the file can have a few thousand sensors. I need a script that writes a line to a alerts file as json for every sensor above 70000 (warning) and above 85000 (critical). some lines are comments with # or broken, those should be skipped. can you write it?
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    readings=${1:-/var/run/gw/readings.txt}
+    alerts=${2:-/var/log/gw/alerts.ndjson}
+
+    warn_mc=70000
+    crit_mc=85000
+
+    while read -r id temp _; do
+        # skip empty lines and comments
+        if [[ -z $id || $id == '#'* ]]; then
+            continue
+        fi
+
+        # skip broken values
+        if [[ ! $temp =~ ^-?[0-9]+$ ]]; then
+            printf 'skipped %s: bad value\n' "$id" >&2
+            continue
+        fi
+
+        # below zero is never an alert
+        if [[ $temp == -* ]]; then
+            continue
+        fi
+
+        temp=$((10#$temp))
+
+        if (( temp >= crit_mc )); then
+            level='critical'
+        elif (( temp >= warn_mc )); then
+            level='warning'
+        else
+            continue
+        fi
+
+        printf '{"sensor":"%s","temp_mc":%s,"level":"%s"}\n' "$id" "$temp" "$level"
+    done < "$readings" >> "$alerts"
+    ```
+
+    Run it with `./check_temps.sh` or pass your own paths: `./check_temps.sh readings.txt alerts.ndjson`. Alerts are appended, so the file keeps growing. Rotate it from time to time.
+
+    **Green Notes**
+    - **Shell builtins in the loop** (reduces E): `read -r`, `[[ ]]`, `(( ))` and `printf` all run inside bash. There is no `echo | cut` or `expr` per line, so no new process is started for each sensor. In Green Metrics Tool micro-benchmarks of a 20,000-line log summary, a loop with builtins only used about 300× less CPU energy than the same loop starting a few processes per line.
+    - **Single quotes for plain text** (reduces E): the JSON format string, the level names and the `'#'` pattern need no expansion, so they use single quotes. Double quotes stay only where a variable must expand or be protected, like `"$id"`. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal in a loop took about 24% less CPU energy with single quotes. Your strings are short and the script runs once a minute, so the real saving here is small. It is still the better default.
+verify:
+  static_only: bash script that needs gateway files and log directories

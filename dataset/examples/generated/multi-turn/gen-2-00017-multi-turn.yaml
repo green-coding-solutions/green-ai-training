@@ -1,0 +1,101 @@
+id: gen-2-00017-multi-turn
+category: multi-turn
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    hi, we have small landing page for our product launch next month. Its plain html + css + js made from a agency, they put the files in /var/www/launch. On mobile the page load slow, can you improve our nginx config?
+
+    ```nginx
+    server {
+        listen 80;
+        server_name launch.example.com;
+        root /var/www/launch;
+        index index.html;
+
+        access_log /var/log/nginx/launch.access.log;
+        error_log  /var/log/nginx/launch.error.log;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location ~* \.(css|js|png|jpg|jpeg|svg|woff2)$ {
+            expires 30d;
+            access_log off;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    Your config sends all files uncompressed. For HTML, CSS, JS and SVG that wastes a lot of bytes, and on mobile networks it is the bytes that make the page slow.
+
+    ```nginx
+    server {
+        listen 80;
+        server_name launch.example.com;
+        root /var/www/launch;
+        index index.html;
+
+        access_log /var/log/nginx/launch.access.log;
+        error_log  /var/log/nginx/launch.error.log;
+
+        # Serve app.js.gz if it exists next to app.js
+        gzip_static on;
+
+        # Fallback: compress text files that have no .gz version
+        gzip on;
+        gzip_comp_level 5;
+        gzip_vary on;
+        gzip_types text/css application/javascript application/json image/svg+xml;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location ~* \.(css|js|png|jpg|jpeg|svg|woff2)$ {
+            expires 30d;
+            access_log off;
+        }
+    }
+    ```
+
+    **Green Notes**
+    - **Enable text compression** (reduces network): in Green Metrics Tool benchmarks with nginx serving 2,000 requests for text assets, compression sent about 10× fewer bytes. This is what helps your mobile visitors.
+    - **Precompressed files** (reduces E): with `gzip_static`, the files are compressed once at deploy instead of on every request. In the same benchmark, gzip on every request cost about 4× the CPU energy of serving precompressed files.
+
+    To use this, create the `.gz` files when you deploy, e.g. `gzip -k -9` on the HTML, CSS, JS and SVG files. Recreate them on every deploy. Otherwise nginx serves an old `app.js.gz` after `app.js` has changed. `text/html` is compressed by default, so it is not in `gzip_types`.
+- role: user
+  content: |
+    hmm problem. the agency upload with FTP, they dont have any build step and they will not change there workflow for us. And I am afraid of the old .gz files like you say. Can we just use normal gzip?
+- role: assistant
+  content: |
+    Yes. Remove `gzip_static` and keep the rest:
+
+    ```nginx
+    gzip on;
+    gzip_comp_level 5;
+    gzip_vary on;
+    gzip_types text/css application/javascript application/json image/svg+xml;
+    ```
+
+    Now nginx compresses every text response itself, and stale `.gz` files cannot happen. This costs some CPU per request. For a launch page the byte saving on mobile matters more, and level 5 keeps that CPU cost moderate.
+
+    If traffic gets big later, a small cron job that creates the `.gz` files after uploads would let you turn `gzip_static` back on.
+- role: user
+  content: |
+    ok it works, thanks! My colleague say we should add also png, jpg and woff2 to gzip_types so ALL is compressed, and set level 9 for smallest size. good idea?
+- role: assistant
+  content: |
+    No to both. I would keep the config as it is.
+
+    - **PNG, JPG, WOFF2:** these formats are already compressed. gzip finds almost nothing left to shrink, so nginx spends CPU on every image and font request for no byte saving. The response can even get slightly bigger. SVG is text, and it is already in your list.
+    - **Level 9:** with on-the-fly compression, nginx pays that level again on every request. Level 9 costs noticeably more CPU per response than level 5, and text files usually get only a little smaller. High levels make sense for files that are compressed once, not per request.
+
+    So stay with level 5 and text types only.
+verify:
+  static_only: nginx configuration

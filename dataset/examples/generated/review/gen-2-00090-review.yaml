@@ -1,0 +1,115 @@
+id: gen-2-00090-review
+category: review
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    Hi, I set up GitLab review apps for our team. Every branch gets its own namespace in our k8s cluster with the app, Postgres, Redis and the worker. It works, but our cluster admin says the cluster keeps running out of resources and asked me to check my CI file. I'm new to CI, so I don't really know what is wrong. Also, sometimes the deploy job fails when I push a second time to the same branch. Can you review it?
+
+    ```yaml
+    stages:
+      - build
+      - review
+
+    variables:
+      IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+
+    build:
+      stage: build
+      image: docker:27
+      services:
+        - docker:27-dind
+      script:
+        - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+        - docker build -t $IMAGE .
+        - docker push $IMAGE
+
+    deploy_review:
+      stage: review
+      image:
+        name: bitnami/kubectl:1.30
+        entrypoint: [""]
+      script:
+        - kubectl create namespace review-$CI_COMMIT_BRANCH
+        - kubectl -n review-$CI_COMMIT_BRANCH apply -f k8s/postgres.yaml
+        - kubectl -n review-$CI_COMMIT_BRANCH apply -f k8s/redis.yaml
+        - kubectl -n review-$CI_COMMIT_BRANCH apply -f k8s/app.yaml
+        - kubectl -n review-$CI_COMMIT_BRANCH apply -f k8s/worker.yaml
+        - kubectl -n review-$CI_COMMIT_BRANCH set image deployment/app app=$IMAGE
+      environment:
+        name: review/$CI_COMMIT_BRANCH
+        url: https://$CI_COMMIT_REF_SLUG.review.example.com
+      rules:
+        - if: $CI_COMMIT_BRANCH != "main"
+    ```
+- role: assistant
+  content: |
+    **Workload:** CI/CD and infrastructure (review apps on Kubernetes)
+
+    #### [Bug] Second push to the same branch fails
+    - **Where:** `kubectl create namespace review-$CI_COMMIT_BRANCH`
+    - **Issue:** `create` fails if the namespace already exists. So the first push works and every later push to that branch fails the job.
+    - **Fix:** create it in a way that can run many times: `kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -` (see the full job below).
+
+    #### [Bug] Branch names are not valid namespace names
+    - **Where:** `review-$CI_COMMIT_BRANCH`, `rules`
+    - **Issue:** namespace names may only contain lowercase letters, digits and `-`, and can be at most 63 characters long. Branches like `feature/login` or `Fix-Header` break the deploy. In tag pipelines `$CI_COMMIT_BRANCH` is empty, so the rule still matches and the job deploys into a namespace called `review-`.
+    - **Fix:** use `$CI_ENVIRONMENT_SLUG` as the namespace. GitLab makes it short and DNS-safe. Run the job only for branches: `if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH`.
+
+    #### [Security] Registry password on the command line
+    - **Where:** `docker login ... -p $CI_REGISTRY_PASSWORD`
+    - **Issue:** the password shows up in the process list, and Docker prints a warning about it.
+    - **Fix:** `echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"`
+
+    #### [High] Review apps are never stopped
+    - **Where:** `environment:` of `deploy_review` (no `on_stop`, no `auto_stop_in`)
+    - **Issue:** every branch anyone ever pushed still has a namespace with Postgres, Redis, the app and the worker. Nothing removes them after a merge, so the cluster fills up. This is what your admin is seeing. An environment costs mostly the hours it exists, not the number of services in it.
+    - **Fix:** add a stop job and an expiry:
+      ```yaml
+      deploy_review:
+        stage: review
+        image:
+          name: bitnami/kubectl:1.30
+          entrypoint: [""]
+        script:
+          - kubectl create namespace "$CI_ENVIRONMENT_SLUG" --dry-run=client -o yaml | kubectl apply -f -
+          - kubectl -n "$CI_ENVIRONMENT_SLUG" apply -f k8s/postgres.yaml -f k8s/redis.yaml -f k8s/app.yaml -f k8s/worker.yaml
+          - kubectl -n "$CI_ENVIRONMENT_SLUG" set image deployment/app app="$IMAGE"
+        environment:
+          name: review/$CI_COMMIT_REF_SLUG
+          url: https://$CI_COMMIT_REF_SLUG.review.example.com
+          on_stop: stop_review
+          auto_stop_in: 3 days
+        rules:
+          - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+
+      stop_review:
+        stage: review
+        image:
+          name: bitnami/kubectl:1.30
+          entrypoint: [""]
+        variables:
+          GIT_STRATEGY: none
+        script:
+          - kubectl delete namespace "$CI_ENVIRONMENT_SLUG" --ignore-not-found
+        environment:
+          name: review/$CI_COMMIT_REF_SLUG
+          action: stop
+        rules:
+          - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+            when: manual
+      ```
+      GitLab runs `stop_review` on its own when the branch is deleted, for example with "Delete source branch" on merge. `auto_stop_in` cleans up abandoned branches, and every new deploy resets the timer. Delete the namespaces that already exist once by hand. If review apps also sit idle overnight, a scheduled pipeline that scales them to zero removes those hours too. The next push redeploys them.
+    - **Impact:** E and M. Merged and abandoned branches no longer use the cluster, and their reserved memory becomes free.
+
+    #### [Low] Full stack in every review app
+    - **Where:** `redis.yaml` and `worker.yaml` are applied for every branch
+    - **Issue:** in Green Metrics Tool measurements, an idle preview environment with 3 app replicas, Postgres, Redis and a polling worker used ~269 J of CPU energy over 60 seconds. One with 1 replica and Postgres used ~262 J, about 3% less, and whole-machine energy differed by less than 1%. So removing services saves little per minute. The stop job above matters much more. The extra pods still reserve memory, though.
+    - **Fix:** if most branches don't touch background jobs, deploy `worker` and `redis` only when needed, for example from a separate manual job.
+    - **Impact:** M. More review apps fit on the cluster.
+verify:
+  static_only: GitLab CI file, needs a runner and a Kubernetes cluster

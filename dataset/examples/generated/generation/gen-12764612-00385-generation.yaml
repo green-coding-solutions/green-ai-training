@@ -1,0 +1,80 @@
+id: gen-12764612-00385-generation
+category: generation
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    We run flash-sale replays for our shop. I need a function that allocates stock to order lines in the order they arrived.
+
+    Inputs:
+    - `sku_idx`: int64 numpy array, the SKU index of each order line (0..n_skus-1)
+    - `qty`: int64 numpy array, the quantity requested per line
+    - `stock`: int64 numpy array, starting stock per SKU
+
+    For each line, in order, fill `min(qty, remaining stock of that SKU)` and reduce the stock. Return the filled quantity per line and the stock left per SKU. Do not change the caller's `stock` array.
+
+    A replay has about 10M order lines and 50k SKUs, and we run many replays in a row. Please validate the inputs (same length, no negative quantities, indexes in range). Python 3.12 with numpy is installed.
+- role: assistant
+  content: |
+    ```python
+    import numpy as np
+    from numba import njit
+
+
+    @njit(cache=True)
+    def _allocate(sku_idx, qty, stock):
+        filled = np.empty_like(qty)
+        for i in range(qty.shape[0]):
+            s = sku_idx[i]
+            available = stock[s]
+            take = qty[i] if qty[i] < available else available
+            filled[i] = take
+            stock[s] = available - take
+        return filled
+
+
+    def allocate_stock(sku_idx, qty, stock):
+        """Fill order lines first come, first served.
+
+        Returns (filled, stock_left). The input `stock` is not modified.
+        """
+        sku_idx = np.ascontiguousarray(sku_idx, dtype=np.int64)
+        qty = np.ascontiguousarray(qty, dtype=np.int64)
+        stock_left = np.array(stock, dtype=np.int64)  # copy
+
+        if sku_idx.shape != qty.shape or sku_idx.ndim != 1:
+            raise ValueError("sku_idx and qty must be 1-D arrays of the same length")
+        if stock_left.ndim != 1:
+            raise ValueError("stock must be a 1-D array")
+        if qty.size and qty.min() < 0:
+            raise ValueError("qty must not contain negative values")
+        if sku_idx.size and (sku_idx.min() < 0 or sku_idx.max() >= stock_left.size):
+            raise ValueError("sku_idx contains an index outside of stock")
+        if stock_left.size and stock_left.min() < 0:
+            raise ValueError("stock must not contain negative values")
+
+        filled = _allocate(sku_idx, qty, stock_left)
+        return filled, stock_left
+    ```
+
+    Example:
+
+    ```python
+    sku_idx = np.array([0, 1, 0, 0], dtype=np.int64)
+    qty = np.array([3, 2, 4, 5], dtype=np.int64)
+    stock = np.array([6, 10], dtype=np.int64)
+
+    filled, left = allocate_stock(sku_idx, qty, stock)
+    # filled -> [3, 2, 3, 0], left -> [0, 8], stock is unchanged
+    ```
+
+    **Green Notes**
+    - **JIT-compile the hot loop with Numba** (reduces E): each line depends on the stock left by earlier lines of the same SKU, so this cannot be vectorized with numpy and would be a slow pure Python loop over 10M lines. In Green Metrics Tool micro-benchmarks, a numeric loop over 10,000,000 samples used ~40 J in pure Python and ~9.5 J with Numba `@njit`, about 4× less. That was a different loop, so treat it as the direction, not a forecast for yours.
+    - **Fixed int64 dtypes and `cache=True`** (reduces E): the kernel compiles once for one type signature, and the compiled code is reused across your many replays and across process starts.
+    - *Not applied:* Numba for small inputs. For a few thousand lines, the compile time is more than the loop costs, so a plain Python loop is the better choice there.
+verify:
+  static_only: needs numba, which is not in the stdlib or numpy

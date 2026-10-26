@@ -1,0 +1,70 @@
+id: gen-1-00262-estimate
+category: estimate
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    Hello, we have a nightly job what make a digest file from our app logs, all lines with WARN or higher go in one text file that we mail to the team. Is running okay but my colegue say the string += is "bad for energy". How much energy we will save if I change it? I dont want to waste time if is only small.
+
+    ```python
+    LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
+
+    def build_digest(entries, min_level="WARN"):
+        threshold = LEVELS[min_level]
+        out = ""
+        for e in entries:
+            if LEVELS[e["level"]] < threshold:
+                continue
+            out += f"{e['ts']} [{e['level']}] {e['host']}: {e['msg']}\n"
+        return out
+    ```
+
+    The entries are already parsed, there are many millions per night.
+- role: assistant
+  content: |
+    Direction first: with many lines, the saving is real. Each `+=` builds a string again from the growing result, so the total work grows much faster than the number of lines. `"".join()` collects the pieces and builds the result once. Your f-string does not help here: an f-string inside a `+=` loop behaves like plain `+=`.
+
+    Measured reference: in Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces used ~469 J with `+=` (~455 J with f-strings in a loop) and ~1.8 J with `"".join()`. That is roughly 260× less CPU energy. I can't turn this into a number for your job, because it depends on your line count, line length and Python version. But with millions of lines per night you are in the range where the difference is large, not small.
+
+    The change is small and the output stays the same:
+
+    ```python
+    LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
+
+    def build_digest(entries, min_level="WARN"):
+        threshold = LEVELS[min_level]
+        return "".join(
+            f"{e['ts']} [{e['level']}] {e['host']}: {e['msg']}\n"
+            for e in entries
+            if LEVELS[e["level"]] >= threshold
+        )
+    ```
+
+    If you write the digest to a file anyway, you can also skip the big string and write each line as you go. That keeps memory low too.
+
+    To measure on your own data, run both versions on a sample of one million entries:
+
+    ```python
+    import time
+    t = time.process_time()
+    build_digest(sample)
+    print(time.process_time() - t)
+    ```
+
+    For real energy, run both versions as a Green Metrics Tool usage scenario. `perf stat` also works as a CPU proxy.
+verify:
+  green_block: 0
+  test: |-
+    sample = [
+        {"ts": "t1", "level": "INFO", "host": "a", "msg": "ok"},
+        {"ts": "t2", "level": "WARN", "host": "b", "msg": "slow"},
+        {"ts": "t3", "level": "ERROR", "host": "c", "msg": "fail"},
+        {"ts": "t4", "level": "DEBUG", "host": "d", "msg": "x"},
+    ]
+    assert build_digest(sample) == "t2 [WARN] b: slow\nt3 [ERROR] c: fail\n"
+    assert build_digest(sample, "ERROR") == "t3 [ERROR] c: fail\n"
+    assert build_digest([]) == ""

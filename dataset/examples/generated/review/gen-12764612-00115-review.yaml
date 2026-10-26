@@ -1,0 +1,79 @@
+id: gen-12764612-00115-review
+category: review
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import math
+
+
+    class DampedOscillator:
+        def __init__(self, omega, gamma, amplitude):
+            self.omega = omega
+            self.gamma = gamma
+            self.amplitude = amplitude
+
+        def displacement(self, t):
+            return self.amplitude * math.exp(-self.gamma * t) * math.cos(self.omega * t)
+
+        def energy_integral(self, t_end, steps):
+            """Integral of x(t)^2 from 0 to t_end, left Riemann sum."""
+            dt = t_end / steps
+            total = 0.0
+            for i in range(steps):
+                t = i * dt
+                x = self.amplitude * math.exp(-self.gamma * t) * math.cos(self.omega * t)
+                total += x * x * dt
+            return total
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (scientific computing)
+
+    #### [Low] Repeated attribute lookups in the integration loop
+    - **Where:** `energy_integral`, the loop body
+    - **Issue:** every step looks up `math.exp`, `math.cos`, `self.amplitude`, `self.gamma` and `self.omega` again. None of them change inside the loop. With millions of steps this is repeated work.
+    - **Fix:** bind them to locals once before the loop. The results are identical, because the math is the same and runs in the same order.
+    - **Impact:** E on the CPU, small. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local before a 10,000,000-iteration loop saved about 4-5%. Expect a similar few percent here, and only for large `steps`. For a few thousand steps it is not worth a change.
+
+    ```python
+    import math
+
+
+    class DampedOscillator:
+        def __init__(self, omega, gamma, amplitude):
+            self.omega = omega
+            self.gamma = gamma
+            self.amplitude = amplitude
+
+        def displacement(self, t):
+            return self.amplitude * math.exp(-self.gamma * t) * math.cos(self.omega * t)
+
+        def energy_integral(self, t_end, steps):
+            """Integral of x(t)^2 from 0 to t_end, left Riemann sum."""
+            dt = t_end / steps
+            exp, cos = math.exp, math.cos
+            amplitude, gamma, omega = self.amplitude, self.gamma, self.omega
+            total = 0.0
+            for i in range(steps):
+                t = i * dt
+                x = amplitude * exp(-gamma * t) * cos(omega * t)
+                total += x * x * dt
+            return total
+    ```
+
+    **Already good:** the loop does no allocation and no I/O, and `total` is a plain float accumulator. Nothing else here is worth changing.
+verify:
+  equivalence:
+    driver: |-
+      osc = DampedOscillator(omega=6.2831853, gamma=0.35, amplitude=1.7)
+      print(repr(osc.energy_integral(10.0, 200000)))
+      print(repr(osc.energy_integral(2.5, 1000)))
+      print(repr(osc.displacement(0.75)))

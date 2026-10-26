@@ -1,0 +1,83 @@
+id: gen-2-00347-no-change
+category: no-change
+language: bash
+patterns:
+- compress-stored
+- context-tradeoff
+facts:
+- F-COMPRESS-BREAKEVEN
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    Our backend team uses a small CLI called `dbsnap` on their dev laptops. It snapshots the local dev database before you test a migration, so you can roll back. A typical flow:
+
+    1. `dbsnap save` (plain SQL dump, about 1.5 GB for our shop_dev DB)
+    2. run the migration and poke at it for 5-30 minutes
+    3. `dbsnap restore` if it went wrong
+    4. `dbsnap clean` runs from our test wrapper after every run and deletes snapshots older than an hour
+
+    In the PR, a reviewer wrote: "pipe pg_dump through `xz -9`, smaller files = greener". Before I change it, my requirements:
+    - restore has to stay fast, it's in the dev loop
+    - must work on macOS and Linux laptops
+    - no extra dependencies beyond the postgres client tools if possible
+    - if compression makes sense, add it (xz or zstd?). If not, tell me why so I can answer the reviewer.
+
+    ```bash
+    #!/usr/bin/env bash
+    # dbsnap: snapshot / restore the local dev database around migration tests
+    set -euo pipefail
+
+    DB="${DBSNAP_DB:-shop_dev}"
+    SNAP_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/dbsnap"
+    mkdir -p "$SNAP_DIR"
+
+    usage() {
+      echo 'usage: dbsnap save|restore|list|clean [name]' >&2
+      exit 1
+    }
+
+    cmd="${1:-}"
+    name="${2:-latest}"
+    file="$SNAP_DIR/$DB-$name.sql"
+
+    case "$cmd" in
+      save)
+        pg_dump --no-owner --clean --if-exists "$DB" > "$file.tmp"
+        mv "$file.tmp" "$file"
+        echo "saved $file"
+        ;;
+      restore)
+        [[ -f "$file" ]] || { echo "no snapshot $file" >&2; exit 1; }
+        psql --quiet -v ON_ERROR_STOP=1 -d "$DB" -f "$file" > /dev/null
+        echo "restored $DB from $name"
+        ;;
+      list)
+        ls -lh "$SNAP_DIR"
+        ;;
+      clean)
+        find "$SNAP_DIR" -name '*.sql' -mmin +60 -delete
+        ;;
+      *)
+        usage
+        ;;
+    esac
+    ```
+- role: assistant
+  content: |
+    Don't add compression. These snapshots are temporary data that you delete within the hour. For data like that, compressing costs more energy than the disk space saves. The script can stay as it is.
+
+    What you can tell the reviewer:
+
+    - **The files don't live long enough.** Green Coding Solutions estimated a break-even point for compressing stored data. It weighs the CPU cost of compressing against the power and embodied carbon of the SSD. With zstd, data has to stay on disk for about 0.15 days before compression pays off. With xz it is about 7 days. Both are lower bounds. Your snapshots are deleted after minutes, so they never get there.
+    - **xz is the most expensive choice here.** In Green Metrics Tool measurements on 100 MB of text, xz at its default level used about 29× the CPU energy of zstd. `-9` is stronger than the default level that was measured, so it is slower still.
+    - **It would also slow your dev loop.** Every `save` would wait for the compressor. Every `restore` would have to decompress before `psql` can replay the dump. That is the step you want to keep fast.
+    - **"Smaller is greener" only holds for data that stays put.** It is true for long-term backups and archives. It is not true for scratch files that `clean` deletes within the hour.
+
+    Things the script already does well:
+    - It writes to `.tmp` and then runs `mv`, so a failed `pg_dump` never leaves a half-written snapshot that looks valid.
+    - `clean` runs after every test run, so old snapshots don't pile up on the laptops.
+
+    One case where compression would make sense: people start keeping snapshots for days, or laptops run out of disk. Then use `zstd` at its default level (`pg_dump ... | zstd -q -o "$file.zst.tmp"`, restore with `zstdcat "$file" | psql ...`). That is a disk-space decision, not an energy one, and it adds a dependency on macOS. The measurements above compare energy only, not how small the files get.
+verify:
+  static_only: Needs a running PostgreSQL server and the pg_dump/psql client tools. The answer keeps the user's script unchanged.

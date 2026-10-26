@@ -1,0 +1,49 @@
+id: gen-12764612-00020-generation
+category: generation
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    Need `rotational_partition(temp_k, b_cm, sigma)` for a linear rigid rotor, direct sum over J, no high-T approximation. We call it once per cell of a 2D temperature field every timestep, 500k cells, and the field only holds a few hundred distinct temperatures. Just the function.
+- role: assistant
+  content: |
+    ```python
+    import math
+    from functools import lru_cache
+
+    SECOND_RADIATION_CONST = 1.438776877  # h*c/k_B in cm*K
+
+
+    @lru_cache(maxsize=1024)
+    def rotational_partition(temp_k: float, b_cm: float, sigma: int = 1) -> float:
+        """Rotational partition function of a linear rigid rotor, direct sum over J."""
+        if temp_k <= 0 or b_cm <= 0 or sigma < 1:
+            raise ValueError("temp_k and b_cm must be > 0, sigma must be >= 1")
+        x = SECOND_RADIATION_CONST * b_cm / temp_k
+        j_max = max(20, int(6 / math.sqrt(x)))
+        total = sum((2 * j + 1) * math.exp(-x * j * (j + 1)) for j in range(j_max + 1))
+        return total / sigma
+    ```
+
+    **Green Notes**
+    - **Memoize repeated pure computations** (reduces E): the function is pure and each call sums up to a few hundred terms, while the field has only a few hundred distinct temperatures. So 500k calls per step become a few hundred real computations and the rest are cache hits. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over 200 distinct inputs used ~43 J uncached and ~4.7 J with `lru_cache`, about 9× less.
+
+    The cache is bounded (`maxsize=1024`) and keyed on exact float values. It only hits if temperatures repeat bit for bit. With a continuous field, every call is a miss and the cache only adds overhead. Snapping temperatures to a grid first would fix that, but it changes the physics, so that is your call. Check `rotational_partition.cache_info()` after a step to see the hit rate.
+verify:
+  test: |-
+    q = rotational_partition(300.0, 1.9987)
+    assert abs(q - 104.6) < 0.5, q
+    assert rotational_partition(300.0, 1.9987, 2) == q / 2
+    before = rotational_partition.cache_info().hits
+    assert rotational_partition(300.0, 1.9987) == q
+    assert rotational_partition.cache_info().hits == before + 1
+    try:
+        rotational_partition(0.0, 1.9987)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError")

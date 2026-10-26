@@ -1,0 +1,191 @@
+id: gen-2-00169-review
+category: review
+language: python
+patterns:
+- vectorize-or-jit
+- batch-db-writes
+facts:
+- F-NUMBA
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    Our self-hosted GitLab runners have inline power meters. After every job, a post-job hook runs the script below. It pushes the job's power trace into our energy DB (Postgres 16). The meter samples at 1 kHz, jobs take 10-30 minutes, and the fleet runs a few hundred jobs a day. Lately the hook keeps hitting the 3 min post-job timeout, and the runner gets reused while the hook is still running.
+
+    Please review it before I change anything. Requirements:
+    - no new packages in the runner image (numpy and psycopg 3 are already installed)
+    - the `jobs` and `job_energy` tables stay as they are, because dashboards read them
+    - the meter file is the only copy of the measurement
+
+    ```python
+    """Post-job hook: ingest the runner power trace into the energy DB."""
+    import argparse
+    import os
+    import sys
+
+    import numpy as np
+    import psycopg
+
+    SAMPLE_HZ = 1000
+    FULL_SCALE_W = 400.0  # meter range
+    CODE_MAX = 32767
+
+
+    def quantize_trace(watts):
+        """Clip to meter range, convert to int16 codes, sum energy per second."""
+        codes = np.empty(len(watts), dtype=np.int16)
+        per_second = []
+        acc = 0.0
+        for i in range(len(watts)):
+            w = watts[i]
+            if w < 0.0:
+                w = 0.0
+            elif w > FULL_SCALE_W:
+                w = FULL_SCALE_W
+            codes[i] = round(w / FULL_SCALE_W * CODE_MAX)
+            acc += w / SAMPLE_HZ
+            if (i + 1) % SAMPLE_HZ == 0:
+                per_second.append(acc)
+                acc = 0.0
+        if len(watts) % SAMPLE_HZ:
+            per_second.append(acc)
+        return codes, per_second
+
+
+    def store(conn, job_id, runner, per_second, codes):
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO jobs (job_id, runner, samples, trace) VALUES (%s, %s, %s, %s)",
+                (job_id, runner, len(codes), codes.tobytes()),
+            )
+            for sec, joules in enumerate(per_second):
+                cur.execute(
+                    "INSERT INTO job_energy (job_id, second, joules) VALUES (%s, %s, %s)",
+                    (job_id, sec, joules),
+                )
+        conn.commit()
+
+
+    def main():
+        p = argparse.ArgumentParser()
+        p.add_argument("trace")
+        p.add_argument("--job-id", default=os.environ.get("CI_JOB_ID"))
+        p.add_argument("--runner", default=os.environ.get("CI_RUNNER_DESCRIPTION", "unknown"))
+        args = p.parse_args()
+
+        watts = np.fromfile(args.trace, dtype=np.float64)
+        os.remove(args.trace)  # free disk on the runner
+        codes, per_second = quantize_trace(watts)
+
+        with psycopg.connect("postgresql://ingest:ingest123@energy-db.internal:5432/energy") as conn:
+            store(conn, args.job_id, args.runner, per_second, codes)
+        print(f"stored {len(per_second)} s for job {args.job_id}", file=sys.stderr)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (post-job CI hook, runs after every job)
+
+    #### [Bug] The trace is deleted before it is stored
+    - **Where:** `main`, `os.remove(args.trace)` right after `np.fromfile`
+    - **Issue:** the file is removed before the commit. If the hook times out, the runner gets reused, or the DB is unreachable, the only copy of the measurement is gone.
+    - **Fix:** delete the file only after `store()` has committed:
+
+    ```python
+    watts = np.fromfile(args.trace, dtype=np.float64)
+    codes, per_second = quantize_trace(watts)
+
+    with psycopg.connect(os.environ["ENERGY_DB_DSN"]) as conn:
+        store(conn, args.job_id, args.runner, per_second, codes)
+    os.remove(args.trace)  # only after the commit
+    ```
+
+    #### [Security] DB password hard-coded in the script
+    - **Where:** the `psycopg.connect(...)` DSN
+    - **Issue:** anyone who can read the repo or the runner image gets write access to the energy DB.
+    - **Fix:** read the DSN from a masked CI variable (`ENERGY_DB_DSN` in the snippet above) and rotate the current password.
+
+    #### [High] Per-sample Python loop in `quantize_trace`
+    - **Where:** `quantize_trace`, the `for i in range(len(watts))` loop
+    - **Issue:** the interpreter does the clipping, rounding, a numpy element write and the accumulation once per sample. On long jobs at the meter's sample rate, the hook spends most of its time in this loop, and that is your timeout problem.
+    - **Fix:** run the same math on the whole array with numpy. No new package is needed. The codes come out identical, because `np.round` rounds half to even just like `round()`. The per-second sums can differ in the last digits, because numpy adds in a different order.
+    - **Impact:** E per job, and a shorter hook run. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples used ~40 J in a pure Python loop and ~9.5 J with Numba `@njit`, about 4× less CPU energy. Numba would be a new package. The numpy version also moves the loop into compiled code, but it was not part of that measurement. Check it on a real trace with `perf stat` or `time`.
+
+    ```python
+    import numpy as np
+
+    def quantize_trace(watts):
+        """Clip to meter range, convert to int16 codes, sum energy per second."""
+        clipped = np.clip(watts, 0.0, FULL_SCALE_W)
+        codes = np.round(clipped / FULL_SCALE_W * CODE_MAX).astype(np.int16)
+        energy = clipped / SAMPLE_HZ
+        n_full = len(energy) // SAMPLE_HZ * SAMPLE_HZ
+        per_second = energy[:n_full].reshape(-1, SAMPLE_HZ).sum(axis=1).tolist()
+        if n_full < len(energy):
+            per_second.append(float(energy[n_full:].sum()))
+        return codes, per_second
+    ```
+
+    #### [Medium] One INSERT per second of job time
+    - **Where:** `store`, the loop over `per_second`
+    - **Issue:** a long job writes one row per second of runtime, and each row is a separate statement and round trip.
+    - **Fix:** stream the rows with `COPY` in the same transaction. The tables and the commit stay the same.
+    - **Impact:** E on both client and DB. In Green Metrics Tool micro-benchmarks with batches of 1,000 rows, `COPY` used about 5× less CPU energy than one `execute()` per row.
+
+    ```python
+    def store(conn, job_id, runner, per_second, codes):
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO jobs (job_id, runner, samples, trace) VALUES (%s, %s, %s, %s)",
+                (job_id, runner, len(codes), codes.tobytes()),
+            )
+            with cur.copy("COPY job_energy (job_id, second, joules) FROM STDIN") as copy:
+                for sec, joules in enumerate(per_second):
+                    copy.write_row((job_id, sec, joules))
+        conn.commit()
+    ```
+
+    **Already good:** one transaction per job. The trace is stored as compact int16 bytes in a single row. `np.fromfile` reads the file in one call.
+verify:
+  green_block: 1
+  test: |
+    SAMPLE_HZ = 1000
+    FULL_SCALE_W = 400.0
+    CODE_MAX = 32767
+
+    def _ref(watts):
+        codes = np.empty(len(watts), dtype=np.int16)
+        per_second = []
+        acc = 0.0
+        for i in range(len(watts)):
+            w = watts[i]
+            if w < 0.0:
+                w = 0.0
+            elif w > FULL_SCALE_W:
+                w = FULL_SCALE_W
+            codes[i] = round(w / FULL_SCALE_W * CODE_MAX)
+            acc += w / SAMPLE_HZ
+            if (i + 1) % SAMPLE_HZ == 0:
+                per_second.append(acc)
+                acc = 0.0
+        if len(watts) % SAMPLE_HZ:
+            per_second.append(acc)
+        return codes, per_second
+
+    rng = np.random.default_rng(7)
+    for n in (0, 1, 999, 1000, 2500, 12345):
+        w = rng.normal(150.0, 120.0, n)
+        if n > 10:
+            w[::97] = 400.0
+            w[5::131] = 0.0
+        c1, p1 = _ref(w)
+        c2, p2 = quantize_trace(w)
+        assert c2.dtype == np.int16
+        assert np.array_equal(c1, c2)
+        assert len(p1) == len(p2)
+        assert np.allclose(np.array(p1, dtype=float), np.array(p2, dtype=float), rtol=1e-12, atol=1e-9)
+        assert all(isinstance(x, float) for x in p2)
+    print("ok")

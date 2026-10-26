@@ -1,0 +1,118 @@
+id: gen-2-00425-multi-turn
+category: multi-turn
+language: python
+patterns:
+- async-concurrent-io
+- context-tradeoff
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    Hi, I am new to this and I don't know what is wrong. My admin status page in FastAPI is slow, and when I open it the other pages of the app hang too until it finishes. Can you look?
+
+    ```python
+    import requests
+    from fastapi import FastAPI
+
+    app = FastAPI()
+
+    SERVICES = {
+        "billing": "http://billing.internal:8001/health",
+        "search": "http://search.internal:8002/health",
+        "mailer": "http://mailer.internal:8003/health",
+    }
+
+
+    @app.get("/admin/status")
+    async def status():
+        result = {}
+        for name, url in SERVICES.items():
+            try:
+                r = requests.get(url, timeout=5)
+                result[name] = "up" if r.status_code == 200 else "down"
+            except Exception:
+                result[name] = "down"
+        return result
+    ```
+- role: assistant
+  content: |
+    There are two problems.
+
+    1. **The hang (bug):** `requests.get` blocks. Inside `async def` it stops the whole event loop, so no other request can run while the page waits.
+    2. **The slowness:** the three checks run one after another, so the page takes as long as all three added together.
+
+    An async client fixes both:
+
+    ```python
+    import asyncio
+
+    import httpx
+    from fastapi import FastAPI
+
+    app = FastAPI()
+
+    SERVICES = {
+        "billing": "http://billing.internal:8001/health",
+        "search": "http://search.internal:8002/health",
+        "mailer": "http://mailer.internal:8003/health",
+    }
+
+
+    async def check(client: httpx.AsyncClient, url: str) -> str:
+        try:
+            r = await client.get(url)
+            return "up" if r.status_code == 200 else "down"
+        except httpx.HTTPError:
+            return "down"
+
+
+    @app.get("/admin/status")
+    async def status():
+        async with httpx.AsyncClient(timeout=5) as client:
+            states = await asyncio.gather(*(check(client, url) for url in SERVICES.values()))
+        return dict(zip(SERVICES, states))
+    ```
+
+    **Green Notes**
+    - **Async concurrent I/O** (reduces wall time): the three checks now wait at the same time, so the page takes as long as the slowest service, not the sum. The event loop stays free for other requests.
+    - The CPU saving is small for only three calls. In Green Metrics Tool micro-benchmarks, 10 requests with async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. For a few requests, the gain is mostly time.
+- role: user
+  content: |
+    thanks but I don't really understand gather and await, it feels too complicated for me. Also only I and my boss open this page, maybe 10 times a day. can I keep it simple?
+- role: assistant
+  content: |
+    Yes. For a page used 10 times a day, simple is the right choice.
+
+    The fix for the hang is small. Change `async def` to plain `def`. FastAPI then runs the function in a worker thread, so a slow `requests` call no longer blocks the other pages.
+
+    ```python
+    import requests
+    from fastapi import FastAPI
+
+    app = FastAPI()
+
+    SERVICES = {
+        "billing": "http://billing.internal:8001/health",
+        "search": "http://search.internal:8002/health",
+        "mailer": "http://mailer.internal:8003/health",
+    }
+
+
+    @app.get("/admin/status")
+    def status():
+        result = {}
+        for name, url in SERVICES.items():
+            try:
+                r = requests.get(url, timeout=5)
+                result[name] = "up" if r.status_code == 200 else "down"
+            except Exception:
+                result[name] = "down"
+        return result
+    ```
+
+    **Green Notes**
+    - **Plain `def` endpoint** (reduces wait on other requests): this removes the freeze. The checks still run one after another, so the page is slower than the async version when a service is down (up to 5 s per service).
+    - *Not applied:* async concurrent I/O. At three requests and about 10 views a day, the saving is mostly wall time, and the CPU difference is small (about 7% in the 10-request micro-benchmark). The simpler code is easier to maintain. Switch to the `gather` version if you add many more services or the page gets heavy use.
+verify:
+  static_only: needs fastapi, httpx, requests and internal network services

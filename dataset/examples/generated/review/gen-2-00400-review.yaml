@@ -1,0 +1,49 @@
+id: gen-2-00400-review
+category: review
+language: sql
+patterns:
+- select-columns
+facts:
+- F-PG-COLUMNS
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    fix this. offline watchdog, runs every 30s. alert only uses eui, name, last_seen, battery_mv. devices has ~40 cols incl raw last_uplink bytea + calibration jsonb
+
+    ```sql
+    SELECT *
+    FROM devices
+    WHERE building = 'hall-3'
+      AND enabled = true
+      AND last_seen < now() - interval '5 minutes'
+       OR last_seen IS NULL
+    ORDER BY last_seen NULLS FIRST;
+    ```
+- role: assistant
+  content: |
+    **Workload:** IoT / embedded gateway (periodic job, runs every 30 s)
+
+    #### [Bug] `OR` escapes the building and enabled filters
+    - **Where:** `WHERE` clause
+    - **Issue:** `AND` binds tighter than `OR`. Postgres reads it as `(building AND enabled AND stale) OR last_seen IS NULL`. So every device that never reported gets returned, from every building, including disabled ones. You get false alerts and more rows on every run.
+    - **Fix:** put parentheses around the two staleness conditions (see query below).
+
+    #### [Medium] `SELECT *` reads blobs the alert never uses
+    - **Where:** select list
+    - **Issue:** every returned row carries `last_uplink` (bytea), `calibration` (jsonb) and the rest of the ~40 columns. Postgres reads them, serializes them and sends them to the watchdog, which then uses four of them.
+    - **Fix:** name the four columns the alert needs.
+    - **Impact:** reduces E on the database and the watchdog for every returned row, every 30 s. In Green Metrics Tool micro-benchmarks on PostgreSQL, reading 2,500 rows 1,000 times from a 52-column table with large text columns, selecting 4 columns used ~32 J and `SELECT *` ~465 J. The saving grows with the size of the skipped columns. Usually only a few devices are offline, so this is Medium. During a site outage, the result grows to every device in the building, each with its blob.
+
+    ```sql
+    SELECT device_eui, name, last_seen, battery_mv
+    FROM devices
+    WHERE building = 'hall-3'
+      AND enabled = true
+      AND (last_seen < now() - interval '5 minutes' OR last_seen IS NULL)
+    ORDER BY last_seen NULLS FIRST;
+    ```
+
+    **Already good:** the staleness check runs in SQL, so only offline devices leave the database. `NULLS FIRST` puts never-seen devices at the top of the alert.
+verify:
+  static_only: Postgres-specific syntax (now() - interval, NULLS FIRST); query cannot run unchanged in SQLite

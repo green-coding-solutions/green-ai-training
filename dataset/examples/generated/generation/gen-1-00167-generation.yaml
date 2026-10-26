@@ -1,0 +1,94 @@
+id: gen-1-00167-generation
+category: generation
+language: python
+patterns:
+- keep-star-imports
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    ```python
+    from decimal import *
+    from dataclasses import dataclass
+
+    CENT = Decimal("0.01")
+
+
+    @dataclass
+    class CartLine:
+        sku: str
+        unit_price: Decimal
+        qty: int
+
+
+    def cart_total(lines, coupon_pct=None, tax_rate=Decimal("0.19")):
+        """Subtotal, minus coupon percent (if any), plus tax. Round to cents, half up.
+        Return a dict: subtotal, discount, tax, total. Reject qty < 1."""
+        ...
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```python
+    from decimal import *
+    from dataclasses import dataclass
+
+    CENT = Decimal("0.01")
+
+
+    @dataclass
+    class CartLine:
+        sku: str
+        unit_price: Decimal
+        qty: int
+
+
+    def cart_total(lines, coupon_pct=None, tax_rate=Decimal("0.19")):
+        """Subtotal, minus coupon percent (if any), plus tax. Round to cents, half up.
+        Return a dict: subtotal, discount, tax, total. Reject qty < 1."""
+        for line in lines:
+            if line.qty < 1:
+                raise ValueError(f"invalid quantity for {line.sku}: {line.qty}")
+
+        subtotal = sum((l.unit_price * l.qty for l in lines), Decimal("0")).quantize(CENT, rounding=ROUND_HALF_UP)
+
+        discount = Decimal("0.00")
+        if coupon_pct:
+            discount = (subtotal * Decimal(coupon_pct) / 100).quantize(CENT, rounding=ROUND_HALF_UP)
+
+        net = subtotal - discount
+        tax = (net * tax_rate).quantize(CENT, rounding=ROUND_HALF_UP)
+
+        return {
+            "subtotal": subtotal,
+            "discount": discount,
+            "tax": tax,
+            "total": net + tax,
+        }
+    ```
+
+    I filled in the body. Money stays in `Decimal`, and each step is rounded to cents so the parts add up to the total.
+
+    **Green Notes**
+    - **Star import left as is** (no change in E): `from decimal import *` costs the same as `import decimal`. In Green Metrics Tool micro-benchmarks of Python process starts, star imports and namespace imports showed no measurable energy difference. What costs energy is loading a heavy module at all, and `decimal` is light.
+    - **Single pass over the cart**: the subtotal is one generator sum, with no temporary lists.
+verify:
+  test: |-
+    from decimal import Decimal as D
+    lines = [CartLine("A", D("19.99"), 3), CartLine("B", D("5.00"), 1)]
+    r = cart_total(lines)
+    assert r["subtotal"] == D("64.97")
+    assert r["discount"] == D("0.00")
+    assert r["tax"] == D("12.34")
+    assert r["total"] == D("77.31")
+    r = cart_total(lines, coupon_pct=10)
+    assert r["discount"] == D("6.50")
+    assert r["tax"] == D("11.11")
+    assert r["total"] == D("69.58")
+    try:
+        cart_total([CartLine("X", D("1.00"), 0)])
+        raise SystemExit("expected ValueError")
+    except ValueError:
+        pass

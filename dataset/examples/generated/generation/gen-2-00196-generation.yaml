@@ -1,0 +1,110 @@
+id: gen-2-00196-generation
+category: generation
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    ```python
+    # rerank/calibrate.py
+    # Runs inside the search request, right after the candidate model returns raw logits.
+    # Plain Python on purpose: this service image has no numpy.
+    import math
+    from dataclasses import dataclass
+
+
+    @dataclass
+    class Candidate:
+        item_id: str
+        logit: float
+
+
+    # fitted offline on last month's click data
+    PLATT_A = -1.37
+    PLATT_B = 0.21
+
+
+    def calibrate(cands: list[Candidate], threshold: float) -> list[tuple[str, float]]:
+        """Return (item_id, probability) for every candidate with p >= threshold.
+
+        p = 1 / (1 + exp(PLATT_A * logit + PLATT_B)), input order is kept.
+        cands has 20k-60k entries per request.
+        """
+        # TODO
+    ```
+
+    ?
+- role: assistant
+  content: |
+    Here is `calibrate`, with a sigmoid that can't overflow on extreme logits:
+
+    ```python
+    import math
+    from dataclasses import dataclass
+
+
+    @dataclass
+    class Candidate:
+        item_id: str
+        logit: float
+
+
+    # fitted offline on last month's click data
+    PLATT_A = -1.37
+    PLATT_B = 0.21
+
+
+    def calibrate(cands: list[Candidate], threshold: float) -> list[tuple[str, float]]:
+        """Return (item_id, probability) for every candidate with p >= threshold.
+
+        p = 1 / (1 + exp(PLATT_A * logit + PLATT_B)), input order is kept.
+        cands has 20k-60k entries per request.
+        """
+        exp = math.exp            # looked up once, not once per candidate
+        a, b = PLATT_A, PLATT_B   # globals -> locals
+        out: list[tuple[str, float]] = []
+        append = out.append
+        for c in cands:
+            z = a * c.logit + b
+            if z >= 0.0:
+                e = exp(-z)       # same value as 1 / (1 + exp(z)), but exp never overflows
+                p = e / (1.0 + e)
+            else:
+                p = 1.0 / (1.0 + exp(z))
+            if p >= threshold:
+                append((c.item_id, p))
+        return out
+    ```
+
+    The written formula `1 / (1 + math.exp(z))` raises `OverflowError` once `z` is above ~709, so one extreme negative logit would have failed the whole request. The split on the sign of `z` gives the same probabilities and never overflows.
+
+    **Green Notes**
+    - **Hoist loop-invariant lookups** (reduces E): `math.exp`, `out.append` and the two Platt constants are bound to locals once, not looked up 20k-60k times per request. This is a small win. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local before a 10,000,000-iteration loop saved about 4-5%. It is worth doing here only because this loop runs on every search request. The remaining cost per candidate is the `exp` call itself.
+verify:
+  test: |-
+    import math
+    def _ref(f):
+        return 1.0 / (1.0 + math.exp(PLATT_A * f + PLATT_B))
+
+    cs = [
+        Candidate("a", 2.0),
+        Candidate("b", -3.0),
+        Candidate("c", 0.5),
+        Candidate("d", 1e6),
+        Candidate("e", -1e6),
+    ]
+    res = calibrate(cs, 0.5)
+    assert [r[0] for r in res] == ["a", "c", "d"], res
+    assert abs(res[0][1] - _ref(2.0)) < 1e-12
+    assert abs(res[1][1] - _ref(0.5)) < 1e-12
+    assert res[2][1] == 1.0
+
+    all_res = calibrate(cs, 0.0)
+    assert [r[0] for r in all_res] == ["a", "b", "c", "d", "e"]
+    assert abs(all_res[1][1] - _ref(-3.0)) < 1e-12
+    assert all_res[4][1] == 0.0
+
+    assert calibrate([], 0.5) == []

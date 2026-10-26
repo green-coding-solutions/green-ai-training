@@ -1,0 +1,203 @@
+id: gen-2-00074-generation
+category: generation
+language: javascript
+patterns:
+- dom-size
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    I need a small log viewer for our ops team. When an incident happens, people export logs from Loki as JSON lines and want to look through them in the browser. One line looks like this:
+
+    ```json
+    {"ts":"2026-10-14T03:12:45.118Z","level":"error","service":"payment-worker","msg":"upstream timeout after 30s (order 88213)"}
+    ```
+
+    Requirements:
+    - open the .jsonl file with a file input, nothing gets uploaded anywhere (the page sits on a shared drive)
+    - exports are usually 20k-60k lines
+    - skip broken lines, but show how many were skipped
+    - newest entries first
+    - filter by level (dropdown) and a free text search over service + message
+    - show "X of Y entries"
+    - error/warn rows should stand out with a color
+    - vanilla JS, no framework, no build step
+
+    Can you write the page + the JS?
+- role: assistant
+  content: |
+    The page shows 100 entries at a time with Previous/Next buttons. The filters and the counts still cover the whole file.
+
+    ```html
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <title>Log viewer</title>
+      <style>
+        body { font-family: system-ui, sans-serif; margin: 1.5rem; }
+        .controls { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
+        table { border-collapse: collapse; width: 100%; margin-top: 1rem; font-size: 0.9rem; }
+        th, td { text-align: left; padding: 0.25rem 0.5rem; border-bottom: 1px solid #ddd; vertical-align: top; }
+        td:first-child { white-space: nowrap; font-family: ui-monospace, monospace; }
+        tr.lvl-error { background: #fde8e8; }
+        tr.lvl-warn { background: #fff6dc; }
+        nav { margin-top: 0.75rem; display: flex; gap: 0.75rem; align-items: center; }
+      </style>
+    </head>
+    <body>
+      <div class="controls">
+        <label>Log file <input type="file" id="file" accept=".jsonl,.json,.log,.txt"></label>
+        <select id="level">
+          <option value="">All levels</option>
+          <option>ERROR</option>
+          <option>WARN</option>
+          <option>INFO</option>
+          <option>DEBUG</option>
+        </select>
+        <input type="search" id="q" placeholder="Search service or message">
+      </div>
+      <p id="summary"></p>
+      <table>
+        <thead><tr><th>Time</th><th>Level</th><th>Service</th><th>Message</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <nav>
+        <button id="prev">Previous</button>
+        <span id="page"></span>
+        <button id="next">Next</button>
+      </nav>
+      <script src="log-viewer.js"></script>
+      <script>initLogViewer(document);</script>
+    </body>
+    </html>
+    ```
+
+    ```javascript
+    // log-viewer.js
+    const PAGE_SIZE = 100;
+
+    function parseJsonl(text) {
+      const entries = [];
+      let skipped = 0;
+      for (const line of text.split('\n')) {
+        if (!line.trim()) continue;
+        try {
+          const o = JSON.parse(line);
+          if (typeof o.ts !== 'string' || typeof o.msg !== 'string') {
+            skipped++;
+            continue;
+          }
+          entries.push({
+            ts: o.ts,
+            level: String(o.level || 'INFO').toUpperCase(),
+            service: String(o.service || ''),
+            msg: o.msg,
+          });
+        } catch {
+          skipped++;
+        }
+      }
+      // ISO 8601 timestamps in the same timezone sort correctly as strings.
+      entries.sort((a, b) => (a.ts < b.ts ? 1 : a.ts > b.ts ? -1 : 0));
+      return { entries, skipped };
+    }
+
+    function filterEntries(entries, level, query) {
+      const q = query.trim().toLowerCase();
+      return entries.filter(e =>
+        (!level || e.level === level) &&
+        (!q || e.msg.toLowerCase().includes(q) || e.service.toLowerCase().includes(q)));
+    }
+
+    function pageCount(total) {
+      return Math.max(1, Math.ceil(total / PAGE_SIZE));
+    }
+
+    function renderPage(tbody, items, page) {
+      const frag = document.createDocumentFragment();
+      const start = page * PAGE_SIZE;
+      for (const e of items.slice(start, start + PAGE_SIZE)) {
+        const tr = document.createElement('tr');
+        tr.className = 'lvl-' + e.level.toLowerCase();
+        for (const text of [e.ts, e.level, e.service, e.msg]) {
+          const td = document.createElement('td');
+          td.textContent = text;
+          tr.appendChild(td);
+        }
+        frag.appendChild(tr);
+      }
+      tbody.replaceChildren(frag);
+    }
+
+    function initLogViewer(doc) {
+      const $ = id => doc.getElementById(id);
+      const tbody = $('rows');
+      const summary = $('summary');
+      const pageLabel = $('page');
+      const prev = $('prev');
+      const next = $('next');
+      let all = [];
+      let filtered = [];
+      let skipped = 0;
+      let page = 0;
+
+      function update() {
+        const pages = pageCount(filtered.length);
+        page = Math.min(page, pages - 1);
+        renderPage(tbody, filtered, page);
+        pageLabel.textContent = `Page ${page + 1} of ${pages}`;
+        prev.disabled = page === 0;
+        next.disabled = page >= pages - 1;
+        summary.textContent = `${filtered.length} of ${all.length} entries` +
+          (skipped ? `, ${skipped} malformed lines skipped` : '');
+      }
+
+      function applyFilter() {
+        filtered = filterEntries(all, $('level').value, $('q').value);
+        page = 0;
+        update();
+      }
+
+      $('file').addEventListener('change', async ev => {
+        const file = ev.target.files[0];
+        if (!file) return;
+        ({ entries: all, skipped } = parseJsonl(await file.text()));
+        applyFilter();
+      });
+      $('level').addEventListener('change', applyFilter);
+      $('q').addEventListener('input', applyFilter);
+      prev.addEventListener('click', () => { page--; update(); });
+      next.addEventListener('click', () => { page++; update(); });
+      update();
+    }
+    ```
+
+    `file.text()` reads the file in the browser, so nothing leaves the machine. Cells are filled with `textContent`, not `innerHTML`. A log message that contains HTML is shown as text and cannot inject markup into the page.
+
+    **Green Notes**
+    - **Paginate large lists** (reduces E): the browser lays out and paints 100 rows at a time, not 60,000. In Green Metrics Tool browser benchmarks, a 10,000-row table paginated to 100 rows per page used about 56% less CPU energy than rendering all rows with wrapper elements around every cell.
+    - **Lean rows, inserted once** (reduces E): one `<td>` per field with no wrapper elements. Each page is built in a `DocumentFragment` and goes into the live DOM with a single `replaceChildren` call, not row by row.
+    - *Not applied:* virtual scrolling. For a lookup tool, pagination keeps the DOM just as small with less code.
+verify:
+  test: |-
+    const sample = [
+      '{"ts":"2026-10-01T10:00:00Z","level":"info","service":"api","msg":"started"}',
+      'not json',
+      '{"ts":"2026-10-01T10:05:00Z","level":"ERROR","service":"worker","msg":"Timeout talking to DB"}',
+      '',
+      '{"level":"WARN","msg":"no ts"}',
+      '{"ts":"2026-10-01T10:02:00Z","level":"WARN","service":"api","msg":"slow request"}\r',
+    ].join('\n');
+    const parsed = parseJsonl(sample);
+    if (parsed.skipped !== 2) throw new Error('skipped: ' + parsed.skipped);
+    if (parsed.entries.length !== 3) throw new Error('entries: ' + parsed.entries.length);
+    if (parsed.entries[0].service !== 'worker') throw new Error('not newest first');
+    if (parsed.entries[2].msg !== 'started' || parsed.entries[2].level !== 'INFO') throw new Error('oldest entry wrong');
+    if (filterEntries(parsed.entries, 'WARN', '').length !== 1) throw new Error('level filter');
+    if (filterEntries(parsed.entries, '', 'DB').length !== 1) throw new Error('message search');
+    if (filterEntries(parsed.entries, '', ' API ').length !== 2) throw new Error('service search');
+    if (filterEntries(parsed.entries, 'ERROR', 'api').length !== 0) throw new Error('combined filter');
+    if (pageCount(0) !== 1 || pageCount(100) !== 1 || pageCount(101) !== 2) throw new Error('pageCount');
+    console.log('ok');

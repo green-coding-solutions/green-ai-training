@@ -1,0 +1,100 @@
+id: gen-2-00019-estimate
+category: estimate
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import re
+    import unicodedata
+
+    import numpy as np
+
+    MAX_LEN = 128
+    LABELS = ["billing", "bug", "feature_request", "account", "other"]
+
+
+    def normalize(text: str) -> str:
+        # perf review (Jonas): "precompile these regexes, saves energy at our volume"
+        # how much would that actually save? we do ~40M predict() calls/day
+        text = unicodedata.normalize("NFKC", text)
+        text = re.sub(r"https?://\S+", " <url> ", text)
+        text = re.sub(r"[\w.+-]+@[\w-]+\.[\w.]+", " <email> ", text)
+        text = re.sub(r"\d+(?:[.,]\d+)*", " <num> ", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip().lower()
+
+
+    def encode(text: str, vocab: dict[str, int]) -> np.ndarray:
+        unk = vocab["<unk>"]
+        ids = [vocab.get(tok, unk) for tok in normalize(text).split(" ")]
+        ids = ids[:MAX_LEN] + [vocab["<pad>"]] * (MAX_LEN - len(ids))
+        return np.asarray(ids, dtype=np.int64)[None, :]
+
+
+    class TicketClassifier:
+        def __init__(self, session, vocab: dict[str, int]):
+            self.session = session  # onnxruntime.InferenceSession
+            self.vocab = vocab
+            self.input_name = session.get_inputs()[0].name
+
+        def predict(self, text: str) -> dict:
+            logits = self.session.run(None, {self.input_name: encode(text, self.vocab)})[0][0]
+            probs = np.exp(logits - logits.max())
+            probs /= probs.sum()
+            best = int(probs.argmax())
+            return {"label": LABELS[best], "score": float(probs[best])}
+    ```
+- role: assistant
+  content: |
+    Short answer: a small saving on the regex calls. It will probably not be visible next to the model run.
+
+    **Why it's small here:** Python's `re` module keeps a cache of compiled patterns, up to 512 of them. Your four patterns are fixed strings. They are compiled on the first call. After that, each `re.sub(pattern, ...)` only pays for a cache lookup, not a recompile.
+
+    **Measured reference:** in Green Metrics Tool micro-benchmarks, 1,000,000 matches with inline `re.match(pattern, s)` used ~21 J. A precompiled pattern used ~18 J, about 18% less. That 18% covers only the regex call itself. It is not 18% of `predict()`. The same benchmark found that forcing a recompile on every call costs about 200× more per match. That is the case worth fixing: patterns built dynamically per call, or more than 512 distinct patterns that push each other out of the cache. Your code has neither.
+
+    I can't turn this into a figure for 40M calls/day. The saving depends on how much of each request goes to `normalize()` and how much goes to `session.run()`. For most models, the forward pass is the larger part.
+
+    Precompiling is still a cheap, safe change with the same output, so you can make it:
+
+    ```python
+    import re
+    import unicodedata
+
+    _URL = re.compile(r"https?://\S+")
+    _EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+    _NUM = re.compile(r"\d+(?:[.,]\d+)*")
+    _WS = re.compile(r"\s+")
+
+
+    def normalize(text: str) -> str:
+        text = unicodedata.normalize("NFKC", text)
+        text = _URL.sub(" <url> ", text)
+        text = _EMAIL.sub(" <email> ", text)
+        text = _NUM.sub(" <num> ", text)
+        text = _WS.sub(" ", text)
+        return text.strip().lower()
+    ```
+
+    **How to measure it for your service:**
+    1. Find the share first. Profile `predict()` on a sample of real tickets (`cProfile` or `py-spy`) and compare time in `normalize()` with time in `session.run()`.
+    2. Get a CPU-time proxy. Run both `normalize()` versions over the same few hundred thousand tickets with `timeit` or `perf stat`.
+    3. Get energy. Replay the same ticket sample through the full `predict()` path with each version as a Green Metrics Tool usage scenario. Compare the energy per request, then multiply by your real call volume.
+verify:
+  equivalence:
+    driver: |-
+      samples = [
+          "Hi, my invoice INV-2024 from https://shop.example.com/x?id=3 is WRONG",
+          "Mail me at Anna.Lee+test@mail.example.org, order 1.299,50 EUR",
+          "  \uff21\uff22\uff23   tabs\tand\nnewlines  ",
+          "",
+          "call 0049 30 123456 or see http://a.b/c",
+      ]
+      for s in samples:
+          print(repr(normalize(s)))

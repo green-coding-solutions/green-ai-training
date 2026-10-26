@@ -1,0 +1,109 @@
+id: gen-2-00098-no-change
+category: no-change
+language: python
+patterns:
+- string-join
+- none
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    make the output part faster, takes forever on the nas
+
+    ```python
+    #!/usr/bin/env python3
+    """dupes.py - list duplicate files under a directory by content hash."""
+    import argparse
+    import hashlib
+    import os
+    import sys
+    from collections import defaultdict
+
+
+    def file_digest(path, chunk_size=1 << 20):
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(chunk_size), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+
+    def find_dupes(root):
+        groups = defaultdict(list)
+        for dirpath, _dirs, files in os.walk(root):
+            for name in files:
+                path = os.path.join(dirpath, name)
+                if os.path.islink(path):
+                    continue
+                try:
+                    groups[file_digest(path)].append(path)
+                except OSError as e:
+                    print(f"skip {path}: {e}", file=sys.stderr)
+        return {d: sorted(p) for d, p in groups.items() if len(p) > 1}
+
+
+    def render(dupes):
+        lines = []
+        for digest, paths in sorted(dupes.items()):
+            lines.append(f"{digest[:12]}  ({len(paths)} copies)")
+            for p in paths:
+                lines.append(f"    {p}")
+        return "\n".join(lines)
+
+
+    def main(argv=None):
+        parser = argparse.ArgumentParser(description="List duplicate files by content.")
+        parser.add_argument("root", nargs="?", default=".")
+        args = parser.parse_args(argv)
+        dupes = find_dupes(args.root)
+        if not dupes:
+            print("no duplicates found", file=sys.stderr)
+            return 1
+        sys.stdout.write(render(dupes) + "\n")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+- role: assistant
+  content: |
+    The output part has nothing to fix. `render()` already builds the string the efficient way:
+
+    - Each line goes into a list, and the list is joined once with `"\n".join(lines)`. The cost grows linearly with the output size, however many duplicates you find.
+    - The f-strings are fine. Each one formats one short line, and that line is appended to the list. The slow pattern is `out += f"..."` onto one growing string. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces with `+=` used roughly 260× more CPU energy than `"".join()`, and f-string concatenation in a loop behaved like `+=`. Your code doesn't do that.
+
+    Keep it as it is:
+
+    ```python
+    def render(dupes):
+        lines = []
+        for digest, paths in sorted(dupes.items()):
+            lines.append(f"{digest[:12]}  ({len(paths)} copies)")
+            for p in paths:
+                lines.append(f"    {p}")
+        return "\n".join(lines)
+    ```
+
+    The run time goes into `file_digest()`, which reads and hashes every byte under `root`. On a NAS that is mostly disk and network I/O. To check, profile one run with `python -m cProfile -s cumtime dupes.py /mnt/nas`. `render` should show up near the bottom of the list.
+verify:
+  green_block: 0
+  test: |-
+    out = render({
+        "ffff000011112222aaaa": ["/b/y.bin", "/c/y.bin"],
+        "abcdef1234567890abcd": ["/a/x.txt", "/b/x.txt", "/c/x.txt"],
+    })
+    expected = (
+        "abcdef123456  (3 copies)\n"
+        "    /a/x.txt\n"
+        "    /b/x.txt\n"
+        "    /c/x.txt\n"
+        "ffff00001111  (2 copies)\n"
+        "    /b/y.bin\n"
+        "    /c/y.bin"
+    )
+    assert out == expected, out
+    assert render({}) == ""
+    big = {f"{i:020x}": [f"/d/{i}/a", f"/d/{i}/b"] for i in range(20000)}
+    assert render(big).count("\n") == 20000 * 3 - 1

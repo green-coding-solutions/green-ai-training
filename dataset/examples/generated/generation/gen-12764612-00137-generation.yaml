@@ -1,0 +1,78 @@
+id: gen-12764612-00137-generation
+category: generation
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    hello, i need bash script for our gitlab ci. we have file images.txt with all docker images from our k8s manifests, one per line like `registry.example.com/team/app:1.4.2` (some lines have comment with # and some empty lines). the file is big, maybe 15k lines, because we merge all envrionments. script should print every image that use tag `latest` or has no tag at all, and at the end count how many images per registry. if some bad image found, pipeline must fail. images with digest (@sha256) are ok. thx!
+- role: assistant
+  content: |
+    This reads the file once and uses only Bash builtins inside the loop. It needs Bash 4 or newer for the associative array.
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    file=${1:?'usage: check-images.sh images.txt'}
+
+    declare -A per_registry=()
+    total=0
+    bad=0
+
+    while IFS= read -r line || [[ -n $line ]]; do
+        # drop comments, trim spaces
+        line=${line%%'#'*}
+        line=${line#"${line%%[![:space:]]*}"}
+        line=${line%"${line##*[![:space:]]}"}
+        [[ -z $line ]] && continue
+        total=$((total + 1))
+
+        ref=${line%%@*}
+        last=${ref##*/}
+
+        # registry: first path part, if it looks like a host
+        registry='docker.io'
+        if [[ $ref == */* ]]; then
+            first=${ref%%/*}
+            case $first in
+                *.*|*:*|localhost) registry=$first ;;
+            esac
+        fi
+        per_registry[$registry]=$(( ${per_registry[$registry]:-0} + 1 ))
+
+        # pinned by digest is fine
+        [[ $line == *@sha256:* ]] && continue
+
+        reason=''
+        if [[ $last != *:* ]]; then
+            reason='no tag'
+        elif [[ ${last#*:} == 'latest' ]]; then
+            reason='tag latest'
+        fi
+
+        if [[ -n $reason ]]; then
+            printf '%s\t%s\n' "$line" "$reason"
+            bad=$((bad + 1))
+        fi
+    done < "$file"
+
+    printf '\nimages: %s, bad: %s\n' "$total" "$bad"
+    printf '%s\n' "${!per_registry[@]}" | sort | while IFS= read -r reg; do
+        printf '%s\t%s\n' "$reg" "${per_registry[$reg]}"
+    done
+
+    if (( bad > 0 )); then
+        exit 1
+    fi
+    ```
+
+    **Green Notes**
+    - **Builtins instead of subprocesses in the loop** (reduces E): splitting the image name with `${ref%%/*}`, `${last#*:}` and `case` starts no process per line. The usual `$(echo "$line" | cut ...)` would start several processes for every line, and your CI job would pay that on every pipeline run. In Green Metrics Tool micro-benchmarks on a 20,000-line log summary, a loop with `$(echo | cut)` and `$(expr)` (about 10 processes per line) used about 300× more energy than the same loop with builtins only.
+    - **One pass over the file** (reduces E): the file is read once and counted in an associative array. Only the final `sort` is an external call, and it runs once on a few registry names.
+    - *Not applied:* a single `awk` call is even cheaper (about 4× less than the builtin loop in the same benchmark). For a file of this size the Bash version is easy to read and fast enough, so I kept it.
+  verify:
+    static_only: bash script reading a file; no python or javascript to execute

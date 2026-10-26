@@ -1,0 +1,181 @@
+id: gen-2-00130-review
+category: review
+language: python
+patterns:
+- simple-conditions
+facts:
+- F-COND
+messages:
+- role: user
+  content: |
+    Can you review the splitter step of our nightly vendor import? Context and requirements:
+
+    - The vendor drops 4-6 pipe-delimited files per night, each with 5-8M rows. We call `split_feed` once per file.
+    - Every row gets one output file based on its record type. We drop heartbeats. Everything we don't recognise goes to quarantine.
+    - Hard requirement: one bad row must never abort the job. Bad rows go to quarantine and ops looks at them in the morning.
+    - For valid rows, the output must stay byte-identical, because a downstream job diffs it against yesterday.
+    - A colleague wants to rewrite `classify` as `match/case` "for speed". Is that worth doing?
+
+    Please rank the findings by severity.
+
+    ```python
+    import csv
+    import logging
+    from pathlib import Path
+
+    log = logging.getLogger("feed_loader")
+
+    # Vendor record types (spec v3.2):
+    #   10 order new, 11 order amend, 12 order cancel
+    #   20 shipment full, 21 shipment partial
+    #   30 return
+    #   90 heartbeat (no payload, skip)
+
+
+    def classify(code: int) -> str | None:
+        if code >= 10 and code < 20 and code % 10 <= 2:
+            return "order"
+        elif code >= 20 and code < 30 and code % 10 < 2:
+            return "shipment"
+        elif code >= 30 and code < 40 and code % 10 == 0:
+            return "return"
+        elif code >= 90 and code < 100 and code % 10 == 0:
+            return None
+        return "quarantine"
+
+
+    def split_feed(src: Path, out_dir: Path) -> dict[str, int]:
+        counts = {"order": 0, "shipment": 0, "return": 0, "quarantine": 0, "heartbeat": 0}
+        writers = {}
+        files = []
+        try:
+            with src.open(newline="") as fh:
+                reader = csv.DictReader(fh, delimiter="|")
+                for row in reader:
+                    kind = classify(int(row["rec_code"]))
+                    if kind is None:
+                        counts["heartbeat"] += 1
+                        continue
+                    if kind not in writers:
+                        f = (out_dir / f"{kind}.csv").open("w", newline="")
+                        files.append(f)
+                        writers[kind] = csv.DictWriter(f, fieldnames=reader.fieldnames, delimiter="|")
+                        writers[kind].writeheader()
+                    writers[kind].writerow(row)
+                    counts[kind] += 1
+        finally:
+            for f in files:
+                f.close()
+        log.info("split %s: %s", src.name, counts)
+        return counts
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly batch, `classify` runs once per row)
+
+    #### [Bug] One malformed `rec_code` aborts the whole file
+    - **Where:** `classify(int(row["rec_code"]))` in `split_feed`
+    - **Issue:** an empty or non-numeric code makes `int()` raise `ValueError`. A short row gives `None`, which raises `TypeError`. The job then stops partway through the file and leaves partial outputs on disk. This breaks your "never abort" requirement.
+    - **Fix:** catch both errors around the parse and send the row to quarantine (see the code below).
+
+    #### [Medium] Range and modulo guards for a fixed set of codes
+    - **Where:** `classify`
+    - **Issue:** the spec defines seven exact codes. Each row still goes through chained range checks and a modulo before it reaches its branch, and quarantined codes go through all four guards. Plain equality checks do less work per row, and they read like the spec table.
+    - **Fix:** compare against the exact codes. For every integer input the result is the same as before (10–12, 20–21, 30 and 90 match, everything else goes to quarantine), so valid output stays byte-identical.
+    - **Impact:** E, per row, on every file. In Green Metrics Tool micro-benchmarks, 10,000,000 classifications with simple equality branches used about 16% less CPU energy than the same classifications with complex range/modulo conditions. Parsing and writing CSV is most of the per-row work here, so the saving for the whole job is smaller than that. To check it, time one nightly file before and after (`perf stat` or `time`).
+
+    **On `match/case`:** it won't make anything faster. In the same benchmarks, `match` and `if/elif` with the same conditions differed by about 1%, which is noise. The gain comes from simpler conditions, not from the syntax. If your team finds `case 10 | 11 | 12:` easier to read, use it. Just don't expect a speedup.
+
+    ```python
+    import csv
+    import logging
+    from pathlib import Path
+
+    log = logging.getLogger("feed_loader")
+
+    # Vendor record types (spec v3.2):
+    #   10 order new, 11 order amend, 12 order cancel
+    #   20 shipment full, 21 shipment partial
+    #   30 return
+    #   90 heartbeat (no payload, skip)
+
+
+    def classify(code: int) -> str | None:
+        if code in (10, 11, 12):
+            return "order"
+        if code in (20, 21):
+            return "shipment"
+        if code == 30:
+            return "return"
+        if code == 90:
+            return None  # heartbeat, skip
+        return "quarantine"
+
+
+    def split_feed(src: Path, out_dir: Path) -> dict[str, int]:
+        counts = {"order": 0, "shipment": 0, "return": 0, "quarantine": 0, "heartbeat": 0}
+        writers = {}
+        files = []
+        try:
+            with src.open(newline="") as fh:
+                reader = csv.DictReader(fh, delimiter="|")
+                for row in reader:
+                    try:
+                        kind = classify(int(row["rec_code"]))
+                    except (TypeError, ValueError):
+                        kind = "quarantine"
+                    if kind is None:
+                        counts["heartbeat"] += 1
+                        continue
+                    if kind not in writers:
+                        f = (out_dir / f"{kind}.csv").open("w", newline="")
+                        files.append(f)
+                        writers[kind] = csv.DictWriter(f, fieldnames=reader.fieldnames, delimiter="|")
+                        writers[kind].writeheader()
+                    writers[kind].writerow(row)
+                    counts[kind] += 1
+        finally:
+            for f in files:
+                f.close()
+        log.info("split %s: %s", src.name, counts)
+        return counts
+    ```
+
+    **Already good:** the file is streamed row by row instead of loaded into memory, each output file is opened once and only when needed, and all files are closed in `finally`.
+verify:
+  test: |
+    import tempfile
+    from pathlib import Path
+
+    assert [k for k in range(-20, 200) if classify(k) != "quarantine"] == [10, 11, 12, 20, 21, 30, 90]
+    assert classify(90) is None
+
+    with tempfile.TemporaryDirectory() as d:
+        src = Path(d) / "f.psv"
+        src.write_text("rec_code|order_id\n10|A1\n|A2\nxx|A3\n90|\n55|A5\n")
+        out = Path(d) / "o"
+        out.mkdir()
+        c = split_feed(src, out)
+        assert c == {"order": 1, "shipment": 0, "return": 0, "quarantine": 3, "heartbeat": 1}, c
+        assert (out / "quarantine.csv").read_text().count("\n") == 4
+  equivalence:
+    driver: |-
+      import tempfile
+      from pathlib import Path
+
+      codes = [10, 11, 12, 13, 19, 20, 21, 22, 29, 30, 31, 35, 40, 89, 90, 91, 95, 99, 100, 0, -10, 110, 120]
+      lines = ["rec_code|order_id|sku|qty"]
+      for i in range(120):
+          c = codes[i % len(codes)]
+          lines.append(f"{c}|A{i:05d}|SKU-{i % 17}|{i % 5 + 1}")
+
+      with tempfile.TemporaryDirectory() as d:
+          src = Path(d) / "feed.psv"
+          src.write_text("\n".join(lines) + "\n")
+          out = Path(d) / "out"
+          out.mkdir()
+          print(split_feed(src, out))
+          for p in sorted(out.iterdir()):
+              print("==", p.name)
+              print(p.read_text())
+      print([classify(k) for k in range(-20, 200)])

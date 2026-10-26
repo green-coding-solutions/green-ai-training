@@ -1,0 +1,81 @@
+id: gen-12764612-00071-review
+category: review
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    ```nginx
+    server {
+        listen 443 ssl http2;
+        server_name shop.example.com;
+
+        ssl_certificate     /etc/ssl/shop/fullchain.pem;
+        ssl_certificate_key /etc/ssl/shop/privkey.pem;
+
+        root /srv/shop/public;
+        index index.html;
+
+        gzip on;
+        gzip_comp_level 6;
+        gzip_min_length 0;
+        gzip_vary on;
+        gzip_proxied any;
+        gzip_types text/css application/javascript application/json
+                   image/svg+xml image/png image/jpeg;
+
+        location /static {
+            alias /srv/shop/public/static/;
+            expires 30d;
+            add_header Cache-Control "public";
+        }
+
+        location /api/ {
+            proxy_pass http://127.0.0.1:8000;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $remote_addr;
+        }
+
+        location / {
+            try_files $uri /index.html;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (e-commerce storefront)
+
+    #### [Security] `alias` without matching slash allows path traversal
+    - **Where:** `location /static` with `alias /srv/shop/public/static/;`
+    - **Issue:** the location has no trailing slash, the alias has one. A request like `/static../secret` maps to `/srv/shop/public/static/../secret`, so files outside the static folder can be read.
+    - **Fix:** make both sides match: `location /static/ { alias /srv/shop/public/static/; ... }`. Since `root` is already `/srv/shop/public`, you can also drop `alias` and use `location /static/ { ... }`.
+
+    #### [High] Static files compressed again on every request
+    - **Where:** `gzip on; gzip_comp_level 6;` with the `/static` and `/` locations
+    - **Issue:** your CSS, JS and SVG files do not change between deploys, but nginx compresses them again for every visitor. In Green Metrics Tool measurements of nginx serving 2,000 requests for text assets, gzip level 5 per request used ~54 J of CPU energy, and serving precompressed files with `gzip_static` ~14 J, about 4× less. Level 6 costs a bit more than the measured level 5. Compression itself is right for real networks: it sent about 10× fewer bytes in that test.
+    - **Fix:** compress once in your build or deploy step, and let nginx send the ready files:
+      ```bash
+      find /srv/shop/public -type f \( -name '*.css' -o -name '*.js' -o -name '*.svg' -o -name '*.json' -o -name '*.html' \) -exec gzip -k -9 {} +
+      ```
+      ```nginx
+      gzip_static on;
+      ```
+      Keep `gzip on` for the `/api/` responses. Those are dynamic, so they cannot be precompressed. A level of 4 or 5 is enough there.
+    - **Impact:** E on the server for every static request. Bytes sent stay the same.
+
+    #### [Medium] Images in `gzip_types`
+    - **Where:** `image/png image/jpeg`
+    - **Issue:** PNG and JPEG are already compressed. Gzip gains almost nothing on them and still costs CPU on every request.
+    - **Fix:** remove both types. Keep `image/svg+xml`, because SVG is text.
+
+    #### [Low] No minimum size
+    - **Where:** `gzip_min_length 0`
+    - **Issue:** tiny responses, like an empty JSON `{}` from the API, get compressed. That costs CPU and can make them bigger.
+    - **Fix:** use `gzip_min_length 256;`.
+
+    **Already good:** `gzip_vary on` keeps caches correct, and long `expires` on static files avoids repeat downloads.
+verify:
+  static_only: nginx config

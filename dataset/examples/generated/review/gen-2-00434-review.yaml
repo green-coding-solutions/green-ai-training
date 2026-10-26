@@ -1,0 +1,107 @@
+id: gen-2-00434-review
+category: review
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    review?
+
+    ```python
+    CAL_TABLE = """
+    TH100:1.00,0.00,-0.50
+    TH200:0.98,0.10,-0.25
+    PR50:1.00,0.00,0.00
+    PR90:1.01,-0.20,0.00
+    """
+
+    def calibration(model, fw):
+        table = {}
+        for line in CAL_TABLE.strip().splitlines():
+            name, vals = line.split(":")
+            table[name] = [float(v) for v in vals.split(",")]
+        gain, offset, drift = table[model]
+        major = int(fw.split(".")[0])
+        if major >= 3:
+            gain *= 1.02
+            offset += 0.05
+        return {"gain": gain, "offset": offset, "drift": drift}
+
+    def handle_reading(msg):
+        cal = calibration(msg["model"], msg["fw"])
+        value = msg["raw"] * cal["gain"] + cal["offset"]
+        value += cal["drift"] * msg["uptime_h"] / 24
+        return round(value, 3)
+
+    def run(readings):
+        return [handle_reading(m) for m in readings]
+    ```
+- role: assistant
+  content: |
+    **Workload:** mixed (IoT gateway, per-message work)
+
+    #### [High] Calibration is rebuilt for every reading
+    - **Where:** `calibration()`, called from `handle_reading()`
+    - **Issue:** each call re-parses the whole calibration table and splits the firmware string. The result only depends on `(model, fw)`, and a gateway sees a handful of distinct pairs, repeated for every message. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over 200 distinct inputs used ~43 J uncached and ~4.7 J with `@functools.lru_cache`, about 9× less. Your inputs repeat even more, so expect the same direction.
+    - **Fix:** parse the table once at import time and memoize the function. Return a tuple, not a dict (see the Low finding):
+      ```python
+      from functools import lru_cache
+
+      CAL_TABLE = """
+      TH100:1.00,0.00,-0.50
+      TH200:0.98,0.10,-0.25
+      PR50:1.00,0.00,0.00
+      PR90:1.01,-0.20,0.00
+      """
+
+      def _parse_table(text):
+          table = {}
+          for line in text.strip().splitlines():
+              name, vals = line.split(":")
+              table[name] = [float(v) for v in vals.split(",")]
+          return table
+
+      CAL = _parse_table(CAL_TABLE)
+
+      @lru_cache(maxsize=256)
+      def calibration(model, fw):
+          gain, offset, drift = CAL[model]
+          major = int(fw.split(".")[0])
+          if major >= 3:
+              gain *= 1.02
+              offset += 0.05
+          return (gain, offset, drift)
+
+      def handle_reading(msg):
+          gain, offset, drift = calibration(msg["model"], msg["fw"])
+          value = msg["raw"] * gain + offset
+          value += drift * msg["uptime_h"] / 24
+          return round(value, 3)
+
+      def run(readings):
+          return [handle_reading(m) for m in readings]
+      ```
+    - **Impact:** E, per message on the hot path. Results are identical. An unknown model still raises `KeyError`, and failed calls are not cached.
+
+    #### [Low] Mutable result would be shared by the cache
+    - **Where:** the returned `dict`
+    - **Issue:** with a cache, every caller gets the same object. If any code later edits `cal["gain"]`, it changes the value for all following readings. A tuple can't be changed by accident.
+    - **Impact:** correctness only, no energy effect.
+
+    #### Note on the cache
+    - `maxsize` keeps memory bounded if a device sends odd firmware strings. The cache only helps because `(model, fw)` repeats. With mostly unique inputs it would only add overhead.
+verify:
+  equivalence:
+    driver: |-
+      readings = [
+          {"model": "TH100", "fw": "2.4.1", "raw": 21.5, "uptime_h": 12},
+          {"model": "TH200", "fw": "3.0.0", "raw": 19.25, "uptime_h": 300},
+          {"model": "PR50", "fw": "3.1.2", "raw": 1013.2, "uptime_h": 5},
+          {"model": "PR90", "fw": "1.9.0", "raw": 998.7, "uptime_h": 48},
+          {"model": "TH100", "fw": "2.4.1", "raw": 22.0, "uptime_h": 36},
+      ] * 3
+      for v in run(readings):
+          print(v)

@@ -1,0 +1,206 @@
+id: gen-2-00225-review
+category: review
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    Hi, I made a small script for our team leads. It runs every night as a scheduled GitHub Actions job and prints how many changed files each team had to review, based on our CODEOWNERS file. We have a monorepo with about 30k files and CODEOWNERS has around 400 rules. prs.json is the last 5000 merged PRs.
+
+    I have two problems and I am not sure what is wrong:
+    1. it takes about 15 minutes, the runner is just busy with it
+    2. almost everything is counted for @acme/platform, and that can't be right. Our CODEOWNERS starts with `* @acme/platform` as the default and then has the specific team rules below.
+
+    Can you review it please?
+
+    ```python
+    #!/usr/bin/env python3
+    """Count how many changed files each team had to review in the last N merged PRs.
+
+    Input: prs.json from `gh pr list --state merged --limit 5000 --json number,files`
+    """
+    import json
+    import sys
+    from collections import Counter
+    from fnmatch import fnmatch
+
+
+    def load_codeowners(path=".github/CODEOWNERS"):
+        rules = []
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                pattern, *owners = line.split()
+                rules.append((pattern, owners))
+        return rules
+
+
+    RULES = load_codeowners()
+
+
+    def to_glob(pattern):
+        if pattern.startswith("/"):
+            pattern = pattern[1:]
+        if pattern.endswith("/"):
+            pattern += "*"
+        return pattern
+
+
+    def owners_for(path):
+        for pattern, owners in RULES:
+            if fnmatch(path, to_glob(pattern)):
+                return owners
+        return ["@acme/unowned"]
+
+
+    def main():
+        prs = json.load(open(sys.argv[1]))
+        load = Counter()
+        for pr in prs:
+            for f in pr["files"]:
+                for team in owners_for(f["path"]):
+                    load[team] += 1
+        for team, n in load.most_common():
+            print(f"{team:30} {n}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (nightly CI job)
+
+    #### [Bug] The first matching rule wins, but in CODEOWNERS the last one does
+    - **Where:** `owners_for`, the loop `for pattern, owners in RULES`
+    - **Issue:** GitHub uses the *last* matching line in CODEOWNERS. Your loop returns the *first* match. Your file starts with `* @acme/platform`, and `*` matches every path, so nearly every file goes to platform and the team rules below are never reached. That explains problem 2.
+    - **Fix:** check the rules from the bottom up by looping over `reversed(rules)`. The team numbers will change after this. They will be correct now.
+
+    #### [High] The same paths are matched against all rules again and again
+    - **Where:** `owners_for`, called once for every changed file in every PR
+    - **Issue:** busy files like `package.json`, shared configs or core modules show up in thousands of PRs. Each time, the function runs `fnmatch` against the whole rule list again and gets the same answer. The result depends only on the path, because the rules don't change during the run. So this is a pure function with heavily repeated inputs, and that is the case where memoizing pays off. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations with inputs drawn from only 200 distinct values used ~43 J uncached and ~4.7 J with `functools.lru_cache`, about 9× less. That gain depends on the repetition. If most inputs were unique, the cache would only add overhead.
+    - **Fix:** load the rules in `main()` and build a cached lookup around them. The cache is bounded and big enough for every file in the repo. Owners are now tuples, so no caller can change a cached result by accident. Full script with both fixes:
+
+    ```python
+    #!/usr/bin/env python3
+    """Count how many changed files each team had to review in the last N merged PRs.
+
+    Input: prs.json from `gh pr list --state merged --limit 5000 --json number,files`
+    """
+    import json
+    import sys
+    from collections import Counter
+    from fnmatch import fnmatch
+    from functools import lru_cache
+
+    UNOWNED = ("@acme/unowned",)
+
+
+    def load_codeowners(path=".github/CODEOWNERS"):
+        rules = []
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                pattern, *owners = line.split()
+                rules.append((pattern, tuple(owners)))
+        return rules
+
+
+    def to_glob(pattern):
+        if pattern.startswith("/"):
+            pattern = pattern[1:]
+        if pattern.endswith("/"):
+            pattern += "*"
+        return pattern
+
+
+    def make_owner_lookup(rules):
+        @lru_cache(maxsize=100_000)
+        def owners_for(path):
+            # CODEOWNERS: the last matching rule wins
+            for pattern, owners in reversed(rules):
+                if fnmatch(path, to_glob(pattern)):
+                    return owners
+            return UNOWNED
+
+        return owners_for
+
+
+    def main():
+        owners_for = make_owner_lookup(load_codeowners())
+        prs = json.load(open(sys.argv[1]))
+        load = Counter()
+        for pr in prs:
+            for f in pr["files"]:
+                for team in owners_for(f["path"]):
+                    load[team] += 1
+        for team, n in load.most_common():
+            print(f"{team:30} {n}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    - **Impact:** E on the CI runner. The full rule scan now runs once per distinct path instead of once per changed file. Every repeat is a dictionary lookup. To see the effect on your data, call `owners_for.cache_info()` at the end. A high `hits` count compared to `misses` means the cache is doing its job.
+
+    **Already good:** the JSON is read once, and `Counter` with `most_common()` is the right tool for the totals.
+verify:
+  module: true
+  test: |-
+    import contextlib
+    import io
+    import json as _json
+    import os
+    import sys as _sys
+    import tempfile
+
+    d = tempfile.mkdtemp()
+    os.makedirs(os.path.join(d, ".github"))
+    co = os.path.join(d, ".github", "CODEOWNERS")
+    with open(co, "w") as fh:
+        fh.write(
+            "# default owner\n"
+            "* @acme/platform\n"
+            "/docs/ @acme/docs\n"
+            "*.tf @acme/infra\n"
+            "/services/billing/ @acme/billing @acme/payments\n"
+        )
+
+    lookup = make_owner_lookup(load_codeowners(co))
+    assert lookup("docs/setup.md") == ("@acme/docs",)
+    assert lookup("services/billing/api.py") == ("@acme/billing", "@acme/payments")
+    assert lookup("infra/main.tf") == ("@acme/infra",)
+    assert lookup("README.md") == ("@acme/platform",)
+    for _ in range(1000):
+        lookup("docs/setup.md")
+    info = lookup.cache_info()
+    assert info.misses == 4 and info.hits == 1000, info
+
+    assert make_owner_lookup([("/src/", ("@acme/app",))])("other/x.py") == UNOWNED
+
+    prs = [
+        {"number": 1, "files": [{"path": "docs/a.md"}, {"path": "services/billing/x.py"}]},
+        {"number": 2, "files": [{"path": "docs/a.md"}, {"path": "Makefile"}]},
+    ]
+    with open(os.path.join(d, "prs.json"), "w") as fh:
+        _json.dump(prs, fh)
+    old_cwd = os.getcwd()
+    os.chdir(d)
+    _sys.argv = ["review_load.py", "prs.json"]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        main()
+    os.chdir(old_cwd)
+    lines = buf.getvalue().splitlines()
+    assert lines[0].split() == ["@acme/docs", "2"], lines
+    assert sorted(l.split()[0] for l in lines) == [
+        "@acme/billing", "@acme/docs", "@acme/payments", "@acme/platform"
+    ], lines

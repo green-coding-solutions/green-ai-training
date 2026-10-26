@@ -1,0 +1,65 @@
+id: gen-1-00026-generation
+category: generation
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    hi, i am new to python scripting and not sure how to do this right. we export the build history from our CI as a big file, about 300k job records. every record has a runner label like "ubuntu-22.04-4core" or "windows-2022" or "macos-14-12core". i need a function that gives me the os, the version and the number of cores (2 if the label has no core number). there are only about 40 different labels in the whole file. i will call it for every record. can you write it?
+- role: assistant
+  content: |
+    Here is a parser that remembers its results, so each of your ~40 labels is parsed once.
+
+    ```python
+    import re
+    from functools import lru_cache
+    from typing import NamedTuple
+
+    _LABEL = re.compile(r"(ubuntu|windows|macos)-(\d+(?:\.\d+)?)(?:-(\d+)core)?")
+
+
+    class Runner(NamedTuple):
+        os: str
+        version: str
+        cores: int
+
+
+    @lru_cache(maxsize=256)
+    def parse_runner_label(label: str) -> Runner:
+        match = _LABEL.fullmatch(label.strip().lower())
+        if match is None:
+            raise ValueError(f"unknown runner label: {label!r}")
+        os_name, version, cores = match.groups()
+        return Runner(os_name, version, int(cores) if cores else 2)
+    ```
+
+    Use it like this:
+
+    ```python
+    runner = parse_runner_label("ubuntu-22.04-4core")
+    print(runner.os, runner.version, runner.cores)  # ubuntu 22.04 4
+    ```
+
+    **Green Notes**
+    - **Memoize repeated pure computations** (reduces E): the same few labels repeat across 300k records, so `lru_cache` turns almost every call into a dictionary lookup. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over 200 distinct inputs used ~4.7 J with `lru_cache` against ~43 J without, about 9× less. That is a different workload from yours, so measure your own file with `time`.
+    - **Bounded cache, immutable result:** `maxsize=256` keeps memory flat even if odd labels appear. The result is a `NamedTuple`, so callers cannot change a cached value by accident. Invalid labels raise `ValueError` and are not cached.
+
+    *Not applied:* no cache if your labels were mostly unique. Then every call is a miss and the cache only adds overhead.
+verify:
+  test: |-
+    parse_runner_label.cache_clear()
+    assert parse_runner_label("ubuntu-22.04-4core") == Runner("ubuntu", "22.04", 4)
+    assert parse_runner_label("windows-2022") == Runner("windows", "2022", 2)
+    assert parse_runner_label("macos-14-12core").cores == 12
+    assert parse_runner_label(" Ubuntu-22.04-4core ") == Runner("ubuntu", "22.04", 4)
+    info = parse_runner_label.cache_info()
+    assert info.hits >= 1, info
+    try:
+        parse_runner_label("solaris-11")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError")

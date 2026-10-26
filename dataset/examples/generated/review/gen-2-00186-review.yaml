@@ -1,0 +1,142 @@
+id: gen-2-00186-review
+category: review
+language: bash
+patterns:
+- bash-quoting
+facts:
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    hi, i'm new to bash. i took over this script from a colleague. it makes the "you forgot your cart" emails every night, usually 3000-5000 carts. it works, but my senior wrote "the quoting is all wrong" on the PR and i don't understand what is wrong?? it runs fine. can you review it and explain
+
+    ```bash
+    #!/bin/bash
+    # abandoned cart reminders - runs every night from cron
+    # input: carts.csv (email;first_name;cart_id;total)
+    # first line is the header row from the shop export
+
+    INPUT="/srv/shop/exports/carts.csv"
+    OUTDIR="/srv/shop/mail/outbox"
+    SHOP_URL="https://shop.example.com"
+
+    mkdir -p $OUTDIR
+
+    count=0
+    while IFS=';' read email first_name cart_id total; do
+        SUBJECT="You left something in your cart"
+        HEADER="<!DOCTYPE html>
+    <html><head><meta charset=\"utf-8\">
+    <style>
+      body { margin:0; background:#f4f4f4; font-family: Helvetica, Arial, sans-serif; color:#333; }
+      .wrap { width:600px; margin:0 auto; background:#fff; }
+      .btn { display:inline-block; padding:12px 24px; background:#e4572e; color:#fff; text-decoration:none; border-radius:4px; }
+      .foot { font-size:11px; color:#999; padding:20px; }
+    </style></head>
+    <body><div class=\"wrap\">
+    <img src=\"https://shop.example.com/img/logo.png\" alt=\"Nordwind Outdoor\" width=\"180\">"
+        FOOTER="<div class=\"foot\">You get this email because you have a customer account at Nordwind Outdoor.<br>
+    Nordwind Outdoor GmbH, Hafenstrasse 12, 20457 Hamburg<br>
+    <a href=\"https://shop.example.com/account/newsletter\">Unsubscribe</a></div>
+    </div></body></html>"
+
+        BODY="<p>Hi $first_name,</p>
+    <p>you still have items worth $total EUR in your cart.</p>
+    <p><a class=\"btn\" href=\"$SHOP_URL/cart/$cart_id\">Back to your cart</a></p>"
+
+        echo "To: $email" > $OUTDIR/$cart_id.eml
+        echo "Subject: $SUBJECT" >> $OUTDIR/$cart_id.eml
+        echo "Content-Type: text/html; charset=utf-8" >> $OUTDIR/$cart_id.eml
+        echo "" >> $OUTDIR/$cart_id.eml
+        echo "$HEADER$BODY$FOOTER" >> $OUTDIR/$cart_id.eml
+        count=$((count + 1))
+    done < $INPUT
+
+    echo "wrote $count mails"
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (nightly batch job, e-commerce)
+
+    Your senior is right. The script breaks two different quoting rules. Variables need double quotes so the script works correctly. Fixed text needs single quotes, because then bash does not have to scan it.
+
+    #### [Bug] The CSV header row becomes an email
+    - **Where:** `while IFS=';' read ...` loop
+    - **Issue:** the loop reads the first line `email;first_name;cart_id;total` as if it were a cart. Every night the script writes `cart_id.eml` addressed to `To: email`. It also counts that file in `wrote $count mails`.
+    - **Fix:** read the header line once before the loop:
+      ```bash
+      {
+          read -r _
+          while IFS=';' read -r email first_name cart_id total; do
+              ...
+          done
+      } < "$INPUT"
+      ```
+
+    #### [Bug] Unquoted variables and `read` without `-r`
+    - **Where:** `mkdir -p $OUTDIR`, `> $OUTDIR/$cart_id.eml`, `done < $INPUT`, `read email ...`
+    - **Issue:** bash splits an unquoted variable at spaces and expands it as a glob. The script only works today because your paths and cart IDs are plain. A path with a space, or a cart ID with a `*`, would break the redirect or write to the wrong file. Without `-r`, `read` also removes backslashes from names.
+    - **Fix:** put double quotes around every variable (`"$OUTDIR/$cart_id.eml"`, `< "$INPUT"`) and use `read -r`.
+
+    #### [Medium] Long fixed HTML in double quotes, assigned again for every cart
+    - **Where:** `SUBJECT`, `HEADER`, `FOOTER` inside the loop, and the `echo "Content-Type: ..."` line
+    - **Issue:** this text has no variables in it, but it is in double quotes. Bash scans every character for `$`, backticks and backslashes, and it does that again for each of the thousands of carts. The double quotes also force you to write `\"` all over the HTML.
+    - **Fix:** use single quotes for fixed text. These values never change, so assign them once before the loop. Inside the single-quoted HTML, write the attribute values without quotes (`class=wrap`, `width=180`). HTML allows this when a value has no spaces. For the alt text, `&#32;` stands for the space. The mail looks the same as before. `BODY` stays in double quotes, because `$first_name`, `$total` and `$cart_id` must expand.
+    - **Impact:** E, on every run. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal in a loop used about 24% less CPU energy with single quotes than with double quotes. Moving the assignments out of the loop removes that work completely. For a few thousand carts a night the absolute saving is small. But the change costs nothing, and the HTML gets easier to read.
+
+    **Already good:** `IFS=';'` is set only for `read`, and the counter uses `$(( ))`, so the loop starts no extra processes.
+
+    Fixed script:
+
+    ```bash
+    #!/bin/bash
+    # abandoned cart reminders - runs every night from cron
+    # input: carts.csv (email;first_name;cart_id;total)
+    # first line is the header row from the shop export
+
+    INPUT='/srv/shop/exports/carts.csv'
+    OUTDIR='/srv/shop/mail/outbox'
+    SHOP_URL='https://shop.example.com'
+
+    SUBJECT='You left something in your cart'
+    HEADER='<!DOCTYPE html>
+    <html><head><meta charset=utf-8>
+    <style>
+      body { margin:0; background:#f4f4f4; font-family: Helvetica, Arial, sans-serif; color:#333; }
+      .wrap { width:600px; margin:0 auto; background:#fff; }
+      .btn { display:inline-block; padding:12px 24px; background:#e4572e; color:#fff; text-decoration:none; border-radius:4px; }
+      .foot { font-size:11px; color:#999; padding:20px; }
+    </style></head>
+    <body><div class=wrap>
+    <img src=https://shop.example.com/img/logo.png alt=Nordwind&#32;Outdoor width=180>'
+    FOOTER='<div class=foot>You get this email because you have a customer account at Nordwind Outdoor.<br>
+    Nordwind Outdoor GmbH, Hafenstrasse 12, 20457 Hamburg<br>
+    <a href=https://shop.example.com/account/newsletter>Unsubscribe</a></div>
+    </div></body></html>'
+
+    mkdir -p "$OUTDIR"
+
+    count=0
+    {
+        read -r _    # skip the header row
+        while IFS=';' read -r email first_name cart_id total; do
+            BODY="<p>Hi $first_name,</p>
+    <p>you still have items worth $total EUR in your cart.</p>
+    <p><a class=\"btn\" href=\"$SHOP_URL/cart/$cart_id\">Back to your cart</a></p>"
+
+            out="$OUTDIR/$cart_id.eml"
+            echo "To: $email" > "$out"
+            echo "Subject: $SUBJECT" >> "$out"
+            echo 'Content-Type: text/html; charset=utf-8' >> "$out"
+            echo >> "$out"
+            echo "$HEADER$BODY$FOOTER" >> "$out"
+            count=$((count + 1))
+        done
+    } < "$INPUT"
+
+    echo "wrote $count mails"
+    ```
+
+    Rule of thumb: `'single quotes'` for fixed text, `"double quotes"` whenever a `$variable` is inside, and never leave a variable without quotes.
+verify:
+  static_only: bash script; reads and writes fixed /srv/shop paths

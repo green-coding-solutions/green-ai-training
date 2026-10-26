@@ -1,0 +1,60 @@
+id: gen-12764612-00039-generation
+category: generation
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    func to tag client ip from nginx access log as internal/public + its /24 network. big logs, same ips again and again
+- role: assistant
+  content: |
+    ```python
+    import ipaddress
+    from functools import lru_cache
+
+    _INTERNAL = tuple(
+        ipaddress.ip_network(n)
+        for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                  "127.0.0.0/8", "::1/128", "fc00::/7")
+    )
+
+    @lru_cache(maxsize=65536)
+    def classify_ip(ip: str) -> tuple[str, str]:
+        """Return (scope, network). IPv4 gets a /24, IPv6 a /48."""
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return ("invalid", "")
+        scope = "internal" if any(addr in net for net in _INTERNAL) else "public"
+        prefix = 24 if addr.version == 4 else 48
+        network = ipaddress.ip_network(f"{addr}/{prefix}", strict=False)
+        return (scope, str(network))
+    ```
+
+    Use it per line, for example `scope, net = classify_ip(fields[0])`.
+
+    **Green Notes**
+    - **Memoize repeated pure computations** (reduces E): parsing an address and checking it against the internal ranges is pure work, and access logs repeat the same client IPs many times. `lru_cache` does it once per distinct IP. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over 200 distinct inputs used ~43 J uncached and ~4.7 J with `lru_cache`, about 9× less.
+    - The cache is bounded (`maxsize=65536`), so memory stays flat even on a log with millions of distinct IPs. The result is an immutable tuple, so it is safe to share.
+    - The ranges are parsed once at import time, not per call.
+
+    *Not applied:* none. But if almost every IP in your logs is unique, the cache only adds overhead. Check `classify_ip.cache_info()` after a run: a low hit count means you can drop the decorator.
+verify:
+  test: |-
+    classify_ip.cache_clear()
+    assert classify_ip("10.1.2.3") == ("internal", "10.1.2.0/24")
+    assert classify_ip("192.168.5.77") == ("internal", "192.168.5.0/24")
+    assert classify_ip("172.20.0.9") == ("internal", "172.20.0.0/24")
+    assert classify_ip("8.8.8.8") == ("public", "8.8.8.0/24")
+    assert classify_ip("2001:db8::1") == ("public", "2001:db8::/48")
+    assert classify_ip("::1")[0] == "internal"
+    assert classify_ip("-") == ("invalid", "")
+    assert classify_ip("garbage") == ("invalid", "")
+    classify_ip.cache_clear()
+    classify_ip("8.8.8.8")
+    classify_ip("8.8.8.8")
+    info = classify_ip.cache_info()
+    assert info.hits == 1 and info.misses == 1

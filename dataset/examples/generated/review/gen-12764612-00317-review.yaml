@@ -1,0 +1,65 @@
+id: gen-12764612-00317-review
+category: review
+language: sql
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+messages:
+- role: user
+  content: |
+    ?
+
+    ```sql
+    -- ci dashboard: active builds
+    SELECT b.*, r.*
+    FROM builds b
+    JOIN runners r ON r.id = b.runner_id
+    WHERE b.status IN ('queued', 'running')
+    ORDER BY b.created_at DESC
+    LIMIT 50;
+
+    -- header badge
+    SELECT COUNT(*) FROM builds WHERE status = 'queued';
+
+    -- build detail page
+    SELECT * FROM builds WHERE id = 4812;
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (CI dashboard, one read per page load)
+
+    #### [Bug] Duplicate column names from `b.*, r.*`
+    - **Where:** the dashboard query
+    - **Issue:** `builds` and `runners` both have columns like `id` and `created_at`. Most clients turn a row into a dict or object, and the second column with the same name overwrites the first. The row can then carry the runner's `id` instead of the build's `id`, so links to a build may point to the wrong page.
+    - **Fix:** name the columns and alias the ones from `runners`, as in the snippet below.
+
+    #### [High] `SELECT *` on wide tables in a list query
+    - **Where:** `SELECT b.*, r.*` in the dashboard query
+    - **Issue:** a build row usually carries large text columns such as the log, the env dump and the artifact manifest. `runners` may carry a config blob. A dashboard row shows only a few fields, but the database reads, copies and sends every column for all 50 rows on each page load.
+    - **Fix:** list only what the page renders. I guessed the fields, so adjust the list to your template:
+      ```sql
+      SELECT b.id, b.pipeline_id, b.branch, b.commit_sha,
+             b.status, b.created_at, b.started_at,
+             r.name AS runner_name
+      FROM builds b
+      JOIN runners r ON r.id = b.runner_id
+      WHERE b.status IN ('queued', 'running')
+      ORDER BY b.created_at DESC
+      LIMIT 50;
+      ```
+    - **Impact:** reduces E, M and network on every dashboard load. In Green Metrics Tool micro-benchmarks on PostgreSQL, a join of two tables read 1,000 times used about 2.3× less CPU energy with named columns at 200 rows, and about 4× less at 1,000 rows. The gap grows with the size of the columns you skip. Large log columns make it bigger than that join, so check the table widths on your side.
+
+    **Already good:**
+    - The badge query reads no wide columns.
+    - `SELECT *` in the detail query is fine. It reads one row, and the page needs the log and the other large fields.
+verify:
+  sql:
+    setup: |
+      CREATE TABLE runners (id INTEGER PRIMARY KEY, name TEXT, created_at TEXT, config_blob TEXT);
+      CREATE TABLE builds (id INTEGER PRIMARY KEY, pipeline_id INTEGER, runner_id INTEGER, branch TEXT, commit_sha TEXT, status TEXT, created_at TEXT, started_at TEXT, log_text TEXT, env_dump TEXT, artifacts_manifest TEXT);
+      INSERT INTO runners VALUES (1, 'runner-a', '2024-01-01', 'cfg');
+      INSERT INTO runners VALUES (2, 'runner-b', '2024-02-01', 'cfg');
+      INSERT INTO builds VALUES (4812, 7, 1, 'main', 'abc123', 'running', '2025-03-01 10:00:00', '2025-03-01 10:00:05', 'log', 'env', 'manifest');
+      INSERT INTO builds VALUES (4813, 7, 2, 'dev', 'def456', 'queued', '2025-03-01 10:05:00', NULL, '', '', '');
+    compare: false

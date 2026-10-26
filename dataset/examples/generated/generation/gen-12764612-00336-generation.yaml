@@ -1,0 +1,107 @@
+id: gen-12764612-00336-generation
+category: generation
+language: javascript
+patterns:
+- dom-size
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    hi, I am new with javascript. We have a small gateway box in our factory, it collects temperature and vibration from sensors. It has an endpoint `/api/readings` that gives a JSON list, now about 12000 items like this:
+
+    ```json
+    {"deviceId": "gw1-s07", "sensor": "temp", "value": 41.2, "unit": "C", "ts": 1761465600}
+    ```
+
+    I want a simple page where the technicians can see all the readings in a table. I tried before but I am not sure what is the right way to do it. Can you write it?
+- role: assistant
+  content: |
+    Here is a small page that shows the readings in a plain table, 100 rows at a time, with Previous and Next buttons.
+
+    ```html
+    <div id="readings">
+      <table>
+        <thead>
+          <tr><th>Device</th><th>Sensor</th><th>Value</th><th>Unit</th><th>Time (UTC)</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <button id="prev">Previous</button>
+      <span id="page-info"></span>
+      <button id="next">Next</button>
+    </div>
+    <script src="readings.js"></script>
+    ```
+
+    ```javascript
+    const PAGE_SIZE = 100;
+
+    async function loadReadings() {
+      const res = await fetch('/api/readings');
+      if (!res.ok) {
+        throw new Error('Could not load readings: ' + res.status);
+      }
+      return res.json();
+    }
+
+    function renderPage(tbody, readings, page) {
+      const start = page * PAGE_SIZE;
+      const frag = document.createDocumentFragment();
+
+      for (const r of readings.slice(start, start + PAGE_SIZE)) {
+        const tr = document.createElement('tr');
+        const cells = [
+          r.deviceId,
+          r.sensor,
+          r.value,
+          r.unit,
+          new Date(r.ts * 1000).toISOString(),
+        ];
+        for (const value of cells) {
+          const td = document.createElement('td');
+          td.textContent = value;
+          tr.appendChild(td);
+        }
+        frag.appendChild(tr);
+      }
+
+      tbody.replaceChildren(frag);
+    }
+
+    async function main() {
+      const root = document.getElementById('readings');
+      const tbody = root.querySelector('tbody');
+      const prev = document.getElementById('prev');
+      const next = document.getElementById('next');
+      const info = document.getElementById('page-info');
+
+      const readings = await loadReadings();
+      const lastPage = Math.max(0, Math.ceil(readings.length / PAGE_SIZE) - 1);
+      let page = 0;
+
+      function show() {
+        renderPage(tbody, readings, page);
+        info.textContent = 'Page ' + (page + 1) + ' of ' + (lastPage + 1);
+        prev.disabled = page === 0;
+        next.disabled = page === lastPage;
+      }
+
+      prev.addEventListener('click', () => { page -= 1; show(); });
+      next.addEventListener('click', () => { page += 1; show(); });
+      show();
+    }
+
+    main().catch((err) => {
+      document.getElementById('readings').textContent = err.message;
+    });
+    ```
+
+    The table uses `textContent`, so a strange device name from a sensor can never inject HTML into the page.
+
+    **Green Notes**
+    - **Small DOM with pagination** (reduces E on the client): the page only ever holds 100 rows, not 12,000, so the browser has far less layout and paint work, and the tab stays responsive. In Green Metrics Tool browser benchmarks, 30 page loads of a 10,000-row table built from 14 elements per row used about 1036 J. The same data paginated to 100 rows per page as a plain `<table>` built in a `DocumentFragment` used about 457 J, roughly 56% less.
+    - **Plain cells, one insert per page** (reduces E on the client): each row is just `<tr>` with `<td>` cells, with no wrapper elements. Rows are collected in a `DocumentFragment` and added in one step, not one by one.
+    - Searching or sorting across all readings is not included. If you add it later, filter the array first, then render only one page of the result.
+verify:
+  static_only: needs a browser DOM and fetch

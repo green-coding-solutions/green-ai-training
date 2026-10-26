@@ -1,0 +1,53 @@
+id: gen-1-00101-generation
+category: generation
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    hi, im new to python. i run a multiple choice benchmark on my local LLM. the model writes some reasoning and then something like "Answer: B" or "The answer is (C)". i have a list of ~50000 outputs and a list of the right letters. i need a function that pulls the letter out of each output (if there are more answers, the last one counts) and one that gives me the accuracy. i dont know if my way is good so i would like to see how you would do it
+- role: assistant
+  content: |-
+    Here is a version with two small functions:
+
+    ```python
+    import re
+
+    # Compiled once when the module loads, reused for every output.
+    _ANSWER = re.compile(r"(?i:answer)\s*(?:is\s*)?[:\-]?\s*\(?([A-D])\b")
+    _BARE_LETTER = re.compile(r"\(?([A-D])\)?[.)]?")
+
+
+    def extract_choice(text: str) -> str | None:
+        """Return the last answer letter (A-D) in a model output, or None."""
+        found = _ANSWER.findall(text)
+        if found:
+            return found[-1]
+        bare = _BARE_LETTER.fullmatch(text.strip())
+        return bare.group(1) if bare else None
+
+
+    def accuracy(outputs: list[str], gold: list[str]) -> float:
+        if len(outputs) != len(gold):
+            raise ValueError("outputs and gold must have the same length")
+        if not outputs:
+            return 0.0
+        correct = sum(extract_choice(o) == g for o, g in zip(outputs, gold))
+        return correct / len(outputs)
+    ```
+
+    Example:
+
+    ```python
+    outputs = ["Let's think. Answer: B", "The answer is (C).", "no idea"]
+    print(accuracy(outputs, ["B", "A", "D"]))  # 0.333...
+    ```
+
+    Outputs where no letter is found count as wrong, because `extract_choice` returns `None`. The word "answer" can be upper or lower case, but the letter must be a capital A-D.
+
+    **Green Notes**
+    - **Compile the regex once** (reduces E): the patterns are module-level constants, so they are not rebuilt or looked up by string on each of the 50,000 calls. Python caches patterns used inline, so the win is small. In Green Metrics Tool micro-benchmarks with 1,000,000 matches, a precompiled pattern used about 18% less CPU energy than inline `re.match`. It also keeps the patterns in one named place.
+    - **One `findall` per output** (reduces E): it scans the text once and gives all matches, so the "last answer counts" rule needs no second pass.

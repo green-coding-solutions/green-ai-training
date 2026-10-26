@@ -1,0 +1,135 @@
+id: gen-2-00124-review
+category: review
+language: python
+patterns:
+- hoist-invariants
+- keep-star-imports
+facts:
+- F-ATTR
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import math
+    from colorsys import *
+
+    WIDTH, HEIGHT = 1440, 720
+    SPACING = 6
+    PHASES = (0.0, 0.8, 1.6)
+
+
+    def dot_field(width=WIDTH, height=HEIGHT, spacing=SPACING, phase=0.0):
+        """Wavy dot grid behind the hero headline, one SVG per animation frame."""
+        cols = width // spacing
+        rows = height // spacing
+        parts = [
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}">'
+        ]
+        for row in range(rows):
+            for col in range(cols):
+                x = col * spacing
+                y = row * spacing
+                d = math.sqrt((x - width / 2) ** 2 + (y - height / 2) ** 2)
+                wave = math.sin(d / 40.0 + phase) * math.cos(x / 90.0)
+                r = 2.2 * wave
+                if abs(r) < 0.15:
+                    continue
+                red, green, blue = hls_to_rgb(0.58 + 0.08 * wave, 0.55, 0.6)
+                fill = "#%02x%02x%02x" % (int(red * 255), int(green * 255), int(blue * 255))
+                parts.append(f'<circle cx="{x}" cy="{y}" r="{r:.2f}" fill="{fill}"/>')
+        parts.append("</svg>")
+        return "".join(parts)
+
+
+    if __name__ == "__main__":
+        for i, phase in enumerate(PHASES):
+            with open(f"static/img/hero-{i}.svg", "w", encoding="utf-8") as fh:
+                fh.write(dot_field(phase=phase))
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (build step for the landing page hero, runs once per build)
+
+    #### [Bug] Negative radius, so the trough dots never appear
+    - **Where:** `r = 2.2 * wave` and `if abs(r) < 0.15`
+    - **Issue:** `wave` goes from -1 to 1, so about half the dots get a negative `r`. The `abs()` check lets them through. A negative `r` on `<circle>` is an error in SVG, and browsers don't draw that circle. The trough half of the pattern is missing from the hero, and the file is full of dead elements.
+    - **Fix:** take the magnitude for the radius: `r = 2.2 * abs(wave)`, then `if r < 0.15: continue`. The hue still uses the signed `wave`, so crests and troughs keep different colors.
+
+    #### [Low] Loop-invariant lookups and arithmetic in the inner loop
+    - **Where:** inner `for col` loop
+    - **Issue:** every dot looks up `math.sqrt`, `math.sin` and `math.cos` again. It also recomputes `width / 2`, `height / 2` and the whole `y` term, which only change per row.
+    - **Fix:** bind the functions to locals and compute the halves once. Compute `y` and its squared distance once per row.
+    - **Impact:** reduces E only slightly. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local before a 10,000,000-iteration loop saved about 4-5%. Here the loop runs about 86,400 times per build (3 frames × 28,800 grid points), so the absolute saving is small. This is Low because the rewrite costs almost no readability.
+
+    ```python
+    import math
+    from colorsys import *
+
+    WIDTH, HEIGHT = 1440, 720
+    SPACING = 6
+    PHASES = (0.0, 0.8, 1.6)
+
+
+    def dot_field(width=WIDTH, height=HEIGHT, spacing=SPACING, phase=0.0):
+        """Wavy dot grid behind the hero headline, one SVG per animation frame."""
+        cols = width // spacing
+        rows = height // spacing
+        sqrt, sin, cos = math.sqrt, math.sin, math.cos
+        half_w, half_h = width / 2, height / 2
+        parts = [
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}">'
+        ]
+        for row in range(rows):
+            y = row * spacing
+            dy2 = (y - half_h) ** 2
+            for col in range(cols):
+                x = col * spacing
+                d = sqrt((x - half_w) ** 2 + dy2)
+                wave = sin(d / 40.0 + phase) * cos(x / 90.0)
+                r = 2.2 * abs(wave)
+                if r < 0.15:
+                    continue
+                red, green, blue = hls_to_rgb(0.58 + 0.08 * wave, 0.55, 0.6)
+                fill = "#%02x%02x%02x" % (int(red * 255), int(green * 255), int(blue * 255))
+                parts.append(f'<circle cx="{x}" cy="{y}" r="{r:.2f}" fill="{fill}"/>')
+        parts.append("</svg>")
+        return "".join(parts)
+
+
+    if __name__ == "__main__":
+        for i, phase in enumerate(PHASES):
+            with open(f"static/img/hero-{i}.svg", "w", encoding="utf-8") as fh:
+                fh.write(dot_field(phase=phase))
+    ```
+
+    I left `from colorsys import *` as it is. In Green Metrics Tool micro-benchmarks, star imports and plain `import` showed no measurable energy difference, so changing it saves nothing.
+
+    **Already good:**
+    - The SVGs are generated once at build time, not per request.
+    - The parts are collected in a list and joined once, not built up with `+=`.
+verify:
+  module: true
+  green_block: 0
+  test: |-
+    import re
+    for ph in PHASES:
+        svg = dot_field(phase=ph)
+        assert svg.startswith('<svg') and svg.endswith('</svg>')
+        radii = [float(v) for v in re.findall(r' r="([-0-9.]+)"', svg)]
+        assert radii, "no circles generated"
+        assert min(radii) >= 0.15, "negative or tiny radius found"
+        fills = set(re.findall(r'fill="(#[0-9a-f]{6})"', svg))
+        assert len(fills) > 1
+    small = dot_field(width=60, height=60, spacing=6, phase=0.0)
+    count = 0
+    for row in range(10):
+        for col in range(10):
+            x, y = col * 6, row * 6
+            d = math.sqrt((x - 30) ** 2 + (y - 30) ** 2)
+            w = math.sin(d / 40.0) * math.cos(x / 90.0)
+            if abs(2.2 * w) >= 0.15:
+                count += 1
+    assert small.count('<circle') == count

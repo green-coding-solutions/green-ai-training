@@ -1,0 +1,107 @@
+id: gen-2-00068-generation
+category: generation
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    ```nginx
+    # /etc/nginx/conf.d/logview.conf
+    upstream log_api {
+        server 127.0.0.1:9200;
+        keepalive 16;
+    }
+
+    server {
+        listen 80;
+        server_name logs.internal.example.com;
+
+        root /srv/logview/dist;   # built dashboard: index.html, js, css, a few json files
+        access_log /var/log/nginx/logview.access.log;
+
+        # TODO compression ???
+
+        location /api/ {
+            proxy_pass http://log_api;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_read_timeout 60s;
+        }
+
+        # raw logs for download: today's *.log is still being written,
+        # older ones get rotated to *.log.gz by logrotate
+        location /archive/ {
+            alias /var/log/archive/;
+            autoindex on;
+        }
+
+        location / {
+            try_files $uri /index.html;
+        }
+    }
+    ```
+
+    ?
+- role: assistant
+  content: |
+    Here is the config with the TODO filled in. Each kind of content gets its own compression setting:
+
+    ```nginx
+    # /etc/nginx/conf.d/logview.conf
+    upstream log_api {
+        server 127.0.0.1:9200;
+        keepalive 16;
+    }
+
+    server {
+        listen 80;
+        server_name logs.internal.example.com;
+
+        root /srv/logview/dist;
+        access_log /var/log/nginx/logview.access.log;
+
+        # on-the-fly gzip, only for content that changes (API JSON, live .log files)
+        gzip on;
+        gzip_comp_level 4;
+        gzip_min_length 1024;
+        gzip_types text/plain application/json;
+        gzip_vary on;
+
+        location /api/ {
+            proxy_pass http://log_api;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_read_timeout 60s;
+        }
+
+        location /archive/ {
+            alias /var/log/archive/;
+            autoindex on;
+            # *.log.gz is already compressed and not in gzip_types, so nginx sends it as is
+        }
+
+        location / {
+            # serve the .gz files made at build time, never compress the dashboard per request
+            gzip_static on;
+            gzip_types text/css application/javascript application/json image/svg+xml;
+            try_files $uri /index.html;
+        }
+    }
+    ```
+
+    Make the `.gz` files once in the dashboard build, next to the originals:
+
+    ```bash
+    find /srv/logview/dist -type f \( -name '*.html' -o -name '*.js' -o -name '*.css' -o -name '*.json' -o -name '*.svg' \) \
+        -exec gzip -k -9 {} +
+    ```
+
+    **Green Notes**
+    - **Precompressed static assets** (reduces E, network): the dashboard files change only on deploy, so they are compressed once. In Green Metrics Tool measurements of nginx serving text assets, compression sent about 10× fewer bytes, and compressing on every request cost about 4× the CPU energy of serving precompressed files. The highest gzip level is fine here because it runs once per build.
+    - **Moderate on-the-fly gzip only where content changes** (reduces network): API responses and today's growing `.log` file can't be precompressed. A middle level still cuts most of the bytes without paying for maximum compression on every request. If the log API already gzips its own responses, nginx passes them through and does not compress them again.
+    - **No recompression of rotated logs:** `*.log.gz` is already compressed, so compressing it again saves no bytes and only costs CPU. `gzip_types` doesn't include it.
+verify:
+  static_only: nginx config

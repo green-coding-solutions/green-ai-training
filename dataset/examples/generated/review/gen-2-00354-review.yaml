@@ -1,0 +1,95 @@
+id: gen-2-00354-review
+category: review
+language: sql
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+messages:
+- role: user
+  content: |
+    hi, can you review the query of our `ops` cli? its a small python tool (sqlalchemy) that our ops team use daily, around 40 people. `ops hosts` print a table of active hosts (hostname, ip, environment, group name). the zsh completion for `ops ssh <TAB>` call the same function and only use the hostname. we have ~1800 hosts. the hosts table is quite wide, it has inventory_json with the full ansible facts (100-300 KB per host), ssh_host_keys, notes, last_provision_log and some more. completion feel slow lately, sometimes 2-3 seconds. Also hosts that dont have a group yet should be listed too, with empty group.
+
+    ```sql
+    -- queries/list_hosts.sql
+    SELECT *
+    FROM hosts h
+    LEFT JOIN host_groups g ON g.id = h.group_id
+    WHERE h.decommissioned_at IS NULL
+      AND g.name <> 'sandbox'
+    ORDER BY h.hostname;
+    ```
+
+    and this one is for `ops show <host>`, it print everything about one host incl. the inventory:
+
+    ```sql
+    -- queries/show_host.sql
+    SELECT *
+    FROM hosts
+    WHERE hostname = :hostname;
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (interactive CLI, runs on every TAB press)
+
+    #### [Bug] Hosts without a group are dropped
+    - **Where:** `AND g.name <> 'sandbox'` in `list_hosts.sql`
+    - **Issue:** if a host has no group, the `LEFT JOIN` sets `g.name` to `NULL`. `NULL <> 'sandbox'` is not true, so the `WHERE` drops these rows. The `LEFT JOIN` then works like an inner join.
+    - **Fix:** keep ungrouped hosts on purpose: `AND (g.id IS NULL OR g.name <> 'sandbox')`. Don't move the condition into `ON`. If you do, sandbox hosts show up as ungrouped hosts.
+
+    #### [High] `SELECT *` pulls the Ansible facts of every host on every call
+    - **Where:** `SELECT *` in `list_hosts.sql`, used by `ops hosts` and by the completion
+    - **Issue:** `ops hosts` prints four columns and the completion prints one. The query still reads `inventory_json`, `last_provision_log`, `ssh_host_keys` and `notes` for every active host. Postgres has to load these large values from TOAST storage and send them to the client, and the tool throws them away. So one TAB press moves hundreds of MB, which very likely explains the slow completion. The join also returns two columns named `id`.
+    - **Fix:** name the columns you print. Give the completion its own query that returns only `hostname`.
+    - **Impact:** cuts E on the database and the client, and the bytes on the network between them. In Green Metrics Tool micro-benchmarks on a 52-column table with large text columns, selecting 10 named columns instead of `SELECT *` used about 5.5× to 7× less CPU energy, depending on the row count. The saving grows with the size of the columns you skip, and yours hold full Ansible facts.
+
+    ```sql
+    -- queries/host_names.sql (zsh completion)
+    SELECT h.hostname
+    FROM hosts h
+    LEFT JOIN host_groups g ON g.id = h.group_id
+    WHERE h.decommissioned_at IS NULL
+      AND (g.id IS NULL OR g.name <> 'sandbox')
+    ORDER BY h.hostname;
+    ```
+
+    ```sql
+    -- queries/list_hosts.sql
+    SELECT h.hostname,
+           h.ip_address,
+           h.environment,
+           COALESCE(g.name, '') AS group_name
+    FROM hosts h
+    LEFT JOIN host_groups g ON g.id = h.group_id
+    WHERE h.decommissioned_at IS NULL
+      AND (g.id IS NULL OR g.name <> 'sandbox')
+    ORDER BY h.hostname;
+    ```
+
+    **Already good:** `SELECT *` in `show_host.sql` is fine. It returns one host, and `ops show` prints every column, including the inventory, so no column goes unused.
+verify:
+  green_block: 1
+  sql:
+    setup: |
+      CREATE TABLE host_groups (id INTEGER PRIMARY KEY, name TEXT);
+      CREATE TABLE hosts (
+        id INTEGER PRIMARY KEY,
+        hostname TEXT NOT NULL UNIQUE,
+        ip_address TEXT,
+        environment TEXT,
+        group_id INTEGER REFERENCES host_groups(id),
+        decommissioned_at TEXT,
+        inventory_json TEXT,
+        ssh_host_keys TEXT,
+        notes TEXT,
+        last_provision_log TEXT
+      );
+      INSERT INTO host_groups (id, name) VALUES (1, 'web'), (2, 'sandbox'), (3, 'db');
+      INSERT INTO hosts (id, hostname, ip_address, environment, group_id, decommissioned_at, inventory_json, ssh_host_keys, notes, last_provision_log) VALUES
+        (1, 'web-01', '10.0.1.11', 'prod', 1, NULL, '{"facts": "big"}', 'ssh-ed25519 AAAA', 'frontend', 'ok'),
+        (2, 'web-02', '10.0.1.12', 'prod', 1, NULL, '{"facts": "big"}', 'ssh-ed25519 BBBB', '', 'ok'),
+        (3, 'sbx-01', '10.0.9.10', 'dev', 2, NULL, '{"facts": "big"}', 'ssh-ed25519 CCCC', 'sandbox', 'ok'),
+        (4, 'db-01', '10.0.2.21', 'prod', 3, NULL, '{"facts": "big"}', 'ssh-ed25519 DDDD', 'primary', 'ok'),
+        (5, 'new-01', '10.0.3.5', 'staging', NULL, NULL, '{"facts": "big"}', 'ssh-ed25519 EEEE', 'no group yet', 'ok'),
+        (6, 'old-01', '10.0.1.5', 'prod', 1, '2026-01-10', '{"facts": "big"}', 'ssh-ed25519 FFFF', 'retired', 'ok');
+    compare: false

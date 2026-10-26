@@ -1,0 +1,132 @@
+id: gen-2-00303-review
+category: review
+language: python
+patterns:
+- avoid-exception-flow
+- select-columns
+facts:
+- F-EXC
+- F-PG-SELECT
+- F-PG-COLUMNS
+messages:
+- role: user
+  content: |
+    hi, im new to python and my lead asked me to write a daily report from our access logs. The logs are in a postgres table `access_log`, about 2 million rows per day. The table has a lot of columns (around 30), also the full raw log line and the request headers as text.
+
+    The script counts server errors (5xx) per team. Two problems: it takes very long, and the payments team says their numbers are too high some days. I don't understand why. Can you look at it?
+
+    ```python
+    import sys
+    from collections import Counter
+
+    import psycopg
+
+    # path -> team that owns it
+    TEAMS = {
+        "/api/checkout": "payments",
+        "/api/payment/confirm": "payments",
+        "/api/cart": "shop",
+        "/api/login": "identity",
+        "/api/search": "search",
+    }
+
+
+    def load_rows(conn, day):
+        cur = conn.cursor()
+        cur.execute(f"SELECT * FROM access_log WHERE log_date = '{day}'")
+        return cur.fetchall()
+
+
+    def summarize(rows):
+        errors = Counter()
+        unowned = 0
+        for row in rows:
+            path = row[4]
+            status = row[6]
+            try:
+                team = TEAMS[path]
+            except KeyError:
+                # most requests are static files and product pages
+                unowned += 1
+            if status >= 500:
+                errors[team] += 1
+        return errors, unowned
+
+
+    if __name__ == "__main__":
+        day = sys.argv[1]  # e.g. 2026-10-24
+        with psycopg.connect("dbname=logs") as conn:
+            rows = load_rows(conn, day)
+        errors, unowned = summarize(rows)
+        for team, n in errors.most_common():
+            print(f"{team}: {n} server errors")
+        print(f"requests without owner: {unowned}")
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (daily log report)
+
+    #### [Bug] Errors are counted for the wrong team
+    - **Where:** `try/except KeyError` in `summarize`
+    - **Issue:** when a path is not in `TEAMS`, the `except` branch only increases `unowned`. `team` still holds the value from the previous row. A 5xx on `/static/app.js` right after a checkout request is counted for payments. That is why their numbers are too high. If the first row of the day has an unknown path, `team` was never set and the script crashes with `UnboundLocalError`.
+    - **Fix:** set `team` on every row. Errors on unknown paths now go to `"unowned"` instead of a random team:
+
+    ```python
+    def summarize(rows):
+        errors = Counter()
+        unowned = 0
+        for path, status in rows:
+            team = TEAMS.get(path)
+            if team is None:
+                unowned += 1
+                team = "unowned"
+            if status >= 500:
+                errors[team] += 1
+        return errors, unowned
+    ```
+
+    `rows` are now `(path, status)` tuples. See the query fix below.
+
+    #### [Security] SQL built with an f-string
+    - **Where:** `load_rows`, `f"... log_date = '{day}'"`
+    - **Issue:** `day` comes from the command line and goes straight into the SQL text. Input like `x' OR '1'='1` changes the query.
+    - **Fix:** pass it as a parameter with `%s`. psycopg sends it separately from the SQL (snippet below).
+
+    #### [High] `SELECT *` reads the raw lines and headers you never use
+    - **Where:** `load_rows`
+    - **Issue:** you only need `path` and `status`, but `SELECT *` sends every column of every row from Postgres to Python, including the big text columns. Python then builds objects for all of them and keeps them in memory. `row[4]` and `row[6]` also break silently if someone adds a column.
+    - **Impact:** E, M and network between database and script, every day. The cost follows the data each column carries, so skipping the large text columns matters most. In Green Metrics Tool micro-benchmarks on a 52-column table with large text columns, naming the 10 needed columns instead of `SELECT *` used about 7× less energy.
+    - **Fix:** name the two columns and pass `day` as a parameter:
+
+    ```python
+    def load_rows(conn, day):
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT path, status FROM access_log WHERE log_date = %s",
+                (day,),
+            )
+            return cur.fetchall()
+    ```
+
+    #### [Medium] Exceptions for a lookup that misses most of the time
+    - **Where:** `TEAMS[path]` with `except KeyError`
+    - **Issue:** most requests are static files and product pages, so most rows raise and catch an exception. Raising is the expensive part. `try/except` is only cheap when misses are rare.
+    - **Fix:** `TEAMS.get(path)`, as in the bug fix above.
+    - **Impact:** E, per row. In Green Metrics Tool micro-benchmarks with about half of the keys missing, `dict.get` used about 12% less energy than `try/except KeyError`. Smaller than the query fix, but it comes for free with the bug fix.
+
+    **Already good:** one query per run instead of one per row, and `Counter` for the totals.
+verify:
+  green_block: 0
+  test: |-
+    from collections import Counter
+    TEAMS = {"/api/checkout": "payments", "/api/cart": "shop"}
+    rows = [
+        ("/static/app.js", 500),
+        ("/api/checkout", 200),
+        ("/img/a.png", 502),
+        ("/api/cart", 503),
+        ("/api/checkout", 504),
+    ]
+    errors, unowned = summarize(rows)
+    assert errors == Counter({"unowned": 2, "shop": 1, "payments": 1}), errors
+    assert unowned == 2

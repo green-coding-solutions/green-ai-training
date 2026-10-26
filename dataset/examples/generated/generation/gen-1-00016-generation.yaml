@@ -1,0 +1,63 @@
+id: gen-1-00016-generation
+category: generation
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    ```python
+    from xml.sax.saxutils import escape
+
+    def build_sitemap(products, base_url="https://shop.example.com"):
+        """
+        products: iterable of dicts with keys slug (str), updated_at (datetime), in_stock (bool)
+        Skip products that are not in stock.
+        Return the sitemap.xml content as a str.
+        Called from the nightly job, catalog has about 40k products.
+        """
+        pass
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```python
+    from xml.sax.saxutils import escape
+
+    def build_sitemap(products, base_url="https://shop.example.com"):
+        base = base_url.rstrip("/")
+        parts = [
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+        ]
+        for p in products:
+            if not p["in_stock"]:
+                continue
+            loc = escape(f'{base}/products/{p["slug"]}')
+            lastmod = p["updated_at"].strftime("%Y-%m-%d")
+            parts.append(f"  <url><loc>{loc}</loc><lastmod>{lastmod}</lastmod></url>\n")
+        parts.append("</urlset>\n")
+        return "".join(parts)
+    ```
+
+    **Green Notes**
+    - **Collect pieces, then `"".join()`** (reduces E): one entry per product means tens of thousands of appends. A list plus a single `join` avoids rebuilding the string on every step. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces used ~469 J with `+=` and ~1.8 J with `join`, roughly 260× less CPU energy. An f-string concatenation in a loop behaved like `+=`, so the f-string is used only for each single entry.
+
+    `escape()` makes slugs with `&` or `<` safe in the XML. A sitemap file may hold at most 50,000 URLs, so split it into several files if the catalog grows past that.
+verify:
+  test: |-
+    from datetime import datetime
+    prods = [
+        {"slug": "a&b", "updated_at": datetime(2026, 1, 2), "in_stock": True},
+        {"slug": "gone", "updated_at": datetime(2026, 1, 3), "in_stock": False},
+        {"slug": "tee", "updated_at": datetime(2026, 2, 3), "in_stock": True},
+    ]
+    out = build_sitemap(prods, "https://x.test/")
+    assert out.startswith('<?xml version="1.0"')
+    assert "a&amp;b" in out and "gone" not in out
+    assert out.count("<url>") == 2
+    assert "<lastmod>2026-02-03</lastmod>" in out
+    assert out.endswith("</urlset>\n")

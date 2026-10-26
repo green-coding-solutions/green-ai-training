@@ -1,0 +1,56 @@
+id: gen-12764612-00295-generation
+category: generation
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    Write `to_line_protocol(readings)` for our edge gateway. It collects sensor readings and every 30 s flushes them to a time-series database over HTTP, using InfluxDB line protocol (one line per point, joined with newlines).
+
+    Input: a list of dicts like `{"metric": "temperature", "sensor_id": "boiler room 2", "value": 21.5, "ts_ns": 1767225600000000000}`. A flush can hold anywhere from a few dozen to ~50,000 readings after the uplink was down.
+
+    Requirements:
+    - Output line: `<metric>,sensor=<sensor_id> value=<float> <ts_ns>`
+    - Escape commas, spaces and `=` in metric and sensor_id with a backslash
+    - Skip readings whose value is `None` (broken sensor)
+    - The body ends with a final newline. An empty result is an empty string.
+    - Runs on a small ARM box, so keep it light on CPU and memory. Stdlib only.
+- role: assistant
+  content: |
+    ```python
+    def _esc(text: str) -> str:
+        return text.replace(",", r"\,").replace(" ", r"\ ").replace("=", r"\=")
+
+
+    def to_line_protocol(readings: list[dict]) -> str:
+        lines = [
+            f"{_esc(r['metric'])},sensor={_esc(r['sensor_id'])} "
+            f"value={float(r['value'])} {r['ts_ns']}"
+            for r in readings
+            if r["value"] is not None
+        ]
+        if not lines:
+            return ""
+        return "\n".join(lines) + "\n"
+    ```
+
+    **Green Notes**
+    - **Join instead of `+=`** (reduces E): each point is formatted once and the body is built with a single `"\n".join(...)`. A `body += line` loop copies the growing string again and again, which hurts most on the 50,000-reading backlog flush. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces used about 469 J with `+=` and about 1.8 J with `join`, roughly 260× less CPU energy. An f-string concatenated in a loop behaved like `+=`, so the f-strings here are only used to format single lines.
+    - **One pass, no extra copies** (reduces M): the list comprehension skips `None` values while it builds the lines, so no second filtered list is needed.
+
+    For a normal flush of a few dozen readings the difference is small. The pattern matters for the large backlog flushes.
+verify:
+  test: |-
+    out = to_line_protocol([
+        {"metric": "temperature", "sensor_id": "boiler room 2", "value": 21.5, "ts_ns": 100},
+        {"metric": "humidity", "sensor_id": "a,b=c", "value": None, "ts_ns": 101},
+        {"metric": "co 2", "sensor_id": "s1", "value": 400, "ts_ns": 102},
+    ])
+    assert out == "temperature,sensor=boiler\\ room\\ 2 value=21.5 100\nco\\ 2,sensor=s1 value=400.0 102\n", repr(out)
+    assert to_line_protocol([]) == ""
+    assert to_line_protocol([{"metric": "m", "sensor_id": "s", "value": None, "ts_ns": 1}]) == ""
+    big = to_line_protocol([{"metric": "m", "sensor_id": "s", "value": 1.0, "ts_ns": i} for i in range(1000)])
+    assert big.count("\n") == 1000 and big.endswith("\n")

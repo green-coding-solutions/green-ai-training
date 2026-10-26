@@ -1,0 +1,63 @@
+id: gen-12764612-00157-no-change
+category: no-change
+language: python
+patterns:
+- batch-db-writes
+- none
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    Hello, I have small gateway on Raspberry Pi 5 what collect modbus readings and write to Postgres on our server. About 400 rows every second come in. I read about batching so I did it like this. Is it ok or can I make it more fast and use less energy? Sorry for my english.
+
+    ```python
+    import time
+    import psycopg
+
+    FLUSH_ROWS = 5000
+    FLUSH_SECONDS = 30
+
+
+    class ReadingWriter:
+        def __init__(self, dsn):
+            self.conn = psycopg.connect(dsn)
+            self.buf = []
+            self.last_flush = time.monotonic()
+
+        def add(self, device_id, ts, metric, value):
+            self.buf.append((device_id, ts, metric, value))
+            too_old = time.monotonic() - self.last_flush > FLUSH_SECONDS
+            if len(self.buf) >= FLUSH_ROWS or too_old:
+                self.flush()
+
+        def flush(self):
+            if self.buf:
+                with self.conn.cursor() as cur:
+                    with cur.copy(
+                        "COPY readings (device_id, ts, metric, value) FROM STDIN"
+                    ) as cp:
+                        for row in self.buf:
+                            cp.write_row(row)
+                self.conn.commit()
+                self.buf.clear()
+            self.last_flush = time.monotonic()
+
+        def close(self):
+            self.flush()
+            self.conn.close()
+    ```
+- role: assistant
+  content: |
+    This is already the efficient way. I would not change it.
+
+    - **COPY with big batches:** In Green Metrics Tool micro-benchmarks on PostgreSQL 16 with psycopg 3, inserting rows in batches of 5,000 with `COPY` used about 22× less CPU energy than one `execute()` per row, and about 8× less than `executemany()`. Your `FLUSH_ROWS = 5000` is the same shape.
+    - **One commit per flush:** The commit cost is paid once per batch, not once per row.
+    - **Safe buffer handling:** You clear the buffer only after the commit. If the connection fails, the rows are still in memory and the next flush can retry them.
+    - **Flush on close:** `close()` writes the rest, so no rows are lost at shutdown.
+
+    The 30-second timer can produce smaller batches when traffic is low. That is fine. In the same benchmarks, batches of about 100 rows showed only small differences between the methods, because per-batch overhead dominates there. At your rate most flushes will be full batches anyway.
+
+    If you want to know the real saving on your Pi, measure CPU time with `perf stat` or `time` for the old and new version with the same input. Don't expect a big change from further tuning.
+verify:
+  static_only: needs a running PostgreSQL server and psycopg

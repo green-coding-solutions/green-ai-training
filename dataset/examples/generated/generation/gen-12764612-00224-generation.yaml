@@ -1,0 +1,93 @@
+id: gen-12764612-00224-generation
+category: generation
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    ```python
+    import json
+    from collections import defaultdict
+
+
+    def load_version_chains(path):
+        """Read a CDC export (one JSON object per line, oldest first,
+        fields: key, ts, op, payload). Skip blank lines.
+
+        Return {key: [records]} with each key's versions NEWEST first,
+        so the merge step can take chain[0] as the current state.
+        """
+        # TODO
+
+
+    if __name__ == "__main__":
+        chains = load_version_chains("orders_cdc.jsonl")
+        current = {k: v[0] for k, v in chains.items()}
+        print(len(current), "keys")
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```python
+    import json
+    from collections import defaultdict
+
+
+    def load_version_chains(path):
+        """Read a CDC export (one JSON object per line, oldest first,
+        fields: key, ts, op, payload). Skip blank lines.
+
+        Return {key: [records]} with each key's versions NEWEST first,
+        so the merge step can take chain[0] as the current state.
+        """
+        chains = defaultdict(list)
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                chains[rec["key"]].append(rec)
+
+        # the file is oldest first, so flip each chain once at the end
+        for versions in chains.values():
+            versions.reverse()
+        return dict(chains)
+
+
+    if __name__ == "__main__":
+        chains = load_version_chains("orders_cdc.jsonl")
+        current = {k: v[0] for k, v in chains.items()}
+        print(len(current), "keys")
+    ```
+
+    **Green Notes**
+    - **Append, then reverse once** (reduces E): `chains[key].insert(0, rec)` would look natural for "newest first", but every front insert shifts the whole list. Hot keys with long histories would turn the load into quadratic work. `append` is O(1), and one `reverse()` per chain at the end is O(n) in total. In Green Metrics Tool micro-benchmarks, 1,000,000 `list.insert(0, x)` calls used about 1515 J, against about 1.2 J for 1,000,000 `list.append(x)` calls.
+    - The file is read line by line, so memory holds only the chains, not the raw text.
+
+    If you only ever need the current record per key, keep just the last record seen instead of whole chains.
+verify:
+  module: true
+  test: |-
+    import os, tempfile
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "c.jsonl")
+    rows = [
+        {"key": "a", "ts": 1, "op": "I", "payload": {}},
+        {"key": "b", "ts": 2, "op": "I", "payload": {}},
+        {"key": "a", "ts": 3, "op": "U", "payload": {}},
+        {"key": "a", "ts": 4, "op": "D", "payload": {}},
+    ]
+    with open(p, "w") as f:
+        for i, r in enumerate(rows):
+            f.write(json.dumps(r) + "\n")
+            if i == 1:
+                f.write("\n")
+    c = load_version_chains(p)
+    assert [r["ts"] for r in c["a"]] == [4, 3, 1]
+    assert [r["ts"] for r in c["b"]] == [2]
+    assert set(c) == {"a", "b"}

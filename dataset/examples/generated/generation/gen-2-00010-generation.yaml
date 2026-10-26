@@ -1,0 +1,51 @@
+id: gen-2-00010-generation
+category: generation
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    cron script, runs every 30 min: dump our product feed (view `catalog.product_feed` in the shop Postgres, ~300 MB as CSV) and PUT it to the search indexer at `$INDEXER_URL/feeds/products`, bearer token in `$INDEXER_TOKEN`. Indexer is in the other DC. It accepts gzip or zstd request bodies via Content-Encoding. Just the script, skip the essay.
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # Export the product feed and push it to the search indexer.
+    # cron: */30 * * * * /opt/shop/bin/push-product-feed.sh
+    set -euo pipefail
+
+    : "${DATABASE_URL:?DATABASE_URL not set}"
+    : "${INDEXER_URL:?INDEXER_URL not set}"
+    : "${INDEXER_TOKEN:?INDEXER_TOKEN not set}"
+
+    # Skip this run if the previous one is still uploading.
+    exec 9>'/tmp/push-product-feed.lock'
+    flock -n 9 || { echo 'previous run still active, skipping' >&2; exit 0; }
+
+    tmp="$(mktemp --suffix=.csv.zst)"
+    trap 'rm -f "$tmp"' EXIT
+
+    # Stream the CSV straight into zstd, so the uncompressed feed never touches disk.
+    psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 \
+      -c '\copy (SELECT * FROM catalog.product_feed) TO STDOUT WITH (FORMAT csv, HEADER)' \
+      | zstd -q -3 -T0 -f -o "$tmp"
+
+    curl --fail-with-body --silent --show-error \
+      --retry 3 --retry-delay 10 --retry-all-errors \
+      -H "Authorization: Bearer $INDEXER_TOKEN" \
+      -H 'Content-Type: text/csv' \
+      -H 'Content-Encoding: zstd' \
+      -T "$tmp" \
+      "$INDEXER_URL/feeds/products"
+    ```
+
+    **Green Notes**
+    - **Compressed upload with zstd** (reduces network, E): CSV text compresses well, so every half-hourly upload to the other DC sends far fewer bytes. In Green Metrics Tool benchmarks on 100 MB of text with default settings, zstd used about 4× less CPU energy to compress than gzip.
+    - *Not applied:* brotli quality 11 or xz. They usually give smaller files, but in the same benchmarks they used about 190× and 29× the energy of zstd. That only makes sense for files you compress once and download many times, not for a feed rebuilt every 30 minutes. These figures compare energy, not compression ratio.
+
+    `--retry-all-errors` needs curl 7.71 or newer. On older curl, drop it.
+verify:
+  static_only: needs psql, zstd, curl, a Postgres database and a reachable indexer endpoint

@@ -1,0 +1,97 @@
+id: gen-2-00324-estimate
+category: estimate
+language: html
+patterns:
+- remove-unused-css
+facts:
+- F-UNUSED-CSS
+messages:
+- role: user
+  content: |
+    We host a public "try it" page for our speech-to-text model. You upload a short audio clip, it calls our inference API and shows the transcript. Most visitors come from links in our docs and open it once, so they are mostly first-time visitors. Traffic is about 120k visits per month.
+
+    The page links `try.css`. It is a copy of the docs theme, about 20 KB, and I'd guess 85% of it is unused on this page. We want to run PurgeCSS on it. Our sustainability lead wants this in the yearly ESG report, so I need:
+
+    1. A number in joules per page load that we save
+    2. kWh and CO2 per year for 120k visits/month
+    3. A way to check it ourselves afterwards
+
+    Please give real numbers, not just "it depends". Here is the page:
+
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Try Whisperline – speech to text</title>
+      <link rel="stylesheet" href="/static/try.css?v=2026.10.1">
+    </head>
+    <body>
+      <header class="site-header">
+        <a class="brand" href="/docs/">Whisperline</a>
+      </header>
+      <main class="container">
+        <h1>Try the model</h1>
+        <form id="upload" class="card">
+          <label for="clip">Audio clip (max 30 s, WAV or MP3)</label>
+          <input id="clip" name="clip" type="file" accept="audio/wav,audio/mpeg" required>
+          <select name="language">
+            <option value="auto">Detect language</option>
+            <option value="en">English</option>
+            <option value="de">German</option>
+          </select>
+          <button type="submit" class="btn btn-primary">Transcribe</button>
+        </form>
+        <pre id="result" class="transcript" aria-live="polite"></pre>
+      </main>
+      <script>
+        const form = document.getElementById('upload');
+        const result = document.getElementById('result');
+        form.addEventListener('submit', async (e) => {
+          e.preventDefault();
+          form.classList.add('is-busy');
+          try {
+            const res = await fetch('/v1/transcribe', { method: 'POST', body: new FormData(form) });
+            const data = await res.json();
+            result.classList.toggle('error', !res.ok);
+            result.textContent = res.ok ? data.text : data.detail;
+          } finally {
+            form.classList.remove('is-busy');
+          }
+        });
+      </script>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    Short answer: for client energy, expect no measurable change. What you save is bytes on the wire.
+
+    **What was measured**
+
+    Green Metrics Tool ran a benchmark close to your case. It did 50 cold page loads in a headful Firefox with an empty cache. With a 16 KB stylesheet of mostly unused rules, the loads used ~783 J. With the stylesheet purged and minified to 0.75 KB, they used ~764 J. That is about 2% less, which is within measurement noise.
+
+    So I can't give you a joules-per-load figure that would hold up in a report. The measured difference is smaller than the noise, and any number I gave you would be made up. For the same reason I won't scale it up to kWh or CO2 per year.
+
+    **What you can report: bytes**
+
+    - Per first-time visit, you send less: the size of today's `try.css` minus the purged file, both as actually served (compressed). Multiply that by the yearly count of full `try.css` responses (status 200, not 304) from your access logs. That gives a real, countable transfer saving.
+    - Repeat visits with a cached stylesheet save nothing. Your visitors are mostly first-time visitors, so most visits do count.
+    - The benchmark ran on a local network, where transfer is almost free. It shows only the CPU side, not the network side. To turn bytes into kWh or CO2 you need a per-GB network energy factor. Published factors vary widely, so name the factor and its source in the report.
+
+    Wording for the report could be: "Removed unused CSS from the try-it page: X KB less per first visit, Y GB less transfer per year. No measurable change in client CPU energy for a stylesheet of this size."
+
+    **How to check it yourselves**
+
+    1. Bytes, once for each version:
+       ```bash
+       curl -s -o /dev/null -H 'Accept-Encoding: gzip, br' -w '%{size_download}\n' 'https://example.com/static/try.css?v=2026.10.1'
+       ```
+    2. Energy: set up a Green Metrics Tool usage scenario. It should open the page in a headful browser with an empty cache, many times, once with the current CSS and once with the purged CSS. Compare the CPU energy of the page-load phase over several repetitions. If the gap is inside the run-to-run variation, report "no measurable difference".
+
+    **One thing to watch before purging**
+
+    Your script adds `is-busy` and `error` at runtime. PurgeCSS only sees class names in the HTML and JS you give it. Add those two classes to the safelist, or the busy state and error styling will silently disappear.
+verify:
+  static_only: estimate answer; the page needs the inference backend and a browser, the curl command needs the real host

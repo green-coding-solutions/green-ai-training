@@ -1,0 +1,146 @@
+id: gen-2-00054-refactor
+category: refactor
+language: python
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+messages:
+- role: user
+  content: |
+    Hi, our shop export a product feed for Google Shopping and idealo. A cron job run it every 15 minutes, about 30k active products. The products table is big, around 50 columns, with description_html, specs json, seo texts and so on. The export become slow and the DB server is busy when it run. Can you clean up and make it more efficent? Output must stay exactly same, the feed is validated by the partners.
+
+    ```python
+    import csv
+    import io
+
+    FEED_COLUMNS = ["id", "title", "link", "price", "availability", "brand", "gtin", "image_link"]
+    SHOP_URL = "https://www.kaffeehaus-shop.de"
+
+
+    def availability(stock):
+        if stock > 0:
+            return "in stock"
+        return "out of stock"
+
+
+    def build_feed(conn):
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM products WHERE active = true ORDER BY id")
+        rows = cur.fetchall()
+
+        out = io.StringIO()
+        writer = csv.writer(out, delimiter="\t")
+        writer.writerow(FEED_COLUMNS)
+        for p in rows:
+            if p["price_cents"] is None:
+                continue
+            price = "%.2f EUR" % (p["price_cents"] / 100)
+            writer.writerow([
+                p["sku"],
+                p["name"],
+                f"{SHOP_URL}/p/{p['slug']}",
+                price,
+                availability(p["stock"]),
+                p["brand"],
+                p["ean"] or "",
+                p["main_image_url"],
+            ])
+        return out.getvalue()
+
+
+    def export_feed(conn, path):
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(build_feed(conn))
+    ```
+- role: assistant
+  content: |
+    ```python
+    import csv
+    import io
+
+    FEED_COLUMNS = ["id", "title", "link", "price", "availability", "brand", "gtin", "image_link"]
+    SHOP_URL = "https://www.kaffeehaus-shop.de"
+
+    FEED_QUERY = """
+        SELECT sku, name, slug, price_cents, stock, brand, ean, main_image_url
+        FROM products
+        WHERE active = true AND price_cents IS NOT NULL
+        ORDER BY id
+    """
+
+
+    def availability(stock):
+        if stock > 0:
+            return "in stock"
+        return "out of stock"
+
+
+    def build_feed(conn):
+        cur = conn.cursor()
+        cur.execute(FEED_QUERY)
+        rows = cur.fetchall()
+
+        out = io.StringIO()
+        writer = csv.writer(out, delimiter="\t")
+        writer.writerow(FEED_COLUMNS)
+        for p in rows:
+            price = "%.2f EUR" % (p["price_cents"] / 100)
+            writer.writerow([
+                p["sku"],
+                p["name"],
+                f"{SHOP_URL}/p/{p['slug']}",
+                price,
+                availability(p["stock"]),
+                p["brand"],
+                p["ean"] or "",
+                p["main_image_url"],
+            ])
+        return out.getvalue()
+
+
+    def export_feed(conn, path):
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(build_feed(conn))
+    ```
+
+    **Green Notes**
+    - **Name the 8 columns the feed uses instead of `SELECT *`** (reduces E, M, network): the old query read, sent and kept in memory `description_html`, the specs JSON and the SEO texts for every product on every run. The feed never used them. In Green Metrics Tool micro-benchmarks on a 52-column products table with large text columns, naming the 10 needed columns used about 7× less CPU energy than `SELECT *` at 2,500 and 10,000 rows. In a second run on the same kind of table, `SELECT *` cost about 8× an 8-column query.
+    - **Rows without a price are filtered in SQL** (reduces E, network): before, they were fetched and then skipped in Python. Now they never leave the database.
+    - The output is byte-for-byte the same: same rows, same order, same formatting. If you add a feed field later, add its column to `FEED_QUERY` too, or the lookup will fail.
+verify:
+  equivalence:
+    driver: |-
+      import sqlite3
+      conn = sqlite3.connect(":memory:")
+      conn.row_factory = sqlite3.Row
+      extra = ", ".join(f"attr_{i} TEXT" for i in range(30))
+      conn.execute(
+          "CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT, name TEXT, slug TEXT, "
+          "price_cents INTEGER, stock INTEGER, brand TEXT, ean TEXT, main_image_url TEXT, "
+          f"active BOOLEAN, description_html TEXT, specs_json TEXT, seo_text TEXT, {extra})"
+      )
+      for i in range(1, 61):
+          conn.execute(
+              "INSERT INTO products (id, sku, name, slug, price_cents, stock, brand, ean, "
+              "main_image_url, active, description_html, specs_json, seo_text) "
+              "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              (
+                  i,
+                  f"SKU-{i:05d}",
+                  f"Espresso Bohnen {i}",
+                  f"espresso-bohnen-{i}",
+                  None if i % 11 == 0 else 499 + i * 37,
+                  i % 4,
+                  "Röstwerk" if i % 2 else "Bergmühle",
+                  None if i % 5 == 0 else f"40{i:011d}",
+                  f"https://cdn.example.com/img/{i}.jpg",
+                  i % 7 != 0,
+                  "<p>" + "Lorem ipsum " * 200 + "</p>",
+                  '{"weight": "1kg", "roast": "dark"}',
+                  "seo text " * 50,
+              ),
+          )
+      conn.commit()
+      print(repr(build_feed(conn)))

@@ -1,0 +1,81 @@
+id: gen-2-00243-generation
+category: generation
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    hi, i need a function for our support ticket API (flask). The endpoint GET /tickets/<id>/comments return up to 500 comments per call and it is called a lot from the agent dashboard.
+
+    every comment is a dict like this:
+    {"id": 81, "ticket_id": 12, "author_id": "u-4411", "body": "...", "created_at": datetime}
+
+    We also have a dict `users` with user_id -> {"name": ..., "avatar_url": ...}. We get it from the user service before. But around half of the comments are from external guests (customers who answer by email), there author_id is from the mail system and it is not in `users`. Sometimes author_id is None too.
+
+    For guests i want name "Guest", avatar_url None and is_guest True. created_at must be iso string for the json. Order must stay same as input. Please only the function, the route i have alredy.
+- role: assistant
+  content: |
+    ```python
+    GUEST_AUTHOR = {"name": "Guest", "avatar_url": None}
+
+
+    def serialize_comments(comments, users):
+        """Turn comment rows into JSON-ready dicts with author info.
+
+        comments: iterable of dicts with id, ticket_id, author_id, body, created_at (datetime)
+        users: dict user_id -> {"name": str, "avatar_url": str | None}
+        Input order is kept.
+        """
+        result = []
+        for c in comments:
+            author = users.get(c["author_id"], GUEST_AUTHOR)
+            is_guest = author is GUEST_AUTHOR
+            result.append({
+                "id": c["id"],
+                "ticket_id": c["ticket_id"],
+                "body": c["body"],
+                "created_at": c["created_at"].isoformat(),
+                "author": {
+                    "id": None if is_guest else c["author_id"],
+                    "name": author["name"],
+                    "avatar_url": author.get("avatar_url"),
+                    "is_guest": is_guest,
+                },
+            })
+        return result
+    ```
+
+    In your route: `return jsonify(serialize_comments(rows, users))`.
+
+    **Green Notes**
+    - **`dict.get` with a default instead of `try/except KeyError`** (reduces E): about half of the authors are missing, so an exception would be raised for every second comment, on every call. In Green Metrics Tool micro-benchmarks with about half of the keys missing, `dict.get` used about 12% less CPU energy than `try/except KeyError`. It also handles `author_id = None` without a special case.
+    - The guest fallback is one shared dict that is only read, never changed, so the per-comment `author` dict is always a new object and safe to modify later.
+
+    *Not applied:* `try/except` would be fine if misses were rare. The cost is in raising, and here misses are the normal case.
+verify:
+  test: |-
+    from datetime import datetime
+
+    users = {
+        "u-1": {"name": "Anna", "avatar_url": "https://cdn.example.com/a.png"},
+        "u-2": {"name": "Ben", "avatar_url": None},
+    }
+    comments = [
+        {"id": 1, "ticket_id": 12, "author_id": "u-1", "body": "hi", "created_at": datetime(2026, 1, 2, 3, 4, 5)},
+        {"id": 2, "ticket_id": 12, "author_id": "mail-77", "body": "thanks", "created_at": datetime(2026, 1, 2, 4, 0, 0)},
+        {"id": 3, "ticket_id": 12, "author_id": None, "body": "?", "created_at": datetime(2026, 1, 2, 5, 0, 0)},
+        {"id": 4, "ticket_id": 12, "author_id": "u-2", "body": "ok", "created_at": datetime(2026, 1, 2, 6, 0, 0)},
+    ]
+    out = serialize_comments(comments, users)
+    assert [c["id"] for c in out] == [1, 2, 3, 4]
+    assert out[0]["created_at"] == "2026-01-02T03:04:05"
+    assert out[0]["author"] == {"id": "u-1", "name": "Anna", "avatar_url": "https://cdn.example.com/a.png", "is_guest": False}
+    assert out[1]["author"] == {"id": None, "name": "Guest", "avatar_url": None, "is_guest": True}
+    assert out[2]["author"] == {"id": None, "name": "Guest", "avatar_url": None, "is_guest": True}
+    assert out[3]["author"] == {"id": "u-2", "name": "Ben", "avatar_url": None, "is_guest": False}
+    out[1]["author"]["name"] = "changed"
+    assert GUEST_AUTHOR["name"] == "Guest"
+    assert serialize_comments([], users) == []

@@ -1,0 +1,105 @@
+id: gen-2-00078-generation
+category: generation
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    ```python
+    # runner_autoscaler.py -- called every 60s by the scaler loop for our CI runner pool
+    import torch
+    from dataclasses import dataclass
+
+    FEATURES = ["queued", "running", "avg_wait_s", "hour", "weekday"]
+
+
+    @dataclass
+    class Sample:
+        queued: int
+        running: int
+        avg_wait_s: float
+        hour: int
+        weekday: int
+
+
+    def load_model(path: str) -> torch.nn.Module:
+        model = torch.jit.load(path, map_location="cpu")
+        model.eval()
+        return model
+
+
+    def desired_runners(model: torch.nn.Module, history: list[Sample],
+                        min_runners: int = 2, max_runners: int = 40) -> int:
+        """Model takes a (1, 30, 5) float tensor of the last 30 samples (FEATURES order)
+        and returns a (1, 1) tensor: predicted queued jobs in 10 minutes.
+        One runner handles ~3 jobs.
+        """
+        # TODO
+        ...
+    ```
+    ?
+- role: assistant
+  content: |
+    ```python
+    # runner_autoscaler.py -- called every 60s by the scaler loop for our CI runner pool
+    import math
+    from dataclasses import dataclass
+
+    import torch
+
+    FEATURES = ["queued", "running", "avg_wait_s", "hour", "weekday"]
+    WINDOW = 30
+    JOBS_PER_RUNNER = 3
+
+
+    @dataclass
+    class Sample:
+        queued: int
+        running: int
+        avg_wait_s: float
+        hour: int
+        weekday: int
+
+
+    def load_model(path: str) -> torch.nn.Module:
+        model = torch.jit.load(path, map_location="cpu")
+        model.eval()
+        return model
+
+
+    def _to_tensor(history: list[Sample]) -> torch.Tensor:
+        rows = [[float(getattr(s, f)) for f in FEATURES] for s in history[-WINDOW:]]
+        return torch.tensor(rows, dtype=torch.float32).unsqueeze(0)  # (1, 30, 5)
+
+
+    def desired_runners(model: torch.nn.Module, history: list[Sample],
+                        min_runners: int = 2, max_runners: int = 40) -> int:
+        """Model takes a (1, 30, 5) float tensor of the last 30 samples (FEATURES order)
+        and returns a (1, 1) tensor: predicted queued jobs in 10 minutes.
+        One runner handles ~3 jobs.
+        """
+        if not history:
+            return min_runners
+
+        fallback = float(history[-1].queued)
+        if len(history) < WINDOW:
+            predicted = fallback  # not enough data yet, e.g. right after a restart
+        else:
+            with torch.inference_mode():
+                predicted = model(_to_tensor(history)).item()
+            if not math.isfinite(predicted):
+                predicted = fallback
+
+        needed = math.ceil(max(predicted, 0.0) / JOBS_PER_RUNNER)
+        return max(min_runners, min(max_runners, needed))
+    ```
+
+    **Green Notes**
+    - **`torch.inference_mode()` around the forward pass** (reduces E, M): PyTorch does not record an autograd graph or keep activations for a backward pass that never comes. This call runs every minute, all day. In Green Metrics Tool micro-benchmarks, 100,000 PyTorch CPU inferences used about 14% less CPU energy with `torch.no_grad()` than without it. `inference_mode()` skips the same work. It is safe here because the result leaves the block as a plain float via `.item()`.
+
+    Behavior: with fewer than 30 samples, or a NaN/inf prediction, it scales on the current queue length. The result is always clamped to `[min_runners, max_runners]`. I assumed the model takes raw feature values, as the docstring says. If it was trained on normalized inputs, apply the same scaling in `_to_tensor`.
+verify:
+  static_only: needs torch and a TorchScript model file

@@ -1,0 +1,74 @@
+id: gen-2-00222-generation
+category: generation
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    need a gh actions workflow that deletes the landing page preview when the PR closes. namespaces are lp-preview-pr-<number>, kubeconfig is in secret PREVIEW_KUBECONFIG
+- role: assistant
+  content: |
+    ```yaml
+    name: preview-teardown
+
+    on:
+      pull_request_target:
+        types: [closed]
+      schedule:
+        - cron: '30 2 * * *'
+      workflow_dispatch:
+
+    permissions:
+      contents: read
+      pull-requests: read
+
+    concurrency:
+      group: preview-teardown-${{ github.event.pull_request.number || 'sweep' }}
+      cancel-in-progress: false
+
+    jobs:
+      teardown:
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        steps:
+          - name: Configure kubectl
+            env:
+              KUBECONFIG_DATA: ${{ secrets.PREVIEW_KUBECONFIG }}
+            run: |
+              mkdir -p ~/.kube
+              printf '%s' "$KUBECONFIG_DATA" > ~/.kube/config
+              chmod 600 ~/.kube/config
+
+          - name: Delete preview of the closed PR
+            if: github.event_name == 'pull_request_target'
+            env:
+              NS: lp-preview-pr-${{ github.event.pull_request.number }}
+            run: kubectl delete namespace "$NS" --ignore-not-found --wait=false
+
+          - name: Sweep previews of PRs that are no longer open
+            if: github.event_name != 'pull_request_target'
+            env:
+              GH_TOKEN: ${{ github.token }}
+            run: |
+              set -euo pipefail
+              open_prs=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 500 --json number --jq '.[].number')
+              for ns in $(kubectl get namespaces -o name | sed -n 's|^namespace/\(lp-preview-pr-[0-9]*\)$|\1|p'); do
+                pr=${ns#lp-preview-pr-}
+                if ! grep -qx "$pr" <<< "$open_prs"; then
+                  echo "Deleting $ns (PR #$pr is not open)"
+                  kubectl delete namespace "$ns" --wait=false
+                fi
+              done
+    ```
+
+    The workflow uses `pull_request_target` so the secret is also available when a PR from a fork closes. This is safe here because the workflow never checks out or runs code from the PR. Don't add a checkout step. `--wait=false` lets the job finish right away while Kubernetes deletes the namespace in the background.
+
+    **Green Notes**
+    - **Tear down on close** (reduces E, M): the preview is gone as soon as the PR is merged or closed. It doesn't sit idle for days and hold node memory. Green Metrics Tool measured a preview environment idling for 60 seconds. Going from three app replicas, Postgres, Redis and a worker down to one replica and Postgres used only about 3% less CPU energy. Idle services cost little per minute, so the saving comes from the hours an environment no longer exists.
+    - **Nightly sweep** (reduces E, M): the scheduled run deletes any `lp-preview-pr-*` namespace whose PR is not open. That covers missed close events, failed runs and namespaces created by hand. If the GitHub API call fails, `set -euo pipefail` stops the step. Without it, an empty list would delete every preview.
+    - *Optional:* if PRs stay open for weeks, add a second schedule. It runs `kubectl scale deployment --all --replicas=0 -n <ns>` in the evening and scales back to 1 in the morning, so open previews don't run overnight.
+verify:
+  static_only: GitHub Actions workflow, needs a Kubernetes cluster and the GitHub API

@@ -1,0 +1,110 @@
+id: gen-12764612-00272-review
+category: review
+language: python
+patterns:
+- vectorize-or-jit
+- batch-db-writes
+facts:
+- F-NUMBA
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    review pls, slow on the big day files
+
+    ```python
+    import sys
+    import numpy as np
+    import psycopg
+
+    BUCKET_MS = 25
+    MAX_BUCKET = 400
+
+
+    def load(path):
+        # day file: ~20M lines, "minute_id latency_ms"
+        data = np.loadtxt(path, dtype=np.float64)
+        return data[:, 0].astype(np.int64), data[:, 1]
+
+
+    def bucketize(lat_ms):
+        out = np.zeros(len(lat_ms), dtype=np.int32)
+        for i in range(len(lat_ms)):
+            b = int(lat_ms[i] // BUCKET_MS)
+            if b > MAX_BUCKET:
+                b = MAX_BUCKET
+            out[i] = b
+        return out
+
+
+    def store(conn, minute_ids, lat_ms, buckets):
+        cur = conn.cursor()
+        for i in range(len(lat_ms)):
+            cur.execute(
+                "INSERT INTO request_latency (minute_id, latency_ms, bucket) "
+                "VALUES (%s, %s, %s)",
+                (int(minute_ids[i]), float(lat_ms[i]), int(buckets[i])),
+            )
+            conn.commit()
+
+
+    def main(path, dsn):
+        minute_ids, lat_ms = load(path)
+        buckets = bucketize(lat_ms)
+        with psycopg.connect(dsn) as conn:
+            store(conn, minute_ids, lat_ms, buckets)
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1], sys.argv[2])
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly log processing, millions of rows per run)
+
+    #### [High] One INSERT and one commit per row
+    - **Where:** `store`
+    - **Issue:** 20M rows means 20M round trips and 20M commits. Each commit waits for the server to flush its log.
+    - **Fix:** stream the rows with `COPY` and commit once per batch of rows:
+      ```python
+      BATCH = 5000
+
+      def store(conn, minute_ids, lat_ms, buckets):
+          with conn.cursor() as cur:
+              for start in range(0, len(lat_ms), BATCH):
+                  end = start + BATCH
+                  with cur.copy(
+                      "COPY request_latency (minute_id, latency_ms, bucket) FROM STDIN"
+                  ) as copy:
+                      for i in range(start, min(end, len(lat_ms))):
+                          copy.write_row(
+                              (int(minute_ids[i]), float(lat_ms[i]), int(buckets[i]))
+                          )
+                  conn.commit()
+      ```
+    - **Impact:** E on both the client and the database server. In Green Metrics Tool micro-benchmarks with 500,000 rows in 5,000-row batches, `COPY` used about 22× less CPU energy than one `execute()` per row (~17 J vs ~384 J). That loop already committed once per batch. Yours commits per row, so the gap should be larger. The saving shrinks if you write only a few hundred rows per run.
+
+    #### [High] Pure Python loop over every sample
+    - **Where:** `bucketize`
+    - **Issue:** this is a numeric loop with simple arithmetic, run once per sample, so the interpreter overhead is paid 20M times.
+    - **Fix:** compile it with Numba:
+      ```python
+      from numba import njit
+
+      @njit(cache=True)
+      def bucketize(lat_ms, bucket_ms, max_bucket):
+          out = np.empty(lat_ms.shape[0], dtype=np.int32)
+          for i in range(lat_ms.shape[0]):
+              b = int(lat_ms[i] // bucket_ms)
+              if b > max_bucket:
+                  b = max_bucket
+              out[i] = b
+          return out
+      ```
+      Call it as `bucketize(lat_ms, BUCKET_MS, MAX_BUCKET)`.
+    - **Impact:** E. In Green Metrics Tool micro-benchmarks, a 10M-sample quantization loop used about 4× less CPU energy with Numba (~9.5 J vs ~40 J). `cache=True` avoids paying the compile cost on every cron start. For small files, the compile time and the extra dependency are not worth it.
+    - **Behavior change:** the old loop raised `ValueError` on a `nan` latency. Compiled code does not. Add `if np.isnan(lat_ms).any(): raise ValueError("nan latency")` in `load` if you want the same failure.
+
+    **Already good:** the SQL is parameterized, and the data is loaded once into numpy arrays.
+verify:
+  static_only: needs a PostgreSQL server, psycopg and numba

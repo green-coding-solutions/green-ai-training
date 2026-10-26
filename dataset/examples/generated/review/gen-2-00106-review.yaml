@@ -1,0 +1,163 @@
+id: gen-2-00106-review
+category: review
+language: python
+patterns:
+- select-columns
+- string-join
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    review pls. prometheus scrapes this every 15s, ~1500 sensors on this gateway, sensors table is wide (raw_frame blobs, calib json, modbus map etc)
+
+    ```python
+    # gateway/metrics.py
+    import sqlite3
+    import time
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from urllib.parse import urlparse, parse_qs
+
+    DB_PATH = "/var/lib/gateway/gateway.db"
+    STALE_AFTER = 300  # 5 min
+
+
+    def render_metrics(conn, site):
+        cur = conn.execute(
+            f"SELECT * FROM sensors WHERE site = '{site}' ORDER BY sensor_id"
+        )
+        cols = [d[0] for d in cur.description]
+        now = time.time()
+        out = "# TYPE gw_sensor_value gauge\n"
+        for row in cur.fetchall():
+            s = dict(zip(cols, row))
+            value = s["last_value"]
+            if now - s["last_seen"] > STALE_AFTER:
+                value = "NaN"
+            out += f'gw_sensor_value{{sensor="{s["sensor_id"]}",kind="{s["kind"]}",unit="{s["unit"]}"}} {value}\n'
+        return out
+
+
+    class MetricsHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            url = urlparse(self.path)
+            if url.path != "/metrics":
+                self.send_error(404)
+                return
+            site = parse_qs(url.query).get("site", ["default"])[0]
+            conn = sqlite3.connect(DB_PATH)
+            try:
+                body = render_metrics(conn, site).encode()
+            finally:
+                conn.close()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt, *args):
+            pass
+
+
+    if __name__ == "__main__":
+        HTTPServer(("0.0.0.0", 9105), MetricsHandler).serve_forever()
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (metrics endpoint on the gateway, scraped every 15 s)
+
+    #### [Security] SQL injection through `?site=`
+    - **Where:** `render_metrics`, the f-string query
+    - **Issue:** `site` goes straight from the URL into the SQL. The server listens on `0.0.0.0`, so anyone who can reach port 9105 can send `?site=x' UNION SELECT ...` and read any table in the gateway database.
+    - **Fix:** bind it as a parameter: `conn.execute("... WHERE site = ?", (site,))`. If possible, also listen only on the interface Prometheus uses.
+
+    #### [Bug] One sensor without data breaks the whole scrape
+    - **Where:** `now - s["last_seen"]` and `{value}`
+    - **Issue:** a sensor that is registered but has never reported has `last_seen` NULL. `now - None` raises `TypeError`, the request fails, and Prometheus loses every sensor, not just that one. If only `last_value` is NULL, the line ends in `None`. That is not a valid sample value, so Prometheus rejects the whole response.
+    - **Fix:** report `NaN` when either column is NULL (see the code below).
+
+    #### [High] `SELECT *` reads raw frames and calibration JSON on every scrape
+    - **Where:** the query in `render_metrics`
+    - **Issue:** the loop uses five columns. `SELECT *` makes SQLite read every column and Python copy it, for ~1500 rows, four times a minute. That includes the `raw_frame` blobs, the calibration JSON and the Modbus map. `dict(zip(...))` then builds a dict per row from all of them.
+    - **Fix:** name the five columns and unpack the row tuple directly.
+    - **Impact:** E and M, on every scrape. In Green Metrics Tool micro-benchmarks on PostgreSQL, reading 2,500 rows from a 52-column table with large text columns used about 7× less CPU energy when the query named only the 10 needed columns. Your database is SQLite, so the figure does not transfer directly. The cause is the same, though: the saving grows with the size of the columns you skip, and blobs are the biggest ones.
+
+    #### [Medium] Response built with `+=`
+    - **Where:** `out += f'...'` in the loop
+    - **Issue:** each `+=` can copy the whole string built so far, so the cost grows faster than the number of sensors. Using an f-string does not change that.
+    - **Fix:** collect the lines in a list and call `"\n".join()` once.
+    - **Impact:** E. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces with `+=` used roughly 260× more CPU energy than `"".join()`. f-string concatenation in a loop behaved like `+=`. With 1500 lines the absolute effect is much smaller, but the endpoint runs all day and the cost grows with every sensor you add.
+
+    Fixed `render_metrics`. The handler stays as it is:
+
+    ```python
+    import time
+
+    STALE_AFTER = 300  # 5 min
+
+
+    def render_metrics(conn, site):
+        cur = conn.execute(
+            "SELECT sensor_id, kind, unit, last_value, last_seen"
+            " FROM sensors WHERE site = ? ORDER BY sensor_id",
+            (site,),
+        )
+        now = time.time()
+        lines = ["# TYPE gw_sensor_value gauge"]
+        for sensor_id, kind, unit, value, last_seen in cur:
+            if value is None or last_seen is None or now - last_seen > STALE_AFTER:
+                value = "NaN"
+            lines.append(
+                f'gw_sensor_value{{sensor="{sensor_id}",kind="{kind}",unit="{unit}"}} {value}'
+            )
+        lines.append("")  # keep the trailing newline
+        return "\n".join(lines)
+    ```
+
+    For sensors that have data, the output is byte-identical to before. Sensors without data now show `NaN` instead of breaking the scrape.
+
+    **Already good:** the connection is closed in `finally`, `Content-Length` is set, and `ORDER BY sensor_id` keeps the output stable between scrapes.
+verify:
+  module: true
+  test: |
+    import sqlite3
+    _c = sqlite3.connect(":memory:")
+    _c.execute("CREATE TABLE sensors (sensor_id TEXT, site TEXT, kind TEXT, unit TEXT, last_value REAL, last_seen REAL, raw_frame BLOB)")
+    _c.executemany(
+        "INSERT INTO sensors VALUES (?,?,?,?,?,?,?)",
+        [
+            ("a", "s1", "temp", "celsius", None, None, None),
+            ("b", "s1", "temp", "celsius", 1.5, 1e12, b"x"),
+            ("c", "s1", "temp", "celsius", None, 1e12, b"y"),
+        ],
+    )
+    _out = render_metrics(_c, "s1")
+    assert 'gw_sensor_value{sensor="a",kind="temp",unit="celsius"} NaN\n' in _out
+    assert 'gw_sensor_value{sensor="b",kind="temp",unit="celsius"} 1.5\n' in _out
+    assert 'gw_sensor_value{sensor="c",kind="temp",unit="celsius"} NaN\n' in _out
+    assert _out.endswith("\n")
+    assert render_metrics(_c, "x' OR '1'='1") == "# TYPE gw_sensor_value gauge\n"
+  equivalence:
+    driver: |-
+      import sqlite3
+      conn = sqlite3.connect(":memory:")
+      conn.execute(
+          "CREATE TABLE sensors (sensor_id TEXT, site TEXT, kind TEXT, unit TEXT,"
+          " last_value REAL, last_seen REAL, modbus_map TEXT, calib_json TEXT,"
+          " raw_frame BLOB, notes TEXT)"
+      )
+      conn.executemany(
+          "INSERT INTO sensors VALUES (?,?,?,?,?,?,?,?,?,?)",
+          [
+              ("p-001", "hall2", "pressure", "bar", 4.2, 1e12, '{"reg": 40001}', '{"k": 1.02}', b"\x00" * 512, "inlet"),
+              ("t-002", "hall2", "temp", "celsius", 21.5, 0.0, '{"reg": 40010}', '{"k": 0.99}', b"\x01" * 512, ""),
+              ("f-003", "hall1", "flow", "m3_per_h", 3.0, 1e12, '{"reg": 40020}', "{}", b"\x02" * 256, "pump 3"),
+              ("t-004", "hall2", "temp", "celsius", -4.0, 1e12, "{}", "{}", b"", ""),
+          ],
+      )
+      print(render_metrics(conn, "hall2"), end="")
+      print(render_metrics(conn, "hall1"), end="")
+      print(render_metrics(conn, "nowhere"), end="")

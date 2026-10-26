@@ -1,0 +1,85 @@
+id: gen-2-00436-review
+category: review
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```bash
+    #!/bin/bash
+    # nightly archive for the vision-api (image classifier), cron 02:30
+    SRC=/data/visionapi
+    OUT=/archive/visionapi
+    DAY=$(date -d yesterday +%F)
+
+    mkdir -p $OUT
+    cd $SRC
+
+    # inputs/<day>/*.jpg  = uploaded images
+    # preds/<day>/*.jsonl = model outputs
+    # requests/<day>/*.jsonl = request logs
+    XZ_OPT=-9 tar -cJf $OUT/$DAY.tar.xz inputs/$DAY preds/$DAY requests/$DAY
+
+    rm -rf $SRC/inputs/$DAY
+    echo "archived $DAY"
+
+    # keep 14 days
+    find $OUT -name '*.tar.xz' -mtime +14 -delete
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (nightly archive of inference data, kept 14 days)
+
+    #### [Bug] Source images are deleted even if the archive failed
+    - **Where:** `rm -rf $SRC/inputs/$DAY` after `tar`
+    - **Issue:** nothing checks that `tar` succeeded. A full disk or a killed job leaves a broken archive, and the original images are gone anyway. `cd $SRC` has no check either.
+    - **Fix:** `set -euo pipefail`, so the `rm` only runs after a successful archive.
+
+    #### [Bug] Unquoted variables in `rm -rf`
+    - **Where:** `rm -rf $SRC/inputs/$DAY`, plus `mkdir`, `tar` and `find`
+    - **Issue:** if `DAY` is ever empty (for example `date -d` fails on a non-GNU system), this deletes every day of uploaded images. Unquoted paths also break on spaces.
+    - **Fix:** quote the variables and use `${DAY:?}` so an empty value aborts.
+
+    #### [High] `xz -9` on data that is compressed every night
+    - **Where:** `XZ_OPT=-9 tar -cJf ...`
+    - **Issue:** you compress new data every night, so compression CPU is a recurring cost. In Green Metrics Tool micro-benchmarks on 100 MB of text, xz used ~458 J and zstd at its default level ~16 J, about 29× less. xz gives a smaller file, but those benchmarks measured energy, not size. For a 14-day retention, zstd's smaller saving is enough.
+    - **Fix:** compress the JSON lines with `zstd` at its default level.
+    - **Impact:** E, large reduction in CPU time per night for the log part.
+
+    #### [High] JPEGs are compressed again
+    - **Where:** `inputs/$DAY` inside the `.tar.xz`
+    - **Issue:** JPEG is already compressed. xz at level 9 burns CPU on it and saves almost nothing. Images are most of the bytes, so most of the work is wasted.
+    - **Fix:** put the images in a plain `.tar` and compress only the text.
+    - **Impact:** E, the biggest part of the nightly CPU time goes away.
+
+    ```bash
+    #!/bin/bash
+    set -euo pipefail
+
+    SRC=/data/visionapi
+    OUT=/archive/visionapi
+    DAY=$(date -d yesterday +%F)
+
+    mkdir -p "$OUT"
+
+    # images are already compressed: store them, don't compress them again
+    tar -cf "$OUT/${DAY:?}-inputs.tar" -C "$SRC/inputs" "$DAY"
+
+    # text logs: fast codec
+    tar -cf - -C "$SRC" "preds/$DAY" "requests/$DAY" | zstd -q -o "$OUT/$DAY-logs.tar.zst"
+
+    rm -rf -- "${SRC:?}/inputs/${DAY:?}"
+    echo "archived $DAY"
+
+    # keep 14 days (.tar.xz covers archives from the old script)
+    find "$OUT" -type f \( -name '*.tar' -o -name '*.tar.zst' -o -name '*.tar.xz' \) -mtime +14 -delete
+    ```
+
+    Each day is now two files instead of one `.tar.xz`. Restore with `tar -xf` for images and `zstd -dc ... | tar -x` for logs.
+verify:
+  static_only: needs tar, zstd and the vision-api data directories

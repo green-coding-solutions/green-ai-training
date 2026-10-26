@@ -1,0 +1,110 @@
+id: gen-2-00163-generation
+category: generation
+language: python
+patterns:
+- keep-star-imports
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    hi, i need small helper for our flask api. Client send `?sort=-created_at,name` and we need to turn it in a list of (field, descending) pairs, later we build the ORDER BY from it. Only fields from a allowed list, unknown field must raise error so we can return 400. Empty or missing param -> default sort. Same field two times is also error.
+
+    It goes in `api/query_params.py`, the file start like this:
+
+    ```python
+    from typing import *
+    from flask import request
+
+    DEFAULT_PAGE_SIZE = 25
+    MAX_PAGE_SIZE = 200
+
+
+    def parse_pagination(args) -> Tuple[int, int]:
+        try:
+            page = max(int(args.get("page", 1)), 1)
+            size = min(max(int(args.get("page_size", DEFAULT_PAGE_SIZE)), 1), MAX_PAGE_SIZE)
+        except ValueError:
+            page, size = 1, DEFAULT_PAGE_SIZE
+        return page, size
+    ```
+
+    Also my colleague say the `from typing import *` make every gunicorn worker start slower and waste resource, and we should change to `from typing import Tuple, List` everywhere. Is it true? We have it in maybe 30 files.
+- role: assistant
+  content: |
+    Here is the helper. It uses built-in generics, so it doesn't need anything from `typing` and fits under your existing imports (Python 3.10+).
+
+    ```python
+    class SortParamError(ValueError):
+        """Invalid ?sort= value. The view turns it into a 400."""
+
+
+    def parse_sort(
+        raw: str | None,
+        allowed: frozenset[str],
+        default: list[tuple[str, bool]],
+    ) -> list[tuple[str, bool]]:
+        """Parse '-created_at,name' into [('created_at', True), ('name', False)]."""
+        if raw is None or not raw.strip():
+            return list(default)
+
+        result: list[tuple[str, bool]] = []
+        seen: set[str] = set()
+        for part in raw.split(","):
+            part = part.strip()
+            descending = part.startswith("-")
+            field = part[1:] if descending else part
+            if not field:
+                raise SortParamError("empty sort field")
+            if field not in allowed:
+                raise SortParamError(f"cannot sort by {field!r}")
+            if field in seen:
+                raise SortParamError(f"duplicate sort field {field!r}")
+            seen.add(field)
+            result.append((field, descending))
+        return result
+    ```
+
+    Usage in a view:
+
+    ```python
+    SORTABLE = frozenset({"created_at", "name", "price"})
+    DEFAULT_SORT = [("created_at", True)]
+
+
+    @bp.get("/products")
+    def list_products():
+        try:
+            order = parse_sort(request.args.get("sort"), SORTABLE, DEFAULT_SORT)
+        except SortParamError as exc:
+            return {"error": str(exc)}, 400
+        page, size = parse_pagination(request.args)
+        ...
+    ```
+
+    Only names from `SORTABLE` can come out of `parse_sort`, so it is safe to put them into `ORDER BY` as column names. Never put the raw query value into SQL.
+
+    **Green Notes**
+    - **Star imports: leave them as they are.** Switching `from typing import *` to `from typing import Tuple, List` makes no measurable energy difference. In Green Metrics Tool micro-benchmarks, 1,000 Python process starts with `from sympy import *` used about the same energy as with `import sympy` (~3103 J vs ~3093 J). Python runs the whole module in both cases. The import form only decides which names get bound. A ticket for 30 files would not make the workers start faster. If you want explicit names, treat it as a style or lint decision.
+    - **What does cost startup:** loading a heavy module at all. In the same benchmarks, a start that imported sympy used about 25× the energy of one that imported only a built-in module. Flask already imports `typing`, so it is loaded either way. If worker startup is slow, check which large libraries your modules import at the top level.
+verify:
+  green_block: 0
+  test: |-
+    A = frozenset({"created_at", "name", "price"})
+    D = [("created_at", True)]
+    assert parse_sort(None, A, D) == D
+    assert parse_sort("   ", A, D) == D
+    assert parse_sort("-created_at,name", A, D) == [("created_at", True), ("name", False)]
+    assert parse_sort(" price , -name ", A, D) == [("price", False), ("name", True)]
+    for bad in ["foo", "name,name", "name,-name", "name,", "-", ",price"]:
+        try:
+            parse_sort(bad, A, D)
+        except SortParamError:
+            pass
+        else:
+            raise AssertionError(bad)
+    r = parse_sort(None, A, D)
+    r.append(("name", False))
+    assert D == [("created_at", True)]
+    assert issubclass(SortParamError, ValueError)
+    print("ok")

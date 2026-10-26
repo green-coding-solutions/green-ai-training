@@ -1,0 +1,113 @@
+id: gen-12764612-00339-generation
+category: generation
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    ```yaml
+    # .github/workflows/preview.yml
+    name: preview
+
+    on:
+      pull_request:
+        # TODO
+
+    jobs:
+      deploy:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+          # TODO: helm upgrade --install ./chart into namespace pr-<number> on our cluster
+          # TODO: post the preview url on the PR
+    ```
+
+    ?
+- role: assistant
+  content: |-
+    Here is the finished workflow. A preview exists only while the PR has a `preview` label, and it is removed when the PR closes or the label is removed.
+
+    ```yaml
+    # .github/workflows/preview.yml
+    name: preview
+
+    on:
+      pull_request:
+        types: [opened, reopened, synchronize, labeled, unlabeled, closed]
+
+    concurrency:
+      group: preview-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+
+    env:
+      NAMESPACE: pr-${{ github.event.pull_request.number }}
+
+    jobs:
+      deploy:
+        if: >-
+          github.event.action != 'closed' &&
+          contains(github.event.pull_request.labels.*.name, 'preview')
+        runs-on: ubuntu-latest
+        permissions:
+          pull-requests: write
+        steps:
+          - uses: actions/checkout@v4
+
+          - name: Configure cluster access
+            run: |
+              echo "${{ secrets.KUBECONFIG }}" > "$RUNNER_TEMP/kubeconfig"
+              chmod 600 "$RUNNER_TEMP/kubeconfig"
+              echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+
+          - name: Deploy preview
+            run: |
+              helm upgrade --install "app-$NAMESPACE" ./chart \
+                --namespace "$NAMESPACE" --create-namespace \
+                --set replicaCount=1 \
+                --set image.tag=${{ github.event.pull_request.head.sha }} \
+                --set ingress.host="$NAMESPACE.preview.example.com" \
+                --wait --timeout 5m
+
+          - name: Post preview URL
+            uses: actions/github-script@v7
+            with:
+              script: |
+                const url = `https://pr-${context.issue.number}.preview.example.com`;
+                const marker = '<!-- preview-url -->';
+                const body = `${marker}\nPreview: ${url}`;
+                const { data: comments } = await github.rest.issues.listComments({
+                  ...context.repo, issue_number: context.issue.number,
+                });
+                const old = comments.find(c => c.body.startsWith(marker));
+                if (old) {
+                  await github.rest.issues.updateComment({ ...context.repo, comment_id: old.id, body });
+                } else {
+                  await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+                }
+
+      teardown:
+        if: >-
+          github.event.action == 'closed' ||
+          (github.event.action == 'unlabeled' && github.event.label.name == 'preview')
+        runs-on: ubuntu-latest
+        steps:
+          - name: Configure cluster access
+            run: |
+              echo "${{ secrets.KUBECONFIG }}" > "$RUNNER_TEMP/kubeconfig"
+              chmod 600 "$RUNNER_TEMP/kubeconfig"
+              echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+
+          - name: Remove preview
+            run: |
+              helm uninstall "app-$NAMESPACE" --namespace "$NAMESPACE" || true
+              kubectl delete namespace "$NAMESPACE" --ignore-not-found
+    ```
+
+    The image tag is the PR head commit, so your CI must push that image before this job runs. The preview host assumes a wildcard DNS entry for `*.preview.example.com`. Adjust both to your setup.
+
+    **Green Notes**
+    - **Minimize environments** (reduces E, M): a preview is created only for PRs labeled `preview`, and `teardown` deletes it on close or when the label is removed. Most PRs never need a running copy. In Green Metrics Tool measurements of an idling preview environment, trimming 3 app replicas, Redis and a worker down to 1 replica plus Postgres saved only about 3% CPU energy. The big saving is environments that don't exist, so the lifetime matters more than the size.
+    - **One replica per preview** (reduces M): `replicaCount=1` is enough for a reviewer clicking through the app, and it reserves less memory on the cluster.

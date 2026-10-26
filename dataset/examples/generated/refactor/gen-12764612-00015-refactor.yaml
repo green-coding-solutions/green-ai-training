@@ -1,0 +1,61 @@
+id: gen-12764612-00015-refactor
+category: refactor
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    Landing page picks the hero block per visitor with a small TorchScript ranker. Endpoint is hit on every page view, CPU only. Optimize, diff only please.
+
+    ```python
+    import torch
+    from flask import Flask, request, jsonify
+
+    app = Flask(__name__)
+
+    model = torch.jit.load("models/hero_ranker.pt")
+    model.eval()
+
+    VARIANTS = ["pricing", "demo", "docs", "case-study"]
+    DEVICES = {"desktop": 0, "mobile": 1, "tablet": 2}
+
+
+    def featurize(args):
+        device = DEVICES.get(args.get("device", "desktop"), 0)
+        utm_known = 1.0 if args.get("utm_source") else 0.0
+        returning = 1.0 if args.get("returning") == "1" else 0.0
+        hour = int(args.get("hour", 12)) / 23.0
+        return [float(device), utm_known, returning, hour]
+
+
+    @app.get("/api/hero")
+    def hero():
+        feats = featurize(request.args)
+        x = torch.tensor([feats], dtype=torch.float32)
+        scores = torch.softmax(model(x), dim=1)[0]
+        best = int(scores.argmax())
+        return jsonify(variant=VARIANTS[best], score=float(scores[best]))
+    ```
+- role: assistant
+  content: |
+    ```diff
+     @app.get("/api/hero")
+     def hero():
+         feats = featurize(request.args)
+         x = torch.tensor([feats], dtype=torch.float32)
+    -    scores = torch.softmax(model(x), dim=1)[0]
+    +    with torch.no_grad():
+    +        scores = torch.softmax(model(x), dim=1)[0]
+         best = int(scores.argmax())
+         return jsonify(variant=VARIANTS[best], score=float(scores[best]))
+    ```
+
+    **Green Notes**
+    - **`torch.no_grad()` for inference** (reduces E on every page view): `model.eval()` only changes layer behavior like dropout. It does not stop autograd. The model's weights still require gradients, so each forward pass records a graph that is never used. In Green Metrics Tool micro-benchmarks of 100,000 PyTorch CPU inferences, this cost ~157 J without `torch.no_grad()` and ~135 J with it, about 14% less. Your model is small, so treat that as the direction, not a forecast for your traffic.
+    - Output is unchanged. The scores are only read, never back-propagated, so nothing depends on the graph. `torch.inference_mode()` is a stricter alternative, but it makes the result tensors unusable in autograd later.
+    - Nothing else in the file needed a change.
+verify:
+  static_only: needs torch, flask and a TorchScript model file, which are not available in the test environment

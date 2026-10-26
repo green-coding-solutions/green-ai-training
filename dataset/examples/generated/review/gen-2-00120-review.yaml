@@ -1,0 +1,137 @@
+id: gen-2-00120-review
+category: review
+language: python
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    Can you review the script that stores our CI test results? It runs as the last job in every pipeline of our monorepo. Some context and requirements:
+
+    - One JUnit report per pipeline, usually 6,000-9,000 test cases.
+    - It runs on every push and every MR pipeline, a few hundred pipelines per day.
+    - Our flaky-test dashboard reads `ci_runs` and `test_results`. A run must be all-or-nothing. Half-written runs make the flaky rate wrong.
+    - The job should finish in a few seconds. Right now it often takes much longer than the tests that ran before it.
+    - Postgres 16 (managed), psycopg 3. Please no new dependencies.
+
+    ```python
+    import os
+    import sys
+    import xml.etree.ElementTree as ET
+
+    import psycopg
+
+    DSN = os.environ["RESULTS_DSN"]
+
+
+    def parse_report(path):
+        tree = ET.parse(path)
+        for suite in tree.getroot().iter("testsuite"):
+            for case in suite.findall("testcase"):
+                if case.find("failure") is not None or case.find("error") is not None:
+                    status = "failed"
+                elif case.find("skipped") is not None:
+                    status = "skipped"
+                else:
+                    status = "passed"
+                yield {
+                    "suite": suite.get("name"),
+                    "name": case.get("name"),
+                    "classname": case.get("classname", ""),
+                    "duration": float(case.get("time", 0)),
+                    "status": status,
+                }
+
+
+    def store_run(conn, pipeline_id, repo, branch, cases):
+        with conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO ci_runs (pipeline_id, repo, branch, finished_at) "
+                f"VALUES ({pipeline_id}, '{repo}', '{branch}', now()) RETURNING id"
+            )
+            run_id = cur.fetchone()[0]
+            conn.commit()
+
+            for c in cases:
+                cur.execute(
+                    "INSERT INTO test_results (run_id, suite, name, classname, duration_s, status) "
+                    "VALUES (%s, %s, %s, %s, %s, %s)",
+                    (run_id, c["suite"], c["name"], c["classname"], c["duration"], c["status"]),
+                )
+                conn.commit()
+        return run_id
+
+
+    def main():
+        report = sys.argv[1]
+        pipeline_id = int(os.environ["CI_PIPELINE_ID"])
+        repo = os.environ["CI_PROJECT_PATH"]
+        branch = os.environ["CI_COMMIT_REF_NAME"]
+
+        with psycopg.connect(DSN) as conn:
+            run_id = store_run(conn, pipeline_id, repo, branch, parse_report(report))
+        print(f"stored run {run_id}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (CI job, every pipeline)
+
+    #### [Bug] Runs are not all-or-nothing
+    - **Where:** `conn.commit()` after the `ci_runs` insert and after every result row
+    - **Issue:** the run row is committed before any result exists, and each result is committed on its own. If the job is cancelled, times out, or the XML is broken halfway, the dashboard sees a run with only part of its results. This breaks your main requirement.
+    - **Fix:** write the run and all its results in one transaction (see the code below). Parse the report before you connect, so a broken XML file fails before anything is written.
+
+    #### [Security] SQL injection through the branch name
+    - **Where:** the f-string in the `ci_runs` insert
+    - **Issue:** `CI_COMMIT_REF_NAME` comes from whoever pushes a branch. A branch named `fix-'quote` breaks the query, and a crafted name can run arbitrary SQL with the job's database user. `repo` goes in the same way.
+    - **Fix:** pass all values as parameters (`%s`), like you already do for `test_results`.
+
+    #### [High] One INSERT and one commit per test case
+    - **Where:** the `for c in cases` loop in `store_run`
+    - **Issue:** every test case costs a round trip, a statement execution and a commit, so 6,000-9,000 of each per pipeline, a few hundred times a day. In Green Metrics Tool micro-benchmarks on PostgreSQL 16 with psycopg 3, inserting 500,000 rows in batches of 5,000 rows took ~384 J and 60 s with one `execute()` per row. `executemany()` used ~139 J (about 2.8× less). `COPY ... FROM STDIN` used ~17 J and 3.1 s, about 22× less than the loop. That benchmark committed once per batch. Your loop commits every row, so it does even more work than the measured loop. Your runs are larger than those batches, which is the range where COPY pays off most.
+    - **Fix:** stream the rows with `cursor.copy()` inside one transaction. It is part of psycopg 3, so you need no new dependency. If you prefer plain SQL, `executemany()` is the smaller step, but COPY fits this job better.
+    - **Impact:** E on the database and the CI runner for every pipeline. It also cuts the job's wall time, which is your "few seconds" goal.
+
+    ```python
+    def store_run(conn, pipeline_id, repo, branch, cases):
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO ci_runs (pipeline_id, repo, branch, finished_at) "
+                "VALUES (%s, %s, %s, now()) RETURNING id",
+                (pipeline_id, repo, branch),
+            )
+            run_id = cur.fetchone()[0]
+            with cur.copy(
+                "COPY test_results (run_id, suite, name, classname, duration_s, status) "
+                "FROM STDIN"
+            ) as copy:
+                for c in cases:
+                    copy.write_row(
+                        (run_id, c["suite"], c["name"], c["classname"],
+                         c["duration"], c["status"])
+                    )
+        return run_id
+
+
+    def main():
+        cases = list(parse_report(sys.argv[1]))  # fail on bad XML before writing anything
+        pipeline_id = int(os.environ["CI_PIPELINE_ID"])
+        repo = os.environ["CI_PROJECT_PATH"]
+        branch = os.environ["CI_COMMIT_REF_NAME"]
+
+        with psycopg.connect(DSN) as conn:
+            run_id = store_run(conn, pipeline_id, repo, branch, cases)
+        print(f"stored run {run_id}")
+    ```
+
+    If anything fails inside `conn.transaction()`, both the run row and the copied results are rolled back. The dashboard then sees either the complete run or no run.
+
+    **Already good:** the `test_results` values were already passed as parameters, the parser is simple and clear, and the script uses a single connection.
+verify:
+  static_only: needs a PostgreSQL server and the psycopg package

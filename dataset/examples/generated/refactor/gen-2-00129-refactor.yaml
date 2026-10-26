@@ -1,0 +1,94 @@
+id: gen-2-00129-refactor
+category: refactor
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    ?
+
+    ```bash
+    #!/bin/bash
+    # post-job hook for self-hosted runners (runner-03..runner-08)
+    # called by the runner after every job
+
+    JOB_ID="$CI_JOB_ID"
+    PIPELINE_ID="$CI_PIPELINE_ID"
+    PROJECT="$CI_PROJECT_PATH_SLUG"
+    STAGE="$CI_JOB_STAGE"
+
+    ARCHIVE_ROOT=/var/ci-archive
+    HANDOFF_DIR=/srv/ci-handoff
+    DAY=$(date +%F)
+
+    mkdir -p "$ARCHIVE_ROOT/$PROJECT/$DAY" "$HANDOFF_DIR"
+
+    # keep job logs for audits (90 days)
+    cp "$CI_BUILDS_DIR/job.log" "$ARCHIVE_ROOT/$PROJECT/$DAY/job-$JOB_ID.log"
+    xz -9 -T1 "$ARCHIVE_ROOT/$PROJECT/$DAY/job-$JOB_ID.log"
+
+    # hand the build output to the test stage (unpacked by pre-job hook, deleted when pipeline ends)
+    if [ "$STAGE" = "build" ]; then
+        tar -cJf "$HANDOFF_DIR/$PIPELINE_ID-dist.tar.xz" -C "$CI_PROJECT_DIR" dist
+    fi
+
+    # junit reports + coverage, kept with the logs
+    if [ -d "$CI_PROJECT_DIR/reports" ]; then
+        tar -cf - -C "$CI_PROJECT_DIR" reports | xz -9 > "$ARCHIVE_ROOT/$PROJECT/$DAY/reports-$JOB_ID.tar.xz"
+    fi
+
+    # cleanup
+    find "$ARCHIVE_ROOT" -type f -mtime +90 -delete
+    find "$HANDOFF_DIR" -type f -mmin +120 -delete
+    ```
+- role: assistant
+  content: |
+    ```bash
+    #!/bin/bash
+    # post-job hook for self-hosted runners (runner-03..runner-08)
+    # called by the runner after every job
+
+    JOB_ID="$CI_JOB_ID"
+    PIPELINE_ID="$CI_PIPELINE_ID"
+    PROJECT="$CI_PROJECT_PATH_SLUG"
+    STAGE="$CI_JOB_STAGE"
+
+    ARCHIVE_ROOT=/var/ci-archive
+    HANDOFF_DIR=/srv/ci-handoff
+    DAY=$(date +%F)
+    DEST="$ARCHIVE_ROOT/$PROJECT/$DAY"
+
+    mkdir -p "$DEST" "$HANDOFF_DIR"
+
+    # keep job logs for audits (90 days): fast codec, compressed after every job
+    zstd -q -o "$DEST/job-$JOB_ID.log.zst" "$CI_BUILDS_DIR/job.log"
+
+    # hand the build output to the test stage: lives only minutes, so no compression
+    if [ "$STAGE" = 'build' ]; then
+        tar -cf "$HANDOFF_DIR/$PIPELINE_ID-dist.tar" -C "$CI_PROJECT_DIR" dist
+    fi
+
+    # junit reports + coverage, kept with the logs
+    if [ -d "$CI_PROJECT_DIR/reports" ]; then
+        tar -cf - -C "$CI_PROJECT_DIR" reports | zstd -q > "$DEST/reports-$JOB_ID.tar.zst"
+    fi
+
+    # cleanup
+    find "$ARCHIVE_ROOT" -type f -mtime +90 -delete
+    find "$HANDOFF_DIR" -type f -mmin +120 -delete
+    ```
+
+    **Green Notes**
+    - **zstd instead of `xz -9` for logs and reports** (reduces E): this runs after every job on six runners, so the compression cost repeats all day. In Green Metrics Tool measurements on 100 MB of text, xz at its default level used ~458 J and zstd ~16 J, about 29× more for xz. `-9` is slower still. zstd also reads `job.log` directly, so the extra `cp` is gone.
+    - **No compression for the handoff tarball** (reduces E): the archive is unpacked by the next stage and deleted within two hours. A Green Coding Solutions estimate puts the break-even for compressing stored data at hours (zstd) to days (xz). Data that lives for minutes should not be compressed at all.
+
+    Behavior changes to know about:
+    - The pre-job hook must now unpack `$PIPELINE_ID-dist.tar` with `tar -xf` instead of `$PIPELINE_ID-dist.tar.xz` with `-xJf`. Change both hooks in the same rollout.
+    - Archived files now end in `.zst`. Read them with `zstd -dc job-123.log.zst` or `tar --zstd -xf reports-123.tar.zst`. Existing `.xz` files stay readable, and the 90-day `find` still deletes them.
+    - The measurements compare energy, not file size. `xz -9` files are smaller. If disk space on `/var/ci-archive` is tight, compare real sizes for a week of logs before you switch.
+verify:
+  static_only: needs a CI runner environment (CI_* variables, job.log) and the zstd binary

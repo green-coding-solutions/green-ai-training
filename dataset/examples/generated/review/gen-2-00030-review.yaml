@@ -1,0 +1,123 @@
+id: gen-2-00030-review
+category: review
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    Nightly job over the last 30 days of CI results, ~8M test executions per run. Feeds our "slow test regression" dashboard. Review it, just give me the diff.
+
+    ```python
+    import csv
+    import math
+    from collections import defaultdict
+
+    MAX_BUCKET = 20  # 2**20 ms, ~17 min; anything slower lands here
+
+
+    def load_results(path):
+        """Rows exported from the CI results DB: suite,test,duration_s,status"""
+        with open(path, newline="") as f:
+            for suite, test, duration_s, status in csv.reader(f):
+                yield suite, test, float(duration_s) * 1000.0, status
+
+
+    def duration_histograms(results):
+        hist = defaultdict(lambda: [0] * (MAX_BUCKET + 1))
+        for suite, _test, duration_ms, status in results:
+            if status == "skipped":
+                continue
+            bucket = int(math.log2(duration_ms))
+            if bucket > MAX_BUCKET:
+                bucket = MAX_BUCKET
+            hist[suite][bucket] += 1
+        return hist
+
+
+    def p95_bucket(counts):
+        total = sum(counts)
+        seen = 0
+        for i, n in enumerate(counts):
+            seen += n
+            if seen >= 0.95 * total:
+                return i
+        return None
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly CI analytics, ~8M rows per run)
+
+    #### [Bug] Very fast tests crash the job or land in the slowest bucket
+    - **Where:** `bucket = int(math.log2(duration_ms))`
+    - **Issue:** a test reported as `0.000` s raises `ValueError: math domain error` and the whole run fails. At or below 0.5 ms, `log2` is negative. `int()` then gives -1, -2, ..., and negative indexes wrap to the end of the list. A 0.4 ms test is counted in bucket 20 (the "17 min+" bucket), which skews `p95_bucket` toward slow.
+    - **Fix:** put everything below 1 ms into bucket 0 and only call `log2` for durations of 1 ms or more.
+
+    #### [Low] Module attribute lookup in the hot loop
+    - **Where:** `math.log2` inside the loop in `duration_histograms`
+    - **Issue:** every one of the ~8M iterations looks up `log2` on the `math` module again.
+    - **Fix:** `log2 = math.log2` once before the loop.
+    - **Impact:** E, small. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local before a 10,000,000-iteration loop saved about 4-5%. It's only worth doing here because the loop is this tight and the change is one line. `p95_bucket` runs over 21 buckets, so leave it alone.
+
+    Only `duration_histograms` changes:
+
+    ```python
+    def duration_histograms(results):
+        hist = defaultdict(lambda: [0] * (MAX_BUCKET + 1))
+        log2 = math.log2
+        for suite, _test, duration_ms, status in results:
+            if status == "skipped":
+                continue
+            if duration_ms < 1.0:
+                bucket = 0
+            else:
+                bucket = int(log2(duration_ms))
+                if bucket > MAX_BUCKET:
+                    bucket = MAX_BUCKET
+            hist[suite][bucket] += 1
+        return hist
+    ```
+
+    Durations of 1 ms and more get the same buckets as before. Zero-duration results are now counted in bucket 0 instead of failing the run.
+
+    **Already good:** `load_results` is a generator, so the 8M rows stream through without being held in memory. Skipped tests are filtered out before any math.
+verify:
+  green_block: 0
+  test: |
+    import math
+    from collections import defaultdict
+    MAX_BUCKET = 20
+    h = duration_histograms([
+        ("s", "zero", 0.0, "passed"),
+        ("s", "tiny", 0.4, "passed"),
+        ("s", "sub", 0.7, "passed"),
+        ("s", "three", 3.0, "passed"),
+        ("s", "huge", 5e6, "failed"),
+        ("s", "skip", 0.0, "skipped"),
+    ])
+    assert h["s"][0] == 3
+    assert h["s"][1] == 1
+    assert h["s"][MAX_BUCKET] == 1
+    assert sum(h["s"]) == 5
+  equivalence:
+    driver: |-
+      import math
+      import random
+      from collections import defaultdict
+      MAX_BUCKET = 20
+      random.seed(7)
+      suites = ["api", "web", "infra", "e2e"]
+      rows = []
+      for i in range(20000):
+          status = random.choice(["passed", "passed", "failed", "skipped"])
+          d = random.choice([
+              random.uniform(1, 50),
+              random.uniform(50, 5000),
+              random.uniform(1e5, 5e6),
+          ])
+          rows.append((random.choice(suites), "t%d" % i, d, status))
+      h = duration_histograms(rows)
+      for suite in sorted(h):
+          print(suite, h[suite])

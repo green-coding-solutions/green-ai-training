@@ -1,0 +1,126 @@
+id: gen-2-00107-review
+category: review
+language: python
+patterns:
+- regex-precompile
+- torch-no-grad
+facts:
+- F-REGEX
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    hi, can you review this? its the query intent part of our shop search. every search request call `predict_categories()` before we go to elastic. the rules csv has around 800 normalisation rules now (merchandising team add more every week), for example `t[- ]?shirts?` -> `tshirt`. since the csv grow the search p95 got much worse, i dont know if its the model or the regex. also the score in the response is always 1.0, my colleague say thats normal for softmax?? thanks
+
+    ```python
+    # search/intent.py - called for every search request
+    import csv
+    import re
+
+    import torch
+
+    from search.vocab import encode  # char-trigram hashing, returns list[int]
+
+    with open("config/query_rules.csv", newline="", encoding="utf-8") as f:
+        RULES = [(row["pattern"], row["replacement"]) for row in csv.DictReader(f)]
+
+    with open("models/categories.txt", encoding="utf-8") as f:
+        CATEGORIES = [line.strip() for line in f if line.strip()]
+
+    model = torch.jit.load("models/query_intent.pt", map_location="cpu")
+    model.eval()
+
+
+    def normalize_query(q):
+        q = q.strip()
+        for pattern, repl in RULES:
+            q = re.sub(pattern, repl, q, re.IGNORECASE)
+        q = re.sub(r"\s+", " ", q)
+        return q.lower()
+
+
+    def predict_categories(query, top_k=3):
+        text = normalize_query(query)
+        ids = torch.tensor([encode(text)], dtype=torch.long)
+        logits = model(ids)
+        probs = torch.softmax(logits, dim=0)
+        top = logits[0].topk(top_k).indices.tolist()
+        return [
+            {"category": CATEGORIES[i], "score": round(probs[0, i].item(), 3)}
+            for i in top
+        ]
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (ML inference on every search request)
+
+    #### [Bug] Scores are always 1.0
+    - **Where:** `torch.softmax(logits, dim=0)`
+    - **Issue:** `logits` has shape `(1, n_categories)`. `dim=0` is the batch dimension, and it has only one element, so every value becomes 1.0. This is not normal. The ranking is still right only because `topk` runs on the logits.
+    - **Fix:** take row 0 and use `softmax(..., dim=-1)` over the categories.
+
+    #### [Bug] `re.IGNORECASE` is passed as `count`
+    - **Where:** `re.sub(pattern, repl, q, re.IGNORECASE)`
+    - **Issue:** the 4th positional argument of `re.sub` is `count`, not `flags`. `re.IGNORECASE` equals 2, so every rule is case-sensitive and replaces at most 2 matches. "T-Shirt" is never normalized, because `.lower()` only runs after the rules. Python 3.13 warns about passing these arguments by position.
+    - **Fix:** pass the flag to `re.compile` (see below). Queries with capital letters will now normalize differently. That is the intended behavior, but check rules that only worked by accident.
+
+    #### [High] All rule patterns are recompiled on every request
+    - **Where:** the `for pattern, repl in RULES` loop in `normalize_query`
+    - **Issue:** `re` caches compiled patterns, but only up to 512. Your loop cycles through about 800 different patterns, so each one is evicted before it is used again. Every request compiles all of them again, and `\s+` gets evicted too. This also explains why p95 got worse as the CSV grew.
+    - **Fix:** compile every rule once at load time and keep the compiled objects in `RULES`.
+    - **Impact:** reduces E on every request. In Green Metrics Tool micro-benchmarks, forcing a recompile on every call cost about 200× more per match. With a few static patterns, precompiling saves little (about 18% less in the same benchmarks), because the cache already does the work. Here the problem is the size of the rule list. A broken rule now fails at startup, not on every request.
+
+    #### [High] Autograd is active during inference
+    - **Where:** `logits = model(ids)`
+    - **Issue:** `model.eval()` does not turn off gradient tracking. Each request records the autograd graph and keeps activations it never uses.
+    - **Fix:** run the function under `torch.inference_mode()`.
+    - **Impact:** reduces E and M per request. In Green Metrics Tool micro-benchmarks, 100,000 CPU inferences with `torch.no_grad()` used about 14% less CPU energy.
+
+    ```python
+    # search/intent.py - called for every search request
+    import csv
+    import re
+
+    import torch
+
+    from search.vocab import encode  # char-trigram hashing, returns list[int]
+
+    with open("config/query_rules.csv", newline="", encoding="utf-8") as f:
+        RULES = [
+            (re.compile(row["pattern"], re.IGNORECASE), row["replacement"])
+            for row in csv.DictReader(f)
+        ]
+    WHITESPACE = re.compile(r"\s+")
+
+    with open("models/categories.txt", encoding="utf-8") as f:
+        CATEGORIES = [line.strip() for line in f if line.strip()]
+
+    model = torch.jit.load("models/query_intent.pt", map_location="cpu")
+    model.eval()
+
+
+    def normalize_query(q):
+        q = q.strip()
+        for rx, repl in RULES:
+            q = rx.sub(repl, q)
+        return WHITESPACE.sub(" ", q).lower()
+
+
+    @torch.inference_mode()
+    def predict_categories(query, top_k=3):
+        text = normalize_query(query)
+        ids = torch.tensor([encode(text)], dtype=torch.long)
+        logits = model(ids)[0]
+        probs = torch.softmax(logits, dim=-1)
+        top = probs.topk(top_k).indices.tolist()
+        return [
+            {"category": CATEGORIES[i], "score": round(probs[i].item(), 3)}
+            for i in top
+        ]
+    ```
+
+    To see which part drove p95, time `normalize_query` and the model call separately for a few hundred real queries, before and after the change.
+
+    **Already good:** the rules, categories and model are loaded once at import, not per request.
+verify:
+  static_only: needs torch, the project's search.vocab module and model/config files

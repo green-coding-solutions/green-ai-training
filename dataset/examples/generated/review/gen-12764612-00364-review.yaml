@@ -1,0 +1,96 @@
+id: gen-12764612-00364-review
+category: review
+language: python
+patterns:
+- torch-no-grad
+- deque-or-append
+facts:
+- F-NOGRAD
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    Please review this rollout function from our groundwater simulation project. A small CNN surrogate predicts the next 64x64 head field from the last 8 fields, and we feed each prediction back in (autoregressive). It runs on a CPU node, for 5,000 to 20,000 steps per scenario, and we run a few hundred scenarios per calibration.
+
+    Requirements:
+    - the returned list must be newest first (the plotting code expects `traj[0]` to be the last step)
+    - results must stay the same as now
+    - we log the mean head every 100 steps
+
+    ```python
+    import torch
+
+    model = torch.load("surrogate_heads.pt", weights_only=False)
+    model.eval()
+
+    WINDOW = 8
+
+    def rollout(initial_fields, n_steps, log_every=100):
+        """initial_fields: list of WINDOW tensors, shape (64, 64), oldest first."""
+        history = list(initial_fields)
+        trajectory = []
+        for step in range(n_steps):
+            x = torch.stack(history[-WINDOW:]).unsqueeze(0)
+            pred = model(x).squeeze(0)
+            history.append(pred)
+            trajectory.insert(0, pred)
+            if step % log_every == 0:
+                print(f"step {step}: mean head {pred.mean().item():.4f}")
+        return trajectory
+    ```
+- role: assistant
+  content: |
+    **Workload:** AI/ML (CPU inference inside a scientific simulation)
+
+    #### [Security] Unpickling the model file
+    - **Where:** `torch.load("surrogate_heads.pt", weights_only=False)`
+    - **Issue:** `weights_only=False` runs pickle, so a tampered model file can execute code on your node.
+    - **Fix:** save a `state_dict` and load it with `weights_only=True` into the model class. If you must load the full object, only load files from a source you control.
+
+    #### [High] Autograd builds a graph for every step
+    - **Where:** `pred = model(x)` without `torch.no_grad()` or `torch.inference_mode()`
+    - **Issue:** PyTorch records a backward graph that is never used. Worse, each `pred` is fed back in and kept in `history` and `trajectory`. The graph therefore chains across the whole rollout, and memory grows with every step.
+    - **Fix:** run the rollout under `torch.inference_mode()`.
+    - **Impact:** reduces E and M on every step. In Green Metrics Tool micro-benchmarks, 100,000 CPU inferences with `no_grad()` used about 14% less energy. The memory growth also disappears.
+
+    #### [High] `insert(0, ...)` shifts the whole list every step
+    - **Where:** `trajectory.insert(0, pred)`
+    - **Issue:** each front insert moves all existing items, so the loop is O(n²) in the number of steps. In Green Metrics Tool micro-benchmarks, 1,000,000 front inserts used about 1515 J, and 1,000,000 `append` calls used about 1.2 J.
+    - **Fix:** `append` in the loop and reverse once at the end. The order stays newest first.
+    - **Impact:** reduces E per scenario. The gap grows with the number of steps, so it matters most for your 20,000-step runs.
+
+    #### [Low] `history` grows without limit
+    - **Where:** `history.append(pred)` with `history[-WINDOW:]`
+    - **Issue:** only the last 8 fields are used, but all of them stay in memory.
+    - **Fix:** a `deque(maxlen=WINDOW)` keeps just the window.
+
+    ```python
+    import torch
+    from collections import deque
+
+    model = torch.load("surrogate_heads.pt", weights_only=False)  # see Security note
+    model.eval()
+
+    WINDOW = 8
+
+    @torch.inference_mode()
+    def rollout(initial_fields, n_steps, log_every=100):
+        """initial_fields: list of WINDOW tensors, shape (64, 64), oldest first."""
+        history = deque(initial_fields[-WINDOW:], maxlen=WINDOW)
+        trajectory = []
+        for step in range(n_steps):
+            x = torch.stack(list(history)).unsqueeze(0)
+            pred = model(x).squeeze(0)
+            history.append(pred)
+            trajectory.append(pred)
+            if step % log_every == 0:
+                print(f"step {step}: mean head {pred.mean().item():.4f}")
+        trajectory.reverse()  # newest first, as the plotting code expects
+        return trajectory
+    ```
+
+    The returned tensors are inference tensors. That is fine for plotting and saving. If you later need them inside an autograd computation, use `torch.no_grad()` instead.
+
+    **Already good:** `model.eval()` is set after loading, and logging only every 100 steps keeps `.item()` syncs rare.
+verify:
+  static_only: needs torch and the trained surrogate model file

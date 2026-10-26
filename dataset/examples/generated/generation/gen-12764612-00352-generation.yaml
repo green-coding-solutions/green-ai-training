@@ -1,0 +1,111 @@
+id: gen-12764612-00352-generation
+category: generation
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    ```nginx
+    upstream orders_api {
+        server 127.0.0.1:8000;
+        keepalive 16;
+    }
+
+    server {
+        listen 443 ssl http2;
+        server_name api.example.com;
+
+        ssl_certificate     /etc/ssl/example/fullchain.pem;
+        ssl_certificate_key /etc/ssl/example/privkey.pem;
+
+        gzip on;
+        gzip_comp_level 9;
+        gzip_proxied any;
+        gzip_types text/plain text/css text/html application/json application/javascript
+                   image/png image/jpeg application/zip;
+
+        location /v1/ {
+            proxy_pass http://orders_api;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+        }
+
+        location /docs/ {
+            alias /srv/api-docs/;
+            index index.html;
+        }
+
+        location /exports/ {
+            alias /srv/exports/;
+        }
+    }
+    ```
+
+    ?
+- role: assistant
+  content: |
+    Here is the same server block with the compression part fixed. Routing and proxy settings are unchanged.
+
+    ```nginx
+    upstream orders_api {
+        server 127.0.0.1:8000;
+        keepalive 16;
+    }
+
+    server {
+        listen 443 ssl http2;
+        server_name api.example.com;
+
+        ssl_certificate     /etc/ssl/example/fullchain.pem;
+        ssl_certificate_key /etc/ssl/example/privkey.pem;
+
+        # Per-request compression: only text formats, moderate level
+        gzip on;
+        gzip_comp_level 5;
+        gzip_min_length 1024;
+        gzip_vary on;
+        gzip_proxied any;
+        gzip_types text/plain text/css text/html application/json application/javascript;
+
+        location /v1/ {
+            proxy_pass http://orders_api;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+        }
+
+        location /docs/ {
+            alias /srv/api-docs/;
+            index index.html;
+            gzip_static on;   # serve index.html.gz, app.js.gz, ... if present
+        }
+
+        location /exports/ {
+            alias /srv/exports/;
+        }
+    }
+    ```
+
+    Create the `.gz` files once, when you publish the docs, not in nginx:
+
+    ```bash
+    find /srv/api-docs -type f \( -name '*.html' -o -name '*.css' -o -name '*.js' -o -name '*.json' \) \
+      -exec gzip -kf {} +
+    ```
+
+    `gzip_static` needs the original file next to the `.gz` file. If a `.gz` file is missing, nginx falls back to the normal `gzip` settings, so nothing breaks.
+
+    **Green Notes**
+    - **Precompress static docs** (reduces E): the `/docs/` files never change between deploys, so they are compressed once at publish time. In Green Metrics Tool micro-benchmarks (nginx, 2,000 requests for text assets), compressing at gzip level 5 on every request used about 54 J of CPU energy. Serving precompressed files used about 14 J, about 4× less.
+    - **Moderate level for the JSON API** (reduces E): `/v1/` responses are dynamic, so they are compressed on every request. Level 9 costs much more CPU than level 5 for only a slightly smaller body, so the level is now 5. The `gzip_min_length` setting skips tiny responses where gzip gains nothing.
+    - **No PNG, JPEG or ZIP in `gzip_types`** (reduces E): these formats are already compressed. Gzip burned CPU on them and saved almost nothing.
+
+    *Not applied:* compression on `/exports/`. I don't know what is in that folder. If it holds already-compressed archives, leave it as it is. If it holds large CSV or JSON files that don't change, precompress them like the docs.
+verify:
+  static_only: nginx configuration, not executable in the test harness

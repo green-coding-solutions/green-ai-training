@@ -1,0 +1,107 @@
+id: gen-2-00304-generation
+category: generation
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    ```python
+    """logwatch - nightly ERROR summary across the log collectors.
+
+    Usage: logwatch.py <service> <since>   e.g. logwatch.py checkout-api 2026-10-24T00:00:00Z
+    """
+    import sys
+    from dataclasses import dataclass
+
+    import httpx
+
+    COLLECTORS = [f"http://logcol-{i:02d}.internal:9200" for i in range(1, 25)]
+    COUNT_PATH = "/api/v1/count"
+
+
+    @dataclass
+    class NodeResult:
+        node: str
+        errors: int | None
+        failed: str | None = None
+
+
+    def fetch_error_counts(nodes: list[str], service: str, since: str,
+                           timeout: float = 10.0) -> list[NodeResult]:
+        # GET {node}{COUNT_PATH}?service=..&level=ERROR&since=..  -> {"count": 123}
+        # one dead collector must not kill the report, just mark it failed
+        # results in the same order as `nodes`
+        # TODO
+        raise NotImplementedError
+
+
+    def render(service: str, results: list[NodeResult]) -> str:
+        ok = [r for r in results if r.failed is None]
+        lines = [f"ERROR lines for {service}: {sum(r.errors for r in ok)} "
+                 f"({len(ok)}/{len(results)} collectors answered)"]
+        for r in results:
+            lines.append(f"  {r.node:<40} {r.failed or r.errors}")
+        return "\n".join(lines)
+
+
+    def main(argv: list[str]) -> int:
+        if len(argv) != 3:
+            print(__doc__, file=sys.stderr)
+            return 2
+        results = fetch_error_counts(COLLECTORS, argv[1], argv[2])
+        print(render(argv[1], results))
+        return 0 if all(r.failed is None for r in results) else 1
+
+
+    if __name__ == "__main__":
+        sys.exit(main(sys.argv))
+    ```
+
+    ?
+- role: assistant
+  content: |
+    This replaces the stub. The collectors are queried concurrently with `httpx.AsyncClient`. The function stays synchronous, so `main()` does not change. Add `import asyncio` at the top of the module.
+
+    ```python
+    import asyncio
+
+    MAX_IN_FLIGHT = 8  # don't hit every collector at once
+
+
+    async def _fetch_one(client: httpx.AsyncClient, sem: asyncio.Semaphore,
+                         node: str, params: dict[str, str]) -> NodeResult:
+        async with sem:
+            try:
+                resp = await client.get(f"{node}{COUNT_PATH}", params=params)
+                resp.raise_for_status()
+                return NodeResult(node, int(resp.json()["count"]))
+            except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+                # dead node, HTTP error or bad JSON: record it, keep going
+                return NodeResult(node, None, failed=f"failed: {type(exc).__name__}")
+
+
+    async def _fetch_all(nodes: list[str], params: dict[str, str],
+                         timeout: float) -> list[NodeResult]:
+        sem = asyncio.Semaphore(MAX_IN_FLIGHT)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            # gather returns results in the order of `nodes`
+            return await asyncio.gather(
+                *(_fetch_one(client, sem, node, params) for node in nodes)
+            )
+
+
+    def fetch_error_counts(nodes: list[str], service: str, since: str,
+                           timeout: float = 10.0) -> list[NodeResult]:
+        params = {"service": service, "level": "ERROR", "since": since}
+        return list(asyncio.run(_fetch_all(nodes, params, timeout)))
+    ```
+
+    If you ever call this from code that already runs an event loop, `await _fetch_all(...)` directly. `asyncio.run()` fails inside a running loop.
+
+    **Green Notes**
+    - **Concurrent async requests** (reduces E, mainly wall time): the 24 collector calls wait on the network at the same time instead of one after another. The report takes about as long as the slowest node, not the sum of all nodes. A dead collector now costs one timeout running in parallel, not an extra timeout added to the run. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. For a request count this small, most of the gain is the shorter run, not CPU energy.
+verify:
+  static_only: needs httpx and the internal log collector endpoints (network)

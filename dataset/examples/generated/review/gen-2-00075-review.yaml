@@ -1,0 +1,109 @@
+id: gen-2-00075-review
+category: review
+language: html
+patterns:
+- system-fonts-and-deps
+- css-animations
+facts:
+- F-FONTS
+- F-ANIM
+messages:
+- role: user
+  content: |
+    review pls, ops has this open on a screen all day
+
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <title>ingest-tail · prod</title>
+    <style>
+      @font-face { font-family: "JetBrains Mono"; src: url("/fonts/JetBrainsMono-Regular.ttf"); font-weight: 400; }
+      @font-face { font-family: "JetBrains Mono"; src: url("/fonts/JetBrainsMono-Italic.ttf"); font-weight: 400; font-style: italic; }
+      @font-face { font-family: "JetBrains Mono"; src: url("/fonts/JetBrainsMono-Bold.ttf"); font-weight: 700; }
+      @font-face { font-family: "Inter"; src: url("/fonts/Inter-Regular.ttf"); font-weight: 400; }
+      @font-face { font-family: "Inter"; src: url("/fonts/Inter-SemiBold.ttf"); font-weight: 600; }
+      @font-face { font-family: "Inter"; src: url("/fonts/Inter-Bold.ttf"); font-weight: 700; }
+
+      body { margin: 0; background: #0d1117; color: #c9d1d9; font-family: "Inter", sans-serif; }
+      header { padding: 8px 16px; font-weight: 600; border-bottom: 1px solid #30363d; }
+      #log { font-family: "JetBrains Mono", monospace; font-size: 13px; padding: 8px 16px;
+             height: calc(100vh - 60px); overflow-y: auto; }
+      .lvl-ERROR { color: #ff7b72; font-weight: 700; }
+      .lvl-WARN  { color: #d29922; }
+      .ts { color: #8b949e; font-style: italic; }
+      #cursor { display: inline-block; width: 8px; height: 14px; background: #58a6ff; }
+    </style>
+    </head>
+    <body>
+    <header>ingest-tail · prod · <span id="count">0</span> lines</header>
+    <div id="log"><span id="cursor"></span></div>
+    <script>
+      const log = document.getElementById('log');
+      const cursor = document.getElementById('cursor');
+      const count = document.getElementById('count');
+      const MAX_LINES = 2000;
+      let n = 0;
+
+      function blink(t) {
+        cursor.style.opacity = Math.floor(t / 530) % 2 ? 0 : 1;
+        requestAnimationFrame(blink);
+      }
+      requestAnimationFrame(blink);
+
+      const es = new EventSource('/tail/stream?service=ingest');
+      es.onmessage = (ev) => {
+        const e = JSON.parse(ev.data);
+        const div = document.createElement('div');
+        div.className = 'lvl-' + e.level;
+        div.innerHTML = '<span class="ts">' + e.ts + '</span> ' + e.msg;
+        log.insertBefore(div, cursor);
+        if (log.childElementCount > MAX_LINES) log.firstElementChild.remove();
+        count.textContent = ++n;
+        log.scrollTop = log.scrollHeight;
+      };
+    </script>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (internal log tail page, open all day)
+
+    #### [Security] Log messages are inserted as HTML
+    - **Where:** `div.innerHTML = '<span class="ts">' + e.ts + '</span> ' + e.msg;`
+    - **Issue:** ingest logs contain data that outsiders control: request paths, user agents, payload fragments. A log line like `<img src=x onerror=...>` runs as script in the browser of whoever is watching the tail. That is stored XSS against your ops team.
+    - **Fix:** build the nodes and insert the message as text:
+      ```javascript
+      const ts = document.createElement('span');
+      ts.className = 'ts';
+      ts.textContent = e.ts;
+      div.append(ts, ' ' + e.msg);   // strings become text nodes, never markup
+      ```
+
+    #### [Medium] Cursor blink runs a JavaScript loop on every frame
+    - **Where:** `blink()` with `requestAnimationFrame`
+    - **Issue:** the opacity only changes every 530 ms, but the loop runs and writes an inline style on every frame, for as long as the screen shows the page. A CSS animation does the same with no script work. In Green Metrics Tool browser benchmarks, a 20-second animation driven by `requestAnimationFrame` with style updates used ~161 J of CPU energy, the same animation as CSS `@keyframes` ~145 J, about 10% less.
+    - **Fix:** delete `blink()` and the `requestAnimationFrame` call, then add this to the CSS:
+      ```css
+      #cursor { animation: blink 1.06s steps(1) infinite; }
+      @keyframes blink { 50% { opacity: 0; } }
+      ```
+      The timing stays the same: visible for 530 ms, hidden for 530 ms.
+    - **Impact:** E on every client while the page is visible. This is a small saving per second, but it adds up because the page stays open all day.
+
+    #### [Medium] Six full TTF font files
+    - **Where:** the six `@font-face` rules
+    - **Issue:** every cold load downloads and parses two complete TTF families for a dark log console. In Green Metrics Tool page-load benchmarks (30 cold loads), six local TTF files (~4 MB) used ~556 J. The system font stack used ~410 J, about 26% less. Two Latin-subset WOFF2 files used ~488 J, about 12% less than the TTF set. The browser caches the fonts afterwards, so the cost falls on first loads and new machines.
+    - **Fix:** remove the `@font-face` rules and use the system stacks:
+      ```css
+      body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+      #log { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+      ```
+      If the team really wants JetBrains Mono, ship only Regular and Bold as Latin-subset WOFF2 and drop Inter.
+    - **Impact:** E on the client and network bytes on every cold load.
+
+    **Already good:** the line cap keeps the DOM bounded during a long tail, and `EventSource` pushes new lines instead of the page asking for them.
+verify:
+  static_only: HTML page that needs a browser and a live EventSource endpoint

@@ -1,0 +1,134 @@
+id: gen-12764612-00193-refactor
+category: refactor
+language: python
+patterns:
+- async-concurrent-io
+- simple-conditions
+facts:
+- F-HTTP
+- F-COND
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import json
+    import sys
+    import urllib.request
+
+    BASE = "https://api.stationnet.example/v2"
+    STATIONS = ["ALP01", "ALP02", "ALP03", "ALP04", "ALP05", "ALP06",
+                "BAL01", "BAL02", "BAL03", "BAL04", "BAL05", "BAL06"]
+
+
+    def fetch_station(station, day):
+        url = f"{BASE}/stations/{station}/readings?date={day}"
+        with urllib.request.urlopen(url, timeout=20) as resp:
+            return json.loads(resp.read())
+
+
+    def flag_reading(code):
+        if code >= 0 and code < 1:
+            return "ok"
+        elif code >= 1 and code < 2:
+            return "suspect"
+        elif code >= 2 and code < 3:
+            return "interpolated"
+        elif code >= 9 and code < 10:
+            return "missing"
+        return "unknown"
+
+
+    def daily_summary(day):
+        summary = {}
+        for station in STATIONS:
+            data = fetch_station(station, day)
+            counts = {}
+            total = 0.0
+            n = 0
+            for r in data["readings"]:
+                flag = flag_reading(r["qc"])
+                counts[flag] = counts.get(flag, 0) + 1
+                if flag == "ok":
+                    total += r["temp_c"]
+                    n += 1
+            summary[station] = {
+                "mean_temp": round(total / n, 2) if n else None,
+                "flags": counts,
+            }
+        return summary
+
+
+    if __name__ == "__main__":
+        print(json.dumps(daily_summary(sys.argv[1]), indent=2))
+    ```
+- role: assistant
+  content: |
+    ```python
+    import asyncio
+    import json
+    import sys
+
+    import httpx
+
+    BASE = "https://api.stationnet.example/v2"
+    STATIONS = ["ALP01", "ALP02", "ALP03", "ALP04", "ALP05", "ALP06",
+                "BAL01", "BAL02", "BAL03", "BAL04", "BAL05", "BAL06"]
+
+
+    async def fetch_station(client, station, day):
+        resp = await client.get(f"{BASE}/stations/{station}/readings", params={"date": day})
+        resp.raise_for_status()
+        return resp.json()
+
+
+    def flag_reading(code):
+        if code == 0:
+            return "ok"
+        if code == 1:
+            return "suspect"
+        if code == 2:
+            return "interpolated"
+        if code == 9:
+            return "missing"
+        return "unknown"
+
+
+    def summarize(data):
+        counts = {}
+        total = 0.0
+        n = 0
+        for r in data["readings"]:
+            flag = flag_reading(r["qc"])
+            counts[flag] = counts.get(flag, 0) + 1
+            if flag == "ok":
+                total += r["temp_c"]
+                n += 1
+        return {
+            "mean_temp": round(total / n, 2) if n else None,
+            "flags": counts,
+        }
+
+
+    async def daily_summary(day):
+        async with httpx.AsyncClient(timeout=20) as client:
+            results = await asyncio.gather(
+                *(fetch_station(client, s, day) for s in STATIONS)
+            )
+        return {s: summarize(data) for s, data in zip(STATIONS, results)}
+
+
+    if __name__ == "__main__":
+        print(json.dumps(asyncio.run(daily_summary(sys.argv[1])), indent=2))
+    ```
+
+    Output and station order are unchanged. A failed request still raises, as before.
+
+    **Green Notes**
+    - **Concurrent requests instead of one after another** (reduces E and idle time): the 12 station calls now overlap, so the run takes about as long as the slowest call, not the sum of all calls. The CPU saving is modest. In Green Metrics Tool micro-benchmarks, 10 HTTP requests with async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. Most of the gain is wall time.
+    - **Equality checks instead of range guards** (reduces E): `flag_reading` runs once per reading. In Green Metrics Tool micro-benchmarks, simple equality branches used about 16% less CPU energy than complex range or modulo conditions over 10,000,000 classifications.
+    - **Behavior note:** this assumes `qc` is always an integer. The old range checks also matched fractional codes like `1.5`, which would now be "unknown". If the API can send those, keep the ranges.
+    - *Not applied:* a concurrency limit. 12 calls are fine. With hundreds of stations, add an `asyncio.Semaphore` so you don't flood the API.
+verify:
+  static_only: needs network access and the httpx package (not stdlib)

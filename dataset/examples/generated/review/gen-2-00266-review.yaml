@@ -1,0 +1,94 @@
+id: gen-2-00266-review
+category: review
+language: html
+patterns:
+- lazy-load-images
+- system-fonts-and-deps
+facts:
+- F-LAZY-IMG
+- F-FONTS
+messages:
+- role: user
+  content: |
+    review pls. landing page our API host serves at `/`, most visits just copy the curl line and leave
+
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Ledgerly API</title>
+      <link rel="preload" href="/static/fonts/Inter-Regular.ttf" as="font">
+      <link rel="preload" href="/static/fonts/Inter-SemiBold.ttf" as="font">
+      <style>
+        @font-face { font-family: "Inter"; src: url("/static/fonts/Inter-Regular.ttf") format("truetype"); font-weight: 400; }
+        @font-face { font-family: "Inter"; src: url("/static/fonts/Inter-Medium.ttf") format("truetype"); font-weight: 500; }
+        @font-face { font-family: "Inter"; src: url("/static/fonts/Inter-SemiBold.ttf") format("truetype"); font-weight: 600; }
+        @font-face { font-family: "Inter"; src: url("/static/fonts/Inter-Bold.ttf") format("truetype"); font-weight: 700; }
+        @font-face { font-family: "JetBrains Mono"; src: url("/static/fonts/JetBrainsMono-Regular.ttf") format("truetype"); font-weight: 400; }
+        @font-face { font-family: "JetBrains Mono"; src: url("/static/fonts/JetBrainsMono-Bold.ttf") format("truetype"); font-weight: 700; }
+        body { font-family: "Inter", sans-serif; margin: 0; color: #1d2230; }
+        code, pre { font-family: "JetBrains Mono", monospace; }
+        .hero { padding: 48px 24px; background: #0f1a2e; color: #fff; }
+        .hero img { width: 100%; max-width: 960px; height: auto; }
+        .hero pre { background: #1b2740; padding: 16px; overflow-x: auto; }
+        .guide { padding: 24px; }
+        .guide img { width: 100%; max-width: 720px; height: auto; border: 1px solid #dde; }
+      </style>
+    </head>
+    <body>
+      <header class="hero">
+        <h1>Ledgerly API</h1>
+        <p>Invoices, payouts and ledgers over one REST API.</p>
+        <img src="/static/img/dashboard-hero.png" alt="Ledgerly dashboard" width="1920" height="1080" loading="lazy">
+        <pre><code>curl https://api.ledgerly.dev/v1/invoices \
+      -H "Authorization: Bearer $LEDGERLY_KEY"</code></pre>
+      </header>
+      <main class="guide">
+        {% for step in quickstart_steps %}
+        <section>
+          <h2>{{ loop.index }}. {{ step.title }}</h2>
+          <p>{{ step.text }}</p>
+          <img src="{{ step.screenshot }}" alt="{{ step.alt }}" width="1440" height="900">
+        </section>
+        {% endfor %}
+      </main>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    **Workload:** web
+
+    #### [Bug] Font preloads are fetched twice
+    - **Where:** the two `<link rel="preload" ... as="font">` lines
+    - **Issue:** fonts are always requested in CORS mode. A font preload without `crossorigin` does not match that request, so the browser downloads Regular and SemiBold a second time.
+    - **Fix:** add `crossorigin`. If you take the system font fix below, delete both preloads.
+
+    #### [High] Lazy loading is on the wrong image
+    - **Where:** hero `<img>` (has `loading="lazy"`) and the quickstart screenshots (eager)
+    - **Issue:** the hero image is in the first viewport, so lazy loading only delays it. The screenshots are below the fold, and most visitors leave after the curl line. Right now every visit still downloads and decodes all of them.
+    - **Fix:**
+      ```html
+      <img src="/static/img/dashboard-hero.png" alt="Ledgerly dashboard" width="1920" height="1080">
+      ...
+      <img src="{{ step.screenshot }}" alt="{{ step.alt }}" width="1440" height="900" loading="lazy">
+      ```
+      Keep `width`/`height` as they are, so the layout doesn't jump when the screenshots load.
+    - **Impact:** reduces E and network per visit that doesn't scroll. In Green Metrics Tool page-load benchmarks with 15 photos and no scrolling, `loading="lazy"` below the fold used about 12% less CPU energy. When visitors scrolled to the end there was no difference. Your traffic fits the case where it saves.
+
+    #### [Medium] Six full TTF fonts on every cold load
+    - **Where:** the `@font-face` block
+    - **Issue:** four Inter weights and two JetBrains Mono weights as uncompressed TTF, for a page that is mostly one heading, one sentence and a code snippet.
+    - **Fix:** use system font stacks and drop all `@font-face` rules:
+      ```css
+      body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0; color: #1d2230; }
+      code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      ```
+      If the brand needs Inter, ship one or two Latin-subset WOFF2 files with `font-display: swap`, and use the system monospace stack for code.
+    - **Impact:** reduces network and E on every first visit. In Green Metrics Tool page-load benchmarks (cold cache), the system font stack used about 26% less CPU energy than six local TTF files. Two Latin-subset WOFF2 files used about 12% less than the TTF set.
+
+    **Already good:** every image has `width`/`height`, so there is no layout shift. The page is server-rendered HTML with no JavaScript.
+verify:
+  static_only: HTML/Jinja template review; no runnable code to execute

@@ -1,0 +1,187 @@
+id: gen-2-00302-refactor
+category: refactor
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    hi, this is one step from our fleet ETL. it run every night over all GPS pings of the day (around 30 milion rows) and add distance, speed and a flag for each ping. profiler say most of the time is inside enrich(). my lead say we should take the math. and self.cfg lookups out of the loop. can you refactor it like this? output must stay exactly the same, downstream job compare with the old runs.
+
+    ```python
+    import csv
+    import math
+    from dataclasses import dataclass
+
+
+    @dataclass
+    class Config:
+        earth_radius_km: float = 6371.0
+        max_speed_kmh: float = 160.0
+        min_move_m: float = 5.0
+
+
+    def load_pings(path):
+        with open(path, newline="") as f:
+            reader = csv.DictReader(f)
+            return [
+                (r["vehicle_id"], int(r["ts"]), float(r["lat"]), float(r["lon"]))
+                for r in reader
+            ]
+
+
+    class TripEnricher:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+        def enrich(self, pings):
+            """pings: list of (vehicle_id, ts, lat, lon), sorted by vehicle_id, ts"""
+            out = []
+            prev = None
+            for vid, ts, lat, lon in pings:
+                if prev is None or prev[0] != vid:
+                    out.append((vid, ts, 0.0, 0.0, "start"))
+                    prev = (vid, ts, lat, lon)
+                    continue
+                _, pts, plat, plon = prev
+                phi1 = math.radians(plat)
+                phi2 = math.radians(lat)
+                dphi = math.radians(lat - plat)
+                dlmb = math.radians(lon - plon)
+                a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlmb / 2) ** 2
+                dist_km = 2 * self.cfg.earth_radius_km * math.asin(math.sqrt(a))
+                dt = ts - pts
+                if dt <= 0:
+                    # duplicate or out-of-order timestamp, keep prev as it is
+                    out.append((vid, ts, dist_km, 0.0, "bad_ts"))
+                    continue
+                speed = dist_km / dt * 3600
+                if speed > self.cfg.max_speed_kmh:
+                    flag = "jump"
+                elif dist_km * 1000 < self.cfg.min_move_m:
+                    flag = "idle"
+                else:
+                    flag = "ok"
+                out.append((vid, ts, round(dist_km, 4), round(speed, 2), flag))
+                prev = (vid, ts, lat, lon)
+            return out
+    ```
+- role: assistant
+  content: |
+    ```python
+    import csv
+    import math
+    from dataclasses import dataclass
+
+
+    @dataclass
+    class Config:
+        earth_radius_km: float = 6371.0
+        max_speed_kmh: float = 160.0
+        min_move_m: float = 5.0
+
+
+    def load_pings(path):
+        with open(path, newline="") as f:
+            reader = csv.DictReader(f)
+            return [
+                (r["vehicle_id"], int(r["ts"]), float(r["lat"]), float(r["lon"]))
+                for r in reader
+            ]
+
+
+    class TripEnricher:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+        def enrich(self, pings):
+            """pings: list of (vehicle_id, ts, lat, lon), sorted by vehicle_id, ts"""
+            # loop invariants: looked up once per call, not once per ping
+            radians, sin, cos = math.radians, math.sin, math.cos
+            asin, sqrt = math.asin, math.sqrt
+            cfg = self.cfg
+            diameter_km = 2 * cfg.earth_radius_km
+            max_speed_kmh = cfg.max_speed_kmh
+            min_move_m = cfg.min_move_m
+
+            out = []
+            emit = out.append
+            prev = None
+            for vid, ts, lat, lon in pings:
+                if prev is None or prev[0] != vid:
+                    emit((vid, ts, 0.0, 0.0, "start"))
+                    prev = (vid, ts, lat, lon)
+                    continue
+                _, pts, plat, plon = prev
+                phi1 = radians(plat)
+                phi2 = radians(lat)
+                dphi = radians(lat - plat)
+                dlmb = radians(lon - plon)
+                a = sin(dphi / 2) ** 2 + cos(phi1) * cos(phi2) * sin(dlmb / 2) ** 2
+                dist_km = diameter_km * asin(sqrt(a))
+                dt = ts - pts
+                if dt <= 0:
+                    # duplicate or out-of-order timestamp, keep prev as it is
+                    emit((vid, ts, dist_km, 0.0, "bad_ts"))
+                    continue
+                speed = dist_km / dt * 3600
+                if speed > max_speed_kmh:
+                    flag = "jump"
+                elif dist_km * 1000 < min_move_m:
+                    flag = "idle"
+                else:
+                    flag = "ok"
+                emit((vid, ts, round(dist_km, 4), round(speed, 2), flag))
+                prev = (vid, ts, lat, lon)
+            return out
+    ```
+
+    **Green Notes**
+    - **Hoisted attribute lookups** (reduces E): each ping did about ten `math.*` lookups, plus `self.cfg.*` and `out.append`. They are now local variables, which are cheaper to load. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local before a 10,000,000-iteration loop saved about 4-5%. Expect a gain of that size here, not a big jump.
+    - **Hoisted invariant arithmetic**: `2 * earth_radius_km` is computed once. Python already evaluated `2 * R` before multiplying by `asin(...)`, so the result is bit-for-bit the same.
+
+    Output is identical: the same float operations run in the same order, and the `dist_km * 1000 < min_move_m` check is kept as is. The only difference is that the config is read once per `enrich()` call. That only matters if something changes `self.cfg` while the call is running. To check the gain, run old and new on one day's file with `perf stat` or `time` and diff the output.
+verify:
+  equivalence:
+    driver: |
+      import random
+      rng = random.Random(7)
+      pings = []
+      for v in range(5):
+          ts = 1_700_000_000
+          lat, lon = 52.5 + v * 0.01, 13.4
+          for i in range(400):
+              r = rng.random()
+              if r < 0.05:
+                  dts = 0
+              elif r < 0.10:
+                  dts = -3
+              else:
+                  dts = rng.randint(1, 30)
+              ts += dts
+              if r > 0.97:
+                  lat += rng.uniform(-0.5, 0.5)
+              elif r > 0.3:
+                  lat += rng.uniform(-0.0005, 0.0005)
+                  lon += rng.uniform(-0.0005, 0.0005)
+              pings.append((f"veh-{v}", ts, lat, lon))
+      res = TripEnricher(Config()).enrich(pings)
+      counts = {}
+      for row in res:
+          counts[row[4]] = counts.get(row[4], 0) + 1
+          print(row)
+      print(sorted(counts.items()))
+  test: |-
+    rows = TripEnricher(Config()).enrich([
+        ("a", 0, 52.0, 13.0),
+        ("a", 10, 52.0, 13.0),
+        ("a", 100, 52.01, 13.0),
+        ("a", 100, 52.02, 13.0),
+        ("a", 101, 53.0, 13.0),
+        ("b", 5, 48.0, 11.0),
+    ])
+    assert [r[4] for r in rows] == ["start", "idle", "ok", "bad_ts", "jump", "start"]
+    assert rows[0] == ("a", 0, 0.0, 0.0, "start")
+    assert abs(rows[2][2] - 1.1119) < 1e-3

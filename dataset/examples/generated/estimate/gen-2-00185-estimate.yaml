@@ -1,0 +1,82 @@
+id: gen-2-00185-estimate
+category: estimate
+language: javascript
+patterns:
+- minify-assets
+facts:
+- F-MINIFY
+messages:
+- role: user
+  content: |
+    Hi, we have small CLI tool `pipewatch` (node). The command `pipewatch serve` start a local dashboard and open it in the browser on localhost. The UI is build with this script, app.js is around 70 KB and not minified.
+
+    My manager want a number for our sustainability report: how much kWh or CO2 we save per year if we add minification to this build? Around 300 devs use the tool, maybe 10 times per day each. Can you calculate it please?
+
+    ```javascript
+    #!/usr/bin/env node
+    // scripts/build-ui.mjs - bundles the web UI for `pipewatch serve`
+    import { readdir, readFile, writeFile, mkdir, copyFile } from 'node:fs/promises';
+    import path from 'node:path';
+
+    const SRC = 'src/ui';
+    const OUT = 'dist/ui';
+    const pkg = JSON.parse(await readFile('package.json', 'utf8'));
+
+    async function build() {
+      await mkdir(OUT, { recursive: true });
+
+      const files = (await readdir(SRC))
+        .filter((f) => f.endsWith('.js'))
+        .sort();
+
+      const parts = [`/* pipewatch ui v${pkg.version} */`];
+      for (const f of files) {
+        const code = await readFile(path.join(SRC, f), 'utf8');
+        parts.push(`// --- ${f} ---\n${code}`);
+      }
+
+      await writeFile(path.join(OUT, 'app.js'), parts.join('\n'));
+      await copyFile(path.join(SRC, 'index.html'), path.join(OUT, 'index.html'));
+      await copyFile(path.join(SRC, 'style.css'), path.join(OUT, 'style.css'));
+
+      console.log(`built ${files.length} files -> ${OUT}/app.js`);
+    }
+
+    build().catch((err) => {
+      console.error(err);
+      process.exit(1);
+    });
+    ```
+- role: assistant
+  content: |
+    I can't give you an honest kWh or CO2 figure. Multiplying a guess by users and days would just make up a number. The direction is clear, though: expect no measurable saving.
+
+    **What minification changes:** fewer bytes to send, and a little less text for the browser to parse. For small bundles, the bytes are the main effect.
+
+    **Measured reference:** in Green Metrics Tool micro-benchmarks, 50 cold page loads of a small booking page used ~837 J with unminified JS and CSS and ~822 J with an esbuild-minified build. That is about 2% less, which is within measurement noise. Your bundle is in the same small range.
+
+    **Why your case is even smaller:** the dashboard is served from localhost. So the byte saving, which is the real benefit on real networks, is almost zero on every page load. Bytes only cross a real network when someone installs or updates the npm package. Then the tarball gets a bit smaller, once per install.
+
+    For the report, the honest line is "minification brings no measurable energy saving for this tool." Don't put a calculated kWh value there.
+
+    **How to check it yourself:**
+    1. Bytes: compare `gzip -c dist/ui/app.js | wc -c` before and after, and the package size from `npm pack --dry-run`.
+    2. Energy: write a Green Metrics Tool usage scenario that starts `pipewatch serve` and loads the dashboard many times in a browser. Run it with both builds on the same machine. If the difference is inside the run-to-run variation, then that is your result.
+
+    If you still want a smaller package, the change is small. Use `banner` so the version comment survives. Minification strips normal comments.
+
+    ```javascript
+    import { transform } from 'esbuild';
+
+    // in build(), instead of the version line in `parts` and the plain writeFile:
+    const { code } = await transform(parts.join('\n'), {
+      loader: 'js',
+      minify: true,
+      banner: `/* pipewatch ui v${pkg.version} */`,
+    });
+    await writeFile(path.join(OUT, 'app.js'), code);
+    ```
+
+    The `// --- file ---` markers will be gone from the output. Add `sourcemap: true` if you still need to debug the dashboard.
+verify:
+  static_only: needs the esbuild package and the project's src/ui files

@@ -1,0 +1,83 @@
+id: gen-1-00035-refactor
+category: refactor
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    fix this, it runs on every model response
+
+    ```python
+    import re
+
+    LABELS = ["spam", "ham", "promo", "support", "billing"]
+
+
+    def parse_generation(text, threshold=0.5):
+        text = re.sub(r"\s+", " ", text).strip()
+        m = re.search(r"label\s*[:=]\s*(" + "|".join(LABELS) + r")", text, re.I)
+        if not m:
+            return None
+        label = m.group(1).lower()
+        c = re.search(r"confidence\s*[:=]\s*(\d*\.?\d+)", text, re.I)
+        conf = float(c.group(1)) if c else 0.0
+        if conf < threshold:
+            return None
+        return {
+            "label": label,
+            "confidence": conf,
+            "tags": re.findall(r"#(\w+)", text),
+        }
+    ```
+- role: assistant
+  content: |
+    ```python
+    import re
+
+    LABELS = ["spam", "ham", "promo", "support", "billing"]
+
+    _WS = re.compile(r"\s+")
+    _LABEL = re.compile(r"label\s*[:=]\s*(" + "|".join(LABELS) + r")", re.I)
+    _CONF = re.compile(r"confidence\s*[:=]\s*(\d*\.?\d+)", re.I)
+    _TAG = re.compile(r"#(\w+)")
+
+
+    def parse_generation(text, threshold=0.5):
+        text = _WS.sub(" ", text).strip()
+        m = _LABEL.search(text)
+        if not m:
+            return None
+        label = m.group(1).lower()
+        c = _CONF.search(text)
+        conf = float(c.group(1)) if c else 0.0
+        if conf < threshold:
+            return None
+        return {
+            "label": label,
+            "confidence": conf,
+            "tags": _TAG.findall(text),
+        }
+    ```
+
+    **Green Notes**
+    - **Compile regex once, outside the function** (reduces E): the four patterns are now module-level constants. The label pattern was also rebuilt with `"|".join(LABELS)` on every response. Now it is built once at import time.
+    - **Expect a small gain.** Python's `re` module caches compiled patterns, so the old code did not recompile each time. In Green Metrics Tool micro-benchmarks, 1,000,000 matches with a precompiled pattern used about 18% less CPU energy than inline `re.match(pattern, s)`. The gain comes from skipping the cache lookup and the string building.
+    - Behavior is unchanged. If `LABELS` can change at runtime, rebuild `_LABEL` when it changes.
+verify:
+  equivalence:
+    driver: |-
+      samples = [
+          "Label: spam\nConfidence: 0.93  #urgent #promo",
+          "label = Billing   confidence=.7 #acct",
+          "LABEL: support",
+          "label: ham confidence: 0.2 #x",
+          "no label here confidence: 0.9",
+          "label: promo confidence: 1 #a   #b_2 #c",
+          "",
+      ]
+      for s in samples:
+          print(parse_generation(s))
+          print(parse_generation(s, threshold=0.0))

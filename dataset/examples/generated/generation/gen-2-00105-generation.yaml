@@ -1,0 +1,137 @@
+id: gen-2-00105-generation
+category: generation
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    hi, I'm a PhD student and I kind of inherited our group's Kubernetes setup, so sorry if this is a basic question.
+
+    We have a staging namespace `seismo-staging` for our seismic waveform portal. It has:
+    - `api` deployment (Flask, 3 replicas)
+    - `celery-worker` deployment (runs the waveform filtering jobs)
+    - `redis` deployment
+    - `postgres` statefulset (with a PVC)
+
+    The university cloud bills us per node-hour. I was told the cluster autoscaler removes nodes when they're not needed, but the bill didn't go down at all. We only use staging during work hours, Mon-Fri. I think staging just runs all the time? I'm not sure if that's the problem or something else.
+
+    Could you write the YAML to switch staging off in the evening (19:00) and on again in the morning (8:00), Berlin time? I don't really know how to do this properly.
+- role: assistant
+  content: |
+    Yes, that's most likely the problem. The autoscaler can only remove a node when no pods are left on it. Your staging pods run 24/7, so their node is never empty and keeps getting billed.
+
+    Two CronJobs can scale the namespace down every weekday evening and up again in the morning. The evening job on Friday also covers the weekend, because nothing scales it up until Monday.
+
+    ```yaml
+    apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: staging-scheduler
+      namespace: seismo-staging
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: Role
+    metadata:
+      name: staging-scheduler
+      namespace: seismo-staging
+    rules:
+      - apiGroups: ["apps"]
+        resources: ["deployments", "statefulsets"]
+        verbs: ["get", "list"]
+      - apiGroups: ["apps"]
+        resources: ["deployments/scale", "statefulsets/scale"]
+        verbs: ["get", "patch", "update"]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata:
+      name: staging-scheduler
+      namespace: seismo-staging
+    subjects:
+      - kind: ServiceAccount
+        name: staging-scheduler
+        namespace: seismo-staging
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: Role
+      name: staging-scheduler
+    ---
+    # Evening: everything to 0 replicas, Mon-Fri 19:00
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata:
+      name: staging-scale-down
+      namespace: seismo-staging
+    spec:
+      schedule: "0 19 * * 1-5"
+      timeZone: "Europe/Berlin"          # needs Kubernetes 1.27 or newer
+      concurrencyPolicy: Forbid
+      jobTemplate:
+        spec:
+          backoffLimit: 2
+          ttlSecondsAfterFinished: 3600
+          template:
+            spec:
+              serviceAccountName: staging-scheduler
+              restartPolicy: OnFailure
+              containers:
+                - name: kubectl
+                  image: registry.k8s.io/kubectl:v1.31.0   # match your cluster version
+                  command: ["kubectl"]
+                  args:
+                    - "--namespace=seismo-staging"
+                    - "scale"
+                    - "--replicas=0"
+                    - "deployment/api"
+                    - "deployment/celery-worker"
+                    - "deployment/redis"
+                    - "statefulset/postgres"
+    ---
+    # Morning: start again, Mon-Fri 08:00
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata:
+      name: staging-scale-up
+      namespace: seismo-staging
+    spec:
+      schedule: "0 8 * * 1-5"
+      timeZone: "Europe/Berlin"
+      concurrencyPolicy: Forbid
+      jobTemplate:
+        spec:
+          backoffLimit: 2
+          ttlSecondsAfterFinished: 3600
+          template:
+            spec:
+              serviceAccountName: staging-scheduler
+              restartPolicy: OnFailure
+              containers:
+                - name: kubectl
+                  image: registry.k8s.io/kubectl:v1.31.0
+                  command: ["kubectl"]
+                  args:
+                    - "--namespace=seismo-staging"
+                    - "scale"
+                    - "--replicas=1"
+                    - "statefulset/postgres"
+                    - "deployment/redis"
+                    - "deployment/api"
+                    - "deployment/celery-worker"
+    ```
+
+    Apply it with `kubectl apply -f staging-schedule.yaml`. To test right away, run `kubectl -n seismo-staging create job --from=cronjob/staging-scale-down test-down`.
+
+    A few things to know:
+    - The Postgres data stays in the PVC. Only the pods stop. The disk is still billed, but nodes are not.
+    - `api` comes back with **1 replica**, not 3. If you need 3 for load tests, change `--replicas=1` for the api, or scale it up by hand that day.
+    - The api and worker may restart once or twice in the morning until Postgres is ready. Kubernetes handles that by itself.
+    - If your CI deploys to staging at night, the deploy sets the replicas again and the pods come back until the next evening.
+
+    **Green Notes**
+    - **Minimize deployed environments** (reduces E and M): staging now runs about 11 hours per weekday instead of all week. It is off about two thirds of the time, and in those hours the autoscaler can drop the node completely.
+    - **Fewer idle replicas** (reduces M): in Green Metrics Tool measurements of a preview environment idling for 60 seconds, 3 app replicas plus Postgres, Redis and a polling worker used ~269 J of CPU energy, and 1 replica plus Postgres used ~262 J, only about 3% less. Trimming replicas mainly helps by reserving less memory, so the pods fit on fewer nodes. The real saving is the hours when staging doesn't run at all.
+verify:
+  static_only: Kubernetes manifests, need a cluster to run

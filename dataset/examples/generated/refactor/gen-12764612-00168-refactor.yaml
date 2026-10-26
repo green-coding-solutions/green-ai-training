@@ -1,0 +1,144 @@
+id: gen-12764612-00168-refactor
+category: refactor
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    Please optimize this CLI. We run it on a weekly export of survey comments (a few hundred thousand rows) on a CPU-only build box. Requirements: keep all CLI flags and the output CSV format exactly as they are, no new dependencies, and keep the code readable because the whole team maintains it.
+
+    ```python
+    import argparse
+    import csv
+    import sys
+
+    import torch
+
+    from sentiment_feats import encode  # text -> list[float], length 128
+
+    LABELS = ["negative", "neutral", "positive"]
+
+
+    def load_model(path):
+        model = torch.jit.load(path, map_location="cpu")
+        model.eval()
+        return model
+
+
+    def score_batch(model, texts):
+        x = torch.tensor([encode(t) for t in texts], dtype=torch.float32)
+        logits = model(x)
+        probs = torch.softmax(logits, dim=1)
+        conf, idx = probs.max(dim=1)
+        return [(LABELS[i], float(c)) for i, c in zip(idx.tolist(), conf.tolist())]
+
+
+    def main():
+        ap = argparse.ArgumentParser(description="Score survey comments")
+        ap.add_argument("input")
+        ap.add_argument("output")
+        ap.add_argument("--model", default="models/sentiment.pt")
+        ap.add_argument("--batch-size", type=int, default=64)
+        ap.add_argument("--text-col", default="comment")
+        args = ap.parse_args()
+
+        model = load_model(args.model)
+
+        with open(args.input, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+
+        for start in range(0, len(rows), args.batch_size):
+            chunk = rows[start:start + args.batch_size]
+            results = score_batch(model, [r[args.text_col] for r in chunk])
+            for row, (label, conf) in zip(chunk, results):
+                row["sentiment"] = label
+                row["confidence"] = f"{conf:.4f}"
+
+        if not rows:
+            print("no rows", file=sys.stderr)
+            return 1
+
+        with open(args.output, "w", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+- role: assistant
+  content: |
+    ```python
+    import argparse
+    import csv
+    import sys
+
+    import torch
+
+    from sentiment_feats import encode  # text -> list[float], length 128
+
+    LABELS = ["negative", "neutral", "positive"]
+
+
+    def load_model(path):
+        model = torch.jit.load(path, map_location="cpu")
+        model.eval()
+        return model
+
+
+    def score_batch(model, texts):
+        x = torch.tensor([encode(t) for t in texts], dtype=torch.float32)
+        with torch.no_grad():
+            logits = model(x)
+            probs = torch.softmax(logits, dim=1)
+            conf, idx = probs.max(dim=1)
+        return [(LABELS[i], float(c)) for i, c in zip(idx.tolist(), conf.tolist())]
+
+
+    def main():
+        ap = argparse.ArgumentParser(description="Score survey comments")
+        ap.add_argument("input")
+        ap.add_argument("output")
+        ap.add_argument("--model", default="models/sentiment.pt")
+        ap.add_argument("--batch-size", type=int, default=64)
+        ap.add_argument("--text-col", default="comment")
+        args = ap.parse_args()
+
+        model = load_model(args.model)
+
+        with open(args.input, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+
+        for start in range(0, len(rows), args.batch_size):
+            chunk = rows[start:start + args.batch_size]
+            results = score_batch(model, [r[args.text_col] for r in chunk])
+            for row, (label, conf) in zip(chunk, results):
+                row["sentiment"] = label
+                row["confidence"] = f"{conf:.4f}"
+
+        if not rows:
+            print("no rows", file=sys.stderr)
+            return 1
+
+        with open(args.output, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+
+    **Green Notes**
+    - **`torch.no_grad()` around the forward pass** (reduces E on every run): `model.eval()` only switches layers like dropout and batch norm. It does not turn off autograd, so every batch was building a gradient graph that you never use. The output CSV is the same as before. In Green Metrics Tool micro-benchmarks, 100,000 PyTorch CPU inferences used about 14% less CPU energy with `torch.no_grad()` than without it. The saving applies to every comment in every run.
+    - **Bug fixed:** the output file is now opened with `newline=""`. The `csv` module needs this, otherwise Windows users get blank lines between rows.
+    - CLI flags, batch size handling, column names and output format are unchanged, and there are no new dependencies.
+verify:
+  static_only: needs torch, a TorchScript model file and the sentiment_feats module

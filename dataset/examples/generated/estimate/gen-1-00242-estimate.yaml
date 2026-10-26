@@ -1,0 +1,70 @@
+id: gen-1-00242-estimate
+category: estimate
+language: javascript
+patterns:
+- dom-size
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    Hello, we have internal page where ops see grouped errors from our log pipeline (one row per error fingerprint, about 9500 rows after the nightly grouping job). Many people open it every morning and the tab is slow. I want to render only one page of rows but my manager ask me "how much energy and CO2 we save per month?" I dont know what to answer. Can you tell me a number?
+
+    This is the render code now:
+
+    ```javascript
+    function renderGroups(groups) {
+      const tbody = document.querySelector('#groups tbody');
+      tbody.innerHTML = '';
+      for (const g of groups) {
+        const tr = document.createElement('tr');
+        tr.innerHTML =
+          '<td><div class="cell"><span class="fp">' + g.fingerprint + '</span></div></td>' +
+          '<td><div class="cell"><span>' + g.service + '</span></div></td>' +
+          '<td><div class="cell"><span class="num">' + g.count + '</span></div></td>' +
+          '<td><div class="cell"><span class="msg">' + g.sampleMessage + '</span></div></td>' +
+          '<td><div class="cell"><span>' + g.lastSeen + '</span></div></td>';
+        tbody.appendChild(tr);
+      }
+    }
+    ```
+- role: assistant
+  content: |-
+    I can't give you a trustworthy number for CO2 per month. I can give you the direction, one measured reference, and a way to get your own number.
+
+    **What drives the saving:** the browser has to build, style and lay out every element you add. Your page makes about 4 elements per cell and appends each row to the live table one by one. A big table means a lot of DOM work on every page open, and it also holds a lot of memory. Rendering one page of rows cuts all of that.
+
+    **Measured reference:** in Green Metrics Tool micro-benchmarks, 30 page loads of a table with 10,000 rows (14 elements per row, wrappers around every cell, rows appended one by one) used ~1036 J of CPU energy and 72 s. The same data paginated to 100 rows per page, as a plain `<table>` built in a `DocumentFragment`, used ~457 J and 36 s. That is about 56% less. This is one machine, one browser and one table shape. Don't multiply it by your number of users to get a monthly figure. Your cell content, browser and hardware are different.
+
+    **How to get your own number:**
+    1. Quick proxy: in the browser dev tools, record a Performance profile of the page load before and after. Compare scripting plus rendering time.
+    2. Real energy: save the page with test data as a usage scenario in the Green Metrics Tool. Load it many times in a headful browser, once for each version, on the same machine. Compare CPU energy.
+    3. For the monthly view, count real page opens per month from your access logs. Multiply the measured difference per load by that count. Carbon needs the grid intensity of the place where the users sit, so ask your sustainability team for that value.
+
+    The change is worth making now, because the tab is also slow for the users. A paginated version:
+
+    ```javascript
+    const PAGE_SIZE = 100;
+    let pageIndex = 0;
+
+    function renderGroups(groups) {
+      const tbody = document.querySelector('#groups tbody');
+      const start = pageIndex * PAGE_SIZE;
+      const frag = document.createDocumentFragment();
+      for (const g of groups.slice(start, start + PAGE_SIZE)) {
+        const tr = document.createElement('tr');
+        for (const value of [g.fingerprint, g.service, g.count, g.sampleMessage, g.lastSeen]) {
+          const td = document.createElement('td');
+          td.textContent = value;
+          tr.appendChild(td);
+        }
+        frag.appendChild(tr);
+      }
+      tbody.replaceChildren(frag);
+    }
+    ```
+
+    **Green Notes**
+    - **Avoid excessive DOM size** (reduces E): one page of rows instead of all groups, plain `<td>` cells without wrapper `div`/`span`, and one insert through a `DocumentFragment`.
+    - Sorting and search must work on the full `groups` array, not on the rows in the DOM. Then only the visible page is rendered.
+    - Your old code puts `sampleMessage` into `innerHTML`. Log text can contain HTML, so this is also an injection risk. `textContent` fixes it.

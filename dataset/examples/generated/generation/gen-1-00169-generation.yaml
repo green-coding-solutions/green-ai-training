@@ -1,0 +1,67 @@
+id: gen-1-00169-generation
+category: generation
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    hi, im new to python and not sure what im doing wrong. i have a small raspberry pi gateway at a customer site. it has a light sensor that looks at the blinking led on the electricity meter, every blink is one pulse. the adc gives me a numpy array of raw readings, about 6 million samples per minute. the signal is a bit noisy so i cant just check "is it bigger than 2000", it flickers around the edges. i need a function that gives me the sample index of every blink start, so i can count them and calculate the time between them. i tried a normal for loop and the pi is at 100% cpu the whole time. can you write it? high level is above 2500 and low level is below 1500.
+- role: assistant
+  content: |
+    The flicker problem is solved with two thresholds (a Schmitt trigger). A blink starts when the signal rises to `high` or above. It can only start again after the signal has dropped to `low` or below. In between, the state stays as it is.
+
+    Each sample depends on the state left by the previous one. That means plain NumPy comparisons can't express it cleanly, so the loop has to stay a loop. Compiling it with Numba makes it run as machine code:
+
+    ```python
+    import numpy as np
+    from numba import njit
+
+
+    @njit(cache=True)
+    def _find_edges(samples, high, low, out):
+        is_high = samples[0] >= high
+        n = 0
+        for i in range(1, samples.size):
+            v = samples[i]
+            if is_high:
+                if v <= low:
+                    is_high = False
+            elif v >= high:
+                is_high = True
+                out[n] = i
+                n += 1
+        return n
+
+
+    def blink_starts(samples: np.ndarray, high: float = 2500, low: float = 1500) -> np.ndarray:
+        """Return the sample index where each blink starts (rising edge)."""
+        if low >= high:
+            raise ValueError("low must be smaller than high")
+        if samples.ndim != 1:
+            raise ValueError("samples must be a 1-D array")
+        if samples.size < 2:
+            return np.empty(0, dtype=np.int64)
+        out = np.empty(samples.size // 2 + 1, dtype=np.int64)
+        n = _find_edges(samples, high, low, out)
+        return out[:n].copy()
+    ```
+
+    Usage:
+
+    ```python
+    starts = blink_starts(adc_buffer)
+    pulse_count = starts.size
+    gaps_in_samples = np.diff(starts)  # divide by your sample rate to get seconds
+    ```
+
+    If the buffer begins while the LED is already on, that first blink is not counted, because its start was in the previous buffer. If you need exact counts across buffers, keep the last state and carry it over.
+
+    **Green Notes**
+    - **JIT-compile the hot loop** (reduces E): the loop runs on every one of the roughly 6 million samples, every minute, so the interpreter overhead repeats all day on a small device. In Green Metrics Tool micro-benchmarks, a comparable per-sample loop over 10 million samples used about 4× less energy with Numba `@njit`.
+    - **`cache=True`** saves the compiled code on disk, so a restart or a new process doesn't pay the compile cost again.
+    - *Not applied:* for a few thousand samples per call, a plain Python loop is fine. The compile time would cost more than it saves.
+verify:
+  static_only: needs numba

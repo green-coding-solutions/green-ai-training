@@ -1,0 +1,50 @@
+id: gen-1-00146-no-change
+category: no-change
+language: sql
+patterns:
+- select-columns
+- context-tradeoff
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+messages:
+- role: user
+  content: |
+    Hi, our IoT gateway read the device list from a small table one time when the service start. Our linter say "SELECT * is bad for performance". Should I change it? The table have only 6 colums and I use all of them in the poller, I think it is ok but my colleague say no.
+
+    ```sql
+    CREATE TABLE device_config (
+        id               INTEGER PRIMARY KEY,
+        name             TEXT NOT NULL,
+        protocol         TEXT NOT NULL,
+        address          TEXT NOT NULL,
+        poll_interval_s  INTEGER NOT NULL,
+        enabled          INTEGER NOT NULL DEFAULT 1
+    );
+
+    SELECT * FROM device_config WHERE enabled = 1;
+    ```
+- role: assistant
+  content: |
+    You are right, no change needed. The query is already efficient for your case.
+
+    - **All columns are used.** `SELECT *` costs extra only when it reads columns you throw away. Here the explicit list would return exactly the same data.
+    - **The columns are small.** Six short columns carry almost no data per row.
+    - **It runs once at startup.** A few device rows, read one time, are not a hot path.
+
+    The saving from naming columns comes from skipping big ones. In Green Metrics Tool micro-benchmarks on a 52-column Postgres table with large text columns, naming 10 columns used about 7× less energy than `SELECT *` at 2,500 rows. Your table is the opposite case: narrow, and every column is needed.
+
+    One thing to watch: if someone later adds a large column to `device_config` (a firmware blob, a long notes field), `SELECT *` will start reading it too. Then switch to a column list. Until then, keep the query as it is:
+
+    ```sql
+    SELECT * FROM device_config WHERE enabled = 1;
+    ```
+
+    You can tell the linter to ignore this line.
+verify:
+  sql:
+    setup: CREATE TABLE device_config (id INTEGER PRIMARY KEY, name TEXT NOT NULL, protocol TEXT NOT NULL, address TEXT NOT
+      NULL, poll_interval_s INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1); INSERT INTO device_config (id, name, protocol,
+      address, poll_interval_s, enabled) VALUES (1, 'temp-hall', 'modbus', '10.0.0.11', 30, 1), (2, 'pump-1', 'modbus', '10.0.0.12',
+      10, 1), (3, 'door-a', 'mqtt', 'broker/door-a', 60, 0), (4, 'meter-main', 'opcua', '10.0.0.20', 15, 1);
+    compare: true

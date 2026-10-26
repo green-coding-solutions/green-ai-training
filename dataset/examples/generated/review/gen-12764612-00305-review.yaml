@@ -1,0 +1,110 @@
+id: gen-12764612-00305-review
+category: review
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    Review of this vhost, diff only please. It serves the viewer for our MD simulation runs (collaborators reach it over WAN). `npm run build` writes to `dist/` on deploy. `/api/` is a Flask app on :8000 that returns timeseries JSON. The run jobs write PNG plots to `/data/sim/plots/`.
+
+    ```nginx
+    server {
+        listen 80;
+        server_name simviewer.lab.example.org;
+
+        root /srv/simviewer/dist;
+        index index.html;
+
+        gzip on;
+        gzip_comp_level 9;
+        gzip_min_length 0;
+        gzip_proxied any;
+        gzip_types text/plain text/css application/javascript application/json image/svg+xml image/png application/zip;
+
+        location / {
+            try_files $uri /index.html;
+        }
+
+        location /api/ {
+            proxy_pass http://127.0.0.1:8000;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+        }
+
+        location /plots {
+            alias /data/sim/plots/;
+            expires 7d;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (static viewer plus JSON API)
+
+    #### [Security] Path traversal through `alias`
+    - **Where:** `location /plots` with `alias /data/sim/plots/;`
+    - **Issue:** the location has no trailing slash but the alias has one. A request like `/plots../secret` maps to `/data/sim/plots/../secret`, so files next to the plots directory can be read.
+    - **Fix:** `location /plots/ { ... }`, see the diff.
+
+    #### [High] Static assets compressed again on every request
+    - **Where:** `gzip on; gzip_comp_level 9;` for files in `dist/`
+    - **Issue:** the JS, CSS and SVG files never change between deploys, but nginx recompresses them for every request, at the most expensive level. In Green Metrics Tool measurements of nginx serving 2,000 text requests, per-request gzip (level 5) used about 4× the CPU energy of serving precompressed files. It still sent about 10× fewer bytes than no compression, so keep compression on for real networks.
+    - **Fix:** compress once at build time and serve the `.gz` files with `gzip_static`. Level 9 is fine there, because it runs once per deploy.
+    - **Impact:** E on the server for every asset request. Bytes on the wire stay the same.
+
+    #### [Medium] Wrong types and a high level on dynamic responses
+    - **Where:** `gzip_types ... image/png application/zip`, `gzip_comp_level 9` on `/api/`
+    - **Issue:** PNG and ZIP are already compressed, so gzip burns CPU and gains almost nothing. The API JSON is built per request, so it must be compressed per request. Level 9 costs more CPU than a moderate level for little extra size reduction.
+    - **Fix:** drop `image/png` and `application/zip`, use level 5 for the dynamic part, and add `gzip_vary on` so caches handle both variants.
+    - **Impact:** E per API and plot request.
+
+    ```diff
+     server {
+         listen 80;
+         server_name simviewer.lab.example.org;
+
+         root /srv/simviewer/dist;
+         index index.html;
+
+    -    gzip on;
+    -    gzip_comp_level 9;
+    -    gzip_min_length 0;
+    -    gzip_proxied any;
+    -    gzip_types text/plain text/css application/javascript application/json image/svg+xml image/png application/zip;
+    +    gzip_static on;
+    +    gzip on;
+    +    gzip_comp_level 5;
+    +    gzip_vary on;
+    +    gzip_proxied any;
+    +    gzip_types text/plain text/css application/javascript application/json image/svg+xml;
+
+         location / {
+             try_files $uri /index.html;
+         }
+
+         location /api/ {
+             proxy_pass http://127.0.0.1:8000;
+             proxy_set_header Host $host;
+             proxy_set_header X-Real-IP $remote_addr;
+         }
+
+    -    location /plots {
+    +    location /plots/ {
+             alias /data/sim/plots/;
+             expires 7d;
+         }
+     }
+    ```
+
+    Build step, after `npm run build` (needs `ngx_http_gzip_static_module`, which the Debian and Ubuntu packages include):
+
+    ```bash
+    find dist -type f \( -name '*.html' -o -name '*.js' -o -name '*.css' -o -name '*.json' -o -name '*.svg' \) -exec gzip -9 -k -f {} +
+    ```
+
+    **Already good:** the SPA fallback with `try_files`, the 7-day `expires` on plots, and `Host` and `X-Real-IP` forwarded to the API.
+verify:
+  static_only: nginx config, no runnable code

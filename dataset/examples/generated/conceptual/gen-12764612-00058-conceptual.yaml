@@ -1,0 +1,36 @@
+id: gen-12764612-00058-conceptual
+category: conceptual
+language: text
+patterns:
+- batch-db-writes
+- context-tradeoff
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    hi, im new with databases. i have a small gateway on a raspberry pi, it reads some temperature sensors and saves every reading to postgres with one INSERT and then commit. it works but a friend said "this is the wrong way, you must batch the writes, COPY is much better". i dont understand if something is wrong with my setup. is he right?
+- role: assistant
+  content: |
+    He is right in general, but whether it matters for you depends on how many rows you write at a time.
+
+    **Why batching helps:** every INSERT with its own commit pays a fixed cost per row: a round trip to the database and a commit. If you send many rows together, you pay that cost once per batch instead of once per row.
+
+    **What was measured:** in Green Metrics Tool micro-benchmarks with PostgreSQL 16, 500,000 rows were written in batches of 5,000 rows.
+    - One `execute()` per row used ~384 J.
+    - `executemany()` used ~139 J (about 2.8× less).
+    - `COPY` used ~17 J (about 22× less than the loop).
+
+    With batches of only 100 rows, the difference was small: ~13 J for the loop, ~15 J for `executemany`, ~9.5 J for COPY. With few rows per batch, the fixed cost per batch dominates, so the method matters little.
+
+    **For your gateway:**
+    - **A few sensors, one reading every few seconds:** your setup is fine. There is nothing to batch, and extra code would cost more of your time than it saves.
+    - **Hundreds of readings per second, or a backlog you load later:** collect the readings in a buffer and write them in one go, for example every few seconds. Use `executemany()` first. Switch to COPY if you write thousands of rows at once.
+
+    **Trade-offs of buffering:**
+    - If the Pi loses power, readings still in the buffer are lost. Flush often, or keep a small local file as a fallback.
+    - Don't buffer anything that must react at once, like an over-temperature alarm. Handle that path directly.
+
+    To check it for your case, run your gateway for a fixed time with `time` or `perf stat`, once per approach, and compare CPU time. Don't extrapolate from the numbers above.
+verify:
+  static_only: conceptual answer

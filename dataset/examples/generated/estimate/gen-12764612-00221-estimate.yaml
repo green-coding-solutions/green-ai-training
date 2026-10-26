@@ -1,0 +1,87 @@
+id: gen-12764612-00221-estimate
+category: estimate
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    Hello, we are small webshop (about 40 products pages, cart, checkout) and next week is big sale. Our devops colegue say nginx use too much CPU on the sale days and I think maybe we should switch off the compression complete, so server do less work and use less energy. How much energy we save with this? This is our config now:
+
+    ```nginx
+    server {
+        listen 443 ssl http2;
+        server_name shop.example.com;
+
+        root /srv/shop/dist;
+
+        gzip on;
+        gzip_comp_level 5;
+        gzip_types text/css application/javascript application/json image/svg+xml;
+
+        location /assets/ {
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+        }
+
+        location /api/ {
+            proxy_pass http://127.0.0.1:8080;
+        }
+
+        location / {
+            try_files $uri /index.html;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    Don't switch it off. Turning it off would save server CPU, but you would pay for it in bytes sent to your customers.
+
+    In Green Metrics Tool micro-benchmarks, nginx served 2,000 requests for text assets (HTML, CSS, JS, JSON):
+
+    - **No compression:** ~7.3 J of CPU energy, 253 MB transferred.
+    - **gzip level 5 on every request** (like your config): ~54 J, 29 MB transferred.
+    - **Precompressed files with `gzip_static`:** ~14 J, 25 MB transferred.
+
+    Compression sent about 10× fewer bytes. Compressing on every request cost about 4× the CPU energy of precompressed files. The test ran on a local network, where moving bytes was almost free. So it shows only the CPU side. On real customer connections, and especially on mobile, the 10× fewer bytes is the part that counts.
+
+    The better change is to compress your static files once at build time and keep per-request compression only for the API:
+
+    ```nginx
+    server {
+        listen 443 ssl http2;
+        server_name shop.example.com;
+
+        root /srv/shop/dist;
+
+        gzip on;
+        gzip_comp_level 5;
+        gzip_vary on;
+        gzip_types text/css application/javascript application/json image/svg+xml;
+
+        location /assets/ {
+            gzip_static on;
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+        }
+
+        location /api/ {
+            proxy_pass http://127.0.0.1:8080;
+        }
+
+        location / {
+            try_files $uri /index.html;
+        }
+    }
+    ```
+
+    In your build, run `gzip -k` on every `.js`, `.css`, `.json` and `.svg` file in `dist/assets`. This writes a `.gz` file next to each original. nginx then sends the `.gz` file and does no compression work for these requests.
+
+    - Your API answers are generated per request, so they cannot be precompressed. Keep `gzip on` for them.
+    - Precompressed files still cost a little more than no compression, because the browser has to decompress them. That is the normal price for the smaller transfer.
+
+    I can't give you a number for the sale days. It depends on your traffic and file sizes, and the benchmark figures should not be scaled up. To measure it, run the same set of requests against both configs and compare CPU time with `perf stat` or `time` on the nginx workers. A Green Metrics Tool usage scenario gives you energy directly.
+verify:
+  static_only: nginx configuration, no runnable code

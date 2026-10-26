@@ -1,0 +1,43 @@
+id: gen-12764612-00096-no-change
+category: no-change
+language: python
+patterns:
+- deque-or-append
+- context-tradeoff
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    We have a "recently viewed" strip on our shop product pages. Requirements:
+    - newest product first
+    - max 10 items per visitor
+    - viewing a product again moves it to the front, no duplicates
+    - stored in the session, which is serialized to JSON by our session middleware
+
+    This runs on every product page view. I read that `list.insert(0, x)` is O(n) and that a `deque` is better. Should I switch?
+
+    ```python
+    MAX_RECENT = 10
+
+    def record_view(session, product_id):
+        recent = session.setdefault("recent_products", [])
+        if product_id in recent:
+            recent.remove(product_id)
+        recent.insert(0, product_id)
+        del recent[MAX_RECENT:]
+        return recent
+    ```
+- role: assistant
+  content: |
+    No, keep it as it is. This code is already fine for your requirements.
+
+    - **The list is capped at 10.** `insert(0, x)` is O(n) in the list length, and here n is at most 11. Shifting 11 pointers is trivial. In Green Metrics Tool micro-benchmarks, 1,000,000 front inserts into a growing list used ~1515 J, against ~1.2 J for 1,000,000 `append` calls. That gap comes from shifting a list that grows to a million elements. Your list never grows.
+    - **`in` and `remove` scan at most 10 items.** A `deque` has the same linear cost for these.
+    - **A `deque` would add work.** Your session middleware serializes to JSON, so you would convert between `deque` and `list` on every request. That costs more than the shift it saves.
+
+    Your per-request cost is dominated by loading and saving the session, not by this function.
+
+    Revisit this only if the cap grows to thousands of items, or if you keep a long unbounded history per visitor. Then a `deque(maxlen=...)` with `appendleft` becomes worth it. If you want to be sure, time `record_view` with `timeit` on a realistic session. I expect it to disappear next to the session I/O.
+verify:
+  static_only: answer contains no code; it keeps the user's code unchanged

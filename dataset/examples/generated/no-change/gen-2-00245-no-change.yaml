@@ -1,0 +1,69 @@
+id: gen-2-00245-no-change
+category: no-change
+language: nginx
+patterns:
+- text-compression
+- context-tradeoff
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    We have an internal CLI called `depcheck` that runs on every build agent. Every agent also runs a small nginx sidecar that serves our dependency manifests. A cron job rewrites these every few minutes, and the biggest JSON file is about 2 MB. `depcheck` reads them from the local nginx with Python's `urllib`, often hundreds of times per build.
+
+    Our new config audit flagged this server block with "text compression not enabled (gzip off)". Before I add `gzip on` everywhere, can you check whether it makes sense here?
+
+    Requirements:
+    - nginx must stay reachable on loopback only, never from outside the agent
+    - no change to `depcheck` if we can avoid it, we can't roll out a new version this sprint
+    - build agents are CPU bound while compiling, so the sidecar should use as little CPU as possible
+    - if we don't change it, I need a short reason I can paste into the audit ticket
+
+    ```nginx
+    server {
+        listen 127.0.0.1:8080;
+        server_name localhost;
+
+        access_log off;
+        root /var/cache/depcache/public;
+
+        location = /healthz {
+            default_type text/plain;
+            return 200 "ok\n";
+        }
+
+        location /manifests/ {
+            default_type application/json;
+            add_header Cache-Control "no-cache";
+            try_files $uri =404;
+        }
+
+        location /locks/ {
+            default_type text/plain;
+            try_files $uri =404;
+        }
+
+        location / {
+            return 404;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    Keep compression off for this server block. The audit rule assumes the clients are on a network. Here, client and server are on the same machine.
+
+    - **The bytes never leave the machine.** Compression saves transferred bytes, and on loopback those bytes cost almost nothing. You would only add CPU work on both ends. In a Green Metrics Tool benchmark, nginx served text assets on a local network. Gzip level 5 on every request cost about 7× the CPU energy of no compression. Even precompressed files (`gzip_static`) cost about 2× no compression, because the client still has to decompress them. Your agents are busy compiling, so that extra CPU is the wrong trade.
+    - **It would not even take effect.** nginx only compresses when the client sends `Accept-Encoding: gzip`. `urllib` does not send that header by default, so `gzip on` would leave `depcheck` traffic exactly as it is now. Making it work would mean changing the CLI, and that buys you nothing on loopback.
+    - **The config already fits your requirements.** It listens on `127.0.0.1` only, serves files straight from disk, and returns 404 for everything else.
+
+    Text for the audit ticket:
+
+    ```text
+    Not applicable: this nginx listens on 127.0.0.1 only and its sole client is a
+    local CLI on the same host. Compression would add CPU work on both ends with no
+    network bytes saved, and the client does not request gzip encoding. Accepted as is.
+    ```
+
+    This changes if the manifests are ever served to other machines, for example from a central cache. Over a real network, turn compression on: it sent about 10× fewer bytes for text assets in the same benchmark. Since the cron job already writes the files, also write a `.gz` copy at that point and use `gzip_static on`. On-the-fly compression cost about 4× the CPU energy of serving precompressed files.
+verify:
+  static_only: nginx configuration, no runnable code

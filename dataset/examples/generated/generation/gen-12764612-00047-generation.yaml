@@ -1,0 +1,79 @@
+id: gen-12764612-00047-generation
+category: generation
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    hello, we have small flask service and prometheus must scrape it on /metrics every 15 sec. i dont want to install the client library, only simple text. I have function collect_snapshot() what give me dict like this:
+
+    {"http_requests_total": ("counter", "Total HTTP requests.", [({"method": "GET", "code": "200"}, 1520), ({"method": "POST", "code": "500"}, 3)]), ...}
+
+    name -> (type, help text, list of (labels dict, value)). we have maybe 40 000 series in total. Can you write render_metrics(snapshot) what return the text in prometheus format, and the route? label values can have quotes or newlines from user agents, so please care about this
+- role: assistant
+  content: |
+    Here is the renderer. It escapes backslash, double quote and newline in label values, as the text format requires.
+
+    ```python
+    def _esc(value) -> str:
+        return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+    def render_metrics(snapshot) -> str:
+        lines = []
+        for name, (mtype, help_text, samples) in snapshot.items():
+            lines.append(f"# HELP {name} {help_text}")
+            lines.append(f"# TYPE {name} {mtype}")
+            for labels, value in samples:
+                if labels:
+                    inner = ",".join(f'{k}="{_esc(v)}"' for k, v in labels.items())
+                    lines.append(f"{name}{{{inner}}} {value}")
+                else:
+                    lines.append(f"{name} {value}")
+        return "\n".join(lines) + "\n"
+    ```
+
+    ```python
+    from flask import Flask, Response
+
+    app = Flask(__name__)
+
+
+    @app.get("/metrics")
+    def metrics():
+        return Response(render_metrics(collect_snapshot()), mimetype="text/plain")
+    ```
+
+    **Green Notes**
+    - **Join instead of `+=`** (reduces E): the lines go into a list and are joined once at the end. This runs on every scrape, with tens of thousands of lines each time. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces used ~469 J with `+=` and ~1.8 J with `"".join()`, roughly 260× less CPU energy. The gap is smaller for fewer pieces, but it repeats on every scrape.
+    - The f-strings only build single lines, which is fine. Appending them to one growing string in the loop would behave like `+=`.
+verify:
+  module: false
+  green_block: 0
+  test: |-
+    snap = {
+        "http_requests_total": (
+            "counter",
+            "Total HTTP requests.",
+            [({"method": "GET", "code": "200"}, 1520), ({"method": "POST", "code": "500"}, 3)],
+        ),
+        "up": ("gauge", "Service is up.", [({}, 1)]),
+        "ua_total": ("counter", "By agent.", [({"ua": 'a"b\\c\nd'}, 2)]),
+    }
+    out = render_metrics(snap)
+    expected = (
+        '# HELP http_requests_total Total HTTP requests.\n'
+        '# TYPE http_requests_total counter\n'
+        'http_requests_total{method="GET",code="200"} 1520\n'
+        'http_requests_total{method="POST",code="500"} 3\n'
+        '# HELP up Service is up.\n'
+        '# TYPE up gauge\n'
+        'up 1\n'
+        '# HELP ua_total By agent.\n'
+        '# TYPE ua_total counter\n'
+        'ua_total{ua="a\\"b\\\\c\\nd"} 2\n'
+    )
+    assert out == expected, out

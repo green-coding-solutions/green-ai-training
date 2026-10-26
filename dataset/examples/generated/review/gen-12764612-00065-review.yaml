@@ -1,0 +1,104 @@
+id: gen-12764612-00065-review
+category: review
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```python
+    import json
+    from flask import Flask, request, jsonify
+
+    app = Flask(__name__)
+
+    # ~20k customer ids, loaded once at startup
+    with open("suspended_customers.json") as f:
+        SUSPENDED = json.load(f)
+
+
+    @app.route("/api/orders/import", methods=["POST"])
+    def import_orders():
+        orders = request.get_json()["orders"]
+        accepted = []
+        rejected = []
+        seen_ids = []
+        for o in orders:
+            if o["order_id"] in seen_ids:
+                rejected.append({"order_id": o["order_id"], "reason": "duplicate"})
+                continue
+            seen_ids.append(o["order_id"])
+            if o["customer_id"] in SUSPENDED:
+                rejected.append({"order_id": o["order_id"], "reason": "suspended"})
+                continue
+            accepted.append(o)
+        return jsonify({"accepted": len(accepted), "rejected": rejected})
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (REST endpoint, batch import)
+
+    #### [Bug] Bad request body gives a 500
+    - **Where:** `request.get_json()["orders"]`
+    - **Issue:** a missing or non-JSON body returns `None`, and a missing `"orders"` key raises `KeyError`. Both end as a server error instead of a client error.
+    - **Fix:** read the body with `get_json(silent=True)` and return 400 if `orders` is not a list (see the code below).
+
+    #### [High] Linear scan of a 20k list for every order
+    - **Where:** `o["customer_id"] in SUSPENDED`
+    - **Issue:** `SUSPENDED` is a list, so each check scans up to 20k items. A batch of N orders costs up to N × 20k comparisons on every request. The list is loaded once and never changes, so the lookups repeat a lot.
+    - **Fix:** build a set once at startup. The one-time O(n) build is paid back by the many O(1) lookups.
+    - **Impact:** E. CPU work per request drops from O(N × list size) to O(N).
+
+    #### [Medium] `seen_ids` is a list that grows during the loop
+    - **Where:** `o["order_id"] in seen_ids` and `seen_ids.append(...)`
+    - **Issue:** every order scans all earlier ids, so a batch costs O(N²) comparisons.
+    - **Fix:** use a local `set` and `add`. Behavior is the same. Order ids must be hashable, so the code checks that they are strings or ints.
+    - **Impact:** E. It is bounded by batch size, which is why this is Medium.
+
+    ```python
+    import json
+    from flask import Flask, request, jsonify
+
+    app = Flask(__name__)
+
+    # ~20k customer ids, loaded once at startup
+    with open("suspended_customers.json") as f:
+        SUSPENDED = frozenset(json.load(f))
+
+
+    @app.route("/api/orders/import", methods=["POST"])
+    def import_orders():
+        body = request.get_json(silent=True)
+        orders = body.get("orders") if isinstance(body, dict) else None
+        if not isinstance(orders, list):
+            return jsonify({"error": "body must be {\"orders\": [...]}"}), 400
+
+        accepted = []
+        rejected = []
+        seen_ids = set()
+        for o in orders:
+            order_id = o["order_id"]
+            if not isinstance(order_id, (str, int)):
+                return jsonify({"error": "order_id must be a string or int"}), 400
+            if order_id in seen_ids:
+                rejected.append({"order_id": order_id, "reason": "duplicate"})
+                continue
+            seen_ids.add(order_id)
+            if o["customer_id"] in SUSPENDED:
+                rejected.append({"order_id": order_id, "reason": "suspended"})
+                continue
+            accepted.append(o)
+        return jsonify({"accepted": len(accepted), "rejected": rejected})
+    ```
+
+    Accepted and rejected results come out in the same order as before. An order item that is not an object, or that lacks `order_id` or `customer_id`, still raises. Validate those the same way if clients can send them.
+
+    **Already good:** the suspended list is loaded once at startup, not per request.
+
+    A set only pays off here because the lookups repeat. In Green Metrics Tool micro-benchmarks, converting a large list to a set for a single membership test cost more than one linear scan.
+verify:
+  static_only: needs Flask and a suspended_customers.json file

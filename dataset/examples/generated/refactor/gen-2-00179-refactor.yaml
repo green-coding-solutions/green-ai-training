@@ -1,0 +1,163 @@
+id: gen-2-00179-refactor
+category: refactor
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    hi, our team use this workflow for preview of our log pipeline (parser + elasticsearch + kafka + kibana). every push make a namespace in the preview cluster and nobody is deleting them. now we have like 40 namespaces and the autoscaler is adding nodes all the time. reviewers only need it for look at the parsed fields in kibana while the PR is open. we work 7-19 CET mostly. can you refactor it pls?
+
+    `.github/workflows/log-preview.yml`:
+
+    ```yaml
+    name: log-pipeline-preview
+
+    on:
+      push:
+        branches: ['**']
+
+    jobs:
+      preview:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+
+          - uses: azure/k8s-set-context@v4
+            with:
+              kubeconfig: ${{ secrets.PREVIEW_KUBECONFIG }}
+
+          - name: deploy
+            run: |
+              NS=logs-${{ github.ref_name }}
+              kubectl create namespace $NS || true
+              helm upgrade --install pipeline ./deploy/preview \
+                -n $NS -f deploy/preview/values.yaml \
+                --set parser.tag=${{ github.sha }}
+              echo "kibana: https://kibana-$NS.preview.acme.dev"
+    ```
+
+    `deploy/preview/values.yaml`:
+
+    ```yaml
+    elasticsearch:
+      replicas: 3
+      indexReplicas: 2
+      resources:
+        requests: {cpu: "1", memory: 4Gi}
+    kafka:
+      replicas: 3
+      replicationFactor: 3
+    kibana:
+      enabled: true
+    parser:
+      replicas: 4
+      image: ghcr.io/acme/log-parser
+    replay:
+      enabled: true
+      source: s3://acme-sample-logs/nginx-2024-05/   # ~2 GB sample
+      loop: true   # replays the sample again and again
+    ```
+- role: assistant
+  content: |
+    ```yaml
+    name: log-pipeline-preview
+
+    on:
+      pull_request:
+        types: [opened, synchronize, reopened, closed]
+      schedule:
+        - cron: '0 18 * * 1-5'   # sleep: 19:00 CET (cron is UTC)
+        - cron: '0 5 * * 1-5'    # wake: 06:00 CET, workdays only
+
+    concurrency:
+      group: log-preview-${{ github.event.pull_request.number || github.event.schedule }}
+      cancel-in-progress: true
+
+    jobs:
+      deploy:
+        if: github.event_name == 'pull_request' && github.event.action != 'closed'
+        runs-on: ubuntu-latest
+        env:
+          NS: logs-pr-${{ github.event.pull_request.number }}
+        steps:
+          - uses: actions/checkout@v4
+
+          - uses: azure/k8s-set-context@v4
+            with:
+              kubeconfig: ${{ secrets.PREVIEW_KUBECONFIG }}
+
+          - name: deploy
+            run: |
+              helm upgrade --install pipeline ./deploy/preview \
+                --namespace "$NS" --create-namespace \
+                -f deploy/preview/values.yaml \
+                --set parser.tag=${{ github.event.pull_request.head.sha }}
+              kubectl label namespace "$NS" preview=logs --overwrite
+              echo "kibana: https://kibana-$NS.preview.acme.dev"
+
+      teardown:
+        if: github.event_name == 'pull_request' && github.event.action == 'closed'
+        runs-on: ubuntu-latest
+        env:
+          NS: logs-pr-${{ github.event.pull_request.number }}
+        steps:
+          - uses: azure/k8s-set-context@v4
+            with:
+              kubeconfig: ${{ secrets.PREVIEW_KUBECONFIG }}
+
+          - name: delete preview
+            run: kubectl delete namespace "$NS" --ignore-not-found
+
+      sleep-wake:
+        if: github.event_name == 'schedule'
+        runs-on: ubuntu-latest
+        env:
+          MODE: ${{ github.event.schedule == '0 18 * * 1-5' && 'sleep' || 'wake' }}
+        steps:
+          - uses: azure/k8s-set-context@v4
+            with:
+              kubeconfig: ${{ secrets.PREVIEW_KUBECONFIG }}
+
+          - name: scale previews
+            run: |
+              if [ "$MODE" = sleep ]; then REPLICAS=0; else REPLICAS=1; fi
+              for ns in $(kubectl get namespaces -l preview=logs -o jsonpath='{.items[*].metadata.name}'); do
+                kubectl scale deployment,statefulset --all --replicas="$REPLICAS" -n "$ns"
+              done
+    ```
+
+    ```yaml
+    elasticsearch:
+      replicas: 1
+      indexReplicas: 0        # one node cannot hold replica shards
+      resources:
+        requests: {cpu: "1", memory: 4Gi}
+    kafka:
+      replicas: 1
+      replicationFactor: 1    # must not be higher than the broker count
+    kibana:
+      enabled: true
+    parser:
+      replicas: 1
+      image: ghcr.io/acme/log-parser
+    replay:
+      enabled: true
+      source: s3://acme-sample-logs/nginx-2024-05/   # ~2 GB sample
+      loop: false             # replay once, enough data to check fields in Kibana
+    ```
+
+    **Green Notes**
+    - **Preview lives only as long as the PR** (reduces E, M): pushes to branches without a PR, and to `main`, no longer create a namespace. Closing or merging the PR deletes the namespace, including the volumes. This removes the 40 forgotten environments and is the biggest saving.
+    - **Scale to zero outside working hours** (reduces E, M): open previews sleep from 19:00 to 06:00 CET and over the weekend. Ongoing environments then run less than half of the week. GitHub cron is in UTC, so the times shift by one hour in summer. The Elasticsearch data stays in its volume, so Kibana has the same data after wake-up.
+    - **One instance per service, replay once** (reduces M, E): a review needs one Elasticsearch node, one Kafka broker and one parser. The looping replay kept the pipeline busy all day. Now it runs once. Idle trimming alone saves little: in Green Metrics Tool measurements of an idle preview environment over 60 seconds, dropping extra replicas, Redis and a worker cut CPU energy by only about 3%, and machine energy by less than 1%. The real gain is fewer reserved nodes, which your autoscaler then removes. `indexReplicas: 0` and `replicationFactor: 1` are required for a single node, so check that your chart uses them.
+
+    **Fixes and behavior changes**
+    - **Bug fixed:** `logs-${{ github.ref_name }}` gives invalid namespace names for branches like `feature/geoip` or `Fix-Parser`. `|| true` hid the error, and then `helm` failed. The namespace now uses the PR number.
+    - `github.sha` on `pull_request` events is the merge commit. The image tag uses `pull_request.head.sha`, which is the same commit your push builds tagged before.
+    - Nobody can open a preview at night. Pushing to the PR redeploys it.
+    - One-time cleanup of the old namespaces: `kubectl get ns -o name | grep '^namespace/logs-' | grep -v 'logs-pr-' | xargs kubectl delete`.
+verify:
+  static_only: GitHub Actions workflow and Helm values, needs a Kubernetes cluster

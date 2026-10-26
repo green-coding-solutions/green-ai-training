@@ -1,0 +1,57 @@
+id: gen-1-00192-generation
+category: generation
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    hi, im new to docker. i wrote a small python script (bridge.py) that listens to mqtt messages from our temperature sensors and forwards them to our REST api. it runs on a small industrial pc at the factory. requirements.txt has only paho-mqtt and requests. can you write me the Dockerfile? i dont know what is needed. we will rebuild the image every time we change the script
+- role: assistant
+  content: |
+    Here is a Dockerfile for it:
+
+    ```dockerfile
+    FROM python:3.12-slim
+
+    ENV PYTHONUNBUFFERED=1
+    WORKDIR /app
+
+    # dependencies first, so this layer is reused when only bridge.py changes
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY bridge.py .
+
+    RUN useradd --system --no-create-home bridge
+    USER bridge
+
+    CMD ["python", "bridge.py"]
+    ```
+
+    Add a `.dockerignore` next to it, so your repo files do not end up in the image:
+
+    ```text
+    .git
+    __pycache__
+    *.pyc
+    .venv
+    *.log
+    ```
+
+    Build and run:
+
+    ```bash
+    docker build -t sensor-bridge .
+    docker run -d --restart unless-stopped --name sensor-bridge sensor-bridge
+    ```
+
+    **Green Notes**
+    - **Slim base image** (reduces E, M, network): `python:3.12-slim` has what a Python script needs, without compilers, git or editors. `paho-mqtt` and `requests` are pure Python, so no `build-essential` is needed. In Green Metrics Tool micro-benchmarks, building a small Flask image on `python:3.12-slim` with runtime dependencies only used about 7× less energy than on the full `python:3.12` image with dev tools (~124 J vs ~885 J per build, no build cache). Running the app cost the same, so the saving is in every build, pull and stored copy.
+    - **Dependency layer before the source** (reduces E, network): when you only edit `bridge.py`, Docker reuses the cached `pip install` layer. The rebuild and the pull on the factory PC only transfer the small last layer.
+    - **`--no-cache-dir`** (reduces M): pip does not keep its download cache inside the image.
+    - **Runtime dependencies only**: keep test and dev tools out of `requirements.txt`. Put them in a separate file for your own machine.
+verify:
+  static_only: Dockerfile build needs Docker and network

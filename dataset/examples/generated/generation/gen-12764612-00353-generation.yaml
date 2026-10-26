@@ -1,0 +1,70 @@
+id: gen-12764612-00353-generation
+category: generation
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    hello, I make small FastAPI backend for our company and I need one endpoint GET /status. It must ask the health url of our 5 internal services (auth, billing, search, mailer, files) and give back json with the state of each one and one overall flag. If service not answer in 2 secons it is marked as down. The urls are like http://auth.internal:8080/health. Thanks for help and sorry for my englsh
+- role: assistant
+  content: |
+    The five checks run at the same time, so the endpoint waits for the slowest service and not for the sum of all five.
+
+    ```python
+    import asyncio
+    from contextlib import asynccontextmanager
+
+    import httpx
+    from fastapi import FastAPI
+
+    SERVICES = {
+        "auth": "http://auth.internal:8080/health",
+        "billing": "http://billing.internal:8080/health",
+        "search": "http://search.internal:8080/health",
+        "mailer": "http://mailer.internal:8080/health",
+        "files": "http://files.internal:8080/health",
+    }
+
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        app.state.client = httpx.AsyncClient(timeout=httpx.Timeout(2.0))
+        yield
+        await app.state.client.aclose()
+
+
+    app = FastAPI(lifespan=lifespan)
+
+
+    async def check(client: httpx.AsyncClient, name: str, url: str) -> tuple[str, dict]:
+        try:
+            response = await client.get(url)
+        except httpx.HTTPError as exc:
+            return name, {"up": False, "error": type(exc).__name__}
+        return name, {"up": response.status_code == 200, "status_code": response.status_code}
+
+
+    @app.get("/status")
+    async def status():
+        client: httpx.AsyncClient = app.state.client
+        results = await asyncio.gather(
+            *(check(client, name, url) for name, url in SERVICES.items())
+        )
+        services = dict(results)
+        return {
+            "ok": all(s["up"] for s in services.values()),
+            "services": services,
+        }
+    ```
+
+    Every failure (timeout, refused connection, DNS error) is caught inside `check`, so one broken service never breaks the whole response. A service that answers with something other than 200 is also marked as down.
+
+    **Green Notes**
+    - **Async concurrent I/O** (reduces E, mostly wall time): the 5 requests wait on the network together. In Green Metrics Tool micro-benchmarks with 10 requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sequential `urllib`. For a handful of requests the gain is mostly wall time, and the request is not held open for the sum of all waits.
+    - **One shared client** (reduces E): the client is created once at startup and reuses its connections, instead of opening a new client for every call.
+    - *Not applied:* no extra worker pool or background polling. Five small GET requests do not need it.
+verify:
+  static_only: needs fastapi and httpx and internal network services

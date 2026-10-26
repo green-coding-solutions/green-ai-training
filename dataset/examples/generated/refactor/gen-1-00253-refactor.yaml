@@ -1,0 +1,102 @@
+id: gen-1-00253-refactor
+category: refactor
+language: python
+patterns:
+- regex-precompile
+- vectorize-or-jit
+facts:
+- F-REGEX
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    We run a nightly repricing job for our shop catalog (about 8 million variant rows, a few hundred thousand titles). It takes too long and I want to cut its CPU time. Requirements:
+    - output must stay identical, we diff the result against last night's file
+    - we can add `numba` to the job image if it really helps, but no other new services
+    - keep the function names, other code imports them
+
+    ```python
+    import re
+    import numpy as np
+
+
+    def pack_size_ml(title):
+        """Total volume in ml from titles like 'Shampoo 6 x 250 ml' or 'Oil 2x1L'."""
+        m = re.search(r"(\d+)\s*x\s*(\d+)\s*(ml|l)\b", title, re.I)
+        if not m:
+            return None
+        count, size, unit = int(m.group(1)), int(m.group(2)), m.group(3).lower()
+        if unit == "l":
+            size *= 1000
+        return count * size
+
+
+    def reprice(cost_cents, floor_cents, margin_bp):
+        """cost_cents: int64 array. Returns selling price in cents, charm priced (…99)."""
+        out = np.empty(len(cost_cents), dtype=np.int64)
+        for i in range(len(cost_cents)):
+            price = int(cost_cents[i]) * (10000 + margin_bp) // 10000
+            if price < floor_cents:
+                price = floor_cents
+            price = ((price + 99) // 100) * 100 - 1
+            out[i] = price
+        return out
+
+
+    def run(titles, cost_cents):
+        sizes = [pack_size_ml(t) for t in titles]
+        prices = reprice(cost_cents, 499, 2500)
+        return sizes, prices
+    ```
+- role: assistant
+  content: |
+    ```python
+    import re
+    import numpy as np
+    from numba import njit
+
+    _PACK_RE = re.compile(r"(\d+)\s*x\s*(\d+)\s*(ml|l)\b", re.I)
+
+
+    def pack_size_ml(title):
+        """Total volume in ml from titles like 'Shampoo 6 x 250 ml' or 'Oil 2x1L'."""
+        m = _PACK_RE.search(title)
+        if not m:
+            return None
+        count, size, unit = int(m.group(1)), int(m.group(2)), m.group(3).lower()
+        if unit == "l":
+            size *= 1000
+        return count * size
+
+
+    @njit(cache=True)
+    def _reprice(cost_cents, floor_cents, margin_bp):
+        out = np.empty(len(cost_cents), dtype=np.int64)
+        for i in range(len(cost_cents)):
+            price = cost_cents[i] * (10000 + margin_bp) // 10000
+            if price < floor_cents:
+                price = floor_cents
+            price = ((price + 99) // 100) * 100 - 1
+            out[i] = price
+        return out
+
+
+    def reprice(cost_cents, floor_cents, margin_bp):
+        """cost_cents: int64 array. Returns selling price in cents, charm priced (…99)."""
+        return _reprice(np.ascontiguousarray(cost_cents, dtype=np.int64), floor_cents, margin_bp)
+
+
+    def run(titles, cost_cents):
+        sizes = [pack_size_ml(t) for t in titles]
+        prices = reprice(cost_cents, 499, 2500)
+        return sizes, prices
+    ```
+
+    **Green Notes**
+    - **Numba `@njit` on the price loop** (reduces E): this is a pure numeric loop over 8 million integers, which is what a JIT is good at. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples in a pure Python loop used ~40 J, and the same loop with Numba `@njit` ~9.5 J (about 4× less). I kept integer arithmetic only, so the results stay identical to your current output. `cache=True` stores the compiled code, so the compile cost is paid once, not on every nightly start.
+    - **Precompiled regex at module level** (reduces E): the pattern is now built once. This is a small win, not a big one, because Python's `re` already caches compiled patterns. In the same benchmarks, 1,000,000 matches with a precompiled pattern used ~18 J against ~21 J for inline `re.match` (about 18% less). It also keeps the pattern in one named place.
+    - `reprice` keeps its name and signature. The wrapper only makes sure the input is a contiguous `int64` array, which your current callers already pass.
+
+    *Not applied:* a Numba version of `pack_size_ml`. Numba does not support `re`, and a few hundred thousand titles are not a hot numeric loop.
+verify:
+  static_only: Needs numba, which is not in the standard test environment

@@ -1,0 +1,89 @@
+id: gen-12764612-00280-multi-turn
+category: multi-turn
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS
+messages:
+- role: user
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # cron: */5 * * * *
+    set -euo pipefail
+
+    SRC="/var/www/landing/data/leads.ndjson"
+    STAMP="$(date +%Y%m%d%H%M)"
+    WORK="/tmp/leads-$STAMP.ndjson"
+    DEST="marketing@mkt-01.example.com:/srv/inbox/"
+
+    [ -s "$SRC" ] || exit 0
+
+    mv "$SRC" "$WORK"
+    xz -9e -k "$WORK"
+    scp -q "$WORK.xz" "$DEST"
+    rm -f "$WORK" "$WORK.xz"
+    ```
+
+    ?
+- role: assistant
+  content: |
+    The logic is fine. The one expensive part is `xz -9e` on a job that runs every 5 minutes. Switch to a fast codec:
+
+    ```bash
+    #!/usr/bin/env bash
+    # cron: */5 * * * *
+    set -euo pipefail
+
+    SRC="/var/www/landing/data/leads.ndjson"
+    STAMP="$(date +%Y%m%d%H%M)"
+    WORK="/tmp/leads-$STAMP.ndjson"
+    DEST="marketing@mkt-01.example.com:/srv/inbox/"
+
+    [ -s "$SRC" ] || exit 0
+
+    mv "$SRC" "$WORK"
+    zstd -q "$WORK"
+    scp -q "$WORK.zst" "$DEST"
+    rm -f "$WORK" "$WORK.zst"
+    ```
+
+    **Green Notes**
+    - **Fast codec for data compressed often** (reduces E): the file is compressed on every run and only lives for the transfer. In Green Metrics Tool micro-benchmarks, compressing 100 MB of text took ~458 J with xz at its default level and ~16 J with zstd, about 29× more for xz. `-9e` costs even more than the default.
+    - This compares energy, not file size. xz usually makes smaller files, but for a short transfer of an ephemeral file the CPU cost matters more.
+
+    The receiving side needs `zstd` to unpack the `.zst` file.
+- role: user
+  content: |
+    mkt-01 is locked down, only has gzip. ops wont install anything. so keep xz then?
+- role: assistant
+  content: |
+    No, use gzip. It is available on both sides, and it is still far cheaper than xz.
+
+    ```bash
+    #!/usr/bin/env bash
+    # cron: */5 * * * *
+    set -euo pipefail
+
+    SRC="/var/www/landing/data/leads.ndjson"
+    STAMP="$(date +%Y%m%d%H%M)"
+    WORK="/tmp/leads-$STAMP.ndjson"
+    DEST="marketing@mkt-01.example.com:/srv/inbox/"
+
+    [ -s "$SRC" ] || exit 0
+
+    mv "$SRC" "$WORK"
+    gzip -q "$WORK"
+    scp -q "$WORK.gz" "$DEST"
+    rm -f "$WORK" "$WORK.gz"
+    ```
+
+    **Green Notes**
+    - **Moderate gzip level** (reduces E): the default level is a good fit for a job that compresses every few minutes. In Green Metrics Tool micro-benchmarks, compressing 100 MB of text took ~67 J with gzip and ~458 J with xz. zstd used about 4× less than gzip, so it stays the first choice if ops ever allow it.
+    - `gzip` replaces the file with `leads-….ndjson.gz`, so the `rm -f` only has to clean up leftovers if a run fails halfway.
+
+    If the link is slow and file size matters more than CPU, xz would give smaller files. For small lead files every 5 minutes, gzip is the better trade.
+verify:
+  static_only: needs ssh/scp access to a remote host and a cron environment

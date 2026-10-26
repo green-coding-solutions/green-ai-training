@@ -1,0 +1,65 @@
+id: gen-12764612-00360-generation
+category: generation
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    ```python
+    import numpy as np
+
+
+    def replay_stock(demand: np.ndarray, start: int, reorder_point: int, restock_qty: int) -> tuple[int, int]:
+        """Replay a flash-sale for one SKU.
+
+        demand: units requested per order line, in arrival order (int array, ~40M entries per replay).
+        Walk through the lines in order:
+          - if the line asks for more units than we have, it is a stockout: count it, sell nothing
+          - otherwise sell the units
+          - after a sale, if stock < reorder_point, add restock_qty right away
+        Return (stockouts, final_stock).
+        """
+        # TODO
+    ```
+
+    ?
+- role: assistant
+  content: |
+    Each step depends on the stock left by the previous one, so this can't be vectorized with NumPy. I compiled the loop with Numba:
+
+    ```python
+    import numpy as np
+    from numba import njit
+
+
+    @njit(cache=True)
+    def _replay(demand, stock, reorder_point, restock_qty):
+        stockouts = 0
+        for i in range(demand.size):
+            units = demand[i]
+            if units > stock:
+                stockouts += 1
+            else:
+                stock -= units
+                if stock < reorder_point:
+                    stock += restock_qty
+        return stockouts, stock
+
+
+    def replay_stock(demand: np.ndarray, start: int, reorder_point: int, restock_qty: int) -> tuple[int, int]:
+        """Replay a flash-sale for one SKU. Returns (stockouts, final_stock)."""
+        lines = np.ascontiguousarray(demand, dtype=np.int64)
+        stockouts, final_stock = _replay(lines, int(start), int(reorder_point), int(restock_qty))
+        return int(stockouts), int(final_stock)
+    ```
+
+    **Green Notes**
+    - **JIT-compile the hot loop** (reduces E): with ~40M lines, the interpreter would run the loop body 40M times. Numba turns it into machine code. In Green Metrics Tool micro-benchmarks, a per-sample loop over 10 million samples used about 4× less energy with `@njit` than in pure Python.
+    - **`cache=True`** keeps the compiled code on disk, so each new process does not pay the compile cost again.
+    - **One conversion up front** (reduces E): `np.ascontiguousarray(..., dtype=np.int64)` costs nothing if the array already fits, and keeps the compiled code on a single type.
+    - *Not applied:* for small replays (thousands of lines) the plain Python loop is fine, because the compile time would cost more than it saves.
+verify:
+  static_only: needs numba

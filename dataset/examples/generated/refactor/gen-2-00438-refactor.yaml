@@ -1,0 +1,101 @@
+id: gen-2-00438-refactor
+category: refactor
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    ```yaml
+    name: preview
+    on:
+      pull_request:
+        types: [opened, synchronize, reopened]
+
+    jobs:
+      deploy:
+        runs-on: ubuntu-latest
+        env:
+          NS: climsim-pr-${{ github.event.number }}
+          KUBECONFIG: /tmp/kube.yaml
+        steps:
+          - uses: actions/checkout@v4
+          - uses: azure/setup-helm@v4
+          - name: Write kubeconfig
+            run: echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > "$KUBECONFIG"
+          - name: Deploy preview
+            run: |
+              helm upgrade --install "$NS" ./deploy/chart \
+                --namespace "$NS" --create-namespace \
+                --set image.tag="${{ github.sha }}" \
+                --set app.replicas=3 \
+                --set postgres.enabled=true \
+                --set redis.enabled=true \
+                --set worker.enabled=true \
+                --set worker.pollSeconds=5 \
+                --set ingress.host="$NS.preview.climsim.example.org" \
+                --wait --timeout 8m
+          - name: Comment URL
+            uses: marocchino/sticky-pull-request-comment@v2
+            with:
+              message: "Preview: https://climsim-pr-${{ github.event.number }}.preview.climsim.example.org"
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```yaml
+    name: preview
+    on:
+      pull_request:
+        types: [opened, synchronize, reopened, closed]
+
+    env:
+      NS: climsim-pr-${{ github.event.number }}
+      KUBECONFIG: /tmp/kube.yaml
+
+    jobs:
+      deploy:
+        if: github.event.action != 'closed'
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+          - uses: azure/setup-helm@v4
+          - name: Write kubeconfig
+            run: echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > "$KUBECONFIG"
+          - name: Deploy preview
+            run: |
+              helm upgrade --install "$NS" ./deploy/chart \
+                --namespace "$NS" --create-namespace \
+                --set image.tag="${{ github.sha }}" \
+                --set app.replicas=1 \
+                --set postgres.enabled=true \
+                --set redis.enabled=true \
+                --set worker.enabled=true \
+                --set worker.pollSeconds=5 \
+                --set ingress.host="$NS.preview.climsim.example.org" \
+                --wait --timeout 8m
+          - name: Comment URL
+            uses: marocchino/sticky-pull-request-comment@v2
+            with:
+              message: "Preview: https://climsim-pr-${{ github.event.number }}.preview.climsim.example.org"
+
+      teardown:
+        if: github.event.action == 'closed'
+        runs-on: ubuntu-latest
+        steps:
+          - name: Write kubeconfig
+            run: echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > "$KUBECONFIG"
+          - name: Delete preview namespace
+            run: kubectl delete namespace "$NS" --ignore-not-found --wait=false
+    ```
+
+    **Green Notes**
+    - **Teardown when the PR closes** (reduces E, M): the old workflow never removed anything, so every merged or abandoned PR kept its namespace, Postgres and worker running forever. The new `teardown` job deletes the namespace on `closed`, which covers both merge and abandon. This is the main saving. Environments that no longer exist cost nothing, however long they would have idled.
+    - **1 app replica instead of 3:** a preview serves a reviewer or two, so it doesn't need redundancy. It reserves less memory and fewer nodes are needed. Idle replicas are cheap per minute. In Green Metrics Tool micro-benchmarks, an idle preview with 1 app replica and Postgres used about 3% less CPU energy than one with 3 replicas, Redis and a polling worker. So don't expect much from trimming alone. Teardown is what pays.
+    - **Redis and the worker are unchanged:** I can't tell if the previews need them. If reviewers don't use the background jobs, set `redis.enabled` and `worker.enabled` to `false` to cut the reserved memory further.
+    - **Not added:** if reviewers only work in office hours, a nightly scale-to-zero job (and a scale-up on the next push) would remove the idle hours of PRs that stay open. That needs an extra workflow, so I left it out.
+verify:
+  static_only: GitHub Actions workflow needs a Kubernetes cluster and secrets

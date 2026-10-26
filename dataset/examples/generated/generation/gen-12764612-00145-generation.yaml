@@ -1,0 +1,72 @@
+id: gen-12764612-00145-generation
+category: generation
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # weekly: pack the order-api JSON exports, keep 90 days
+    EXPORT_DIR=/var/lib/ordersapi/exports
+    ARCHIVE_DIR=/srv/archive/ordersapi
+    KEEP_DAYS=90
+
+    archive_exports() {
+      # TODO
+      :
+    }
+
+    archive_exports
+    find "$ARCHIVE_DIR" -name '*.tar.*' -mtime +"$KEEP_DAYS" -delete
+    ```
+
+    ?
+- role: assistant
+  content: |-
+    I filled in `archive_exports`. It packs every export file older than a day into one zstd archive. It removes the originals only after the archive is written and checked.
+
+    ```bash
+    #!/usr/bin/env bash
+    # weekly: pack the order-api JSON exports, keep 90 days
+    set -euo pipefail
+
+    EXPORT_DIR=/var/lib/ordersapi/exports
+    ARCHIVE_DIR=/srv/archive/ordersapi
+    KEEP_DAYS=90
+
+    archive_exports() {
+      local stamp list archive
+      stamp=$(date +%Y-%m-%d)
+      archive="$ARCHIVE_DIR/exports-$stamp.tar.zst"
+      list=$(mktemp)
+      trap 'rm -f "$list"' RETURN
+
+      mkdir -p "$ARCHIVE_DIR"
+
+      # files older than one day, paths relative to EXPORT_DIR
+      find "$EXPORT_DIR" -type f -name '*.json' -mtime +0 -printf '%P\0' > "$list"
+      [ -s "$list" ] || return 0
+
+      tar --zstd -cf "$archive.tmp" -C "$EXPORT_DIR" --null -T "$list"
+      tar --zstd -tf "$archive.tmp" > /dev/null
+      mv "$archive.tmp" "$archive"
+
+      # archive is complete, now remove the originals
+      xargs -0 -a "$list" -I{} rm -f -- "$EXPORT_DIR/{}"
+    }
+
+    archive_exports
+    find "$ARCHIVE_DIR" -name 'exports-*.tar.zst' -mtime +"$KEEP_DAYS" -delete
+    ```
+
+    I also added `set -euo pipefail`, so a failed `tar` can never lead to deleted originals. The cleanup `find` now matches only `exports-*.tar.zst`, so it won't touch other files in that folder.
+
+    **Green Notes**
+    - **Compress stored data with a fast codec** (reduces E, storage): JSON compresses well, and the archives sit on disk for 90 days. In Green Metrics Tool micro-benchmarks on 100 MB of text, zstd at its default level used about 4× less energy than gzip to compress. xz used about 29× more than zstd. Those figures compare energy only, not file size. xz would give smaller files, but it costs far more CPU each week.
+    - **Worth compressing at this retention** (reduces storage): a Green Coding Solutions estimate puts the break-even for zstd at about 0.15 days of storage. Data kept for 90 days clears that easily. Files that live only minutes should not be compressed.
+    - **One archive per run** (reduces E): one `tar` process packs the whole batch. That avoids starting a compressor for each file.

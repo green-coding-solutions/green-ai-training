@@ -1,0 +1,121 @@
+id: gen-2-00276-refactor
+category: refactor
+language: python
+patterns:
+- string-join
+- keep-star-imports
+facts:
+- F-STRCAT
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    This builds the product feed we push to Google Merchant Center and two marketplaces. Cron runs it every 15 minutes over the full catalog (~180k active SKUs). The job has started to overlap with the next run. Can you refactor it?
+
+    Requirements:
+    - `build_feed(products, base_url)` must still return the whole feed as one string. Our snapshot tests compare it against fixture files.
+    - The output must stay byte-identical. Merchant Center re-reviews items when anything changes.
+    - Python 3.11, stdlib only.
+    - Feel free to tidy up anything else that looks off.
+
+    ```python
+    from decimal import *
+
+    CURRENCY = "EUR"
+    FEED_HEADER = "id\ttitle\tlink\tprice\tsale_price\tavailability\tgtin\n"
+
+
+    def fmt_price(value):
+        return str(Decimal(value).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)) + " " + CURRENCY
+
+
+    def clean(text):
+        return " ".join(str(text).replace("\t", " ").split())
+
+
+    def build_feed(products, base_url):
+        feed = FEED_HEADER
+        for p in products:
+            if not p.get("active", True):
+                continue
+            price = fmt_price(p["price"])
+            sale = ""
+            if p.get("sale_price") is not None and Decimal(p["sale_price"]) < Decimal(p["price"]):
+                sale = fmt_price(p["sale_price"])
+            availability = "in_stock" if p["stock"] > 0 else "out_of_stock"
+            feed += f"{p['sku']}\t{clean(p['title'])}\t{base_url}/p/{p['slug']}\t{price}\t{sale}\t{availability}\t{p.get('gtin') or ''}\n"
+        return feed
+
+
+    def write_feed(path, products, base_url):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(build_feed(products, base_url))
+    ```
+- role: assistant
+  content: |
+    ```python
+    from decimal import *
+
+    CURRENCY = "EUR"
+    FEED_HEADER = "id\ttitle\tlink\tprice\tsale_price\tavailability\tgtin\n"
+
+
+    def fmt_price(value):
+        return str(Decimal(value).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)) + " " + CURRENCY
+
+
+    def clean(text):
+        return " ".join(str(text).replace("\t", " ").split())
+
+
+    def build_feed(products, base_url):
+        lines = [FEED_HEADER]
+        for p in products:
+            if not p.get("active", True):
+                continue
+            price = fmt_price(p["price"])
+            sale = ""
+            if p.get("sale_price") is not None and Decimal(p["sale_price"]) < Decimal(p["price"]):
+                sale = fmt_price(p["sale_price"])
+            availability = "in_stock" if p["stock"] > 0 else "out_of_stock"
+            lines.append(
+                f"{p['sku']}\t{clean(p['title'])}\t{base_url}/p/{p['slug']}\t"
+                f"{price}\t{sale}\t{availability}\t{p.get('gtin') or ''}\n"
+            )
+        return "".join(lines)
+
+
+    def write_feed(path, products, base_url):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(build_feed(products, base_url))
+    ```
+
+    **Green Notes**
+    - **`"".join()` instead of `+=` on the feed string** (reduces E): the loop added each row to one growing string, about 180k times per run and 96 runs a day. Now each row goes into a list, and the final string is built once at the end. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces with `+=` used ~469 J, and `"".join()` used ~1.8 J. Building each row with an f-string does not avoid this: f-string concatenation in a loop measured like `+=` (~455 J).
+    - **Star import left unchanged:** `from decimal import *` stays as it is. Replacing it with `import decimal` or explicit names makes no measurable energy difference.
+    - **Same output:** same header, same rows, same order, same price rounding. `build_feed` still returns one string, so your snapshot tests work as before. I found nothing else that needed changing.
+    - To check whether this fixes the overlap, time one full run before and after the change (`time python your_feed_job.py`).
+verify:
+  equivalence:
+    driver: |-
+      import hashlib
+      products = []
+      for i in range(300):
+          products.append({
+              "sku": f"SKU-{i:05d}",
+              "title": f"  Merino\tSocks  size {i % 7} ",
+              "slug": f"merino-socks-{i}",
+              "price": f"{10 + i * 0.37:.3f}",
+              "sale_price": None if i % 3 else f"{8 + i * 0.37:.2f}",
+              "stock": i % 5,
+              "gtin": None if i % 4 == 0 else f"0{4000000000000 + i}",
+              "active": i % 11 != 0,
+          })
+      products.append({"sku": "X1", "title": "Gift card", "slug": "gift-card", "price": 25, "sale_price": 30, "stock": 1})
+      products.append({"sku": "X2", "title": "Tote bag", "slug": "tote", "price": 19.995, "sale_price": 12.5, "stock": 0, "gtin": ""})
+      feed = build_feed(products, "https://shop.example")
+      print(len(feed))
+      print(feed[:400])
+      print(feed[-300:])
+      print(hashlib.sha256(feed.encode("utf-8")).hexdigest())
+      print(build_feed([], "https://shop.example") == FEED_HEADER)

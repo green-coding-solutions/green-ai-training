@@ -1,0 +1,175 @@
+id: gen-2-00334-generation
+category: generation
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    ```python
+    """Generate the soft radial glow behind the hero headline.
+
+    Runs in the landing-page build (plain python:3.12 image, no Pillow/numpy).
+    Output: static/img/hero-glow.png, 1920x1080 RGBA. Brand color everywhere,
+    alpha falls off from the center, with a slight sine ripple so the gradient
+    doesn't band on cheap monitors.
+    """
+    import math
+    import struct
+    import zlib
+    from pathlib import Path
+
+    WIDTH, HEIGHT = 1920, 1080
+    COLOR = (99, 102, 241)   # brand indigo
+    RADIUS = 0.75            # fraction of the half-diagonal where alpha reaches 0
+    RIPPLE = 0.04
+    MAX_ALPHA = 0.55
+
+
+    def render_rows(width, height):
+        # TODO: yield one PNG scanline per row (filter byte + RGBA pixels)
+        ...
+
+
+    def write_png(path, width, height, rows):
+        # TODO
+        ...
+
+
+    def main():
+        # TODO
+        ...
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```python
+    """Generate the soft radial glow behind the hero headline.
+
+    Runs in the landing-page build (plain python:3.12 image, no Pillow/numpy).
+    Output: static/img/hero-glow.png, 1920x1080 RGBA. Brand color everywhere,
+    alpha falls off from the center, with a slight sine ripple so the gradient
+    doesn't band on cheap monitors.
+    """
+    import math
+    import struct
+    import zlib
+    from pathlib import Path
+
+    WIDTH, HEIGHT = 1920, 1080
+    COLOR = (99, 102, 241)   # brand indigo
+    RADIUS = 0.75            # fraction of the half-diagonal where alpha reaches 0
+    RIPPLE = 0.04
+    MAX_ALPHA = 0.55
+
+
+    def render_rows(width, height):
+        """Yield one PNG scanline per row: filter byte 0 + RGBA pixels."""
+        r, g, b = COLOR
+        cx, cy = (width - 1) / 2, (height - 1) / 2
+        falloff = RADIUS * math.hypot(cx, cy)
+        # The inner loop runs width * height times: keep its lookups local.
+        sqrt = math.sqrt
+        sin = math.sin
+        ripple = RIPPLE
+        scale = 255 * MAX_ALPHA
+        for y in range(height):
+            dy2 = (y - cy) ** 2          # same for the whole row
+            row = bytearray(b"\x00")     # PNG filter type 0 (none)
+            put = row.extend
+            for x in range(width):
+                d = sqrt((x - cx) ** 2 + dy2) / falloff
+                if d >= 1.0:
+                    a = 0
+                else:
+                    rest = 1.0 - d
+                    t = rest * rest + ripple * sin(d * 40.0) * rest
+                    if t < 0.0:
+                        t = 0.0
+                    elif t > 1.0:
+                        t = 1.0
+                    a = int(scale * t)
+                put((r, g, b, a))
+            yield bytes(row)
+
+
+    def _chunk(tag, data):
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+
+    def write_png(path, width, height, rows):
+        """Write 8-bit RGBA scanlines (with filter bytes) as a PNG file."""
+        comp = zlib.compressobj()
+        idat = bytearray()
+        for row in rows:
+            idat += comp.compress(row)
+        idat += comp.flush()
+        header = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)  # 8-bit RGBA
+        with open(path, "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n")
+            f.write(_chunk(b"IHDR", header))
+            f.write(_chunk(b"IDAT", bytes(idat)))
+            f.write(_chunk(b"IEND", b""))
+
+
+    def main():
+        out = Path("static/img/hero-glow.png")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        write_png(out, WIDTH, HEIGHT, render_rows(WIDTH, HEIGHT))
+        print(f"wrote {out} ({out.stat().st_size} bytes)")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **Hoist loop-invariant lookups** (reduces E): `math.sqrt`, `math.sin`, the constants and `row.extend` are bound to local names once. The vertical distance is computed once per row, not once per pixel. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local before a 10,000,000-iteration loop saved about 4-5%. Here the loop runs about 2 million times per build, so the gain is small, but it costs no readability.
+    - *Not applied:* Numba or other JIT. The docstring rules out extra dependencies, and the script runs once per build, so a pure-stdlib loop is the right trade-off.
+verify:
+  module: true
+  test: |-
+    import os
+    import tempfile
+
+    rows = list(render_rows(64, 36))
+    assert len(rows) == 36
+    assert all(len(r) == 1 + 64 * 4 for r in rows)
+    assert all(r[0] == 0 for r in rows)
+    # corner is outside the falloff radius -> fully transparent
+    assert rows[0][1 + 3] == 0
+    # center pixel carries the brand color and a strong alpha
+    mid = rows[18]
+    px = 1 + 32 * 4
+    assert tuple(mid[px:px + 3]) == (99, 102, 241)
+    assert mid[px + 3] > 100, mid[px + 3]
+    # alpha never exceeds the configured maximum
+    limit = int(255 * MAX_ALPHA)
+    assert all(r[i] <= limit for r in rows for i in range(4, len(r), 4))
+
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "glow.png")
+        write_png(p, 64, 36, render_rows(64, 36))
+        with open(p, "rb") as f:
+            data = f.read()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    assert data[12:16] == b"IHDR"
+    w, h = struct.unpack(">II", data[16:24])
+    assert (w, h) == (64, 36)
+    i = data.index(b"IDAT")
+    n = struct.unpack(">I", data[i - 4:i])[0]
+    raw = zlib.decompress(data[i + 4:i + 4 + n])
+    assert raw == b"".join(render_rows(64, 36))
+    assert data.endswith(b"IEND\xaeB`\x82")

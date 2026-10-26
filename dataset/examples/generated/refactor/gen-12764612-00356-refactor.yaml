@@ -1,0 +1,71 @@
+id: gen-12764612-00356-refactor
+category: refactor
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # archive yesterday's raw extracts after the load finished
+    set -euo pipefail
+
+    RAW_DIR="/data/etl/raw"
+    ARCHIVE_DIR="/data/etl/archive"
+    KEEP_DAYS=90
+    DAY=$(date -d yesterday +%F)
+
+    mkdir -p "$ARCHIVE_DIR/$DAY"
+
+    for f in "$RAW_DIR/$DAY"/*.csv; do
+        [ -e "$f" ] || continue
+        name=$(basename "$f")
+        xz -9e -c "$f" > "$ARCHIVE_DIR/$DAY/$name.xz"
+        xz -t "$ARCHIVE_DIR/$DAY/$name.xz" && rm "$f"
+    done
+
+    find "$ARCHIVE_DIR" -name '*.xz' -mtime +"$KEEP_DAYS" -delete
+    echo "archived $DAY"
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # archive yesterday's raw extracts after the load finished
+    set -euo pipefail
+
+    RAW_DIR='/data/etl/raw'
+    ARCHIVE_DIR='/data/etl/archive'
+    KEEP_DAYS=90
+    DAY=$(date -d yesterday +%F)
+
+    mkdir -p "$ARCHIVE_DIR/$DAY"
+
+    for f in "$RAW_DIR/$DAY"/*.csv; do
+        [ -e "$f" ] || continue
+        name=${f##*/}
+        zstd -q -c "$f" > "$ARCHIVE_DIR/$DAY/$name.zst"
+        zstd -q -t "$ARCHIVE_DIR/$DAY/$name.zst" && rm "$f"
+    done
+
+    # also match old .xz archives so they still expire
+    find "$ARCHIVE_DIR" \( -name '*.zst' -o -name '*.xz' \) -mtime +"$KEEP_DAYS" -delete
+    echo "archived $DAY"
+    ```
+
+    **Green Notes**
+    - **Fast codec for data you compress every day** (reduces E): `xz -9e` is one of the most expensive ways to compress. In Green Metrics Tool micro-benchmarks on 100 MB of text, xz at its default level used about 29× more CPU energy than zstd at its default level. Decompression was also cheaper with zstd (~5.3 J vs ~11.7 J). This job runs on every extract, every night, so the cost repeats daily. The script now uses zstd at its default level.
+    - **No subprocess for the file name:** `${f##*/}` replaces `$(basename ...)`, so there is one process less per file.
+    - **Single quotes** on the fixed paths. This is a very small saving in a script that runs once a day.
+
+    **Behavior changes**
+    - Archives are now `.csv.zst`. Anything that reads them (restores, backfills) must use `zstd -d` or `zstdcat` instead of `xz -d`.
+    - The energy figures compare energy only, not file size. xz usually makes smaller files. If disk space or a slow link to the archive matters more than nightly CPU, keep xz, but drop `-e`, because the extra effort costs a lot for little gain.
+    - Old `.xz` files stay as they are and are still deleted after 90 days.
+verify:
+  static_only: needs xz and zstd binaries plus a dated directory layout under /data

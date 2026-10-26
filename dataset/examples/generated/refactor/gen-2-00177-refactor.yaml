@@ -1,0 +1,121 @@
+id: gen-2-00177-refactor
+category: refactor
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    Our launch page goes live next week. Marketing plans a newsletter blast and a Product Hunt post, so we expect a traffic spike. Please refactor the nginx config before then.
+
+    Setup: Vite build in a `node:20-alpine` stage in CI, `dist/` is copied into `nginx:1.27-alpine`. TLS ends at the load balancer. The container is limited to 0.5 vCPU and we can't raise that.
+
+    Requirements:
+    - keep the cache headers exactly as they are (hashed files in /assets/ are immutable, html must revalidate)
+    - /api/waitlist (small node service) must keep working
+    - no brotli, the stock image doesn't have the module and we don't want a custom build
+    - if the Dockerfile needs changes tell me what to add
+
+    ```nginx
+    server {
+        listen 80;
+        server_name _;
+        root /usr/share/nginx/html;
+        index index.html;
+
+        add_header Strict-Transport-Security "max-age=31536000" always;
+        add_header X-Content-Type-Options nosniff;
+
+        gzip on;
+        gzip_comp_level 9;
+        gzip_min_length 256;
+        gzip_proxied any;
+        gzip_vary on;
+        gzip_types text/css application/javascript application/json image/svg+xml font/woff2;
+
+        location / {
+            try_files $uri $uri/ /index.html;
+            add_header Cache-Control "no-cache";
+        }
+
+        location /assets/ {
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+        }
+
+        location /api/waitlist {
+            proxy_pass http://waitlist:3000;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        error_page 404 /404.html;
+    }
+    ```
+- role: assistant
+  content: |
+    ```nginx
+    server {
+        listen 80;
+        server_name _;
+        root /usr/share/nginx/html;
+        index index.html;
+
+        # Static text files: serve the .gz files built in CI
+        gzip_static on;
+
+        # On-the-fly fallback: /api/waitlist and files without a .gz
+        gzip on;
+        gzip_comp_level 5;
+        gzip_min_length 256;
+        gzip_proxied any;
+        gzip_vary on;
+        gzip_types text/css application/javascript application/json image/svg+xml;
+
+        add_header Strict-Transport-Security "max-age=31536000" always;
+        add_header X-Content-Type-Options nosniff;
+
+        location / {
+            try_files $uri $uri/ /index.html;
+            add_header Cache-Control "no-cache";
+            add_header Strict-Transport-Security "max-age=31536000" always;
+            add_header X-Content-Type-Options nosniff;
+        }
+
+        location /assets/ {
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+            add_header Strict-Transport-Security "max-age=31536000" always;
+            add_header X-Content-Type-Options nosniff;
+        }
+
+        location /api/waitlist {
+            proxy_pass http://waitlist:3000;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        error_page 404 /404.html;
+    }
+    ```
+
+    Add this to the build stage of the Dockerfile, right after the Vite build:
+
+    ```dockerfile
+    RUN npm run build \
+     && find dist -type f \( -name '*.html' -o -name '*.css' -o -name '*.js' -o -name '*.json' -o -name '*.svg' \) \
+          -exec gzip -9 -k {} +
+    ```
+
+    `-k` keeps the originals next to the `.gz` files. Clients that don't send `Accept-Encoding: gzip` still get the plain file. The `gzip_static` module is part of the official nginx image. Run `nginx -t` after the change.
+
+    **Green Notes**
+    - **Precompress static assets at build time** (reduces E, network): before, nginx compressed every HTML, CSS and JS response again at level 9, on 0.5 vCPU, during a spike. Now each file is compressed once per deploy and nginx only sends the `.gz` from disk. In Green Metrics Tool benchmarks where nginx served 2,000 requests for text assets, gzip level 5 per request used ~54 J of client and server CPU energy, precompressed files with `gzip_static` ~14 J, about 4× less. Both sent about 10× fewer bytes than no compression. Level 9 does more work per request than the measured level 5. At build time that cost is paid once, so `-9` is fine there.
+    - **Moderate level for what is still compressed per request** (reduces E): the on-the-fly fallback now runs at level 5. Most `/api/waitlist` replies are below `gzip_min_length 256`, so they are sent without compression anyway.
+    - **`font/woff2` removed from `gzip_types`** (reduces E): WOFF2 is already compressed. Gzipping it costs CPU on every request and saves nothing.
+
+    **Bug fixed:** nginx only inherits `add_header` from the server block if a location sets no `add_header` of its own. Your `/` and `/assets/` locations set `Cache-Control`, so HSTS and `nosniff` were missing on every page and asset. Both headers are now repeated in those locations. The cache headers are unchanged.
+verify:
+  static_only: nginx config and Dockerfile; needs nginx and docker to test

@@ -1,0 +1,108 @@
+id: gen-1-00148-generation
+category: generation
+language: python
+patterns:
+- keep-star-imports
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    I'm adding a small CLI tool, `dupes.py`, to our ops-scripts repo. It finds duplicate files under a directory.
+
+    Requirements:
+    - positional arg: root directory
+    - `--min-size BYTES`, default 1, to skip empty or tiny files
+    - duplicates are files with identical content, so compare by SHA-256 and not by name
+    - files can be several GB, so don't read a whole file into memory
+    - skip symlinks, and don't crash on unreadable files: print a warning to stderr and go on
+    - output must be deterministic: one group per block, paths sorted, groups sorted
+    - exit code 1 if duplicates were found, 0 otherwise (we use it in cron checks)
+
+    Our scripts all start with `from os.path import *`, that's the repo convention. Please keep it, I don't want a style discussion in the PR.
+- role: assistant
+  content: |
+    ```python
+    #!/usr/bin/env python3
+    """Find files with identical content under a directory."""
+    import argparse
+    import hashlib
+    import os
+    import sys
+    from collections import defaultdict
+    from os.path import *
+
+    CHUNK_SIZE = 1 << 20  # 1 MiB
+
+
+    def file_hash(path):
+        digest = hashlib.sha256()
+        with open(path, 'rb') as f:
+            while chunk := f.read(CHUNK_SIZE):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+
+    def find_duplicates(root, min_size=1):
+        by_hash = defaultdict(list)
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames.sort()
+            for name in sorted(filenames):
+                path = join(dirpath, name)
+                if islink(path) or not isfile(path):
+                    continue
+                try:
+                    if getsize(path) < min_size:
+                        continue
+                    by_hash[file_hash(path)].append(path)
+                except OSError as exc:
+                    print(f'warning: skipping {path}: {exc}', file=sys.stderr)
+        groups = [sorted(paths) for paths in by_hash.values() if len(paths) > 1]
+        return sorted(groups)
+
+
+    def main():
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument('root', help='directory to scan')
+        parser.add_argument('--min-size', type=int, default=1,
+                            help='skip files smaller than this many bytes')
+        args = parser.parse_args()
+
+        if not isdir(args.root):
+            parser.error(f'not a directory: {args.root}')
+
+        groups = find_duplicates(args.root, args.min_size)
+        for group in groups:
+            print('\n'.join(group))
+            print()
+        return 1 if groups else 0
+
+
+    if __name__ == '__main__':
+        sys.exit(main())
+    ```
+
+    Files are read in 1 MiB chunks, so memory use stays flat for multi-GB files. The `os.walk` order is sorted, so the output is the same on every run.
+
+    **Green Notes**
+    - **Star import kept as is** (no change in E): `from os.path import *` stays. In Green Metrics Tool micro-benchmarks of 1,000 Python process starts, `from posix import *` and `import posix` both used ~121 J, and `from sympy import *` (~3103 J) and `import sympy` (~3093 J) were equally close. The import style makes no measurable difference. What costs energy is loading a heavy module at all, and this script only uses the standard library.
+    - **Chunked hashing** (reduces M): one chunk is in memory at a time, so a multi-GB file does not need a multi-GB buffer.
+- role: user
+  content: |
+    Thanks, that matches what we need.
+- role: assistant
+  content: |
+    Good. Run it with `./dupes.py /srv/data --min-size 1024` and check `$?` in the cron job.
+verify:
+  module: true
+  test: |-
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, 'sub'))
+        for rel, data in [('a.txt', b'hello'), ('sub/b.txt', b'hello'),
+                          ('c.txt', b'other'), ('empty1', b''), ('empty2', b'')]:
+            with open(os.path.join(d, rel), 'wb') as f:
+                f.write(data)
+        groups = find_duplicates(d)
+        assert groups == [[os.path.join(d, 'a.txt'), os.path.join(d, 'sub', 'b.txt')]], groups
+        assert find_duplicates(d, min_size=100) == []

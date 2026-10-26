@@ -1,0 +1,93 @@
+id: gen-2-00154-generation
+category: generation
+language: sql
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    Hi, i am writing a endpoint POST /api/timesheets/import for our time tracking app (Node + Postgres, we use the `pg` library). Users upload a export from there old tool, it is between 50 and 5000 entries. Backend already parse the file and has a array of objects like `{external_id, project_id, work_date, hours, note}`.
+
+    I need the SQL for it. Requirements:
+    - only insert entries for projects that belong to the users org and are not archived
+    - if entry with same external_id already exist for this user, skip it (re-upload must be safe)
+    - return how many was inserted and how many skipped, and why skipped if possible
+
+    Schema:
+
+    ```sql
+    CREATE TABLE projects (
+      id        bigint PRIMARY KEY,
+      org_id    bigint NOT NULL,
+      name      text NOT NULL,
+      archived  boolean NOT NULL DEFAULT false
+    );
+
+    CREATE TABLE time_entries (
+      id           bigserial PRIMARY KEY,
+      user_id      bigint NOT NULL,
+      project_id   bigint NOT NULL REFERENCES projects(id),
+      work_date    date NOT NULL,
+      hours        numeric(4,2) NOT NULL,
+      note         text,
+      external_id  text NOT NULL,
+      created_at   timestamptz NOT NULL DEFAULT now(),
+      UNIQUE (user_id, external_id)
+    );
+    ```
+
+    Parameters i have: user id, org id and the entries array. Thanks!
+- role: assistant
+  content: |
+    The backend sends the whole array as one JSON parameter, and one statement does the validation, the duplicate check and the insert.
+
+    ```sql
+    -- $1 = user_id, $2 = org_id, $3 = entries as JSON array
+    WITH input AS (
+      SELECT e.external_id, e.project_id, e.work_date, e.hours, e.note
+      FROM jsonb_to_recordset($3::jsonb)
+           AS e(external_id text, project_id bigint, work_date date, hours numeric, note text)
+    ),
+    valid AS (
+      SELECT i.*
+      FROM input i
+      JOIN projects p
+        ON p.id = i.project_id
+       AND p.org_id = $2
+       AND NOT p.archived
+    ),
+    inserted AS (
+      INSERT INTO time_entries (user_id, project_id, work_date, hours, note, external_id)
+      SELECT $1, v.project_id, v.work_date, v.hours, v.note, v.external_id
+      FROM valid v
+      ON CONFLICT (user_id, external_id) DO NOTHING
+      RETURNING 1
+    )
+    SELECT
+      (SELECT count(*) FROM inserted)                               AS inserted,
+      (SELECT count(*) FROM input) - (SELECT count(*) FROM valid)   AS skipped_invalid_project,
+      (SELECT count(*) FROM valid) - (SELECT count(*) FROM inserted) AS skipped_duplicate;
+    ```
+
+    Calling it from Node:
+
+    ```javascript
+    const { rows } = await pool.query(IMPORT_SQL, [userId, orgId, JSON.stringify(entries)]);
+    // rows[0] -> { inserted, skipped_invalid_project, skipped_duplicate }
+    ```
+
+    Notes:
+    - `skipped_duplicate` counts rows that already exist for this user and also repeated `external_id`s inside the same file. `ON CONFLICT DO NOTHING` keeps the first one.
+    - It is a single statement, so it is atomic. If any row is invalid (for example `hours` too large for `numeric(4,2)`, or a bad date), the whole import fails and nothing is written. Validate those fields in the backend first if you want to skip bad rows instead.
+    - `count(*)` comes back as a string in `pg` (bigint). Use `Number()` on it before you put it in the response.
+
+    **Green Notes**
+    - **Batch database writes** (reduces E): the whole upload is one statement and one round trip, not one INSERT per entry. In Green Metrics Tool micro-benchmarks on PostgreSQL with 5,000-row batches, `executemany()` used about 2.8× less CPU energy than one `execute()` per row, and `COPY` about 22× less.
+    - **No per-entry lookups** (reduces E): the project check and the duplicate check run as one join and one conflict check inside the same statement. There is no extra SELECT per row.
+    - *Not applied:* `COPY` — it can't join or use `ON CONFLICT`, so you would need a temp staging table plus a second statement. For one upload of a few thousand rows, a single set-based INSERT is enough and much simpler. `COPY` makes more sense for large nightly bulk loads.
+verify:
+  static_only: PostgreSQL-specific SQL (jsonb_to_recordset, $n parameters, data-modifying CTE) plus a Node pg call; not runnable
+    in SQLite

@@ -1,0 +1,112 @@
+id: gen-2-00140-refactor
+category: refactor
+language: python
+patterns:
+- torch-no-grad
+- string-join
+facts:
+- F-NOGRAD
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import sys
+    import zlib
+
+    import torch
+
+    LABELS = ["ok", "warning", "incident"]
+    DIM = 512
+
+    model = torch.jit.load("models/log_triage.pt")
+    model.eval()
+
+
+    def featurize(line):
+        vec = torch.zeros(DIM)
+        for tok in line.lower().split():
+            vec[zlib.crc32(tok.encode()) % DIM] += 1.0
+        return vec
+
+
+    def triage(path, batch_size=256):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = [l.rstrip("\n") for l in f if l.strip()]
+
+        report = ""
+        counts = {label: 0 for label in LABELS}
+        for start in range(0, len(lines), batch_size):
+            chunk = lines[start:start + batch_size]
+            x = torch.stack([featurize(l) for l in chunk])
+            probs = torch.softmax(model(x), dim=1)
+            conf, idx = probs.max(dim=1)
+            for line, c, i in zip(chunk, conf.tolist(), idx.tolist()):
+                label = LABELS[i]
+                counts[label] += 1
+                if label != "ok":
+                    report += f"[{label.upper()} {c:.2f}] {line}\n"
+
+        summary = " ".join(f"{k}={v}" for k, v in counts.items())
+        return summary + "\n" + report
+
+
+    if __name__ == "__main__":
+        sys.stdout.write(triage(sys.argv[1]))
+    ```
+- role: assistant
+  content: |
+    ```python
+    import sys
+    import zlib
+
+    import torch
+
+    LABELS = ["ok", "warning", "incident"]
+    DIM = 512
+
+    model = torch.jit.load("models/log_triage.pt")
+    model.eval()
+
+
+    def featurize(line):
+        vec = torch.zeros(DIM)
+        for tok in line.lower().split():
+            vec[zlib.crc32(tok.encode()) % DIM] += 1.0
+        return vec
+
+
+    def triage(path, batch_size=256):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = [l.rstrip("\n") for l in f if l.strip()]
+
+        flagged = []
+        counts = {label: 0 for label in LABELS}
+        with torch.no_grad():
+            for start in range(0, len(lines), batch_size):
+                chunk = lines[start:start + batch_size]
+                x = torch.stack([featurize(l) for l in chunk])
+                probs = torch.softmax(model(x), dim=1)
+                conf, idx = probs.max(dim=1)
+                for line, c, i in zip(chunk, conf.tolist(), idx.tolist()):
+                    label = LABELS[i]
+                    counts[label] += 1
+                    if label != "ok":
+                        flagged.append(f"[{label.upper()} {c:.2f}] {line}\n")
+
+        summary = " ".join(f"{k}={v}" for k, v in counts.items())
+        return summary + "\n" + "".join(flagged)
+
+
+    if __name__ == "__main__":
+        sys.stdout.write(triage(sys.argv[1]))
+    ```
+
+    **Green Notes**
+    - **`torch.no_grad()` around inference** (reduces E and M): without it, every forward pass builds the autograd graph and keeps intermediate tensors for a backward pass that never runs. In Green Metrics Tool micro-benchmarks, 100,000 PyTorch CPU inferences used about 14% less CPU energy with `torch.no_grad()`. Keep `model.eval()`. It switches dropout and batch norm to inference mode, but it does not turn off gradient tracking.
+    - **`"".join()` instead of `+=`** (reduces E): the report used to grow with one f-string `+=` per flagged line. On a big log, that can copy the growing string over and over. Now the lines go into a list and get joined once at the end. In Green Metrics Tool micro-benchmarks with Python, `"".join()` used roughly 260× less CPU energy than `+=` when building a string from 1,000,000 pieces. Using f-strings in a loop cost about the same as `+=`.
+    - The output stays the same: same counts, same flagged lines, same order.
+verify:
+  static_only: needs torch and the TorchScript model file models/log_triage.pt

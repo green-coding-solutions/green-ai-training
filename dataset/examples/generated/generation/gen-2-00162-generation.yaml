@@ -1,0 +1,62 @@
+id: gen-2-00162-generation
+category: generation
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    py func: pull ups / dhl / dpd tracking nums out of shipping confirmation email body, return list of (carrier, number), no dupes
+- role: assistant
+  content: |
+    ```python
+    import re
+
+    # Compiled once at import, reused for every email.
+    _TRACKING_RE = re.compile(
+        r"\b(?:"
+        r"(?P<UPS>1Z[0-9A-Z]{16})"           # UPS: 1Z + 16 alphanumerics
+        r"|(?P<DHL>JJD\d{18}|\d{20})"        # DHL Paket: JJD + 18 digits, or 20 digits
+        r"|(?P<DPD>\d{14})"                  # DPD: 14 digits
+        r")\b",
+        re.IGNORECASE,
+    )
+
+
+    def find_tracking_numbers(body: str) -> list[tuple[str, str]]:
+        """Return (carrier, number) pairs in order of appearance, without duplicates."""
+        seen = set()
+        result = []
+        for m in _TRACKING_RE.finditer(body):
+            carrier = m.lastgroup
+            number = m.group(carrier).upper()
+            if number not in seen:
+                seen.add(number)
+                result.append((carrier, number))
+        return result
+    ```
+
+    All three carriers share one pattern, so results come back in the order they appear in the email. Numbers are uppercased, so `1z…` and `1Z…` count as the same number. A plain 14-digit order number would also match as DPD. If your emails have those, require a keyword such as "Sendungsnummer" or "tracking" before the number.
+
+    **Green Notes**
+    - **Compile regex once, outside the call** (reduces E): the pattern is compiled at import, not for every email. In Green Metrics Tool micro-benchmarks, a precompiled pattern used about 18% less CPU energy than inline `re.match()` over 1,000,000 matches. The gain is small because Python's `re` caches compiled patterns. The real cost comes from building the pattern string inside the function, for example per carrier or per shop. In the same benchmarks, forcing a recompile on every call cost about 200× more per match.
+verify:
+  test: |-
+    body = (
+        "Hi Anna, your order #48213 has shipped.\n"
+        "UPS: 1Z999AA10123456784 and DPD 01234567890123.\n"
+        "Again: 1z999aa10123456784\n"
+        "DHL JJD000390007880012345 and 00340434161234567890.\n"
+        "Order 123456, ref 1234567890123456."
+    )
+    got = find_tracking_numbers(body)
+    assert got == [
+        ("UPS", "1Z999AA10123456784"),
+        ("DPD", "01234567890123"),
+        ("DHL", "JJD000390007880012345"),
+        ("DHL", "00340434161234567890"),
+    ], got
+    assert find_tracking_numbers("no tracking here") == []
+    assert find_tracking_numbers("x123456789012345678y") == []

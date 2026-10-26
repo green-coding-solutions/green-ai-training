@@ -1,0 +1,165 @@
+id: gen-2-00102-refactor
+category: refactor
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    hi, this is the command dispatcher on our gateway (raspberry pi CM4). it take commands from the cloud and forward them to the modbus devices over RS485. when we push a firmware update the queue get 20-30k chunk entries. my colleague say the list operations are slow when the list is big, can you optimise and clean up a bit? the urgent commands must still go first, and on retry the chunk order must stay same, otherwise the device reject the image.
+
+    ```python
+    import logging
+
+    log = logging.getLogger("dispatch")
+
+    URGENT = {"estop", "valve_close", "relay_off"}
+
+
+    class CommandDispatcher:
+        def __init__(self, bus, max_retries=3):
+            self.bus = bus
+            self.max_retries = max_retries
+            self.pending = []
+            self.sent = 0
+            self.failed = []
+
+        def submit(self, cmd):
+            # cmd = {"dev": 12, "op": "fw_chunk", "data": b"..."}
+            cmd.setdefault("tries", 0)
+            if cmd["op"] in URGENT:
+                self.pending.insert(0, cmd)   # urgent go first
+            else:
+                self.pending.append(cmd)
+
+        def submit_firmware(self, dev, image, chunk_size=256):
+            for off in range(0, len(image), chunk_size):
+                self.submit({"dev": dev, "op": "fw_chunk", "off": off,
+                             "data": image[off:off + chunk_size]})
+
+        def run_once(self):
+            if len(self.pending) == 0:
+                return False
+            cmd = self.pending.pop(0)
+            try:
+                self.bus.write(cmd["dev"], cmd["op"], cmd.get("data", b""))
+                self.sent += 1
+            except IOError as e:
+                cmd["tries"] += 1
+                if cmd["tries"] < self.max_retries:
+                    self.pending.insert(0, cmd)   # retry first, keep chunk order
+                else:
+                    log.warning("drop %s for dev %s: %s", cmd["op"], cmd["dev"], e)
+                    self.failed.append(cmd)
+            return True
+
+        def drain(self):
+            while self.run_once():
+                pass
+
+        def queued_for(self, dev):
+            return [c for c in self.pending if c["dev"] == dev]
+    ```
+- role: assistant
+  content: |
+    ```python
+    import logging
+    from collections import deque
+
+    log = logging.getLogger("dispatch")
+
+    URGENT = {"estop", "valve_close", "relay_off"}
+
+
+    class CommandDispatcher:
+        def __init__(self, bus, max_retries=3):
+            self.bus = bus
+            self.max_retries = max_retries
+            self.pending = deque()
+            self.sent = 0
+            self.failed = []
+
+        def submit(self, cmd):
+            # cmd = {"dev": 12, "op": "fw_chunk", "data": b"..."}
+            cmd.setdefault("tries", 0)
+            if cmd["op"] in URGENT:
+                self.pending.appendleft(cmd)   # urgent go first
+            else:
+                self.pending.append(cmd)
+
+        def submit_firmware(self, dev, image, chunk_size=256):
+            for off in range(0, len(image), chunk_size):
+                self.submit({"dev": dev, "op": "fw_chunk", "off": off,
+                             "data": image[off:off + chunk_size]})
+
+        def run_once(self):
+            if not self.pending:
+                return False
+            cmd = self.pending.popleft()
+            try:
+                self.bus.write(cmd["dev"], cmd["op"], cmd.get("data", b""))
+                self.sent += 1
+            except IOError as e:
+                cmd["tries"] += 1
+                if cmd["tries"] < self.max_retries:
+                    self.pending.appendleft(cmd)   # retry first, keep chunk order
+                else:
+                    log.warning("drop %s for dev %s: %s", cmd["op"], cmd["dev"], e)
+                    self.failed.append(cmd)
+            return True
+
+        def drain(self):
+            while self.run_once():
+                pass
+
+        def queued_for(self, dev):
+            return [c for c in self.pending if c["dev"] == dev]
+    ```
+
+    **Green Notes**
+    - **`deque` instead of front operations on a list** (reduces E): `pop(0)` and `insert(0, ...)` move every entry in the list. With 20-30k firmware chunks in the queue, each command you dispatched shifted all of them. A `deque` does `popleft()` and `appendleft()` in O(1). In Green Metrics Tool micro-benchmarks, 1,000,000 × `list.insert(0, x)` used ~1515 J and 1,000,000 × `append` used ~1.2 J, a difference of over 1000×.
+    - **Same order as before:** urgent commands still jump the queue. A failed command still goes back to the head, so the chunk order stays the same. Two urgent commands sent right after each other still run newest first, like in your version. If you want them in arrival order, keep them in a second deque.
+    - **Watch for slicing:** a `deque` has no slicing (`pending[:10]`), and indexing into the middle is O(n). If other code slices `pending`, use `itertools.islice(self.pending, 10)` there. `len()`, `if self.pending` and iteration still work.
+verify:
+  equivalence:
+    driver: |
+      class FakeBus:
+          def __init__(self):
+              self.n = 0
+              self.log = []
+
+          def write(self, dev, op, data):
+              self.n += 1
+              if dev == 9 or self.n % 7 == 0:
+                  raise IOError("timeout")
+              self.log.append((dev, op, len(data)))
+
+      bus = FakeBus()
+      d = CommandDispatcher(bus)
+      d.submit_firmware(4, bytes(range(256)) * 20, chunk_size=100)
+      d.submit({"dev": 2, "op": "estop"})
+      d.submit({"dev": 9, "op": "valve_close"})
+      d.submit({"dev": 3, "op": "read_cfg"})
+      print(len(d.queued_for(4)), len(d.queued_for(9)))
+      for _ in range(5):
+          d.run_once()
+      d.submit({"dev": 5, "op": "relay_off"})
+      d.drain()
+      print(d.sent, len(bus.log))
+      print(bus.log)
+      print([(c["dev"], c["op"], c["tries"]) for c in d.failed])
+      print(d.run_once())
+  benchmark:
+    driver: |
+      class NullBus:
+          def write(self, dev, op, data):
+              pass
+
+      d = CommandDispatcher(NullBus())
+      d.submit_firmware(4, bytes(50000 * 16), chunk_size=16)
+      d.submit({"dev": 2, "op": "estop"})
+      d.drain()
+      print(d.sent)
+    min_speedup: 1.5

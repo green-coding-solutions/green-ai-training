@@ -1,0 +1,85 @@
+id: gen-2-00000-review
+category: review
+language: sql
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+messages:
+- role: user
+  content: |
+    hi, can you review this query pls? it is from the photometry worker of our telescope survey. the worker run every 10 minute and take the next 500 calibrated observation in r and i band, for do the photometry on them.
+
+    table `observations` have 48 columns and some are big: `fits_header` (the full FITS header as text, around 30 KB each one), `reduction_log`, and `quicklook_b64` (thumbnail as base64). the worker only need id, target name, coordinates, band, exposure, airmass, obs time and fits path. we read the rows in python with psycopg `dict_row`, so like `row["id"]`, `row["fits_path"]`. Postgres 16.
+
+    ```sql
+    SELECT *
+    FROM observations o
+    JOIN targets t ON t.id = o.target_id
+    WHERE o.status = 'calibrated'
+      AND o.filter_band = 'r' OR o.filter_band = 'i'
+      AND o.photometry_done = false
+    ORDER BY o.obs_time
+    LIMIT 500;
+    ```
+
+    sometimes we see same observation get photometry twice and i dont understand why. thanks!
+- role: assistant
+  content: |
+    **Workload:** data pipeline (recurring batch, 500 rows per run)
+
+    #### [Bug] `AND`/`OR` precedence picks the wrong rows
+    - **Where:** `WHERE` clause
+    - **Issue:** `AND` binds tighter than `OR`, so the filter is read as `(status = 'calibrated' AND band = 'r') OR (band = 'i' AND photometry_done = false)`. r-band rows are selected even when `photometry_done` is already true, which explains the double photometry. i-band rows are selected even when they are not calibrated yet.
+    - **Fix:** `AND o.filter_band IN ('r', 'i')`, or put the `OR` in parentheses.
+
+    #### [Bug] Duplicate `id` column in the result
+    - **Where:** `SELECT *` over the join
+    - **Issue:** both `observations` and `targets` have an `id` column. With `dict_row` the later column overwrites the earlier one, so `row["id"]` holds the **target** id, not the observation id. Any update you make with it, like marking the observation as done, hits the wrong row.
+    - **Fix:** name the columns and alias where needed (see query below).
+
+    #### [High] `SELECT *` pulls the large text columns on every run
+    - **Where:** `SELECT *`
+    - **Issue:** every batch reads `fits_header`, `reduction_log` and `quicklook_b64` for all 500 rows, plus all `targets` columns. The worker uses none of them. PostgreSQL has to load these values from storage, decompress them and send them to the client, and the worker has to decode and keep them in memory.
+    - **Fix:** select only the columns the worker uses.
+    - **Impact:** reduces E on the database and the worker, and M in the worker. In Green Metrics Tool micro-benchmarks on PostgreSQL 16, reading 500 rows from a 52-column table with large text columns used about 5.5× less CPU energy when the query named the 10 needed columns instead of `SELECT *`. The cost scales with the data each column carries, so skipping the header and thumbnail columns is where most of the saving comes from.
+
+    ```sql
+    SELECT o.id,
+           t.name AS target_name,
+           t.ra_deg,
+           t.dec_deg,
+           o.filter_band,
+           o.exposure_s,
+           o.airmass,
+           o.obs_time,
+           o.fits_path
+    FROM observations o
+    JOIN targets t ON t.id = o.target_id
+    WHERE o.status = 'calibrated'
+      AND o.filter_band IN ('r', 'i')
+      AND o.photometry_done = false
+    ORDER BY o.obs_time
+    LIMIT 500;
+    ```
+
+    Update the Python keys to these names (`row["target_name"]`, `row["ra_deg"]`, ...). Now `row["id"]` is always the observation id.
+
+    **Already good:** the batch is bounded with `LIMIT`, and the `ORDER BY obs_time` gives a stable processing order.
+verify:
+  sql:
+    setup: |
+      CREATE TABLE targets (id INTEGER PRIMARY KEY, name TEXT, ra_deg REAL, dec_deg REAL, notes TEXT);
+      CREATE TABLE observations (
+        id INTEGER PRIMARY KEY, target_id INTEGER, status TEXT, filter_band TEXT,
+        photometry_done BOOLEAN, exposure_s REAL, airmass REAL, obs_time TEXT,
+        fits_path TEXT, fits_header TEXT, reduction_log TEXT, quicklook_b64 TEXT);
+      INSERT INTO targets VALUES (1, 'NGC 7789', 359.33, 56.72, 'open cluster'), (2, 'M67', 132.85, 11.81, 'old cluster');
+      INSERT INTO observations VALUES
+        (101, 1, 'calibrated', 'r', false, 60, 1.12, '2026-10-01T21:00:00', '/data/101.fits', 'SIMPLE = T', 'ok', 'aGVsbG8='),
+        (102, 1, 'calibrated', 'r', true,  60, 1.15, '2026-10-01T21:05:00', '/data/102.fits', 'SIMPLE = T', 'ok', 'aGVsbG8='),
+        (103, 2, 'raw',        'i', false, 90, 1.30, '2026-10-01T21:10:00', '/data/103.fits', 'SIMPLE = T', 'ok', 'aGVsbG8='),
+        (104, 2, 'calibrated', 'i', false, 90, 1.28, '2026-10-01T21:15:00', '/data/104.fits', 'SIMPLE = T', 'ok', 'aGVsbG8='),
+        (105, 1, 'calibrated', 'g', false, 45, 1.10, '2026-10-01T21:20:00', '/data/105.fits', 'SIMPLE = T', 'ok', 'aGVsbG8=');
+    compare: false

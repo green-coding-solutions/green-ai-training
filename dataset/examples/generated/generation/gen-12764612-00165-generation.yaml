@@ -1,0 +1,62 @@
+id: gen-12764612-00165-generation
+category: generation
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    flask endpoint for landing page contact form, send the message to sales or support with our torch model models/intent.pt (torchscript, cpu). POST /route
+- role: assistant
+  content: |
+    ```python
+    import re
+    import zlib
+
+    import torch
+    from flask import Flask, jsonify, request
+
+    app = Flask(__name__)
+
+    DIM = 512
+    LABELS = ["sales", "support"]
+    TOKEN = re.compile(r"[a-z0-9']+")
+
+    model = torch.jit.load("models/intent.pt", map_location="cpu")
+    model.eval()
+
+
+    def featurize(text: str) -> torch.Tensor:
+        # Hashed bag of words. Replace with the exact features used in training.
+        vec = torch.zeros(1, DIM)
+        for tok in TOKEN.findall(text.lower()):
+            vec[0, zlib.crc32(tok.encode()) % DIM] += 1.0
+        return vec
+
+
+    @app.post("/route")
+    def route():
+        data = request.get_json(silent=True) or {}
+        message = (data.get("message") or "").strip()
+        if not message:
+            return jsonify(error="message is required"), 400
+        if len(message) > 5000:
+            return jsonify(error="message too long"), 413
+
+        with torch.no_grad():
+            logits = model(featurize(message))
+            probs = torch.softmax(logits, dim=-1)[0]
+
+        idx = int(probs.argmax())
+        return jsonify(team=LABELS[idx], confidence=round(float(probs[idx]), 3))
+    ```
+
+    The model is loaded once at startup, not per request. I assumed two output classes (`sales`, `support`) and a 512-dim input. Adjust both to your model.
+
+    **Green Notes**
+    - **`torch.no_grad()` for inference** (reduces E): the form only needs predictions, so PyTorch should not build an autograd graph for every request. In Green Metrics Tool micro-benchmarks of 100,000 CPU inferences, running without `no_grad` used about 14% more CPU energy than with it. The answer is identical.
+    - *Not applied:* request batching. A contact form sends one message at a time and the visitor waits for the result, so collecting requests would only add delay.
+verify:
+  static_only: needs torch, flask and a TorchScript model file

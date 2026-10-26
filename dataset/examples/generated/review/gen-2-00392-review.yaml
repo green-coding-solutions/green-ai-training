@@ -1,0 +1,192 @@
+id: gen-2-00392-review
+category: review
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    Can you review the ingest module of our IoT gateway? Some context and requirements:
+
+    - Runs on a Raspberry Pi CM4 based gateway. Python 3.9, no extra packages allowed.
+    - Around 6,000 provisioned sensors. The broker pushes roughly 2,000 msgs/s at peak.
+    - The provisioning service rewrites `devices.json` from time to time. We reload it every 5 minutes.
+    - Please don't change function signatures. `main.py` and the tests import them.
+    - Tell me if something is actually wrong, not just style.
+
+    ```python
+    # gateway/ingest.py
+    import json
+    import logging
+    import time
+
+    log = logging.getLogger("gateway.ingest")
+
+    ALLOWLIST_PATH = "/etc/gateway/devices.json"
+    RELOAD_INTERVAL = 300  # seconds, provisioning service rewrites the file
+
+    _allowed_devices = []
+    _last_reload = 0.0
+
+
+    def load_allowlist(path=ALLOWLIST_PATH):
+        global _last_reload
+        with open(path) as f:
+            data = json.load(f)
+        for dev in data["devices"]:
+            if dev.get("active", True):
+                _allowed_devices.append(dev["id"])
+        _last_reload = time.monotonic()
+        log.info("allowlist loaded: %d devices", len(_allowed_devices))
+
+
+    def is_allowed(device_id):
+        if time.monotonic() - _last_reload > RELOAD_INTERVAL:
+            load_allowlist()
+        return device_id in _allowed_devices
+
+
+    def check_gateway_config(cfg, gateway_id):
+        # called once from main() before we connect to the broker
+        if gateway_id not in cfg["gateways"]:
+            raise SystemExit(f"gateway {gateway_id} is not registered in config")
+
+
+    def handle_batch(messages, forward):
+        """messages: decoded MQTT messages from the paho on_message buffer."""
+        accepted = 0
+        for msg in messages:
+            device_id = msg.get("device_id")
+            if not is_allowed(device_id):
+                log.debug("drop message from unknown device %s", device_id)
+                continue
+            forward(msg["topic"], msg["payload"])
+            accepted += 1
+        return accepted
+    ```
+- role: assistant
+  content: |
+    **Workload:** IoT gateway (per-message hot path)
+
+    #### [Security] Revoked devices stay allowed after a reload
+    - **Where:** `load_allowlist`, `_allowed_devices.append(...)`
+    - **Issue:** every reload appends to the existing list and never clears it. A device that is deactivated or removed from `devices.json` stays allowed until the gateway restarts. The list also grows by about 6,000 entries every 5 minutes, so memory use climbs all day on the CM4. The logged device count is wrong for the same reason.
+    - **Fix:** build a new collection on each reload and swap it in with one assignment (see the module below).
+
+    #### [Bug] A failed reload breaks message handling
+    - **Where:** `is_allowed` → `load_allowlist()`
+    - **Issue:** if the reload fires while the provisioning service is rewriting the file, `json.load` raises `JSONDecodeError`. The exception escapes from `handle_batch`, and the rest of the batch is lost. `_last_reload` is not updated, so every following message tries to reload again until the file is valid.
+    - **Fix:** catch the error in `is_allowed`, keep the previous allowlist and retry at the next interval. A direct `load_allowlist()` call at startup still raises, as before. If you can, let the provisioning service write to a temp file and `rename` it, so the gateway never sees a half-written file.
+
+    #### [High] Linear scan of the allowlist for every message
+    - **Where:** `is_allowed`, `device_id in _allowed_devices`
+    - **Issue:** `in` on a list compares the ID against the entries one by one. At about 2,000 messages per second and 6,000 devices, that is millions of string comparisons per second. Unknown devices always scan the whole list. Because of the reload bug above, the list also gets longer all day.
+    - **Fix:** store the allowlist as a `frozenset`. It is built once per reload and then serves every lookup until the next reload, so the build cost is paid once for a very large number of lookups.
+    - **Impact:** E (CPU on the gateway). Per message, a scan of up to 6,000 strings becomes one hash lookup, which leaves more CPU headroom at peak.
+
+    `_allowed_devices` is now a `frozenset`. `in` and `len()` work as before. If code outside this module indexes it or relies on its order, that code needs to change too.
+
+    Revised module (same signatures, Python 3.9 compatible):
+
+    ```python
+    # gateway/ingest.py
+    import json
+    import logging
+    import time
+
+    log = logging.getLogger("gateway.ingest")
+
+    ALLOWLIST_PATH = "/etc/gateway/devices.json"
+    RELOAD_INTERVAL = 300  # seconds, provisioning service rewrites the file
+
+    _allowed_devices = frozenset()
+    _last_reload = 0.0
+
+
+    def load_allowlist(path=ALLOWLIST_PATH):
+        global _allowed_devices, _last_reload
+        with open(path) as f:
+            data = json.load(f)
+        # build the new set first, then swap: revoked devices disappear on reload
+        _allowed_devices = frozenset(
+            dev["id"] for dev in data["devices"] if dev.get("active", True)
+        )
+        _last_reload = time.monotonic()
+        log.info("allowlist loaded: %d devices", len(_allowed_devices))
+
+
+    def is_allowed(device_id):
+        global _last_reload
+        if time.monotonic() - _last_reload > RELOAD_INTERVAL:
+            try:
+                load_allowlist()
+            except (OSError, ValueError, KeyError):
+                log.exception("allowlist reload failed, keeping %d devices", len(_allowed_devices))
+                _last_reload = time.monotonic()  # retry at the next interval, not per message
+        return device_id in _allowed_devices
+
+
+    def check_gateway_config(cfg, gateway_id):
+        # called once from main() before we connect to the broker
+        if gateway_id not in cfg["gateways"]:
+            raise SystemExit(f"gateway {gateway_id} is not registered in config")
+
+
+    def handle_batch(messages, forward):
+        """messages: decoded MQTT messages from the paho on_message buffer."""
+        accepted = 0
+        for msg in messages:
+            device_id = msg.get("device_id")
+            if not is_allowed(device_id):
+                log.debug("drop message from unknown device %s", device_id)
+                continue
+            forward(msg["topic"], msg["payload"])
+            accepted += 1
+        return accepted
+    ```
+
+    **Already good:**
+    - `check_gateway_config` does one lookup at startup, so keep the list there. Converting it to a set would only add work. In Green Metrics Tool micro-benchmarks, building a set from a 10,000,000-element list and testing once used about 50% more energy than one scan of the list.
+    - `handle_batch` drops unknown devices before doing any other work for them.
+verify:
+  test: |
+    import json, os, tempfile
+    _d = tempfile.mkdtemp()
+    _p = os.path.join(_d, "devices.json")
+    def _write(devs):
+        with open(_p, "w") as f:
+            json.dump({"devices": devs}, f)
+    _write([{"id": "a"}, {"id": "b", "active": False}, {"id": "c"}])
+    load_allowlist(_p)
+    assert is_allowed("a") and is_allowed("c") and not is_allowed("b")
+    _write([{"id": "a"}])
+    load_allowlist(_p)
+    assert is_allowed("a") and not is_allowed("c")
+    assert len(_allowed_devices) == 1
+    # reload failure: the default path does not exist here, previous set is kept
+    _last_reload = time.monotonic() - 10 * RELOAD_INTERVAL
+    assert is_allowed("a")
+    assert time.monotonic() - _last_reload < RELOAD_INTERVAL
+    _out = []
+    _n = handle_batch(
+        [{"device_id": "a", "topic": "t", "payload": 1},
+         {"device_id": "x", "topic": "t", "payload": 2}],
+        lambda t, pl: _out.append((t, pl)),
+    )
+    assert _n == 1 and _out == [("t", 1)]
+    assert check_gateway_config({"gateways": ["gw-1"]}, "gw-1") is None
+  equivalence:
+    driver: |-
+      import json, os, tempfile
+      _d = tempfile.mkdtemp()
+      _p = os.path.join(_d, "devices.json")
+      with open(_p, "w") as f:
+          json.dump({"devices": [{"id": "dev-%03d" % i, "active": i % 7 != 0} for i in range(300)]}, f)
+      load_allowlist(_p)
+      _out = []
+      _msgs = [{"device_id": "dev-%03d" % i, "topic": "sensors/%d" % i, "payload": i} for i in range(0, 400, 3)]
+      _n = handle_batch(_msgs, lambda t, pl: _out.append((t, pl)))
+      print(_n)
+      print(_out)

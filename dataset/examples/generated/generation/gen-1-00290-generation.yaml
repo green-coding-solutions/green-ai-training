@@ -1,0 +1,51 @@
+id: gen-1-00290-generation
+category: generation
+language: python
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    Hi, I'm a chemistry PhD student and I'm not good with databases. I run molecular dynamics simulations and each run gives me numpy arrays with about 400,000 time steps: step number, potential energy, temperature and pressure. I want to save them in our group's Postgres (psycopg 3) so my colleagues can query them. The table is `md_frames(run_id, step, energy, temperature, pressure)`. I tried to write the function myself but it takes forever and I don't know what is wrong. Can you write it for me?
+- role: assistant
+  content: |
+    Your function is probably slow because it sends one `INSERT` per time step, so 400,000 separate statements go to the server. Stream all rows in one `COPY` instead:
+
+    ```python
+    import numpy as np
+    import psycopg
+
+    def save_md_run(dsn: str, run_id: int, steps: np.ndarray, energy: np.ndarray,
+                    temperature: np.ndarray, pressure: np.ndarray) -> int:
+        n = len(steps)
+        if not (len(energy) == len(temperature) == len(pressure) == n):
+            raise ValueError("all arrays must have the same length")
+
+        # .tolist() turns numpy numbers into plain Python numbers, which psycopg understands
+        rows = zip(steps.tolist(), energy.tolist(), temperature.tolist(), pressure.tolist())
+
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                with cur.copy(
+                    "COPY md_frames (run_id, step, energy, temperature, pressure) FROM STDIN"
+                ) as copy:
+                    for step, e, t, p in rows:
+                        copy.write_row((run_id, step, e, t, p))
+            # the connection context manager commits once at the end
+        return n
+    ```
+
+    Example call:
+
+    ```python
+    save_md_run(dsn, run_id=42, steps=steps, energy=epot, temperature=temp, pressure=press)
+    ```
+
+    **Green Notes**
+    - **`COPY` instead of one `INSERT` per row** (reduces E): all rows go to the server in one bulk operation, so 400,000 statements and round trips become one. In Green Metrics Tool micro-benchmarks with PostgreSQL and psycopg, loading 500,000 rows in batches of 5,000 used about 22× less CPU energy with `COPY` than with one `execute()` per row, and about 8× less than `executemany()`.
+    - **One transaction:** it commits once. If something fails halfway, no partial run ends up in the table.
+    - *Not applied:* for a run that only has a few dozen rows, a plain `executemany()` is fine. With small batches the measured differences were small.
+verify:
+  static_only: needs psycopg and PostgreSQL

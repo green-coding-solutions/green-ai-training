@@ -1,0 +1,47 @@
+id: gen-1-00281-review
+category: review
+language: sql
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+messages:
+- role: user
+  content: |
+    ?
+
+    ```sql
+    -- picklist for the warehouse screen, polled by every open tab
+    SELECT o.*, oi.*
+    FROM orders o
+    JOIN order_items oi ON oi.order_id = o.id
+    WHERE o.status = 'paid'
+      AND o.shipped_at IS NULL
+    ORDER BY o.created_at ASC;
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (screen polled by many clients)
+
+    #### [Bug] Duplicate column names overwrite each other
+    - **Where:** `SELECT o.*, oi.*`
+    - **Issue:** both tables have columns like `id` and `created_at`. Most drivers and ORMs that return rows as dicts keep only the last one. So `id` can silently be the item id instead of the order id.
+    - **Fix:** name the columns and alias the clashing ones (see below).
+
+    #### [High] Every column of both tables on every row
+    - **Where:** `o.*, oi.*`
+    - **Issue:** the order columns are repeated for each item row, and wide columns (notes, address JSON, product snapshots) travel with them. A picklist screen needs only a few fields. Cost grows with the size of the columns you skip. In Green Metrics Tool micro-benchmarks reading a JOIN of orders and order items, naming the needed columns used about 2.3× less CPU energy than `SELECT *` at 200 rows and about 4× less at 1,000 rows. That table had fewer and smaller columns than a wide products table, so the gap was smaller there.
+    - **Fix:** select only what the screen shows. Adjust the list to your screen:
+      ```sql
+      SELECT o.id AS order_id, o.order_number, o.created_at, o.shipping_method,
+             oi.id AS item_id, oi.sku, oi.quantity
+      FROM orders o
+      JOIN order_items oi ON oi.order_id = o.id
+      WHERE o.status = 'paid'
+        AND o.shipped_at IS NULL
+      ORDER BY o.created_at ASC;
+      ```
+    - **Impact:** E on the database and the app server, and network, because fewer bytes per row are sent on every poll. The result has the same rows in the same order, with fewer columns. Check that no client code reads a column you dropped.
+verify:
+  static_only: needs a wide orders/order_items schema; the answer deliberately returns fewer columns than the original, so
+    results are not comparable

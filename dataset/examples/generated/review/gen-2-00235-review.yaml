@@ -1,0 +1,106 @@
+id: gen-2-00235-review
+category: review
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    hi, I am quite new to bash. We have a REST API for product imports (shops POST a CSV to /v1/imports, a worker processes it in chunks). This script runs from cron every 10 minutes on the api server. Two things I don't understand: the import workers sometimes log `chunk file not found`, and the CPU jumps every time the script runs. We get a few hundred imports a day, 5-50 MB each. Archives are kept 90 days, and support opens them quite often when a customer asks about an old import. Can you review it? I don't really know what is wrong.
+
+    ```bash
+    #!/bin/bash
+    # archive-imports.sh - runs from cron every 10 min on api-01
+    # moves finished CSV imports to the archive (kept 90 days for support/audit)
+
+    UPLOAD_DIR=/var/lib/importer/uploads
+    DONE_DIR=/var/lib/importer/done
+    ARCHIVE_DIR=/mnt/archive/imports
+    TMP_DIR=/var/lib/importer/tmp
+    LOG=/var/log/importer/archive.log
+
+    echo "$(date) start" >> $LOG
+
+    # the API moves finished uploads here as <import_id>_<original filename>.csv
+    for f in $(ls $DONE_DIR/*.csv); do
+        name=$(basename $f)
+        day=$(date +%Y-%m-%d)
+        mkdir -p $ARCHIVE_DIR/$day
+        bzip2 -9 $f
+        mv $f.bz2 $ARCHIVE_DIR/$day/
+        echo "$(date) archived $name" >> $LOG
+    done
+
+    # chunk files for the workers, the API deletes them after ~15 min
+    for f in $TMP_DIR/*.chunk; do
+        gzip -9 $f
+    done
+
+    # delete archives older than 90 days
+    find $ARCHIVE_DIR -name "*.bz2" -mtime +90 -delete
+
+    echo "$(date) done" >> $LOG
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (cron script on the API server)
+
+    #### [Bug] The script renames chunk files while workers still need them
+    - **Where:** the `gzip -9 $f` loop over `$TMP_DIR/*.chunk`
+    - **Issue:** `gzip` replaces `x.chunk` with `x.chunk.gz`. A worker that hasn't read its chunk yet looks for `x.chunk` and gets `chunk file not found`. This is your worker error. The loop is also wasted CPU: these files live about 15 minutes, and `gzip -9` is the slowest gzip level. Data kept for minutes should not be compressed at all. An estimate from Green Coding Solutions says even a fast codec like zstd only pays off when stored data is kept about 0.15 days or longer.
+    - **Fix:** delete the whole loop. Leave the chunk files alone, the API cleans them up anyway.
+    - **Impact:** fixes the failing imports, and removes the compression work on every run for data that is about to be deleted (E).
+
+    #### [Bug] Filenames with spaces are never archived
+    - **Where:** `for f in $(ls $DONE_DIR/*.csv)` and every unquoted `$f`
+    - **Issue:** the filename contains the shop's original name. `123_Q3 prices.csv` gets split into `123_Q3` and `prices.csv`. Both `bzip2` calls fail, and the file stays in `done/` forever. Glob characters like `*` in a name get expanded too. Also, `mv` runs even when `bzip2` failed.
+    - **Fix:** loop over the glob directly (`for f in "$DONE_DIR"/*.csv`), quote every variable, and only log success when compression worked (see the script below).
+
+    #### [High] bzip2 -9 for an archive that is written and read all the time
+    - **Where:** `bzip2 -9 $f`
+    - **Issue:** every import goes through this step, and support often decompresses the files again. bzip2 is expensive on both sides. In Green Metrics Tool measurements on 100 MB of text, bzip2 at its default level (which is `-9`) used ~106 J to compress and ~52 J to decompress. zstd at its default level used ~16 J to compress and ~5.3 J to decompress.
+    - **Fix:** `zstd` at its default level. It can write straight into the archive and remove the source, so you don't need the extra `mv`. Install it with `apt install zstd`. Support opens files with `zstdcat file.csv.zst | less`.
+    - **Impact:** less CPU (E) for every import you archive and every file support opens. The measurement compares energy, not file size. If space on the archive volume is tight, compare `.bz2` and `.zst` sizes on a few real CSVs before you switch.
+
+    ```bash
+    #!/bin/bash
+    # archive-imports.sh - runs from cron every 10 min on api-01
+    # moves finished CSV imports to the archive (kept 90 days for support/audit)
+    shopt -s nullglob
+
+    DONE_DIR=/var/lib/importer/done
+    ARCHIVE_DIR=/mnt/archive/imports
+    LOG=/var/log/importer/archive.log
+
+    echo "$(date) start" >> "$LOG"
+
+    day=$(date +%Y-%m-%d)
+    mkdir -p "$ARCHIVE_DIR/$day"
+
+    # the API moves finished uploads here as <import_id>_<original filename>.csv
+    for f in "$DONE_DIR"/*.csv; do
+        name=${f##*/}
+        if zstd -q --rm -o "$ARCHIVE_DIR/$day/$name.zst" "$f"; then
+            echo "$(date) archived $name" >> "$LOG"
+        else
+            echo "$(date) FAILED $name" >> "$LOG"
+        fi
+    done
+
+    # chunk files in tmp/ are left alone: the API deletes them after ~15 min
+
+    # delete archives older than 90 days (.bz2 until the old ones have aged out)
+    find "$ARCHIVE_DIR" -type f \( -name '*.bz2' -o -name '*.zst' \) -mtime +90 -delete
+
+    echo "$(date) done" >> "$LOG"
+    ```
+
+    I removed `UPLOAD_DIR` and `TMP_DIR` because nothing uses them anymore. The old `.bz2` archives can stay as they are. Converting them would cost more CPU than it saves, and the `find` line deletes them after 90 days.
+
+    **Already good:** finished imports are archived and deleted after a fixed time, so the archive doesn't grow without limit.
+verify:
+  static_only: needs zstd/bzip2 binaries and the importer directories; the archive format intentionally changes from .bz2
+    to .zst, so the outputs are not byte-identical

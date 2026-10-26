@@ -1,0 +1,87 @@
+id: gen-2-00441-multi-turn
+category: multi-turn
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    diff only please. CLI that filters a proxy log by an allowlist of hostnames (allowlist ~50k lines, logs are a few million lines)
+
+    ```python
+    #!/usr/bin/env python3
+    import argparse
+    import sys
+
+
+    def load_hosts(path):
+        with open(path) as f:
+            return [line.strip().lower() for line in f if line.strip()]
+
+
+    def filter_log(log_path, hosts, out):
+        kept = 0
+        with open(log_path) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                if parts[1].lower() in hosts:
+                    out.write(line)
+                    kept += 1
+        return kept
+
+
+    def main():
+        ap = argparse.ArgumentParser()
+        ap.add_argument("allowlist")
+        ap.add_argument("log")
+        ap.add_argument("--check", help="check a single host and exit")
+        args = ap.parse_args()
+
+        hosts = load_hosts(args.allowlist)
+        if args.check:
+            print("allowed" if args.check.lower() in hosts else "denied")
+            return 0
+
+        n = filter_log(args.log, hosts, sys.stdout)
+        print(f"kept {n}", file=sys.stderr)
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+- role: assistant
+  content: |
+    ```diff
+    -    n = filter_log(args.log, hosts, sys.stdout)
+    +    n = filter_log(args.log, set(hosts), sys.stdout)
+    ```
+
+    **Green Notes**
+    - **Set for repeated membership tests** (reduces E): `filter_log` does one `in` check per log line. On a list that is a linear scan of up to 50k entries per line. On a set it is O(1) on average, and the set is built once.
+    - *Not applied:* the `--check` path. It does a single lookup, so building a set would cost more than one scan of the list.
+
+    Output is the same. Nothing in the script depends on the order or duplicates of the allowlist.
+- role: user
+  content: |
+    I don't want two code paths. just make load_hosts return a set
+- role: assistant
+  content: |
+    ```diff
+     def load_hosts(path):
+         with open(path) as f:
+    -        return [line.strip().lower() for line in f if line.strip()]
+    +        return {line.strip().lower() for line in f if line.strip()}
+    ```
+
+    Drop the `set(hosts)` change from before, so `main` stays as in your original.
+
+    **Green Notes**
+    - **Set built while reading** (reduces E): the log filter keeps its O(1) lookups. The set comprehension builds the set directly, so there is no extra list and no second pass.
+    - The `--check` path now pays for building a set to answer one lookup. In Green Metrics Tool micro-benchmarks, converting a 10M-element list to a set and testing once used about 50% more CPU energy than one scan of the list (~10.5 J vs ~6.9 J). Here the set is built straight from the file you already read, and a 50k-line file is small, so this cost is minor. One code path is a fair trade.
+verify:
+  static_only: answer is a diff against the pasted script, not runnable on its own

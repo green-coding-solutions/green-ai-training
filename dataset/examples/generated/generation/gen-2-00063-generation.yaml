@@ -1,0 +1,98 @@
+id: gen-2-00063-generation
+category: generation
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    I need a bash script for our eventhub CLI tooling. At the start of every month someone from ops runs it by hand for the previous month.
+
+    Context:
+    - Exports live in /var/lib/eventhub/exports/YYYY-MM/ — JSON Lines files, about 40 GB per month, all text
+    - We must keep them 12 months for audit. Auditors ask for a month maybe 2-3 times a year
+    - Archives go to /mnt/archive/eventhub/
+    - The box has gzip, xz and zstd installed
+
+    Requirements:
+    1. Usage: `archive-exports.sh YYYY-MM [--dry-run]`, validate the month format
+    2. One archive file per month
+    3. Refuse to run if the archive for that month already exists
+    4. Verify the archive before deleting the original directory. Never delete if anything failed
+    5. Write a sha256 file next to each archive
+    6. Delete archives older than 12 months
+    7. `--dry-run` only prints what it would do
+    8. Plain bash + coreutils, no python
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # archive-exports.sh - pack one month of eventhub exports into a verified zstd tarball.
+    # Usage: archive-exports.sh YYYY-MM [--dry-run]
+    set -euo pipefail
+
+    readonly EXPORT_ROOT='/var/lib/eventhub/exports'
+    readonly ARCHIVE_ROOT='/mnt/archive/eventhub'
+    readonly RETENTION_DAYS=365
+
+    usage() {
+      echo 'Usage: archive-exports.sh YYYY-MM [--dry-run]' >&2
+      exit 2
+    }
+
+    [[ $# -ge 1 && $# -le 2 ]] || usage
+    month=$1
+    dry_run=0
+    if [[ $# -eq 2 ]]; then
+      [[ $2 == '--dry-run' ]] || usage
+      dry_run=1
+    fi
+    [[ $month =~ ^[0-9]{4}-(0[1-9]|1[0-2])$ ]] || usage
+
+    src="$EXPORT_ROOT/$month"
+    name="exports-$month.tar.zst"
+    archive="$ARCHIVE_ROOT/$name"
+
+    command -v zstd >/dev/null || { echo 'zstd is not installed' >&2; exit 1; }
+    [[ -d $src ]] || { echo "No export directory: $src" >&2; exit 1; }
+    [[ ! -e $archive ]] || { echo "Archive already exists: $archive" >&2; exit 1; }
+
+    if (( dry_run )); then
+      echo "Would archive $src -> $archive"
+      du -sh -- "$src"
+      echo 'Would delete these expired archives:'
+      find "$ARCHIVE_ROOT" -maxdepth 1 -name 'exports-*.tar.zst*' -mtime "+$RETENTION_DAYS" -print
+      exit 0
+    fi
+
+    mkdir -p -- "$ARCHIVE_ROOT"
+    tmp="$archive.partial"
+    trap 'rm -f -- "$tmp"' EXIT
+
+    # Compress with zstd at its default level.
+    tar -C "$EXPORT_ROOT" -cf - "$month" | zstd -q -o "$tmp"
+
+    # Verify: zstd checks its frame checksum, tar must be able to read every entry.
+    zstd -q -dc -- "$tmp" | tar -tf - >/dev/null
+
+    mv -- "$tmp" "$archive"
+    (cd -- "$ARCHIVE_ROOT" && sha256sum -- "$name" > "$name.sha256")
+
+    # Only reached if every step above succeeded (set -e + pipefail).
+    rm -rf -- "$src"
+    echo "Archived $month -> $archive"
+
+    find "$ARCHIVE_ROOT" -maxdepth 1 -name 'exports-*.tar.zst*' -mtime "+$RETENTION_DAYS" -delete
+    ```
+
+    To restore a month for the auditors: `zstd -dc exports-2026-03.tar.zst | tar -xf - -C /tmp/audit`.
+
+    **Green Notes**
+    - **Compress stored data with a fast codec** (reduces E and M): the exports are text, compressed once and kept a year, so compression clearly pays off. Green Coding Solutions estimates (not a direct measurement) that zstd-compressed data has to stay on disk only about 0.15 days before compression pays off. Yours stays 12 months.
+    - **zstd at the default level instead of gzip or xz** (reduces E): when Green Metrics Tool compressed 100 MB of text, zstd at its default level used about 4× less energy than gzip, and xz used about 29× more than zstd. Decompressing for the verify step and for audit restores is cheap too.
+    - *Not applied:* `xz` or a high zstd level. Those measurements compare energy, not file size. If disk space on `/mnt/archive` gets tight, try `zstd -19` on one month and compare the size and run time before you switch.
+verify:
+  static_only: bash script that needs tar, zstd and the eventhub export and archive directories

@@ -1,0 +1,156 @@
+id: gen-12764612-00190-refactor
+category: refactor
+language: html
+patterns:
+- dom-size
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    ?
+
+    ```html
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>API clients</title>
+      <style>
+        body { font-family: sans-serif; margin: 24px; }
+        table { border-collapse: collapse; width: 100%; }
+        th, .cell { padding: 4px 8px; text-align: left; }
+        tr { border-bottom: 1px solid #ddd; }
+        .num { text-align: right; }
+      </style>
+    </head>
+    <body>
+      <h1>API clients</h1>
+      <table id="clients">
+        <thead>
+          <tr><th>Key ID</th><th>Name</th><th>Plan</th><th>Requests 24h</th><th>Errors 24h</th><th>Last seen</th></tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+
+      <script>
+        async function load() {
+          const res = await fetch('/api/admin/clients');
+          const clients = await res.json();
+          const tbody = document.getElementById('rows');
+
+          clients.forEach(function (c) {
+            const tr = document.createElement('tr');
+            const values = [c.key_id, c.name, c.plan, c.requests_24h, c.errors_24h, c.last_seen];
+
+            values.forEach(function (v, i) {
+              const td = document.createElement('td');
+              const div = document.createElement('div');
+              div.className = i === 3 || i === 4 ? 'cell num' : 'cell';
+              const span = document.createElement('span');
+              span.innerHTML = v;
+              div.appendChild(span);
+              td.appendChild(div);
+              tr.appendChild(td);
+            });
+
+            tbody.appendChild(tr);
+          });
+        }
+
+        load();
+      </script>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    ```html
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>API clients</title>
+      <style>
+        body { font-family: sans-serif; margin: 24px; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { padding: 4px 8px; text-align: left; }
+        tr { border-bottom: 1px solid #ddd; }
+        .num { text-align: right; }
+        nav { margin-top: 12px; display: flex; gap: 12px; align-items: center; }
+      </style>
+    </head>
+    <body>
+      <h1>API clients</h1>
+      <table id="clients">
+        <thead>
+          <tr><th>Key ID</th><th>Name</th><th>Plan</th><th class="num">Requests 24h</th><th class="num">Errors 24h</th><th>Last seen</th></tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <nav>
+        <button id="prev" type="button">Previous</button>
+        <span id="status"></span>
+        <button id="next" type="button">Next</button>
+      </nav>
+
+      <script>
+        const PAGE_SIZE = 100;
+        const NUMERIC = new Set([3, 4]);
+        let clients = [];
+        let page = 0;
+
+        function render() {
+          const tbody = document.getElementById('rows');
+          const start = page * PAGE_SIZE;
+          const fragment = document.createDocumentFragment();
+
+          clients.slice(start, start + PAGE_SIZE).forEach(function (c) {
+            const tr = document.createElement('tr');
+            const values = [c.key_id, c.name, c.plan, c.requests_24h, c.errors_24h, c.last_seen];
+
+            values.forEach(function (v, i) {
+              const td = document.createElement('td');
+              if (NUMERIC.has(i)) td.className = 'num';
+              td.textContent = v;
+              tr.appendChild(td);
+            });
+
+            fragment.appendChild(tr);
+          });
+
+          tbody.replaceChildren(fragment);
+
+          const pages = Math.max(1, Math.ceil(clients.length / PAGE_SIZE));
+          document.getElementById('status').textContent =
+            'Page ' + (page + 1) + ' of ' + pages + ' (' + clients.length + ' clients)';
+          document.getElementById('prev').disabled = page === 0;
+          document.getElementById('next').disabled = page >= pages - 1;
+        }
+
+        document.getElementById('prev').addEventListener('click', function () { page--; render(); });
+        document.getElementById('next').addEventListener('click', function () { page++; render(); });
+
+        async function load() {
+          const res = await fetch('/api/admin/clients');
+          if (!res.ok) throw new Error('Failed to load clients: ' + res.status);
+          clients = await res.json();
+          render();
+        }
+
+        load();
+      </script>
+    </body>
+    </html>
+    ```
+
+    **Green Notes**
+    - **Avoid excessive DOM size** (reduces E on the client): the page no longer builds one row per client in the live DOM. It shows 100 rows at a time, so the browser keeps a small tree to lay out and paint, however many clients the API returns. In Green Metrics Tool micro-benchmarks, 30 page loads of a 10,000-row table with 14 elements per row used about 56% less CPU energy when paginated to 100 rows as a plain `<table>` built in a `DocumentFragment`. That was about 457 J against about 1036 J.
+    - **Fewer wrapper elements:** each cell was `td > div > span`, which is 3 elements per value. It is now a plain `td`, and the `num` class sits on the `td` itself. The look is the same.
+    - **One DOM write per page:** rows are collected in a `DocumentFragment` and swapped in with `replaceChildren`. The old code appended each row to the live table one by one.
+
+    Two things behave differently:
+    - Browser find (Ctrl+F) only sees the current page. If admins need to search all clients, add a filter box that filters `clients` before `render()`.
+    - I fixed a security bug: `span.innerHTML = v` put API values into the page as HTML. A client name like `<img src=x onerror=...>` would run script in the admin's session. `textContent` shows the value as plain text.
+verify:
+  static_only: needs a browser DOM and a fetch endpoint

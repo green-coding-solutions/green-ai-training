@@ -1,0 +1,211 @@
+id: gen-2-00378-review
+category: review
+language: python
+patterns:
+- set-membership
+- avoid-exception-flow
+facts:
+- F-MEMB
+- F-EXC
+messages:
+- role: user
+  content: |
+    Can you review our variant annotation step before we run it on the full cohort? Context and constraints:
+
+    - runs on the HPC cluster, one job per sample, ~400 tumor samples, each calls file has 5-8 million rows
+    - the known-variant file is a dbSNP subset (VCF, gzipped, a few million records)
+    - the mask file is ~2,000 gene symbols we exclude (low-mappability / highly polymorphic genes)
+    - stdlib only, the nodes don't have pandas
+    - output TSV format must stay the same, a downstream R script parses it
+    - most calls are somatic, so well over half of them are not in dbSNP
+
+    Correctness issues first please, then anything that makes it slow.
+
+    ```python
+    import csv
+    import gzip
+
+
+    def load_known(path):
+        known = {}
+        with gzip.open(path, "rt") as fh:
+            for line in fh:
+                if line.startswith("#"):
+                    continue
+                chrom, pos, rsid, ref, alt = line.rstrip("\n").split("\t")[:5]
+                known[(chrom, int(pos), ref, alt)] = rsid
+        return known
+
+
+    def load_mask(path):
+        genes = []
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    genes.append(line)
+        return genes
+
+
+    def annotate(calls_path, known, masked_genes, out_path, min_qual=30):
+        stats = {"total": 0, "known": 0, "novel": 0, "masked": 0, "low_qual": 0}
+        with open(calls_path) as src, open(out_path, "w", newline="") as dst:
+            reader = csv.DictReader(src, delimiter="\t")
+            writer = csv.writer(dst, delimiter="\t")
+            writer.writerow(["chrom", "pos", "ref", "alt", "gene", "qual", "rsid"])
+            for row in reader:
+                stats["total"] += 1
+                if row["gene"] in masked_genes:
+                    stats["masked"] += 1
+                    continue
+                if float(row["qual"]) < min_qual:
+                    stats["low_qual"] += 1
+                    continue
+                key = (row["chrom"], int(row["pos"]), row["ref"], row["alt"])
+                try:
+                    rsid = known[key]
+                    stats["known"] += 1
+                except KeyError:
+                    rsid = "."
+                    stats["novel"] += 1
+                writer.writerow([row["chrom"], row["pos"], row["ref"], row["alt"],
+                                 row["gene"], row["qual"], rsid])
+        return stats
+
+
+    if __name__ == "__main__":
+        import sys
+        known = load_known(sys.argv[1])
+        masked = load_mask(sys.argv[2])
+        stats = annotate(sys.argv[3], known, masked, sys.argv[4])
+        for k, v in stats.items():
+            print(f"{k}\t{v}")
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (per-call work, runs over every row of every sample)
+
+    #### [Bug] Multi-allelic dbSNP records never match
+    - **Where:** `load_known`, the key built from `alt`
+    - **Issue:** dbSNP puts several alternate alleles into one record, for example `ALT = G,T`. The key then stores the string `"G,T"`. Your calls have a single alt each, so these sites never match. They are written with `.` and counted as `novel`.
+    - **Fix:** split ALT on commas and add one key per allele, with `int(pos)` computed once per record (see the full code below).
+    - **Note:** the TSV format stays the same. Calls at multi-allelic sites now get their rsID, so those rows and the `known`/`novel` counts will change. That is the intended fix.
+
+    #### [High] Masked-gene check scans a list for every call
+    - **Where:** `row["gene"] in masked_genes` in `annotate`. `load_mask` returns a list.
+    - **Issue:** `in` on a list compares the gene against each masked symbol in turn. Most genes are not masked, so most checks walk the whole list of ~2,000 entries. This runs once per call.
+    - **Fix:** return a set from `load_mask`. Nothing in the script depends on the list order.
+    - **Impact:** reduces E on every row: O(n) → O(1) per lookup. Building the set is a one-off O(n) cost per job. In Green Metrics Tool micro-benchmarks, converting a 10,000,000-element list to a set for one lookup cost about 50% more than a single scan. A set only pays off with repeated lookups. Here you do millions of lookups per job.
+
+    #### [Medium] `try/except KeyError` where misses are the common case
+    - **Where:** the dbSNP lookup in `annotate`
+    - **Issue:** most of the cost of `try/except` comes from raising the exception. Most of your calls are somatic, so the `except` branch is the normal path, and it raises on most rows.
+    - **Fix:** use `known.get(key)`. rsIDs are always strings, so `None` reliably means "not in dbSNP".
+    - **Impact:** reduces E per call, but modestly. In Green Metrics Tool micro-benchmarks with about half of the keys missing, `dict.get` used about 12% less energy than `try/except KeyError`. If misses were rare, `try/except` would be fine.
+
+    Apart from the multi-allelic fix, the output and stats are unchanged:
+
+    ```python
+    import csv
+    import gzip
+
+
+    def load_known(path):
+        known = {}
+        with gzip.open(path, "rt") as fh:
+            for line in fh:
+                if line.startswith("#"):
+                    continue
+                chrom, pos, rsid, ref, alt = line.rstrip("\n").split("\t")[:5]
+                pos = int(pos)
+                for allele in alt.split(","):
+                    known[(chrom, pos, ref, allele)] = rsid
+        return known
+
+
+    def load_mask(path):
+        with open(path) as fh:
+            return {line.strip() for line in fh if line.strip()}
+
+
+    def annotate(calls_path, known, masked_genes, out_path, min_qual=30):
+        stats = {"total": 0, "known": 0, "novel": 0, "masked": 0, "low_qual": 0}
+        with open(calls_path) as src, open(out_path, "w", newline="") as dst:
+            reader = csv.DictReader(src, delimiter="\t")
+            writer = csv.writer(dst, delimiter="\t")
+            writer.writerow(["chrom", "pos", "ref", "alt", "gene", "qual", "rsid"])
+            for row in reader:
+                stats["total"] += 1
+                if row["gene"] in masked_genes:
+                    stats["masked"] += 1
+                    continue
+                if float(row["qual"]) < min_qual:
+                    stats["low_qual"] += 1
+                    continue
+                key = (row["chrom"], int(row["pos"]), row["ref"], row["alt"])
+                rsid = known.get(key)
+                if rsid is None:
+                    rsid = "."
+                    stats["novel"] += 1
+                else:
+                    stats["known"] += 1
+                writer.writerow([row["chrom"], row["pos"], row["ref"], row["alt"],
+                                 row["gene"], row["qual"], rsid])
+        return stats
+
+
+    if __name__ == "__main__":
+        import sys
+        known = load_known(sys.argv[1])
+        masked = load_mask(sys.argv[2])
+        stats = annotate(sys.argv[3], known, masked, sys.argv[4])
+        for k, v in stats.items():
+            print(f"{k}\t{v}")
+    ```
+
+    **Already good:** both files are streamed, so memory does not grow with the calls file. The known-variant table is loaded once and reused for the whole job. The cheap filters run before the key is built.
+verify:
+  module: true
+  test: |
+    import gzip, os, tempfile
+    d = tempfile.mkdtemp()
+    kp = os.path.join(d, "known.vcf.gz")
+    with gzip.open(kp, "wt") as fh:
+        fh.write("#CHROM\tPOS\tID\tREF\tALT\n")
+        fh.write("1\t1000\trs1\tA\tG,T\n")
+    known = load_known(kp)
+    assert known[("1", 1000, "A", "G")] == "rs1"
+    assert known[("1", 1000, "A", "T")] == "rs1"
+    mp = os.path.join(d, "mask.txt")
+    with open(mp, "w") as fh:
+        fh.write("TTN\n\nMUC16\n")
+    assert load_mask(mp) == {"TTN", "MUC16"}
+  equivalence:
+    driver: |-
+      import gzip, os, tempfile
+      d = tempfile.mkdtemp()
+      kp = os.path.join(d, "known.vcf.gz")
+      with gzip.open(kp, "wt") as fh:
+          fh.write("##fileformat=VCFv4.2\n")
+          fh.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
+          fh.write("1\t1000\trs1\tA\tG\t.\t.\t.\n")
+          fh.write("1\t2000\trs2\tC\tT\t.\t.\t.\n")
+          fh.write("2\t500\trs3\tG\tA\t.\t.\t.\n")
+      mp = os.path.join(d, "mask.txt")
+      with open(mp, "w") as fh:
+          fh.write("HLA-A\n\nMUC16\nTTN\n")
+      cp = os.path.join(d, "calls.tsv")
+      genes = ["TP53", "TTN", "KRAS", "MUC16", "EGFR"]
+      alleles = [("A", "G"), ("C", "T"), ("G", "A"), ("T", "C")]
+      positions = [1000, 2000, 500, 777]
+      with open(cp, "w") as fh:
+          fh.write("chrom\tpos\tref\talt\tgene\tqual\n")
+          for i in range(200):
+              chrom = "1" if i % 3 else "2"
+              ref, alt = alleles[i % 4]
+              fh.write(f"{chrom}\t{positions[i % 4]}\t{ref}\t{alt}\t{genes[i % 5]}\t{(i * 7) % 60}.5\n")
+      op = os.path.join(d, "out.tsv")
+      stats = annotate(cp, load_known(kp), load_mask(mp), op)
+      print(sorted(stats.items()))
+      with open(op) as fh:
+          print(fh.read())

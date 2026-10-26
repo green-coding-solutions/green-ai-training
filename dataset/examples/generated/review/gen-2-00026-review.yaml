@@ -1,0 +1,81 @@
+id: gen-2-00026-review
+category: review
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```bash
+    #!/bin/bash
+    # ship predictions from the batch scorer to the feature store ingest
+    # cron: */5 * * * *  (runs on every scorer box)
+
+    OUT_DIR=/var/lib/scorer/out
+    INGEST_URL=https://ingest.ml-internal.example/v1/predictions
+    MODEL_TAG=$(cat /etc/scorer/model_tag)
+
+    for f in $(ls $OUT_DIR/*.jsonl 2>/dev/null); do
+      # skip the file the scorer is still writing
+      if [ "$f" == "$OUT_DIR/current.jsonl" ]; then
+        continue
+      fi
+      xz -9 -k $f
+      curl -s -X POST \
+        -H "Content-Type: application/x-xz" \
+        -H "X-Model-Tag: $MODEL_TAG" \
+        --data-binary @$f.xz \
+        $INGEST_URL
+      rm $f $f.xz
+      echo "$(date -Is) shipped $(basename $f)" >> /var/log/scorer/ship.log
+    done
+    ```
+- role: assistant
+  content: |
+    **Workload:** AI/ML (batch inference, shipping script)
+
+    #### [Bug] Predictions are deleted even when the upload fails
+    - **Where:** `curl -s ...` followed by `rm $f $f.xz`
+    - **Issue:** `curl -s` exits with 0 on HTTP 4xx/5xx, and `rm` runs whatever curl returns. If the ingest is down or rejects the request, that batch of predictions is gone.
+    - **Fix:** use `curl -fsS` and delete only after it succeeds (see the script below). Also quote `$f` and loop over the glob instead of `$(ls ...)`, so odd file names don't break the loop.
+
+    #### [High] `xz -9` on data that is decompressed right after transfer
+    - **Where:** `xz -9 -k $f`
+    - **Issue:** this runs every 5 minutes on every scorer box. The file is only compressed for transport: the ingest unpacks it right away. `xz` at its highest level is one of the most expensive codecs you can pick for that. In Green Metrics Tool measurements compressing 100 MB of English text with default settings, xz used about 29× the CPU energy of zstd, and `-9` is heavier than the default.
+    - **Fix:** stream through `zstd` at its default level straight into curl. That also drops the temporary `.xz` file:
+      ```bash
+      #!/bin/bash
+      # ship predictions from the batch scorer to the feature store ingest
+      # cron: */5 * * * *  (runs on every scorer box)
+      set -uo pipefail
+
+      OUT_DIR=/var/lib/scorer/out
+      INGEST_URL=https://ingest.ml-internal.example/v1/predictions
+      MODEL_TAG=$(cat /etc/scorer/model_tag)
+
+      for f in "$OUT_DIR"/*.jsonl; do
+        [ -e "$f" ] || continue                      # no matches
+        [ "$f" = "$OUT_DIR/current.jsonl" ] && continue
+
+        if zstd -q -c -- "$f" | curl -fsS -X POST \
+            -H 'Content-Type: application/zstd' \
+            -H "X-Model-Tag: $MODEL_TAG" \
+            --data-binary @- \
+            "$INGEST_URL"; then
+          rm -- "$f"
+          echo "$(date -Is) shipped $(basename "$f")" >> /var/log/scorer/ship.log
+        else
+          echo "$(date -Is) FAILED $(basename "$f"), retry next run" >> /var/log/scorer/ship.log
+        fi
+      done
+      ```
+      The ingest has to accept `application/zstd`. If it only takes gzip, use `gzip -c` at its default level. In the same measurements gzip cost about 4× zstd, which is still far below xz.
+    - **Impact:** reduces E on every run on every box. xz gives smaller files than zstd. That only matters on a slow or metered link, not between internal services.
+
+    **Already good:** skipping `current.jsonl` so a half-written file is never shipped.
+verify:
+  static_only: needs network (curl to an internal ingest endpoint) and the zstd CLI

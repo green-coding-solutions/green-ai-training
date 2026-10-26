@@ -1,0 +1,107 @@
+id: gen-1-00193-review
+category: review
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    Can you review the Dockerfile for our log aggregation service `logfold`? It reads app logs from a mounted volume, parses and dedupes them, and exposes a small HTTP endpoint on port 9000 with metrics and `/healthz`. Pure Python deps (pyyaml, orjson, aiofiles, prometheus-client).
+
+    Requirements: the healthcheck must keep working, the entrypoint stays `python -m logfold.main`, and we run the unit tests in a separate CI job, not in this image. GitLab CI builds this image on every push to every branch, and about 40 nodes pull it.
+
+    ```dockerfile
+    FROM python:3.12
+
+    ENV DEBIAN_FRONTEND=noninteractive
+    ENV PYTHONUNBUFFERED=1
+
+    RUN apt-get update && apt-get install -y \
+        build-essential \
+        git \
+        curl \
+        vim \
+        htop \
+        net-tools
+
+    WORKDIR /app
+    COPY . .
+
+    RUN pip install -r requirements.txt
+    RUN pip install pytest black mypy ipython
+
+    EXPOSE 9000
+    HEALTHCHECK --interval=30s --timeout=3s \
+      CMD curl -f http://localhost:9000/healthz || exit 1
+
+    CMD ["python", "-m", "logfold.main"]
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (container image built in CI)
+
+    #### [Security] `COPY . .` puts everything in the image
+    - **Where:** `COPY . .`
+    - **Issue:** without a `.dockerignore`, the image gets `.git`, any `.env` file, local test logs and other files from the build context. Anyone who can pull the image can read them.
+    - **Fix:** add a `.dockerignore` (see below) and copy only the package.
+
+    #### [Security] The service runs as root
+    - **Where:** no `USER` instruction
+    - **Issue:** the service parses untrusted log lines. A bug in a parser would give an attacker root in the container.
+    - **Fix:** create an unprivileged user and switch to it before `CMD`. Mount the log volume read-only if you can.
+
+    #### [High] Full base image with build and dev tools in the runtime image
+    - **Where:** `FROM python:3.12`, the `apt-get install` block, `pip install pytest black mypy ipython`
+    - **Issue:** your deps are pure Python, so the compiler, git, vim, htop and net-tools are never used at runtime. The test and lint tools are not needed either, because tests run in a separate CI job. The `apt` lists are also left in the layer. In Green Metrics Tool micro-benchmarks, building a small Flask app image from `python:3.12` with build tools and dev packages used about 7× more energy than a `python:3.12-slim` image with runtime dependencies only. Serving 2,000 requests afterwards cost the same with both images.
+    - **Fix:** use `python:3.12-slim`, drop the `apt-get` block and the dev tools. The healthcheck only needs `curl` because you wrote it that way, so use Python for it.
+    - **Impact:** E for every build, every pull by the 40 nodes and every stored copy. Runtime cost stays the same, so the saving comes from how often CI builds and nodes pull.
+
+    #### [High] Dependency install comes after `COPY . .`
+    - **Where:** `COPY . .` before `pip install`
+    - **Issue:** every code change invalidates the layer cache, so all dependencies are downloaded and installed again on every push.
+    - **Fix:** copy `requirements.txt` first, install, then copy the source.
+    - **Impact:** E and network on every push where only code changed.
+
+    #### [Low] pip cache stays in the layer
+    - **Where:** `pip install -r requirements.txt`
+    - **Fix:** use `--no-cache-dir`.
+
+    ```dockerfile
+    FROM python:3.12-slim
+
+    ENV PYTHONUNBUFFERED=1
+
+    WORKDIR /app
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY logfold/ logfold/
+
+    RUN useradd --system --no-create-home logfold
+    USER logfold
+
+    EXPOSE 9000
+    HEALTHCHECK --interval=30s --timeout=3s \
+      CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:9000/healthz', timeout=2)" || exit 1
+
+    CMD ["python", "-m", "logfold.main"]
+    ```
+
+    ```text
+    .git
+    .env
+    *.log
+    __pycache__/
+    .pytest_cache/
+    .mypy_cache/
+    tests/
+    ```
+
+    Install `pytest`, `black` and `mypy` in the CI test job instead. If a dependency ever needs to be compiled, build wheels in a separate builder stage and copy them over, so the compiler stays out of the final image.
+
+    **Already good:** `PYTHONUNBUFFERED=1` keeps logs flowing to the container output. `WORKDIR`, `EXPOSE` and the exec-form `CMD` are correct.
+verify:
+  static_only: Dockerfile review, needs a container build

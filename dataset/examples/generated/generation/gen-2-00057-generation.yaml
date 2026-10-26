@@ -1,0 +1,165 @@
+id: gen-2-00057-generation
+category: generation
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    ```python
+    import re
+    from dataclasses import dataclass
+    from typing import Callable
+
+    Handler = Callable[..., dict]
+
+
+    class MethodNotAllowed(Exception):
+        pass
+
+
+    @dataclass
+    class Route:
+        method: str
+        template: str  # e.g. "/shops/{shop_id}/orders/{order_id:int}"
+        handler: Handler
+
+
+    class Router:
+        """Tiny router for our internal order API (no framework, runs behind gunicorn)."""
+
+        def __init__(self) -> None:
+            self.routes: list[Route] = []
+
+        def add(self, method: str, template: str, handler: Handler) -> None:
+            # TODO
+            ...
+
+        def resolve(self, method: str, path: str):
+            """Return (handler, params) or None.
+
+            {name} matches exactly one path segment, {name:int} matches digits
+            only and is passed to the handler as int.
+            If the path matches a route but the method doesn't, raise
+            MethodNotAllowed with the allowed methods (for the 405 Allow header).
+            Literal parts of the template must match exactly (dots are dots).
+            """
+            # TODO
+            ...
+    ```
+
+    ?
+- role: assistant
+  content: |
+    Each template becomes a regex once, in `add()`. `resolve()` then only runs `fullmatch` on every request.
+
+    ```python
+    import re
+    from dataclasses import dataclass, field
+    from typing import Callable
+
+    Handler = Callable[..., dict]
+
+    _PARAM = re.compile(r"\{(\w+)(?::(int))?\}")
+
+
+    class MethodNotAllowed(Exception):
+        def __init__(self, allowed: set[str]) -> None:
+            super().__init__(", ".join(sorted(allowed)))
+            self.allowed = allowed
+
+
+    @dataclass
+    class Route:
+        method: str
+        template: str  # e.g. "/shops/{shop_id}/orders/{order_id:int}"
+        handler: Handler
+        regex: re.Pattern = field(init=False, repr=False)
+        int_params: frozenset = field(init=False, repr=False)
+
+        def __post_init__(self) -> None:
+            parts = []
+            ints = set()
+            pos = 0
+            for m in _PARAM.finditer(self.template):
+                parts.append(re.escape(self.template[pos:m.start()]))
+                name, kind = m.group(1), m.group(2)
+                if kind == "int":
+                    parts.append(f"(?P<{name}>[0-9]+)")
+                    ints.add(name)
+                else:
+                    parts.append(f"(?P<{name}>[^/]+)")
+                pos = m.end()
+            parts.append(re.escape(self.template[pos:]))
+            self.regex = re.compile("".join(parts))
+            self.int_params = frozenset(ints)
+
+
+    class Router:
+        """Tiny router for our internal order API (no framework, runs behind gunicorn)."""
+
+        def __init__(self) -> None:
+            self.routes: list[Route] = []
+
+        def add(self, method: str, template: str, handler: Handler) -> None:
+            self.routes.append(Route(method.upper(), template, handler))
+
+        def resolve(self, method: str, path: str):
+            method = method.upper()
+            allowed = set()
+            for route in self.routes:
+                m = route.regex.fullmatch(path)
+                if m is None:
+                    continue
+                if route.method != method:
+                    allowed.add(route.method)
+                    continue
+                params = m.groupdict()
+                for name in route.int_params:
+                    params[name] = int(params[name])
+                return route.handler, params
+            if allowed:
+                raise MethodNotAllowed(allowed)
+            return None
+    ```
+
+    Routes are checked in the order you register them. If a template uses the same parameter name twice, `add()` raises `re.error` at startup, not during a request.
+
+    **Green Notes**
+    - **Compile dynamic patterns once, outside the request path** (reduces E): the regex for each route is built and compiled in `add()`, so no request repeats the escaping, string building and compiling. Patterns built at runtime are where precompiling really pays off. With many distinct patterns, `re`'s internal cache can't hold them all and every call recompiles. In Green Metrics Tool micro-benchmarks, a recompile on every call cost about 200× more per match than a precompiled pattern.
+    - **Static patterns gain less** (reduces E): for a fixed pattern like `_PARAM`, `re` already caches the compiled form, so precompiling saved only about 18% in the same benchmarks. It is still the clearer way to write it.
+verify:
+  test: |-
+    def _h(**kw):
+        return kw
+
+    r = Router()
+    r.add("get", "/shops/{shop_id}/orders/{order_id:int}", _h)
+    r.add("POST", "/shops/{shop_id}/orders", _h)
+    r.add("GET", "/health", _h)
+    r.add("GET", "/files/v1.0", _h)
+
+    assert all(isinstance(rt.regex, re.Pattern) for rt in r.routes)
+
+    h, p = r.resolve("GET", "/shops/acme/orders/42")
+    assert h is _h
+    assert p == {"shop_id": "acme", "order_id": 42}
+    assert isinstance(p["order_id"], int)
+
+    assert r.resolve("GET", "/shops/acme/orders/abc") is None
+    assert r.resolve("GET", "/shops/a/b/orders/1") is None
+    assert r.resolve("GET", "/nope") is None
+    assert r.resolve("GET", "/healthz") is None
+    assert r.resolve("get", "/health")[1] == {}
+
+    try:
+        r.resolve("GET", "/shops/acme/orders")
+        raise AssertionError("expected MethodNotAllowed")
+    except MethodNotAllowed as e:
+        assert e.allowed == {"POST"}
+
+    assert r.resolve("POST", "/shops/acme/orders")[1] == {"shop_id": "acme"}
+    assert r.resolve("GET", "/files/v1x0") is None
+    assert r.resolve("GET", "/files/v1.0") is not None

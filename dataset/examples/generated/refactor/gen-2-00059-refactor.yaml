@@ -1,0 +1,148 @@
+id: gen-2-00059-refactor
+category: refactor
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    This module exports our MD trajectories (CP2K output, already parsed into dicts) to extended XYZ so people can open them in VMD and ASE. For production runs it takes forever: about 5,000 frames of a 3,000-atom water box. Please clean it up and make it faster. Requirements:
+
+    - Output must stay byte-identical. We have golden files in the test suite.
+    - `trajectory_to_xyz` must still return one `str`, because the analysis notebooks preview it.
+    - Stdlib only. The cluster runs Python 3.9.
+    - Keep the public function signatures.
+
+    ```python
+    """Export MD trajectories to extended XYZ for VMD / ASE."""
+    import math
+
+    BOHR_TO_ANG = 0.529177210903
+
+
+    def wrap_into_box(pos, box):
+        return tuple(p - box[i] * math.floor(p / box[i]) for i, p in enumerate(pos))
+
+
+    def frame_comment(step, dt_fs, energy_ha, box):
+        t_ps = step * dt_fs / 1000.0
+        return (
+            f'Lattice="{box[0]:.6f} 0.0 0.0 0.0 {box[1]:.6f} 0.0 0.0 0.0 {box[2]:.6f}" '
+            f"Properties=species:S:1:pos:R:3 time={t_ps:.4f} energy={energy_ha:.8f}"
+        )
+
+
+    def trajectory_to_xyz(frames, symbols, box_bohr, dt_fs, wrap=True):
+        box = [b * BOHR_TO_ANG for b in box_bohr]
+        out = ""
+        for frame in frames:
+            out += str(len(symbols)) + "\n"
+            out += frame_comment(frame["step"], dt_fs, frame["energy"], box) + "\n"
+            for sym, pos in zip(symbols, frame["positions"]):
+                pos = [c * BOHR_TO_ANG for c in pos]
+                if wrap:
+                    pos = wrap_into_box(pos, box)
+                out += f"{sym:<2s} {pos[0]:14.8f} {pos[1]:14.8f} {pos[2]:14.8f}\n"
+        return out
+
+
+    def write_xyz(path, frames, symbols, box_bohr, dt_fs, wrap=True):
+        text = trajectory_to_xyz(frames, symbols, box_bohr, dt_fs, wrap)
+        with open(path, "w") as fh:
+            fh.write(text)
+    ```
+- role: assistant
+  content: |
+    ```python
+    """Export MD trajectories to extended XYZ for VMD / ASE."""
+    import math
+
+    BOHR_TO_ANG = 0.529177210903
+
+
+    def wrap_into_box(pos, box):
+        return tuple(p - box[i] * math.floor(p / box[i]) for i, p in enumerate(pos))
+
+
+    def frame_comment(step, dt_fs, energy_ha, box):
+        t_ps = step * dt_fs / 1000.0
+        return (
+            f'Lattice="{box[0]:.6f} 0.0 0.0 0.0 {box[1]:.6f} 0.0 0.0 0.0 {box[2]:.6f}" '
+            f"Properties=species:S:1:pos:R:3 time={t_ps:.4f} energy={energy_ha:.8f}"
+        )
+
+
+    def trajectory_to_xyz(frames, symbols, box_bohr, dt_fs, wrap=True):
+        box = [b * BOHR_TO_ANG for b in box_bohr]
+        atom_count_line = f"{len(symbols)}\n"
+        parts = []
+        append = parts.append
+        for frame in frames:
+            append(atom_count_line)
+            append(frame_comment(frame["step"], dt_fs, frame["energy"], box) + "\n")
+            for sym, pos in zip(symbols, frame["positions"]):
+                pos = [c * BOHR_TO_ANG for c in pos]
+                if wrap:
+                    pos = wrap_into_box(pos, box)
+                append(f"{sym:<2s} {pos[0]:14.8f} {pos[1]:14.8f} {pos[2]:14.8f}\n")
+        return "".join(parts)
+
+
+    def write_xyz(path, frames, symbols, box_bohr, dt_fs, wrap=True):
+        text = trajectory_to_xyz(frames, symbols, box_bohr, dt_fs, wrap)
+        with open(path, "w") as fh:
+            fh.write(text)
+    ```
+
+    Signatures, return type and every byte of output are unchanged. The lines are formatted exactly as before. Only the way they are put together changed.
+
+    **Green Notes**
+    - **`"".join()` instead of `+=` on one growing string** (reduces E): your run adds millions of atom lines to `out`, and `+=` can copy the growing string over and over. Collecting the lines in a list and joining once builds the result in one pass. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces with `join` used roughly 260× less CPU energy than `+=`.
+    - **The per-line f-string stays:** formatting one line with an f-string is fine. The cost was in adding each line to `out`. Using an f-string to append to `out` in the loop would cost the same as `+=`.
+    - **Memory:** at the moment of the join, both the list of lines and the final string are in memory. `write_xyz` has to keep calling `trajectory_to_xyz` to return a `str`, so this is fine. If memory gets tight on the biggest runs, `write_xyz` could write the lines straight to the file with `fh.writelines(...)` instead.
+verify:
+  test: |
+    import os, tempfile
+    _syms = ["O", "H", "H"]
+    _frames = [
+        {"step": s, "energy": -17.2 - s * 1e-4,
+         "positions": [(1.0 + s, 2.0, 3.0), (70.0, -1.5, 0.2), (0.1, 0.2, -80.0)]}
+        for s in range(4)
+    ]
+    _txt = trajectory_to_xyz(_frames, _syms, (30.0, 30.0, 30.0), 0.5)
+    assert isinstance(_txt, str)
+    _lines = _txt.splitlines()
+    assert len(_lines) == 4 * (3 + 2)
+    assert _lines[0] == "3"
+    assert _lines[1].startswith('Lattice="15.875316')
+    assert "time=0.0000" in _lines[1]
+    _d = tempfile.mkdtemp()
+    _p = os.path.join(_d, "t.xyz")
+    write_xyz(_p, _frames, _syms, (30.0, 30.0, 30.0), 0.5, wrap=False)
+    with open(_p) as _fh:
+        assert _fh.read() == trajectory_to_xyz(_frames, _syms, (30.0, 30.0, 30.0), 0.5, wrap=False)
+    assert trajectory_to_xyz([], _syms, (30.0, 30.0, 30.0), 0.5) == ""
+  equivalence:
+    driver: |-
+      import hashlib
+      import random
+      rng = random.Random(42)
+      symbols = ["O", "H", "H"] * 20
+      frames = []
+      for step in range(0, 500, 10):
+          frames.append({
+              "step": step,
+              "energy": -76.4 + rng.random() * 0.01,
+              "positions": [
+                  (rng.uniform(-5, 40), rng.uniform(-5, 40), rng.uniform(-5, 40))
+                  for _ in symbols
+              ],
+          })
+      box = (35.0, 35.0, 35.0)
+      for wrap in (True, False):
+          s = trajectory_to_xyz(frames, symbols, box, 0.5, wrap=wrap)
+          print(type(s).__name__, len(s), hashlib.sha256(s.encode()).hexdigest())
+      print(trajectory_to_xyz(frames[:1], symbols[:3], box, 0.5).splitlines())
+      print(repr(trajectory_to_xyz([], symbols, box, 0.5)))

@@ -1,0 +1,58 @@
+id: gen-1-00078-refactor
+category: refactor
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    Cron, every minute, ships checkout events to our ingest. Box is a shared 2 vCPU VM and this script shows up in top every run. Diff only please.
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    SPOOL=/var/spool/shop/checkout-events
+    INGEST=https://ingest.shop.example.com/v1/events
+    TOKEN_FILE=/etc/shop/ingest.token
+
+    cd "$SPOOL"
+    shopt -s nullglob
+    files=(events-*.jsonl)
+    [ ${#files[@]} -eq 0 ] && exit 0
+
+    batch="batch-$(date +%Y%m%dT%H%M%S).jsonl"
+    cat "${files[@]}" > "$batch"
+    xz -9e -T1 "$batch"
+
+    curl -fsS -X POST "$INGEST" \
+      -H "Authorization: Bearer $(cat "$TOKEN_FILE")" \
+      -H 'Content-Type: application/x-xz' \
+      --data-binary @"$batch.xz"
+
+    rm -f "${files[@]}" "$batch.xz"
+    ```
+- role: assistant
+  content: |
+    Only these lines change:
+
+    ```bash
+    zstd -q -3 --rm "$batch"
+
+    curl -fsS -X POST "$INGEST" \
+      -H "Authorization: Bearer $(cat "$TOKEN_FILE")" \
+      -H 'Content-Type: application/zstd' \
+      --data-binary @"$batch.zst"
+
+    rm -f "${files[@]}" "$batch.zst"
+    ```
+
+    **Green Notes**
+    - **Fast codec for data compressed often** (reduces E): `xz -9e` is the most expensive setting of an expensive codec, and it runs every minute on small, short-lived batches. In Green Metrics Tool micro-benchmarks on 100 MB of English text, compressing with xz used about 29× the CPU energy of zstd at its default level, and zstd used about 4× less than gzip. Decompression is cheap for both: zstd ~5.3 J and xz ~11.7 J per 100 MB, so the receiver does not get worse.
+    - These figures compare energy only, not output size. xz usually makes smaller files. On a slow or metered link, or for data you store for a long time, that can matter. For one-minute batches on a normal uplink, the CPU cost is the bigger term.
+    - The ingest endpoint must accept `application/zstd`, so check that before you deploy. If it can only take xz, use gzip at a moderate level (`gzip -6`), which is still far cheaper than `xz -9e`.
+    - `--rm` deletes the plain `$batch` file after compression, like `xz` did.
+verify:
+  static_only: needs xz, zstd, curl and a remote ingest endpoint

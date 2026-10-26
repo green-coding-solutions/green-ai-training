@@ -1,0 +1,85 @@
+id: gen-12764612-00151-refactor
+category: refactor
+language: javascript
+patterns:
+- css-animations
+- minify-assets
+facts:
+- F-ANIM
+- F-MINIFY
+messages:
+- role: user
+  content: |
+    hi, I made a small status page for our nightly ETL job so the team can see how far it is. it works but when I leave the tab open my laptop fan gets loud and I dont know why. I also read I should minify the file, should I? here is the js
+
+    ```javascript
+    // etl-status.js
+    const fill = document.getElementById('progress-fill');
+    const dot = document.getElementById('running-dot');
+    const label = document.getElementById('progress-label');
+
+    let start = null;
+    function pulse(ts) {
+      if (start === null) start = ts;
+      const t = (ts - start) / 1000;
+      const scale = 1 + 0.3 * Math.sin((t * 2 * Math.PI) / 1.5);
+      dot.style.transform = 'scale(' + scale + ')';
+      dot.style.opacity = 0.6 + 0.4 * Math.abs(Math.sin((t * Math.PI) / 1.5));
+      requestAnimationFrame(pulse);
+    }
+    requestAnimationFrame(pulse);
+
+    async function refresh() {
+      const res = await fetch('/api/etl/status');
+      const s = await res.json();
+      const pct = Math.round((100 * s.rows_done) / s.rows_total);
+      fill.style.width = pct + '%';
+      label.textContent =
+        s.stage + ': ' + pct + '% (' + s.rows_done + ' / ' + s.rows_total + ' rows)';
+    }
+
+    setInterval(refresh, 5000);
+    refresh();
+    ```
+- role: assistant
+  content: |
+    The fan noise comes from `pulse`. It runs JavaScript on every frame, about 60 times a second, just to move a dot. CSS can do this without running your script each frame.
+
+    ```css
+    #running-dot {
+      animation: pulse 1.5s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { transform: scale(1);   opacity: 0.6; }
+      50%      { transform: scale(1.3); opacity: 1; }
+    }
+    ```
+
+    ```javascript
+    // etl-status.js
+    const fill = document.getElementById('progress-fill');
+    const label = document.getElementById('progress-label');
+
+    async function refresh() {
+      const res = await fetch('/api/etl/status');
+      const s = await res.json();
+      const pct = s.rows_total > 0 ? Math.round((100 * s.rows_done) / s.rows_total) : 0;
+      fill.style.width = pct + '%';
+      label.textContent =
+        s.stage + ': ' + pct + '% (' + s.rows_done + ' / ' + s.rows_total + ' rows)';
+    }
+
+    setInterval(refresh, 5000);
+    refresh();
+    ```
+
+    **Green Notes**
+    - **CSS `@keyframes` instead of a `requestAnimationFrame` loop** (reduces E): the script no longer wakes up every frame, and the browser animates `transform` and `opacity` itself. In Green Metrics Tool micro-benchmarks, a 20-second animation used about 10% less CPU energy with CSS `@keyframes` (~145 J) than with JavaScript `requestAnimationFrame` style updates (~161 J). This page is open for hours, so the loop matters more than the 5-second refresh.
+    - *Not applied:* minification. For a small file like this, minifying saves bytes on the network, not measurable CPU. In Green Metrics Tool micro-benchmarks, 50 cold loads of a small page used about 2% less with minified JS and CSS (~822 J vs ~837 J), which is within noise. Skip it for an internal page.
+
+    Two behavior notes:
+    - The pulse now follows an ease-in-out curve, so it looks close to the old one but is not identical. Adjust the keyframes if you want it different.
+    - I fixed a bug. If `rows_total` is `0` (the job just started), the old code showed `NaN%`. It now shows `0%`.
+verify:
+  static_only: needs a browser DOM, fetch and CSS animation to run

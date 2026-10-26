@@ -1,0 +1,82 @@
+id: gen-2-00126-review
+category: review
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    hi, i'm new to bash. our shop exports all product returns every night and i wrote this script to make a small summary for the support team. two problems: "Returns" and "Refunded" always show 0, but the list by reason looks right?? and it is really slow, the file has about 15000 lines. what am i doing wrong?
+
+    ```bash
+    #!/bin/bash
+    # summarize returns from the nightly export
+    # returns.csv: return_id,order_id,sku,reason,refund_cents
+
+    FILE=$1
+    total=0
+    count=0
+
+    cat $FILE | tail -n +2 | while read line
+    do
+      reason=$(echo $line | cut -d',' -f4)
+      refund=$(echo $line | cut -d',' -f5)
+      total=$(expr $total + $refund)
+      count=$(expr $count + 1)
+      echo "$reason" >> /tmp/reasons.txt
+    done
+
+    echo "Returns: $count"
+    echo "Refunded: $(expr $total / 100) EUR"
+    echo "By reason:"
+    sort /tmp/reasons.txt | uniq -c | sort -rn
+    rm /tmp/reasons.txt
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (nightly batch job)
+
+    #### [Bug] `count` and `total` are always 0
+    - **Where:** `cat $FILE | tail -n +2 | while read line`
+    - **Issue:** every part of a pipeline runs in its own subshell. The loop changes its own copies of `count` and `total`, and those copies are gone after `done`. The reason list still works because it goes to a file on disk.
+    - **Fix:** the awk version below has no subshell problem. If you keep a loop, feed it with a redirect instead of a pipe: `while IFS=, read -r ...; do ...; done < <(tail -n +2 "$file")`.
+
+    #### [Bug] Fixed temp file `/tmp/reasons.txt`
+    - **Where:** `echo "$reason" >> /tmp/reasons.txt` and the final `rm`
+    - **Issue:** if a run stops before `rm`, the next run appends to the old lines and the reason counts are too high. Two runs at the same time mix their data. On a shared machine, a predictable name in `/tmp` also lets another user put a symlink there, and the script then appends to whatever file the link points to.
+    - **Fix:** you don't need a temp file at all (see below). If you ever do, use `tmp=$(mktemp)` and `trap 'rm -f "$tmp"' EXIT`.
+
+    #### [High] New processes for every line
+    - **Where:** `$(echo $line | cut ...)` twice and `$(expr ...)` twice inside the loop
+    - **Issue:** each command substitution forks a subshell, and `echo | cut` and `expr` start more processes on top of that. That is several process starts per line, so well over a hundred thousand for a 15,000-line file. Almost all of the runtime is spent starting processes, not reading your data.
+    - **Fix:** do the whole summary in one `awk` pass:
+      ```bash
+      #!/bin/bash
+      # summarize returns from the nightly export
+      # returns.csv: return_id,order_id,sku,reason,refund_cents
+      set -euo pipefail
+
+      file=${1:?usage: $0 returns.csv}
+
+      awk -F',' -v sort_cmd='sort -rn' '
+      NR > 1 {
+        count++
+        total += $5
+        by_reason[$4]++
+      }
+      END {
+        printf "Returns: %d\n", count
+        printf "Refunded: %d EUR\n", int(total / 100)
+        printf "By reason:\n"
+        fflush()
+        for (r in by_reason) printf "%7d %s\n", by_reason[r], r | sort_cmd
+        close(sort_cmd)
+      }' "$file"
+      ```
+    - **Impact:** E on every run, scaling with the number of lines. In Green Metrics Tool micro-benchmarks that summarized a 20,000-line access log, a loop using builtins (`read -r`, `$(( ))`) used about 300× less CPU energy than the same loop with `$(echo | cut)` and `$(expr)` per field. One `awk` pass used over 1000× less.
+
+    The output format stays the same: refunds are still cut down to whole EUR, and the reason list looks like `uniq -c` output. One small difference: the old `echo $line` without quotes squeezed repeated spaces in a reason and could expand `*`. awk keeps the text exactly as it is in the file. Neither version handles commas inside quoted CSV fields. If your export can contain them, use a real CSV parser.
+verify:
+  static_only: bash script; the harness only executes python and javascript

@@ -1,0 +1,102 @@
+id: gen-12764612-00169-multi-turn
+category: multi-turn
+language: python
+patterns:
+- vectorize-or-jit
+- context-tradeoff
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    hello, we have a flask endpoint where our sensor boxes upload raw readings and we store them as 8 bit levels. with big uploads (about 1 million values) it is very slow and cpu is high. can you make it faster pls?
+
+    ```python
+    from flask import Flask, request, jsonify
+
+    app = Flask(__name__)
+
+    LO, HI = -40.0, 125.0
+
+
+    def quantize_readings(values, lo, hi, levels=256):
+        step = (hi - lo) / (levels - 1)
+        out = []
+        for v in values:
+            if v < lo:
+                v = lo
+            elif v > hi:
+                v = hi
+            out.append(int(round((v - lo) / step)))
+        return out
+
+
+    @app.route("/api/v1/readings", methods=["POST"])
+    def upload_readings():
+        payload = request.get_json()
+        levels = quantize_readings(payload["values"], LO, HI)
+        return jsonify({"device": payload["device"], "count": len(levels), "levels": levels})
+    ```
+- role: assistant
+  content: |
+    The hot spot is the Python loop in `quantize_readings`. It is a plain numeric loop, so a Numba JIT fits well.
+
+    ```python
+    import numpy as np
+    from numba import njit
+    from flask import Flask, request, jsonify
+
+    app = Flask(__name__)
+
+    LO, HI = -40.0, 125.0
+
+
+    @njit(cache=True)
+    def _quantize(values, lo, hi, step, out):
+        for i in range(values.shape[0]):
+            v = values[i]
+            if v < lo:
+                v = lo
+            elif v > hi:
+                v = hi
+            out[i] = np.rint((v - lo) / step)
+
+
+    def quantize_readings(values, lo, hi, levels=256):
+        arr = np.asarray(values, dtype=np.float64)
+        if np.isnan(arr).any():
+            raise ValueError("NaN in readings")
+        out = np.empty(arr.shape[0], dtype=np.int32)
+        _quantize(arr, lo, hi, (hi - lo) / (levels - 1), out)
+        return out.tolist()
+
+
+    @app.route("/api/v1/readings", methods=["POST"])
+    def upload_readings():
+        payload = request.get_json()
+        levels = quantize_readings(payload["values"], LO, HI)
+        return jsonify({"device": payload["device"], "count": len(levels), "levels": levels})
+    ```
+
+    **Green Notes**
+    - **JIT-compiled numeric loop** (reduces E): the loop runs as machine code instead of the Python interpreter. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples with Numba used about 4× less CPU energy than the pure Python loop.
+    - **`cache=True`**: the compiled code is saved to disk, so a restarted worker does not compile again.
+
+    The results are the same as before. `np.rint` rounds half to even, like Python's `round`. The NaN check keeps the old behavior of failing on NaN. Without it, Numba would write a garbage level.
+- role: user
+  content: |
+    ok thanks. but i look in the logs now and most calls have only about 300 values. only the nightly upload of 2 customers is big. is numba still need for this? my boss dont like new dependency
+
+    sorry for my english
+- role: assistant
+  content: |
+    No, not for the small calls. A loop over 300 values takes microseconds, so the JIT gives you nothing there. It only adds a dependency, a bigger image, and a compile step in each new process.
+
+    Numba only pays off on the big nightly uploads, because that is where the loop runs long. So decide by those two uploads:
+
+    - **If they finish fast enough and the CPU load is fine:** keep your original function. It is simple and needs nothing new.
+    - **If they are slow or block other requests:** add Numba, but only if you accept the extra dependency for those few calls.
+
+    I would keep the original for now. Measure one nightly upload first, with `time` or `perf stat`, and add Numba only if that run is a real problem.
+verify:
+  static_only: needs numba, which is not in the stdlib or numpy

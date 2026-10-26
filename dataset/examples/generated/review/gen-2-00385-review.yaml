@@ -1,0 +1,93 @@
+id: gen-2-00385-review
+category: review
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    hi, I'm new to docker. I made this Dockerfile for our product landing page (Vite + React, only static content, a hero section, pricing and a contact form). GitHub Actions builds it on every push so the marketing team can check a preview. A colleague said the image is way too big and the build is slow, but it works on my laptop and I don't really understand what is wrong with it. Can you review it?
+
+    ```dockerfile
+    FROM node:20
+
+    RUN apt-get update && apt-get install -y \
+        git \
+        curl \
+        vim \
+        python3 \
+        build-essential
+
+    WORKDIR /app
+
+    COPY . .
+
+    RUN npm install
+    RUN npm install -g serve
+
+    RUN npm run build
+
+    ENV NODE_ENV=production
+    EXPOSE 3000
+
+    CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "3000"]
+    ```
+
+    we don't have a .dockerignore file, i didn't know we need one.
+- role: assistant
+  content: |
+    **Workload:** web
+
+    #### [Bug] The container runs the dev server, not your build
+    - **Where:** `CMD ["npm", "run", "dev", ...]`
+    - **Issue:** `npm run build` creates `dist/`, but the container never uses it. It starts the Vite dev server instead. That server watches files and compiles modules on demand, and it is not meant for production. `serve` is installed but never used.
+    - **Fix:** serve the files in `dist/` with a static web server (see the Dockerfile below).
+
+    #### [Security] Everything in the project folder goes into the image
+    - **Where:** `COPY . .` without a `.dockerignore`
+    - **Issue:** `.env`, `.git` and your local `node_modules` are copied into the image. Anyone who can pull the image can read them.
+    - **Fix:** add a `.dockerignore`:
+
+      ```text
+      node_modules
+      dist
+      .git
+      .env
+      *.log
+      ```
+
+    #### [High] The runtime image carries the whole toolchain
+    - **Where:** `FROM node:20`, the `apt-get install` line, `npm install -g serve`
+    - **Issue:** the page is only static HTML, CSS and JS after the build. But the image ships the full Node base image, compilers, `git`, `vim`, all npm dev dependencies and your source code. All of this is downloaded, installed, pushed and stored again on every push.
+    - **Fix:** use a multi-stage build. Build with `node:20-slim`, then copy only `dist/` into a small `nginx:alpine` image. Vite and esbuild ship prebuilt binaries, so you can drop `build-essential` and `python3`. If a dependency fails to install without them, add only that package to the build stage.
+    - **Impact:** reduces E and network on every CI build, pull and stored copy. In Green Metrics Tool measurements of a small Flask app, a slim base with runtime dependencies only and the dependency layer first used about 7× less energy to build without cache. Serving requests afterwards cost the same with both images, so the saving is all in building and moving the image.
+
+    #### [Medium] Source is copied before installing dependencies
+    - **Where:** `COPY . .` before `RUN npm install`
+    - **Issue:** any change to any file breaks the layer cache, so every push reinstalls all npm packages from scratch.
+    - **Fix:** copy `package.json` and `package-lock.json` first, run `npm ci`, then copy the source. Then the install layer is only rebuilt when your dependencies change. `npm ci` also installs exactly what the lockfile says.
+
+    ```dockerfile
+    # Build stage: Node is only needed to create dist/
+    FROM node:20-slim AS build
+    WORKDIR /app
+    COPY package.json package-lock.json ./
+    RUN npm ci
+    COPY . .
+    RUN npm run build
+
+    # Runtime stage: only the static files
+    FROM nginx:1.27-alpine
+    COPY --from=build /app/dist /usr/share/nginx/html
+    EXPOSE 80
+    ```
+
+    Behavior changes:
+    - nginx listens on port 80, not 3000. Update your port mapping, for example `docker run -p 3000:80 ...`.
+    - If the page uses client-side routes, the default nginx config returns 404 when someone reloads a sub-route. In that case add a small nginx config with `try_files $uri /index.html;`.
+
+    **Already good:** the site is built to static files, so a tiny static web server is all it needs at runtime.
+verify:
+  static_only: Dockerfile review, needs a Docker build and the project's npm dependencies

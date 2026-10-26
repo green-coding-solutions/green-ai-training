@@ -1,0 +1,79 @@
+id: gen-2-00060-no-change
+category: no-change
+language: python
+patterns:
+- batch-db-writes
+- context-tradeoff
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    inserts one row at a time, fix this
+
+    ```python
+    import itertools
+    import sys
+    import time
+
+    import numpy as np
+    import psycopg
+
+    from sim import run_ensemble  # Monte Carlo ensemble, a few minutes per parameter point
+
+    DSN = "dbname=sweeps user=lab"
+
+    COUPLINGS = np.linspace(0.1, 2.0, 8)
+    TEMPERATURES = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+
+
+    def main(sweep_id: str) -> None:
+        with psycopg.connect(DSN) as conn:
+            done = {
+                (row[0], row[1])
+                for row in conn.execute(
+                    "SELECT coupling, temperature FROM sweep_results WHERE sweep_id = %s",
+                    (sweep_id,),
+                )
+            }
+            for j, t in itertools.product(COUPLINGS, TEMPERATURES):
+                if (float(j), t) in done:
+                    continue
+                t0 = time.perf_counter()
+                res = run_ensemble(coupling=j, temperature=t, n_samples=200_000, seed=42)
+                conn.execute(
+                    """INSERT INTO sweep_results
+                       (sweep_id, coupling, temperature, energy_mean, energy_std,
+                        magnetization, acceptance_rate, runtime_s)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (sweep_id, float(j), t, res.energy_mean, res.energy_std,
+                     res.magnetization, res.acceptance, time.perf_counter() - t0),
+                )
+                conn.commit()
+                print(f"J={j:.3f} T={t:.1f} E={res.energy_mean:.4f}")
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1])
+    ```
+- role: assistant
+  content: |
+    I'd leave it as it is. Inserting one row at a time is the right choice for this script.
+
+    - **There are very few rows.** A full sweep writes 8 × 6 = 48 summary rows, one every few minutes. Batching helps when you write many rows per batch. In Green Metrics Tool micro-benchmarks with 5,000-row batches, `COPY` used about 22× less energy than one `INSERT` per row. With batches of only 100 rows the differences were small, because the fixed cost per batch dominates. You have 48 single-row writes in total. The database work is tiny next to 48 runs of `run_ensemble`.
+    - **The per-row commit makes resume work.** The `done` query skips points that are already stored. If you collected results and wrote them all at the end, a crash at point 40 would lose every finished point. You would have to rerun hours of simulation, and that costs far more than any insert.
+
+    If the sweep feels slow, the time is spent in `run_ensemble`, so profile that.
+
+    Batching becomes worth it if you start storing raw per-sample data, for example 200,000 rows per parameter point. For that table, use one `COPY` per point inside the same transaction as the summary row:
+
+    ```python
+    with conn.cursor() as cur:
+        with cur.copy(
+            "COPY sweep_samples (sweep_id, coupling, temperature, step, energy) FROM STDIN"
+        ) as copy:
+            for step, e in enumerate(res.energies):
+                copy.write_row((sweep_id, float(j), t, step, float(e)))
+    ```
+verify:
+  static_only: Needs a running PostgreSQL server, the psycopg package and the user's sim module.

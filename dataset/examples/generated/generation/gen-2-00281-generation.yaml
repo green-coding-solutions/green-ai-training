@@ -1,0 +1,96 @@
+id: gen-2-00281-generation
+category: generation
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    k8s yaml for nightly regression tests of our lattice-boltzmann solver. tests image registry.lab.local/lbm-tests:main, needs the reference db registry.lab.local/lbm-refdb:2026.10 (postgres) running
+- role: assistant
+  content: |
+    This is one CronJob. The reference database runs as a sidecar inside the test pod. It starts with the tests and stops when they finish.
+
+    ```yaml
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata:
+      name: lbm-nightly-regression
+      namespace: lbm-ci
+    spec:
+      schedule: "0 2 * * *"
+      concurrencyPolicy: Forbid
+      startingDeadlineSeconds: 3600
+      successfulJobsHistoryLimit: 1
+      failedJobsHistoryLimit: 3
+      jobTemplate:
+        spec:
+          backoffLimit: 0
+          activeDeadlineSeconds: 10800
+          ttlSecondsAfterFinished: 259200
+          template:
+            metadata:
+              labels:
+                app: lbm-nightly-regression
+            spec:
+              restartPolicy: Never
+              initContainers:
+                # Native sidecar: starts first, is stopped once "tests" exits.
+                - name: refdb
+                  image: registry.lab.local/lbm-refdb:2026.10
+                  restartPolicy: Always
+                  args: ["postgres", "-c", "listen_addresses=localhost"]
+                  env:
+                    - name: POSTGRES_HOST_AUTH_METHOD
+                      value: trust
+                  startupProbe:
+                    exec:
+                      command: ["pg_isready", "-h", "localhost", "-U", "postgres"]
+                    periodSeconds: 5
+                    failureThreshold: 60
+                  resources:
+                    requests:
+                      cpu: 500m
+                      memory: 1Gi
+                    limits:
+                      memory: 2Gi
+                  volumeMounts:
+                    - name: pgdata
+                      mountPath: /var/lib/postgresql/data
+              containers:
+                - name: tests
+                  image: registry.lab.local/lbm-tests:main
+                  imagePullPolicy: Always
+                  env:
+                    - name: PGHOST
+                      value: localhost
+                    - name: PGPORT
+                      value: "5432"
+                    - name: PGUSER
+                      value: postgres
+                  resources:
+                    requests:
+                      cpu: "4"
+                      memory: 8Gi
+                    limits:
+                      memory: 8Gi
+              volumes:
+                - name: pgdata
+                  emptyDir: {}
+    ```
+
+    Assumptions:
+    - `lbm-refdb` is built on the official `postgres` image, and its init scripts load the reference data.
+    - The tests read the standard `PG*` variables.
+    - The cluster runs Kubernetes 1.29 or newer, which native sidecars need. On older clusters, run `refdb` as a second container and have the tests wait for `pg_isready` themselves.
+
+    Postgres listens only on `localhost`, so the `trust` auth applies only inside the pod.
+
+    **Green Notes**
+    - **Environment exists only during the run** (reduces E, M): there is no permanent database Deployment that idles all day between nightly runs. The pod and its reserved CPU and memory are gone when the tests finish. In Green Metrics Tool measurements, an idling preview environment with extra services used only about 3% more CPU energy per minute than a trimmed one. The real saving is the hours an environment does not exist at all.
+    - **No leftovers or pile-ups** (reduces E, M): `concurrencyPolicy: Forbid` stops a slow run from overlapping the next one. `activeDeadlineSeconds` kills a hung run after 3 hours, so it can't block a node. `ttlSecondsAfterFinished` removes finished jobs after 3 days, which leaves the logs for a weekend failure until Monday.
+    - **No automatic retries** (reduces E): with `backoffLimit: 0`, a failing regression is reported once instead of rerunning the full solver suite. Rerun it by hand with `kubectl create job --from=cronjob/lbm-nightly-regression rerun -n lbm-ci`.
+verify:
+  static_only: Kubernetes manifest, needs a cluster and the lab's private images

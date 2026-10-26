@@ -1,0 +1,118 @@
+id: gen-2-00285-review
+category: review
+language: bash
+patterns:
+- bash-builtins
+- compress-transmitted
+facts:
+- F-BASH-SUBPROC
+- F-COMPRESS
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    hi, can you review my upload script for our gateways? We have ~150 of this boxes in field (raspberry pi like, with LTE modem). Each one have ~60 sensors that write one line every few seconds into the spool file, cron run the script every 5 min. CPU on the boxes is often very high around the upload, and sometime we see gaps in the data on the dashboard after the LTE was down.
+
+    ```bash
+    #!/bin/bash
+    # upload_readings.sh - cron every 5 min on the gateway
+    SPOOL=/var/spool/sensors/readings.csv
+    OUT=/tmp/batch.json
+    ENDPOINT="https://ingest.example-iot.net/v1/batch"
+    GW_ID=$(cat /etc/gateway-id)
+
+    echo "{\"gateway\":\"$GW_ID\",\"readings\":[" > $OUT
+    sep=""
+    count=0
+    while read line; do
+        ts=$(echo $line | cut -d',' -f1)
+        sensor=$(echo $line | cut -d',' -f2)
+        kind=$(echo $line | cut -d',' -f3)
+        raw=$(echo $line | cut -d',' -f4)
+        if [ "$kind" = "temp" ]; then
+            value=$(expr $raw / 10)     # sensor send tenth of degree
+        else
+            value=$raw
+        fi
+        echo "$sep{\"ts\":$ts,\"sensor\":\"$sensor\",\"kind\":\"$kind\",\"value\":$value}" >> $OUT
+        sep=","
+        count=$(expr $count + 1)
+    done < $SPOOL
+    echo "]}" >> $OUT
+
+    brotli -q 11 -f -o $OUT.br $OUT
+    curl -s -X POST -H "Content-Type: application/json" -H "Content-Encoding: br" \
+        --data-binary @$OUT.br $ENDPOINT
+    logger -t sensor-upload "sent $count readings"
+    rm -f $SPOOL $OUT $OUT.br
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (IoT gateway upload)
+
+    #### [Bug] Readings are deleted even when the upload fails
+    - **Where:** `curl -s ...` followed by `rm -f $SPOOL ...`
+    - **Issue:** `curl -s` without `-f` does not fail on HTTP errors. The script also never checks the exit code, so when LTE is down the spool file is deleted anyway. These are your dashboard gaps. A second loss: lines the sensors write while the loop runs land in `$SPOOL` and are deleted without being sent. A hanging `curl` can also overlap with the next cron run, and both runs write the same `/tmp/batch.json`.
+    - **Fix:** `mv` the spool to a work file first and send that file. Delete it only when `curl -f` succeeds, and retry it on the next run if not. Add `--max-time` and a `flock` so runs can't overlap. The `mv` assumes your collector opens the spool file for each write, or reopens it on a signal. If it keeps the file open, it will keep writing into the renamed file.
+
+    #### [Bug] Temperatures lose their decimal
+    - **Where:** `value=$(expr $raw / 10)`
+    - **Issue:** `expr` does integer division, so `215` (21.5 °C) is sent as `21`.
+    - **Fix:** divide in `awk` and format with one decimal place (see below).
+
+    #### [High] Several process starts for every reading
+    - **Where:** the `while read` loop
+    - **Issue:** each line runs 4 `$(echo $line | cut ...)` pipelines and up to 2 `expr` calls. Every one of them starts new processes. With ~60 sensors, every 5-minute batch has thousands of lines, so the gateway spends the upload window forking. This is your CPU spike. `read` without `-r` and unquoted `$line` can also mangle backslashes and glob characters.
+    - **Fix:** build the whole JSON in one `awk` pass over the file.
+    - **Impact:** reduces E on every gateway, every 5 minutes. In Green Metrics Tool micro-benchmarks summarizing a 20,000-line log, a loop with builtins only used about 300× less CPU energy than a `$(echo | cut)` / `$(expr)` loop. One `awk` pass used over 1000× less.
+
+    #### [Medium] Brotli at maximum quality for a fresh batch every 5 minutes
+    - **Where:** `brotli -q 11`
+    - **Issue:** quality 11 is the slowest brotli setting. It fits static files that are compressed once and served many times, not data compressed again every 5 minutes on a small ARM CPU.
+    - **Fix:** `gzip -6` with `Content-Encoding: gzip`. Every ingest stack can decode it. `zstd` is cheaper still, but only if your ingest accepts `Content-Encoding: zstd`. Keep compression on, because on LTE the bytes count.
+    - **Impact:** reduces E per upload. In Green Metrics Tool measurements compressing 100 MB of text, brotli at quality 11 used about 45× the energy of gzip and about 190× that of zstd. Those measurements compare energy only, not file size. Brotli -q 11 usually gives the smallest output. If your LTE data plan is tight, compare the sizes on one real batch before you switch.
+
+    ```bash
+    #!/bin/bash
+    # upload_readings.sh - cron every 5 min on the gateway
+    set -u
+    SPOOL=/var/spool/sensors/readings.csv
+    WORK=/var/spool/sensors/sending.csv
+    OUT=/var/spool/sensors/batch.json
+    ENDPOINT='https://ingest.example-iot.net/v1/batch'
+    GW_ID=$(cat /etc/gateway-id)
+
+    exec 9>/run/lock/sensor-upload.lock
+    flock -n 9 || exit 0
+
+    # take a new batch only if no failed batch is waiting
+    if [ ! -e "$WORK" ]; then
+        [ -s "$SPOOL" ] || exit 0
+        mv "$SPOOL" "$WORK"
+    fi
+
+    awk -F',' -v gw="$GW_ID" -v tkind='temp' -v tfmt='%.1f' -v tail=']}' '
+        BEGIN { printf "{\"gateway\":\"%s\",\"readings\":[", gw }
+        {
+            v = ($3 == tkind) ? sprintf(tfmt, $4 / 10) : $4
+            printf "%s{\"ts\":%s,\"sensor\":\"%s\",\"kind\":\"%s\",\"value\":%s}", sep, $1, $2, $3, v
+            sep = FS
+        }
+        END { print tail }
+    ' "$WORK" > "$OUT"
+    count=$(wc -l < "$WORK")
+
+    gzip -6 -c "$OUT" > "$OUT.gz"
+    if curl -sf --max-time 60 -X POST \
+            -H 'Content-Type: application/json' -H 'Content-Encoding: gzip' \
+            --data-binary @"$OUT.gz" "$ENDPOINT"; then
+        logger -t sensor-upload "sent $count readings"
+        rm -f "$WORK" "$OUT" "$OUT.gz"
+    else
+        logger -t sensor-upload "upload failed, $count readings kept for retry"
+    fi
+    ```
+
+    **Already good:** readings are sent as one compressed batch every 5 minutes, not one request per reading.
+verify:
+  static_only: bash script for a gateway, needs the sensor spool file, /etc/gateway-id and a network ingest endpoint

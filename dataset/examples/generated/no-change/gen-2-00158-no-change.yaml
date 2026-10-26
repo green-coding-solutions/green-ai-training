@@ -1,0 +1,58 @@
+id: gen-2-00158-no-change
+category: no-change
+language: bash
+patterns:
+- bash-builtins
+- none
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    speed this up
+
+    ```bash
+    #!/usr/bin/env bash
+    # slow-queries.sh - top slow statements from a postgres log
+    set -eu
+
+    log=${1:-/var/log/postgresql/postgresql-16-main.log}
+    threshold_ms=${2:-500}
+    top=${3:-20}
+
+    if [[ ! -r $log ]]; then
+      echo "cannot read $log" >&2
+      exit 1
+    fi
+
+    awk -v t="$threshold_ms" '
+      /duration: [0-9.]+ ms/ {
+        match($0, /duration: [0-9.]+ ms/)
+        ms = substr($0, RSTART + 10, RLENGTH - 13) + 0
+        if (ms < t) next
+        slow++
+        sub(/.*(statement|execute [^:]*): /, "")
+        printf "%10.1f  %s\n", ms, substr($0, 1, 120)
+      }
+      END { printf "%d statements over %d ms\n", slow, t > "/dev/stderr" }
+    ' "$log" | sort -rn | head -n "$top"
+    ```
+- role: assistant
+  content: |
+    This is already efficient. I would leave it as it is.
+
+    - **One `awk` pass:** it reads the log once. Parsing, the threshold filter and formatting all happen in one process. Nothing starts a new process per line.
+    - **`sort` and `head` run once:** they only see the lines over the threshold, not the whole log.
+    - **Defaults via parameter expansion:** reading the arguments starts no extra commands.
+
+    This is the right shape for log processing in shell. In Green Metrics Tool micro-benchmarks on a 20,000-line access log, one `awk` pass used over 1000× less CPU energy than a `while read` loop that ran `cut` and `expr` for every field. It also used about 4× less than a loop with bash builtins only. Rewriting this in pure bash would make it slower, not faster.
+
+    If a run still feels slow, the cause is almost certainly the size of the input, because `awk` has to read every line. Check it first:
+
+    ```bash
+    time ./slow-queries.sh /var/log/postgresql/postgresql-16-main.log 500 20 > /dev/null
+    ```
+
+    If the file is huge, run the script on the rotated log for the period you care about, not on one ever-growing file. That cuts the work more than any change to the script.
+verify:
+  static_only: bash no-change answer; the only code block is a timing command, there is no rewritten script to test

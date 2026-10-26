@@ -1,0 +1,44 @@
+id: gen-2-00130-generation
+category: generation
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    need a script that pulls /var/log/payments/ from a given host into ./logs/<host>/ over ssh, vpn is slow. rotated ones are already .gz
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # Usage: pull-logs.sh <host> [remote_dir]
+    set -euo pipefail
+
+    host=${1:?'usage: pull-logs.sh <host> [remote_dir]'}
+    remote_dir=${2:-/var/log/payments}
+    dest="./logs/$host"
+
+    mkdir -p "$dest"
+    printf -v rdir '%q' "$remote_dir"   # safe to embed in the remote command
+
+    # Plain-text logs: compress with zstd on the host, decompress locally.
+    ssh "$host" "cd $rdir && tar -cf - --exclude='*.gz' --exclude='*.zst' . | zstd -q -T0" \
+      | zstd -dq | tar -xf - -C "$dest"
+
+    # Rotated logs are already compressed: copy them as they are.
+    ssh "$host" "cd $rdir && find . -maxdepth 1 -type f \( -name '*.gz' -o -name '*.zst' \) -print0 | tar -cf - --null -T -" \
+      | tar -xf - -C "$dest"
+
+    echo "Logs from $host are in $dest"
+    ```
+
+    `zstd` must be installed on both machines. Don't add `ssh -C` on top: the stream is already compressed.
+
+    **Green Notes**
+    - **Compress transmitted data with a fast codec** (reduces network and E): text logs shrink a lot, so the slow VPN carries far fewer bytes. zstd at its default level is cheap. In Green Metrics Tool measurements on 100 MB of text, zstd used ~16 J to compress and gzip ~67 J, about 4× less energy for zstd. Decompressing was cheap for both.
+    - **Skip already-compressed files** (reduces E): the rotated `.gz` files gain nothing from a second pass, so they go over a plain tar stream.
+    - *Not applied:* xz or brotli. In the same measurements they used about 29× and 190× more energy than zstd. These figures compare energy, not compression ratio. If the link is extremely slow and smaller output matters more, try a higher zstd level first and check the transfer time.
+verify:
+  static_only: needs ssh access to a remote host and zstd

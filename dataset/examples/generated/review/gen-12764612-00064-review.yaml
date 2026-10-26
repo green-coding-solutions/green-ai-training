@@ -1,0 +1,110 @@
+id: gen-12764612-00064-review
+category: review
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    ```python
+    import json
+    import math
+    import random
+
+    WIDTH, HEIGHT = 1920, 1080
+
+
+    def build_stars(count, seed=7):
+        rng = random.Random(seed)
+        stars = []
+        for i in range(count):
+            x = rng.random() * 2 - 1
+            y = rng.random() * 2 - 1
+            dist = math.sqrt(x * x + y * y)
+            if dist > 1:
+                continue
+            size = 0.5 + rng.random() * 1.5
+            twinkle = round(2 + rng.random() * 4, 2)
+            fade = 1 - dist * 0.6
+            stars.append({
+                "x": round(WIDTH / 2 + x * WIDTH / 2, 1),
+                "y": round(HEIGHT / 2 + y * HEIGHT / 2, 1),
+                "r": round(size * fade, 2),
+                "t": twinkle,
+            })
+        return stars
+
+
+    if __name__ == "__main__":
+        stars = build_stars(200000)
+        with open("static/stars.json", "w") as f:
+            json.dump(stars, f)
+        print(len(stars), "stars")
+    ```
+
+    ?
+- role: assistant
+  content: |
+    **Workload:** script (build step that generates data for the landing page)
+
+    #### [Bug] Fewer stars than requested
+    - **Where:** `for i in range(count)` with `if dist > 1: continue`
+    - **Issue:** every rejected point still uses up one loop turn. Only about π/4 of random points in the square fall inside the circle, so `build_stars(200000)` returns roughly 157,000 stars, not 200,000. The unused `i` also hints that the loop was meant to count stars.
+    - **Fix:** loop until you have `count` stars (see the code below). The first stars stay the same for the same seed. The file just gets the missing ones added at the end.
+
+    #### [Low] Attribute lookups repeated in the loop
+    - **Where:** `math.sqrt`, `rng.random` and `stars.append` inside the loop
+    - **Issue:** each turn looks up these names again, and `rng.random` four times. In Green Metrics Tool micro-benchmarks, binding `math.sqrt` to a local before a 10,000,000-iteration loop saved about 4-5%. This script runs once per build, so the gain is small. It costs nothing in readability, so it is fine to do it while you fix the loop.
+    - **Fix:**
+      ```python
+      import json
+      import math
+      import random
+
+      WIDTH, HEIGHT = 1920, 1080
+
+
+      def build_stars(count, seed=7):
+          rng = random.Random(seed)
+          rand = rng.random
+          sqrt = math.sqrt
+          stars = []
+          append = stars.append
+          while len(stars) < count:
+              x = rand() * 2 - 1
+              y = rand() * 2 - 1
+              dist = sqrt(x * x + y * y)
+              if dist > 1:
+                  continue
+              size = 0.5 + rand() * 1.5
+              twinkle = round(2 + rand() * 4, 2)
+              fade = 1 - dist * 0.6
+              append({
+                  "x": round(WIDTH / 2 + x * WIDTH / 2, 1),
+                  "y": round(HEIGHT / 2 + y * HEIGHT / 2, 1),
+                  "r": round(size * fade, 2),
+                  "t": twinkle,
+              })
+          return stars
+
+
+      if __name__ == "__main__":
+          stars = build_stars(200000)
+          with open("static/stars.json", "w") as f:
+              json.dump(stars, f)
+          print(len(stars), "stars")
+      ```
+    - **Impact:** E, a few percent of the loop time at most. It adds up only if you call this for much larger counts or on every build.
+
+    **Already good:** the seeded `random.Random` makes the output the same on every build, and the file is closed by `with`.
+verify:
+  module: true
+  green_block: 0
+  test: |-
+    s = build_stars(1000)
+    assert len(s) == 1000
+    assert all(set(d) == {"x", "y", "r", "t"} for d in s)
+    assert build_stars(1000) == s
+    assert all(0 <= d["x"] <= WIDTH and 0 <= d["y"] <= HEIGHT for d in s)

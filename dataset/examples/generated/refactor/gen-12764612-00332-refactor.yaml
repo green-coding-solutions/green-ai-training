@@ -1,0 +1,104 @@
+id: gen-12764612-00332-refactor
+category: refactor
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    ```python
+    import numpy as np
+    import torch
+
+    from models import DemandLSTM
+
+    WINDOW = 28
+    HORIZON = 14
+    N_FEATURES = 6
+
+    model = DemandLSTM(n_features=N_FEATURES, hidden=64)
+    model.load_state_dict(torch.load("weights/demand_lstm.pt", map_location="cpu"))
+    model.eval()
+
+
+    def forecast_store(history: np.ndarray) -> list[float]:
+        """history: (days, N_FEATURES), demand is feature 0. Returns next HORIZON days."""
+        window = torch.tensor(history[-WINDOW:], dtype=torch.float32).unsqueeze(0)
+        preds = []
+        for _ in range(HORIZON):
+            out = model(window)                      # (1, N_FEATURES)
+            preds.append(out[0, 0].item())
+            window = torch.cat([window[:, 1:, :], out.unsqueeze(1)], dim=1)
+        return preds
+
+
+    def run_nightly(stores: dict[str, np.ndarray]) -> dict[str, list[float]]:
+        results = {}
+        for store_id, history in stores.items():
+            if len(history) < WINDOW:
+                continue
+            results[store_id] = forecast_store(history)
+        return results
+
+
+    if __name__ == "__main__":
+        rng = np.random.default_rng(0)
+        fake = {f"store-{i}": rng.random((60, N_FEATURES)) for i in range(3)}
+        print(run_nightly(fake))
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```python
+    import numpy as np
+    import torch
+
+    from models import DemandLSTM
+
+    WINDOW = 28
+    HORIZON = 14
+    N_FEATURES = 6
+
+    model = DemandLSTM(n_features=N_FEATURES, hidden=64)
+    model.load_state_dict(torch.load("weights/demand_lstm.pt", map_location="cpu"))
+    model.eval()
+
+
+    @torch.no_grad()
+    def forecast_store(history: np.ndarray) -> list[float]:
+        """history: (days, N_FEATURES), demand is feature 0. Returns next HORIZON days."""
+        window = torch.tensor(history[-WINDOW:], dtype=torch.float32).unsqueeze(0)
+        preds = []
+        for _ in range(HORIZON):
+            out = model(window)                      # (1, N_FEATURES)
+            preds.append(out[0, 0].item())
+            window = torch.cat([window[:, 1:, :], out.unsqueeze(1)], dim=1)
+        return preds
+
+
+    def run_nightly(stores: dict[str, np.ndarray]) -> dict[str, list[float]]:
+        results = {}
+        for store_id, history in stores.items():
+            if len(history) < WINDOW:
+                continue
+            results[store_id] = forecast_store(history)
+        return results
+
+
+    if __name__ == "__main__":
+        rng = np.random.default_rng(0)
+        fake = {f"store-{i}": rng.random((60, N_FEATURES)) for i in range(3)}
+        print(run_nightly(fake))
+    ```
+
+    The only change is `@torch.no_grad()` on `forecast_store`. The forecasts are the same numbers as before.
+
+    **Green Notes**
+    - **`torch.no_grad()` for inference** (reduces E, M): without it, PyTorch records an autograd graph for every forward pass. Here the output is fed back into the next step, so the graph grows through all 14 steps for every store, and nobody ever calls `backward()`. In Green Metrics Tool micro-benchmarks, 100,000 PyTorch CPU inferences used about 14% less CPU energy with `no_grad`. The saving is per call, so it adds up over all stores in the nightly run.
+    - **`model.eval()` is not a replacement:** you already call it, which is right. It switches off dropout and similar layers, but it does not stop graph recording. You need both.
+    - Put the decorator on the function, not around the model load, so any other code that later trains or fine-tunes in this module is not affected.
+verify:
+  static_only: needs torch and a local models module with trained weights

@@ -1,0 +1,120 @@
+id: gen-1-00224-generation
+category: generation
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    k8s cronjob to scale down namespace sim-dev at night and weekends, back up in the morning
+- role: assistant
+  content: |
+    ```yaml
+    apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: env-sleeper
+      namespace: sim-dev
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: Role
+    metadata:
+      name: env-sleeper
+      namespace: sim-dev
+    rules:
+      - apiGroups: ["apps"]
+        resources: ["deployments", "statefulsets"]
+        verbs: ["get", "list", "patch"]
+      - apiGroups: ["apps"]
+        resources: ["deployments/scale", "statefulsets/scale"]
+        verbs: ["get", "patch", "update"]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata:
+      name: env-sleeper
+      namespace: sim-dev
+    subjects:
+      - kind: ServiceAccount
+        name: env-sleeper
+        namespace: sim-dev
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: Role
+      name: env-sleeper
+    ---
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata:
+      name: env-sleep
+      namespace: sim-dev
+    spec:
+      schedule: "0 19 * * 1-5"      # every weekday evening, stays down over the weekend
+      timeZone: Europe/Berlin
+      concurrencyPolicy: Forbid
+      successfulJobsHistoryLimit: 1
+      failedJobsHistoryLimit: 1
+      jobTemplate:
+        spec:
+          backoffLimit: 1
+          template:
+            spec:
+              serviceAccountName: env-sleeper
+              restartPolicy: Never
+              containers:
+                - name: kubectl
+                  image: alpine/k8s:1.29.2
+                  command:
+                    - sh
+                    - -c
+                    - |
+                      for res in $(kubectl get deployments,statefulsets -n sim-dev -o name); do
+                        replicas=$(kubectl get "$res" -n sim-dev -o jsonpath='{.spec.replicas}')
+                        if [ "${replicas:-0}" -gt 0 ]; then
+                          kubectl annotate "$res" -n sim-dev --overwrite nightly-replicas="$replicas"
+                          kubectl scale "$res" -n sim-dev --replicas=0
+                        fi
+                      done
+    ---
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata:
+      name: env-wake
+      namespace: sim-dev
+    spec:
+      schedule: "0 7 * * 1-5"       # every weekday morning
+      timeZone: Europe/Berlin
+      concurrencyPolicy: Forbid
+      successfulJobsHistoryLimit: 1
+      failedJobsHistoryLimit: 1
+      jobTemplate:
+        spec:
+          backoffLimit: 1
+          template:
+            spec:
+              serviceAccountName: env-sleeper
+              restartPolicy: Never
+              containers:
+                - name: kubectl
+                  image: alpine/k8s:1.29.2
+                  command:
+                    - sh
+                    - -c
+                    - |
+                      for res in $(kubectl get deployments,statefulsets -n sim-dev -o name); do
+                        replicas=$(kubectl get "$res" -n sim-dev -o jsonpath='{.metadata.annotations.nightly-replicas}')
+                        if [ -n "$replicas" ]; then
+                          kubectl scale "$res" -n sim-dev --replicas="$replicas"
+                          kubectl annotate "$res" -n sim-dev nightly-replicas-
+                        fi
+                      done
+    ```
+
+    **Green Notes**
+    - **Minimize deployed environments** (reduces E and M): `sim-dev` runs only on weekdays from 07:00 to 19:00. That is about 60 of the 168 hours in a week. In Green Metrics Tool micro-benchmarks, an idle environment with extra services used only about 3% more CPU energy per minute than a minimal one. So the saving is in the hours the environment is up, not in its size.
+    - **Replica counts are stored, not hard-coded** (correctness): the evening job saves each count in an annotation and the morning job restores it. Workloads you scaled by hand keep their size, and workloads that were already at 0 stay at 0.
+    - Persistent volumes stay in place, so database and result data survive the night. If the environment is per branch, delete it when the branch is merged. That removes all of its hours.
+verify:
+  static_only: Kubernetes manifests, needs a cluster

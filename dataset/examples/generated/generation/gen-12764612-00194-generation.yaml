@@ -1,0 +1,43 @@
+id: gen-12764612-00194-generation
+category: generation
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    bash script to rotate /var/log/myapp/app.log every night, keep 14 days compressed
+- role: assistant
+  content: |-
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    log_dir=/var/log/myapp
+    pid_file=/run/myapp.pid
+    keep_days=14
+    stamp=$(date +%F)
+
+    cd "$log_dir"
+    [ -s app.log ] || exit 0
+
+    mv app.log "app-$stamp.log"
+
+    # Make the app open a fresh app.log
+    if [ -f "$pid_file" ]; then
+      kill -HUP "$(cat "$pid_file")"
+    fi
+
+    zstd -q --rm "app-$stamp.log"
+
+    find "$log_dir" -maxdepth 1 -name 'app-*.log.zst' -mtime +"$keep_days" -delete
+    ```
+
+    Run it from cron once per night, for example `5 0 * * * /usr/local/bin/rotate-app-log.sh`. Adjust the PID file path to your service. If the app can't reopen its log on `SIGHUP`, use `copytruncate` in logrotate instead of `mv`.
+
+    **Green Notes**
+    - **Fast codec for data compressed often** (reduces E): the log is compressed every night, so the codec's CPU cost repeats. In Green Metrics Tool micro-benchmarks on 100 MB of text, `zstd` at its default level used ~16 J, `gzip` ~67 J (about 4× more) and `xz` ~458 J. Those figures compare energy only, not file size. `xz` usually gives smaller files, but for 14 days of retention it isn't worth the extra CPU.
+    - **Compress after rotation** (reduces M): the 14 old files take a fraction of the disk space. The current `app.log` stays plain text, so it is cheap to write and read.
+    - **Delete with `find -mtime`** (reduces M): old archives don't pile up.

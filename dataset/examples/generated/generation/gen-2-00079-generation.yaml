@@ -1,0 +1,123 @@
+id: gen-2-00079-generation
+category: generation
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    Need a new step in our bank statement loader. `memo` is free text from the bank. Partners put their invoice ref in it as `<PREFIX>-<6 to 10 digits>`. The prefix is per partner and comes from `PARTNER_PREFIXES` in config (~80 partners). Add `extract_invoice_ref(partner_id, memo)` that returns the digits or None, case-insensitive, and fill `invoice_ref` in `transform_row`. Runs nightly over ~3M rows. Only the diff please.
+
+    ```python
+    import csv
+    import logging
+    import re
+    from datetime import datetime
+    from decimal import Decimal, InvalidOperation
+
+    from .config import PARTNER_PREFIXES  # {"p-0142": "ACM", "p-0177": "NRD", ...}
+
+    log = logging.getLogger(__name__)
+
+    AMOUNT_RE = re.compile(r"^-?\d{1,3}(?:\.\d{3})*,\d{2}$")
+
+
+    def parse_amount(raw: str) -> Decimal:
+        raw = raw.strip()
+        if not AMOUNT_RE.match(raw):
+            raise ValueError(f"bad amount: {raw!r}")
+        try:
+            return Decimal(raw.replace(".", "").replace(",", "."))
+        except InvalidOperation as exc:
+            raise ValueError(f"bad amount: {raw!r}") from exc
+
+
+    def parse_date(raw: str):
+        return datetime.strptime(raw.strip(), "%d.%m.%Y").date()
+
+
+    def transform_row(row: dict) -> dict:
+        return {
+            "partner_id": row["partner_id"],
+            "booked_at": parse_date(row["booking_date"]),
+            "amount": parse_amount(row["amount"]),
+            "currency": row["currency"].upper(),
+            "memo": row["memo"].strip(),
+        }
+
+
+    def transform_file(path: str):
+        with open(path, newline="", encoding="utf-8") as fh:
+            for lineno, row in enumerate(csv.DictReader(fh, delimiter=";"), start=2):
+                try:
+                    yield transform_row(row)
+                except ValueError as exc:
+                    log.warning("%s:%d skipped: %s", path, lineno, exc)
+    ```
+- role: assistant
+  content: |
+    Add below `AMOUNT_RE`:
+
+    ```python
+    # partner_id -> compiled invoice-ref pattern (None for partners without a prefix)
+    _INVOICE_REF_RES: dict[str, "re.Pattern[str] | None"] = {}
+
+
+    def _invoice_ref_re(partner_id: str):
+        if partner_id not in _INVOICE_REF_RES:
+            prefix = PARTNER_PREFIXES.get(partner_id)
+            _INVOICE_REF_RES[partner_id] = (
+                re.compile(rf"\b{re.escape(prefix)}-(\d{{6,10}})\b", re.IGNORECASE)
+                if prefix
+                else None
+            )
+        return _INVOICE_REF_RES[partner_id]
+
+
+    def extract_invoice_ref(partner_id: str, memo: str) -> str | None:
+        pattern = _invoice_ref_re(partner_id)
+        if pattern is None:
+            return None
+        m = pattern.search(memo)
+        return m.group(1) if m else None
+    ```
+
+    `transform_row`:
+
+    ```python
+    def transform_row(row: dict) -> dict:
+        return {
+            "partner_id": row["partner_id"],
+            "booked_at": parse_date(row["booking_date"]),
+            "amount": parse_amount(row["amount"]),
+            "currency": row["currency"].upper(),
+            "memo": row["memo"].strip(),
+            "invoice_ref": extract_invoice_ref(row["partner_id"], row["memo"]),
+        }
+    ```
+
+    `re.escape` keeps prefixes like `A.B` literal. The `\b` on both sides rejects `XACM-…` and refs longer than 10 digits. Unknown partners give `None`. If `PARTNER_PREFIXES` can change while the process runs, clear `_INVOICE_REF_RES` when it reloads.
+
+    **Green Notes**
+    - **Compile regex once, outside loops** (reduces E): the pattern depends on the partner. A simple version would build the f-string pattern and go through `re`'s cache on every row. Here each partner's pattern is built and compiled once, the first time that partner appears. With ~80 partners, `re`'s internal cache (512 patterns) would also cover an inline call, so the gain is modest. In Green Metrics Tool micro-benchmarks, a precompiled pattern used about 18% less CPU energy than inline `re.match` over 1,000,000 matches. The gain gets big if you ever go past 512 distinct patterns. Then the cache thrashes and every call recompiles, which cost about 200× more per match in the same benchmarks.
+verify:
+  green_block: 0
+  test: |-
+    import re
+    PARTNER_PREFIXES = {"p-0142": "ACM", "p-0177": "NRD", "p-0200": "A.B", "p-0300": ""}
+    assert extract_invoice_ref("p-0142", "Zahlung ACM-0012345 danke") == "0012345"
+    assert extract_invoice_ref("p-0142", "acm-123456/2026") == "123456"
+    assert extract_invoice_ref("p-0142", "ACM-12345") is None
+    assert extract_invoice_ref("p-0142", "ACM-12345678901") is None
+    assert extract_invoice_ref("p-0142", "XACM-123456") is None
+    assert extract_invoice_ref("p-0142", "no ref here") is None
+    assert extract_invoice_ref("p-0177", "ACM-123456") is None
+    assert extract_invoice_ref("p-0177", "Rechnung nrd-9876543210") == "9876543210"
+    assert extract_invoice_ref("p-9999", "ACM-123456") is None
+    assert extract_invoice_ref("p-0300", "-123456") is None
+    assert extract_invoice_ref("p-0200", "A.B-123456") == "123456"
+    assert extract_invoice_ref("p-0200", "AxB-123456") is None
+    assert _INVOICE_REF_RES["p-9999"] is None
+    assert _invoice_ref_re("p-0142") is _invoice_ref_re("p-0142")

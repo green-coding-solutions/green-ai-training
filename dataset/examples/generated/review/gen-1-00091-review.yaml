@@ -1,0 +1,168 @@
+id: gen-1-00091-review
+category: review
+language: python
+patterns:
+- regex-precompile
+- memoize
+facts:
+- F-REGEX
+- F-LRU
+messages:
+- role: user
+  content: |
+    Hello, i have small gateway on Raspberry Pi. It read the lines from our LoRa sensor nodes over serial and write json lines for the uploader. Its working but my colegue say the code is not so clean. Can you make review pls? Maybe something is wrong that I dont see.
+
+    ```python
+    import json
+    import re
+    import sys
+
+    CALIBRATION = {
+        "TH": {"100": (0.1, -40.0), "200": (0.01, -40.0)},
+        "TP": {"100": (0.05, -20.0)},
+    }
+
+
+    def load_calibration(model):
+        m = re.match(r"^([A-Z]{2})-(\d{3})(?:-R(\d))?$", model)
+        if not m:
+            raise ValueError("bad model " + model)
+        family, series, rev = m.groups()
+        scale, offset = CALIBRATION[family][series]
+        if rev and int(rev) >= 2:
+            offset = offset + 0.5
+        return {"scale": scale, "offset": offset}
+
+
+    def parse_frame(line):
+        # example: $N0042,TH-100,650,455,3100*7F
+        m = re.match(
+            r"^\$(N\d{4}),([A-Z]{2}-\d{3}(?:-R\d)?),(-?\d+),(\d+),(\d+)\*[0-9A-F]{2}$",
+            line,
+        )
+        if not m:
+            return None
+        node, model, raw_t, raw_h, raw_b = m.groups()
+        cal = load_calibration(model)
+        return {
+            "node": node,
+            "temp_c": round(int(raw_t) * cal["scale"] + cal["offset"], 2),
+            "hum_pct": int(raw_h) / 10,
+            "batt_mv": int(raw_b),
+        }
+
+
+    def run(lines, out=sys.stdout):
+        for raw in lines:
+            line = raw.strip()
+            try:
+                reading = parse_frame(line)
+                if reading:
+                    out.write(json.dumps(reading) + "\n")
+            except:
+                pass
+    ```
+- role: assistant
+  content: |
+    **Workload:** IoT gateway (script that runs all the time)
+
+    #### [Bug] Bare `except: pass` hides every error
+    - **Where:** `run()`
+    - **Issue:** a bare `except` also catches `KeyboardInterrupt` and `SystemExit`, so Ctrl-C and some service stops can be swallowed. It also hides real problems. A frame with an unknown sensor family (for example `XX-999`) raises `KeyError` in `load_calibration` and disappears without a trace, so you never learn that a node sends data you cannot decode.
+    - **Fix:** catch only the errors you expect and log them:
+      ```python
+      except (ValueError, KeyError) as exc:
+          log.warning("dropped frame %r: %s", line, exc)
+      ```
+    - **Impact:** correctness. Bad frames become visible, and the process can be stopped normally.
+
+    #### [Medium] Calibration is recomputed for every frame
+    - **Where:** `load_calibration()`, called from `parse_frame()`
+    - **Issue:** the function is pure, and the same few model strings come back all the time. Each frame still runs a regex and two dict lookups. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over 200 distinct inputs used ~43 J without a cache and ~4.7 J with `functools.lru_cache`, about 9× less. This only holds because the inputs repeat. You have few models, so it fits well. The cache must stay bounded.
+    - **Fix:** use `@lru_cache(maxsize=64)`. Return a tuple instead of a dict. A cached dict is shared, and one caller that changes it would break every later frame.
+    - **Impact:** E, per frame, on a CPU-limited device.
+
+    #### [Low] Regex patterns are passed as strings on every call
+    - **Where:** `re.match(...)` in `parse_frame()` and `load_calibration()`
+    - **Issue:** Python's `re` keeps an internal cache of compiled patterns, so this is not a big problem. In Green Metrics Tool micro-benchmarks, 1,000,000 matches used ~21 J with inline `re.match` and ~18 J with a precompiled pattern, about 18% less. Your patterns are fixed, so compile them once at module level. It also gives them names.
+    - **Impact:** E, small, per frame.
+
+    Here is the code with all three changes:
+
+    ```python
+    import json
+    import logging
+    import re
+    import sys
+    from functools import lru_cache
+
+    log = logging.getLogger("gateway")
+
+    CALIBRATION = {
+        "TH": {"100": (0.1, -40.0), "200": (0.01, -40.0)},
+        "TP": {"100": (0.05, -20.0)},
+    }
+
+    MODEL_RE = re.compile(r"^([A-Z]{2})-(\d{3})(?:-R(\d))?$")
+    FRAME_RE = re.compile(
+        r"^\$(N\d{4}),([A-Z]{2}-\d{3}(?:-R\d)?),(-?\d+),(\d+),(\d+)\*[0-9A-F]{2}$"
+    )
+
+
+    @lru_cache(maxsize=64)
+    def load_calibration(model):
+        m = MODEL_RE.match(model)
+        if not m:
+            raise ValueError("bad model " + model)
+        family, series, rev = m.groups()
+        scale, offset = CALIBRATION[family][series]
+        if rev and int(rev) >= 2:
+            offset = offset + 0.5
+        return (scale, offset)
+
+
+    def parse_frame(line):
+        # example: $N0042,TH-100,650,455,3100*7F
+        m = FRAME_RE.match(line)
+        if not m:
+            return None
+        node, model, raw_t, raw_h, raw_b = m.groups()
+        scale, offset = load_calibration(model)
+        return {
+            "node": node,
+            "temp_c": round(int(raw_t) * scale + offset, 2),
+            "hum_pct": int(raw_h) / 10,
+            "batt_mv": int(raw_b),
+        }
+
+
+    def run(lines, out=sys.stdout):
+        for raw in lines:
+            line = raw.strip()
+            try:
+                reading = parse_frame(line)
+                if reading:
+                    out.write(json.dumps(reading) + "\n")
+            except (ValueError, KeyError) as exc:
+                log.warning("dropped frame %r: %s", line, exc)
+    ```
+
+    **Already good:** `run()` takes any iterable and any output stream, so you can test it without a serial port. The output is the same as before for valid frames.
+verify:
+  module: true
+  test: |-
+    import io
+    out = io.StringIO()
+    run([
+        "$N0042,TH-100,650,455,3100*7F",
+        "garbage",
+        "$N0007,XX-999,1,2,3*00",
+        "$N0042,TH-200-R2,6500,500,3000*00",
+        "$N0043,TH-100,650,455,3100*7F",
+    ], out)
+    rows = [json.loads(l) for l in out.getvalue().splitlines()]
+    assert len(rows) == 3
+    assert rows[0] == {"node": "N0042", "temp_c": 25.0, "hum_pct": 45.5, "batt_mv": 3100}
+    assert rows[1]["temp_c"] == 25.5
+    assert isinstance(load_calibration("TH-100"), tuple)
+    assert load_calibration.cache_info().hits >= 1

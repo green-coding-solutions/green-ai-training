@@ -1,0 +1,111 @@
+id: gen-1-00102-refactor
+category: refactor
+language: python
+patterns:
+- string-join
+- keep-star-imports
+facts:
+- F-STRCAT
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import json
+    import sys
+    from os.path import *
+    from csv import *
+
+
+    def load_rows(path):
+        with open(path, newline="") as f:
+            return list(DictReader(f))
+
+
+    def build_report(rows):
+        out = ""
+        for row in rows:
+            if not row["sku"].strip():
+                continue
+            rec = {
+                "sku": row["sku"].strip().upper(),
+                "qty": int(row["qty"] or 0),
+                "price": float(row["price"]),
+            }
+            out += json.dumps(rec) + "\n"
+        return out
+
+
+    if __name__ == "__main__":
+        src, outdir = sys.argv[1], sys.argv[2]
+        rows = load_rows(src)
+        report = build_report(rows)
+        with open(join(outdir, basename(src) + ".ndjson"), "w") as f:
+            f.write(report)
+    ```
+- role: assistant
+  content: |
+    ```python
+    import json
+    import sys
+    from os.path import *
+    from csv import *
+
+
+    def load_rows(path):
+        with open(path, newline="") as f:
+            return list(DictReader(f))
+
+
+    def build_report(rows):
+        lines = []
+        for row in rows:
+            if not row["sku"].strip():
+                continue
+            rec = {
+                "sku": row["sku"].strip().upper(),
+                "qty": int(row["qty"] or 0),
+                "price": float(row["price"]),
+            }
+            lines.append(json.dumps(rec))
+        return "".join(line + "\n" for line in lines)
+
+
+    if __name__ == "__main__":
+        src, outdir = sys.argv[1], sys.argv[2]
+        rows = load_rows(src)
+        report = build_report(rows)
+        with open(join(outdir, basename(src) + ".ndjson"), "w") as f:
+            f.write(report)
+    ```
+
+    **Green Notes**
+    - **Join instead of `+=` in the row loop** (reduces E): `out += ...` builds the report piece by piece for every row, and the cost grows with the size of the file. Collecting the lines in a list and joining once does the work in one pass. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces used ~469 J with `+=` and ~1.8 J with `"".join()`, roughly 260× less CPU energy. The output is byte-for-byte the same.
+
+    *Not applied:* replacing `from os.path import *` and `from csv import *` with explicit imports. In Green Metrics Tool micro-benchmarks, star imports and `import x` showed no measurable energy difference, so I left them as they are.
+verify:
+  module: true
+  test: |
+    rows = [
+        {"sku": " ab1 ", "qty": "3", "price": "1.5"},
+        {"sku": "  ", "qty": "1", "price": "2"},
+        {"sku": "zz", "qty": "", "price": "10"},
+    ]
+    expected = (
+        '{"sku": "AB1", "qty": 3, "price": 1.5}\n'
+        '{"sku": "ZZ", "qty": 0, "price": 10.0}\n'
+    )
+    assert build_report(rows) == expected
+    assert build_report([]) == ""
+  equivalence:
+    driver: |-
+      rows = [
+          {"sku": " ab1 ", "qty": "3", "price": "1.5"},
+          {"sku": "", "qty": "1", "price": "2"},
+          {"sku": "zz", "qty": "", "price": "10"},
+          {"sku": "k9", "qty": "7", "price": "0.25"},
+      ]
+      print(build_report(rows), end="")
+      print(repr(build_report([])))

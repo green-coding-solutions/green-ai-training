@@ -1,0 +1,154 @@
+id: gen-2-00004-multi-turn
+category: multi-turn
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    hi, I'm pretty new to docker so sorry if this is obvious. we have a small python service that runs on our IoT gateways (raspberry pi 4, arm64). it subscribes to the sensor topics on the local mosquitto broker and forwards the readings to InfluxDB. github actions builds the image for arm64 on every push to main and it takes around 25 minutes. the image is 1.2 GB and the gateways download it over LTE. my colleague says something is wrong with the Dockerfile but I don't know what. the code is bridge.py plus a gateway/ folder, requirements.txt has paho-mqtt, influxdb-client and a few more.
+
+    ```dockerfile
+    FROM python:3.12
+
+    RUN apt-get update
+    RUN apt-get install -y build-essential git curl vim nano htop mosquitto-clients
+
+    WORKDIR /app
+    COPY . /app
+
+    RUN pip install --upgrade pip
+    RUN pip install -r requirements.txt
+    RUN pip install pytest black ipython
+
+    ENV PYTHONUNBUFFERED=1
+
+    CMD ["python", "bridge.py"]
+    ```
+- role: assistant
+  content: |
+    Your colleague is right. Three things make it big and slow:
+    - the full `python:3.12` base image
+    - build and debug tools the bridge never uses at runtime
+    - `COPY . /app` runs before `pip install`, so every code change reinstalls all packages. It also copies `.git` and the tests into the image.
+
+    ```dockerfile
+    FROM python:3.12-slim
+
+    ENV PYTHONUNBUFFERED=1 \
+        PIP_DISABLE_PIP_VERSION_CHECK=1
+
+    WORKDIR /app
+
+    # Dependencies first: this layer stays cached until requirements.txt changes
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    # Source last: a code change only rebuilds from here
+    COPY bridge.py .
+    COPY gateway/ gateway/
+
+    CMD ["python", "bridge.py"]
+    ```
+
+    **Green Notes**
+    - **Slim base, runtime dependencies only** (reduces E, network): `build-essential`, `git`, editors and `htop` are gone, and so is `mosquitto-clients`, because the bridge talks to the broker through `paho-mqtt`. Green Metrics Tool measured this on a small Flask app image built without cache: a slim base with only runtime dependencies and the dependency layer first used about 7× less energy to build than a full image with build and dev tools. The running app used the same energy with both images. Your CI builds on every push and every gateway pulls the image, so the saving comes back each time.
+    - **Dependency layer before the source** (reduces E, network): when you only change `bridge.py`, the pip layer is reused. In GitHub Actions this needs layer caching, e.g. `cache-from: type=gha` and `cache-to: type=gha,mode=max` in `docker/build-push-action`. The gateways also download only the layers that changed.
+    - **Dev tools out of the image:** `pytest`, `black` and `ipython` belong in a CI test step. The gateways never run them.
+
+    If one of your packages has to be compiled during `pip install`, the build will fail without a compiler. Paste me the error and we'll handle that separately.
+- role: user
+  content: |
+    ok I tried it and now the build fails :(
+
+    ```text
+      Building wheel for RPi.GPIO (pyproject.toml) ... error
+      ...
+      error: command 'gcc' failed: No such file or directory
+    ```
+
+    we use RPi.GPIO for the status LED on the gateway. should I just put build-essential back in?
+- role: assistant
+  content: |
+    Close, but you don't need it in the final image. RPi.GPIO is only published as source, so pip compiles it and needs a C compiler. Put the compiler in a separate build stage and copy only the installed packages into the image that ships.
+
+    ```dockerfile
+    # --- build stage: has a compiler, never shipped ---
+    FROM python:3.12-slim AS build
+
+    RUN apt-get update \
+     && apt-get install -y --no-install-recommends gcc libc6-dev \
+     && rm -rf /var/lib/apt/lists/*
+
+    RUN python -m venv /venv
+    ENV PATH="/venv/bin:$PATH"
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    # --- runtime stage: what the gateways pull ---
+    FROM python:3.12-slim
+
+    ENV PYTHONUNBUFFERED=1 \
+        PATH="/venv/bin:$PATH"
+
+    WORKDIR /app
+
+    COPY --from=build /venv /venv
+
+    COPY bridge.py .
+    COPY gateway/ gateway/
+
+    CMD ["python", "bridge.py"]
+    ```
+
+    - `gcc` and `libc6-dev` are all RPi.GPIO needs. The Python headers are already in the slim image.
+    - Both stages use the same base, so the copied virtualenv works as is.
+    - The build stage stays cached until `requirements.txt` changes. A push that only touches your code doesn't compile again.
+- role: user
+  content: |
+    it works now, thanks!! one more thing. my team lead says the field techs need curl, vim and mosquitto_pub inside the container when they debug a gateway on site. can you add them back?
+- role: assistant
+  content: |
+    Sure. Add them to the runtime stage with `--no-install-recommends`, so apt doesn't pull in extra packages:
+
+    ```dockerfile
+    # --- build stage: has a compiler, never shipped ---
+    FROM python:3.12-slim AS build
+
+    RUN apt-get update \
+     && apt-get install -y --no-install-recommends gcc libc6-dev \
+     && rm -rf /var/lib/apt/lists/*
+
+    RUN python -m venv /venv
+    ENV PATH="/venv/bin:$PATH"
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    # --- runtime stage: what the gateways pull ---
+    FROM python:3.12-slim
+
+    # Debug tools for the field techs
+    RUN apt-get update \
+     && apt-get install -y --no-install-recommends curl vim mosquitto-clients \
+     && rm -rf /var/lib/apt/lists/*
+
+    ENV PYTHONUNBUFFERED=1 \
+        PATH="/venv/bin:$PATH"
+
+    WORKDIR /app
+
+    COPY --from=build /venv /venv
+
+    COPY bridge.py .
+    COPY gateway/ gateway/
+
+    CMD ["python", "bridge.py"]
+    ```
+
+    The tools layer comes before your code, so it is built once, stays cached, and the gateways download it only when that line changes. If you later want a leaner everyday image, these tools could move into a separate `debug` target.
+verify:
+  static_only: Dockerfile; needs docker buildx and arm64 Debian packages to build

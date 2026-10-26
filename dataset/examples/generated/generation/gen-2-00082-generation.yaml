@@ -1,0 +1,72 @@
+id: gen-2-00082-generation
+category: generation
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    Hi, we build our frontend in gitlab CI (`npm run build`, output go to `dist/`) and after that we copy it into a `nginx:alpine` image together with our own nginx.conf. Can you write me the server block for it?
+
+    Requirments:
+    - it is a SPA, so every unknown path should give index.html
+    - `/api/` must go to the backend container, in compose it is called `api` on port 3000 (backend routes also start with /api, so dont strip it)
+    - files in `dist/assets/` have a hash in the name, they can be cached forever
+    - nginx listen on 8080 inside the container
+    - part of our users work over a slow VPN, so the transfer should be small as possible
+
+    Thanks!
+- role: assistant
+  content: |
+    ```nginx
+    server {
+        listen 8080;
+        server_name _;
+        root /usr/share/nginx/html;
+
+        # static files: serve the .gz created in CI, no compression work per request
+        gzip_static on;
+
+        # API responses are dynamic, so they are compressed on the fly at a moderate level
+        gzip on;
+        gzip_vary on;
+        gzip_comp_level 4;
+        gzip_min_length 1024;
+        gzip_types text/css application/javascript application/json image/svg+xml text/plain;
+
+        location /assets/ {
+            add_header Cache-Control "public, max-age=31536000, immutable";
+            try_files $uri =404;
+        }
+
+        location /api/ {
+            proxy_pass http://api:3000;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        location / {
+            add_header Cache-Control "no-cache";
+            try_files $uri /index.html;
+        }
+    }
+    ```
+
+    Add this to the CI job after `npm run build`. It runs before `docker build`, so the `.gz` files end up in the image next to the originals:
+
+    ```bash
+    find dist -type f \( -name '*.html' -o -name '*.js' -o -name '*.css' -o -name '*.json' -o -name '*.svg' \) \
+        -exec gzip -k -9 {} +
+    ```
+
+    The official `nginx:alpine` image already includes the `gzip_static` module.
+
+    **Green Notes**
+    - **Precompressed static assets** (reduces E, network): each file is compressed once per pipeline run, not on every request. In Green Metrics Tool measurements of nginx serving text assets, compression sent about 10× fewer bytes. Compressing on every request cost about 4× the CPU energy of serving precompressed files. Level 9 is fine here because it runs once per build, and it gives your VPN users the smallest files.
+    - **On-the-fly gzip only where it is needed** (reduces E, network): API JSON can't be precompressed. Level 4 keeps the CPU cost per response moderate, and `gzip_min_length` skips tiny responses where compression saves almost nothing.
+    - **Text types only:** images and `woff2` fonts are already compressed. Gzipping them again only costs CPU, so they are not in `gzip_types`.
+verify:
+  static_only: nginx config

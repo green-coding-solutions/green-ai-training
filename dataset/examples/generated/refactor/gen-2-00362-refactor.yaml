@@ -1,0 +1,167 @@
+id: gen-2-00362-refactor
+category: refactor
+language: python
+patterns:
+- set-membership
+- keep-star-imports
+facts:
+- F-MEMB
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    We have a small CLI in our frontend repo that lists files under `static/` that no template references. CI runs it on every PR. `static/` has about 40k files now and the manifest about 25k lines, and the step takes several minutes. Can you optimize it?
+
+    Requirements:
+    - CLI flags and exit codes must stay the same (`--fail` is used in CI)
+    - output order must not change, we diff it against the previous run
+    - stdlib only, runners have Python 3.8
+    - a colleague says we should also drop `from os.path import *` because star imports are slow and waste energy. Do that too if it helps.
+
+    ```python
+    #!/usr/bin/env python3
+    """List files under static/ that no template or manifest references."""
+    import argparse
+    import os
+    import sys
+    from os.path import *
+
+    IGNORED_EXT = [".map", ".bak"]
+
+
+    def load_manifest(path):
+        referenced = []
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                referenced.append(normpath(line))
+        return referenced
+
+
+    def walk_static(root):
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames.sort()
+            for name in sorted(filenames):
+                yield relpath(join(dirpath, name), root)
+
+
+    def find_orphans(files, referenced):
+        orphans = []
+        for rel in files:
+            if splitext(rel)[1] in IGNORED_EXT:
+                continue
+            if rel not in referenced:
+                orphans.append(rel)
+        return orphans
+
+
+    def main(argv=None):
+        p = argparse.ArgumentParser(description=__doc__)
+        p.add_argument("static_root")
+        p.add_argument("manifest")
+        p.add_argument("--fail", action="store_true", help="exit 1 if orphans found")
+        args = p.parse_args(argv)
+
+        referenced = load_manifest(args.manifest)
+        orphans = find_orphans(walk_static(args.static_root), referenced)
+        for rel in orphans:
+            print(rel)
+        print(f"{len(orphans)} orphaned files", file=sys.stderr)
+        return 1 if args.fail and orphans else 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+- role: assistant
+  content: |
+    ```python
+    #!/usr/bin/env python3
+    """List files under static/ that no template or manifest references."""
+    import argparse
+    import os
+    import sys
+    from os.path import *
+
+    IGNORED_EXT = [".map", ".bak"]
+
+
+    def load_manifest(path):
+        referenced = []
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                referenced.append(normpath(line))
+        return referenced
+
+
+    def walk_static(root):
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames.sort()
+            for name in sorted(filenames):
+                yield relpath(join(dirpath, name), root)
+
+
+    def find_orphans(files, referenced):
+        referenced = set(referenced)  # built once, looked up once per file
+        orphans = []
+        for rel in files:
+            if splitext(rel)[1] in IGNORED_EXT:
+                continue
+            if rel not in referenced:
+                orphans.append(rel)
+        return orphans
+
+
+    def main(argv=None):
+        p = argparse.ArgumentParser(description=__doc__)
+        p.add_argument("static_root")
+        p.add_argument("manifest")
+        p.add_argument("--fail", action="store_true", help="exit 1 if orphans found")
+        args = p.parse_args(argv)
+
+        referenced = load_manifest(args.manifest)
+        orphans = find_orphans(walk_static(args.static_root), referenced)
+        for rel in orphans:
+            print(rel)
+        print(f"{len(orphans)} orphaned files", file=sys.stderr)
+        return 1 if args.fail and orphans else 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+
+    **Green Notes**
+    - **Set for repeated membership tests** (reduces E): `rel not in referenced` scanned the 25k-entry list for each of the 40k files. That is O(n) per lookup, and about a billion string comparisons when most files are referenced. The set is built once in O(n), and then each lookup is O(1). This is worth it only because there are many lookups. In Green Metrics Tool micro-benchmarks, a *single* test on a large list was cheaper than converting the list to a set first.
+    - **Star import left unchanged**: in Green Metrics Tool micro-benchmarks, `from x import *` and `import x` showed no measurable energy difference. `import os` loads `os.path` anyway, so changing the import would not make this step faster. Keep it or change it for style, not for performance.
+    - **Behavior is unchanged**: same flags, same exit codes, same output order. The output still follows the sorted walk of `static/`, and the set only answers "is it referenced?". Duplicate lines in the manifest give the same result as before.
+verify:
+  module: true
+  equivalence:
+    driver: |
+      import random
+      random.seed(42)
+      dirs = ["css", "js", "img/icons", "img/hero", "fonts", "vendor/lib"]
+      exts = [".css", ".js", ".png", ".svg", ".woff2", ".map", ".bak", ".json"]
+      files = sorted(
+          f"{random.choice(dirs)}/asset_{i}{random.choice(exts)}" for i in range(3000)
+      )
+      referenced = [f for f in files if random.random() < 0.7]
+      referenced += referenced[:50]
+      referenced += ["css/does_not_exist.css", "js/old/legacy.js"]
+      random.shuffle(referenced)
+      result = find_orphans(iter(files), referenced)
+      print(len(result))
+      for rel in result:
+          print(rel)
+  benchmark:
+    driver: |
+      files = [f"img/asset_{i}.png" for i in range(6000)]
+      referenced = [f"img/asset_{i}.png" for i in range(0, 12000, 2)]
+      find_orphans(iter(files), referenced)
+    min_speedup: 5

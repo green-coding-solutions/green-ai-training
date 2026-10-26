@@ -1,0 +1,82 @@
+id: gen-2-00160-no-change
+category: no-change
+language: python
+patterns:
+- vectorize-or-jit
+- context-tradeoff
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    Hi, we have this script for nginx access logs, it run by cron every night on the day file (around 1.5 GB, take ~4 minutes). My colleage say we should put numba `@njit` on the parse function because "numba makes python as fast as C" and the server will be less busy. Is it worth it? I never used numba before so not sure how it work with this.
+
+    ```python
+    import re
+    import sys
+    from collections import Counter
+
+    import numpy as np
+
+    LINE_RE = re.compile(
+        r'(?P<ip>\S+) \S+ \S+ \[(?P<ts>[^\]]+)\] "(?P<method>\S+) (?P<path>\S+) \S+" '
+        r'(?P<status>\d{3}) \S+ "[^"]*" "[^"]*" (?P<rt>\d+\.\d+)'
+    )
+
+
+    def parse(path):
+        statuses = Counter()
+        endpoints = Counter()
+        rts = []
+        bad = 0
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                m = LINE_RE.match(line)
+                if m is None:
+                    bad += 1
+                    continue
+                statuses[m["status"][0] + "xx"] += 1
+                endpoints[m["path"].split("?", 1)[0]] += 1
+                rts.append(float(m["rt"]))
+        return statuses, endpoints, np.array(rts), bad
+
+
+    def report(path):
+        statuses, endpoints, rts, bad = parse(path)
+        print(f"lines skipped: {bad}")
+        for cls, n in sorted(statuses.items()):
+            print(f"{cls}: {n}")
+        print("top endpoints:")
+        for ep, n in endpoints.most_common(10):
+            print(f"  {n:8d}  {ep}")
+        if rts.size:
+            p50, p95, p99 = np.percentile(rts, [50, 95, 99])
+            print(f"request_time p50={p50:.3f}s p95={p95:.3f}s p99={p99:.3f}s")
+            print(f"slow (>1s): {np.count_nonzero(rts > 1.0)}")
+
+
+    if __name__ == "__main__":
+        report(sys.argv[1])
+    ```
+- role: assistant
+  content: |
+    No, Numba won't help here. Keep the script as it is.
+
+    Numba compiles numeric loops over numbers and NumPy arrays. Your `parse` loop does something else:
+    - It reads text lines from a file, runs a regex, splits strings and counts into `Counter` dicts. Numba's `@njit` doesn't support `re`, file reading or `Counter`, so the function won't compile. Numba raises a typing error on the first call.
+    - The numeric part is already vectorized. `np.percentile` and `np.count_nonzero(rts > 1.0)` run in NumPy's compiled code, once per night, on one array. There is no Python loop over numbers left to compile.
+    - The regex is compiled once at module level, and most of the per-line work runs inside the C-implemented `re` engine.
+
+    Numba pays off in a different kind of loop. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples in a pure Python loop used ~40 J of CPU energy, and with Numba `@njit` ~9.5 J, about 4× less. That loop did only float arithmetic on an array, which is the case Numba is built for. Your loop is mostly string parsing.
+
+    It's also a nightly cron job of about 4 minutes. Adding a JIT dependency and its compile step would cost more in maintenance than it could save.
+
+    To find out where the 4 minutes actually go, profile it once:
+
+    ```bash
+    python -m cProfile -s cumtime logstats.py /var/log/nginx/access.log.1 | head -25
+    ```
+
+    If something other than reading and matching lines shows up at the top, send me that part and I'll look at it.
+verify:
+  static_only: 'no-change answer: the user''s code stays unchanged, the only code block is a bash profiling command'

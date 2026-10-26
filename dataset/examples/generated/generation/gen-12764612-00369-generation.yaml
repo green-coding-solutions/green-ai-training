@@ -1,0 +1,63 @@
+id: gen-12764612-00369-generation
+category: generation
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    hi, im new to python and i dont know if im doing this right. our webshop gets a JSON webhook from the payment provider every time an order is paid, and my flask view needs to turn it into a small dict for our database. fields: id, total_cents and currency, plus customer email, shipping phone, coupon_code and a note. a lot of orders dont have a phone or a coupon or a note, and sometimes "customer" is missing completely. can you write the function? i was going to wrap everything in try / except KeyError but it looks ugly
+- role: assistant
+  content: |
+    Use `dict.get()` with a default for the optional fields. Missing optional fields are normal here, so they should not raise an error at all.
+
+    ```python
+    from typing import Any
+
+    def parse_order_webhook(payload: dict[str, Any]) -> dict[str, Any]:
+        customer = payload.get("customer") or {}
+        shipping = payload.get("shipping") or {}
+
+        return {
+            # required: a missing key is a real error, so let KeyError surface
+            "order_id": payload["id"],
+            "total_cents": int(payload["total_cents"]),
+            # optional: missing is a normal case
+            "currency": payload.get("currency", "EUR"),
+            "email": (customer.get("email") or "").strip().lower(),
+            "phone": shipping.get("phone"),
+            "coupon": payload.get("coupon_code"),
+            "note": payload.get("note", ""),
+        }
+    ```
+
+    In your Flask view, catch `KeyError` once around the call and return a 400, because it then means the provider sent a broken payload.
+
+    **Green Notes**
+    - **`dict.get()` instead of `try/except KeyError` for optional fields** (reduces E): a miss with `get` is a plain lookup, while a miss with `except` raises and catches an exception. In Green Metrics Tool micro-benchmarks with 10,000,000 dict lookups where about half of the keys were missing, `dict.get` used ~67 J and `try/except KeyError` ~76 J, about 12% less. Your webhook runs on every paid order and many optional fields are missing, so `get` fits.
+    - **Required fields still use `[]`:** these keys should almost always exist, and `try/except` is cheap when misses are rare. The cost is in raising.
+    - `or {}` also covers the case where the provider sends `"customer": null`.
+verify:
+  test: |-
+    full = {
+        "id": "o1", "total_cents": "1999", "currency": "USD",
+        "customer": {"email": "  Ann@Example.COM "},
+        "shipping": {"phone": "123"}, "coupon_code": "X1", "note": "hi",
+    }
+    r = parse_order_webhook(full)
+    assert r == {
+        "order_id": "o1", "total_cents": 1999, "currency": "USD",
+        "email": "ann@example.com", "phone": "123", "coupon": "X1", "note": "hi",
+    }
+    r = parse_order_webhook({"id": "o2", "total_cents": 500, "customer": None})
+    assert r == {
+        "order_id": "o2", "total_cents": 500, "currency": "EUR",
+        "email": "", "phone": None, "coupon": None, "note": "",
+    }
+    try:
+        parse_order_webhook({"total_cents": 5})
+        raise SystemExit("expected KeyError")
+    except KeyError:
+        pass

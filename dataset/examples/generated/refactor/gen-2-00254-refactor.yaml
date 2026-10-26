@@ -1,0 +1,187 @@
+id: gen-2-00254-refactor
+category: refactor
+language: python
+patterns:
+- torch-no-grad
+- async-concurrent-io
+facts:
+- F-NOGRAD
+- F-HTTP
+messages:
+- role: user
+  content: |
+    This script builds the "Trending from our partners" strip on our landing page. Cron runs it every 5 minutes on a small VM. It pulls about 30 partner JSON feeds, scores each item with our PyTorch ranker and writes a static JSON file that the frontend fetches. A run takes around 40 seconds, mostly waiting on feeds, and the CPU spikes while it scores.
+
+    Please refactor it. Requirements:
+    - Output JSON must stay exactly the same (fields, order, rounding). The frontend depends on it.
+    - A dead or broken feed must only be logged and skipped, like now. It must not kill the run.
+    - Keep the 5 second timeout per feed.
+    - httpx is already in our requirements, Python 3.11.
+    - Don't touch the model itself (`ranker.py`), that's another team.
+
+    ```python
+    import json
+    import logging
+    import urllib.request
+    from pathlib import Path
+
+    import torch
+
+    from ranker import TrendRanker
+
+    FEEDS_FILE = Path("config/partner_feeds.json")
+    OUT_FILE = Path("public/data/trending.json")
+    TOP_N = 12
+
+    log = logging.getLogger("trending")
+
+
+    def load_model():
+        model = TrendRanker()
+        model.load_state_dict(torch.load("models/trend_ranker.pt", map_location="cpu"))
+        model.eval()
+        return model
+
+
+    def fetch_feed(url):
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            return json.loads(resp.read())
+
+
+    def score_items(model, items):
+        feats = torch.tensor([it["features"] for it in items], dtype=torch.float32)
+        scores = model(feats).squeeze(-1)
+        return scores.tolist()
+
+
+    def build_trending(model, feeds):
+        candidates = []
+        for feed in feeds:
+            try:
+                data = fetch_feed(feed["url"])
+            except Exception as exc:
+                log.warning("feed %s failed: %s", feed["name"], exc)
+                continue
+            items = data.get("items", [])
+            if not items:
+                continue
+            for item, score in zip(items, score_items(model, items)):
+                candidates.append({
+                    "title": item["title"],
+                    "url": item["link"],
+                    "image": item.get("image"),
+                    "partner": feed["name"],
+                    "score": round(score, 4),
+                })
+        candidates.sort(key=lambda c: c["score"], reverse=True)
+        return candidates[:TOP_N]
+
+
+    def main():
+        logging.basicConfig(level=logging.INFO)
+        feeds = json.loads(FEEDS_FILE.read_text())
+        model = load_model()
+        trending = build_trending(model, feeds)
+        OUT_FILE.write_text(json.dumps(trending, indent=2))
+        log.info("wrote %d items", len(trending))
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    ```python
+    import asyncio
+    import json
+    import logging
+    from pathlib import Path
+
+    import httpx
+    import torch
+
+    from ranker import TrendRanker
+
+    FEEDS_FILE = Path("config/partner_feeds.json")
+    OUT_FILE = Path("public/data/trending.json")
+    TOP_N = 12
+    FEED_TIMEOUT = 5.0
+
+    log = logging.getLogger("trending")
+
+
+    def load_model():
+        model = TrendRanker()
+        model.load_state_dict(torch.load("models/trend_ranker.pt", map_location="cpu"))
+        model.eval()
+        return model
+
+
+    async def fetch_feed(client, feed):
+        try:
+            resp = await client.get(feed["url"])
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:
+            log.warning("feed %s failed: %s", feed["name"], exc)
+            return None
+
+
+    async def fetch_all(feeds):
+        async with httpx.AsyncClient(timeout=FEED_TIMEOUT, follow_redirects=True) as client:
+            # gather returns results in the same order as `feeds`
+            return await asyncio.gather(*(fetch_feed(client, f) for f in feeds))
+
+
+    def score_items(model, items):
+        feats = torch.tensor([it["features"] for it in items], dtype=torch.float32)
+        with torch.no_grad():
+            scores = model(feats).squeeze(-1)
+        return scores.tolist()
+
+
+    def build_trending(model, feeds, results):
+        candidates = []
+        for feed, data in zip(feeds, results):
+            if data is None:
+                continue
+            items = data.get("items", [])
+            if not items:
+                continue
+            for item, score in zip(items, score_items(model, items)):
+                candidates.append({
+                    "title": item["title"],
+                    "url": item["link"],
+                    "image": item.get("image"),
+                    "partner": feed["name"],
+                    "score": round(score, 4),
+                })
+        candidates.sort(key=lambda c: c["score"], reverse=True)
+        return candidates[:TOP_N]
+
+
+    def main():
+        logging.basicConfig(level=logging.INFO)
+        feeds = json.loads(FEEDS_FILE.read_text())
+        model = load_model()
+        results = asyncio.run(fetch_all(feeds))
+        trending = build_trending(model, feeds, results)
+        OUT_FILE.write_text(json.dumps(trending, indent=2))
+        log.info("wrote %d items", len(trending))
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **`torch.no_grad()` around the forward pass** (reduces E): before, PyTorch built an autograd graph for every feed on every run, and nothing ever called `backward()`. In Green Metrics Tool micro-benchmarks, 100,000 PyTorch CPU inferences used ~157 J without `no_grad()` and ~135 J with it, about 14% less. The scores are only turned into floats, so the results are identical.
+    - **Concurrent feed fetches with `httpx.AsyncClient`** (reduces E, mostly wall time): the run now waits about as long as the slowest feed, not the sum of all feeds. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used ~8.4 J and 2.6 s, sync `urllib` ~9.1 J and 3.1 s. That is about 7% less CPU energy and about 17% less wall time. Expect the main gain to be a shorter run that holds the VM for less time, not a big CPU drop.
+
+    Behavior stays the same:
+    - `gather` keeps the feed order, so candidates are built in the same order and ties in the score sort come out as before.
+    - `raise_for_status()` and `follow_redirects=True` match `urlopen`: HTTP errors are logged and skipped, and redirects are followed. Invalid JSON is still caught and skipped too.
+    - `FEED_TIMEOUT` applies per feed to connect and read, like the old `timeout=5`.
+    - The only visible difference: warnings for dead feeds are now logged in the order the requests fail, not in feed order.
+verify:
+  static_only: needs torch, httpx, the team's ranker module and network access to the partner feeds

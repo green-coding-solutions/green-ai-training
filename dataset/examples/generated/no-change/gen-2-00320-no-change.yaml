@@ -1,0 +1,163 @@
+id: gen-2-00320-no-change
+category: no-change
+language: python
+patterns:
+- keep-star-imports
+- none
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    reviewer says the `from html import *` makes our landing page build slower. fix this
+
+    ```python
+    import json
+    import sys
+    from html import *
+    from pathlib import Path
+
+    TEMPLATE = """<!doctype html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <title>{title}</title>
+    <link rel="stylesheet" href="/styles.css">
+    </head>
+    <body>
+    <header><h1>{title}</h1><p>{tagline}</p></header>
+    <section class="features">
+    {features}
+    </section>
+    <a class="cta" href="{cta_url}">{cta_label}</a>
+    </body>
+    </html>
+    """
+
+
+    def render_feature(feature):
+        return (
+            '<article class="feature">'
+            f'<h2>{escape(feature["name"])}</h2>'
+            f'<p>{escape(feature["text"])}</p>'
+            "</article>"
+        )
+
+
+    def render_page(content):
+        features = "\n".join(render_feature(f) for f in content["features"])
+        return TEMPLATE.format(
+            title=escape(content["title"]),
+            tagline=escape(content["tagline"]),
+            features=features,
+            cta_url=escape(content["cta"]["url"]),
+            cta_label=escape(content["cta"]["label"]),
+        )
+
+
+    def main(src, dest):
+        content = json.loads(Path(src).read_text(encoding="utf-8"))
+        Path(dest).write_text(render_page(content), encoding="utf-8")
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1], sys.argv[2])
+    ```
+- role: assistant
+  content: |
+    There is nothing to fix here. The star import does not make the build slower.
+
+    `from html import *` and `import html` both load and run the `html` module once, at startup. The only difference is which names end up in your namespace. In Green Metrics Tool micro-benchmarks, star imports and namespace imports showed no measurable energy difference, so I'd leave the import as it is. The only import cost that showed up was loading a heavy library at all, and `html` is a small stdlib module.
+
+    The rest of the script is already lean:
+    - The feature blocks are built in one `"\n".join(...)` pass, not with repeated `+=`.
+    - There is one read, one render and one write per build.
+    - `escape` is the stdlib C-backed helper, called once per field.
+
+    The file stays unchanged:
+
+    ```python
+    import json
+    import sys
+    from html import *
+    from pathlib import Path
+
+    TEMPLATE = """<!doctype html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <title>{title}</title>
+    <link rel="stylesheet" href="/styles.css">
+    </head>
+    <body>
+    <header><h1>{title}</h1><p>{tagline}</p></header>
+    <section class="features">
+    {features}
+    </section>
+    <a class="cta" href="{cta_url}">{cta_label}</a>
+    </body>
+    </html>
+    """
+
+
+    def render_feature(feature):
+        return (
+            '<article class="feature">'
+            f'<h2>{escape(feature["name"])}</h2>'
+            f'<p>{escape(feature["text"])}</p>'
+            "</article>"
+        )
+
+
+    def render_page(content):
+        features = "\n".join(render_feature(f) for f in content["features"])
+        return TEMPLATE.format(
+            title=escape(content["title"]),
+            tagline=escape(content["tagline"]),
+            features=features,
+            cta_url=escape(content["cta"]["url"]),
+            cta_label=escape(content["cta"]["label"]),
+        )
+
+
+    def main(src, dest):
+        content = json.loads(Path(src).read_text(encoding="utf-8"))
+        Path(dest).write_text(render_page(content), encoding="utf-8")
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1], sys.argv[2])
+    ```
+
+    If the build step feels slow, measure before changing code. Run `time` on this step alone, and use `python -X importtime` if you suspect imports. The cost is most likely in another step of the build, not in this script.
+verify:
+  module: true
+  green_block: 0
+  test: |-
+    content = {
+        "title": "Ship & Grow",
+        "tagline": "Faster <launches>",
+        "features": [
+            {"name": "Fast", "text": "Deploys in <b>seconds</b>"},
+            {"name": "Safe", "text": "Rollbacks \"built in\""},
+        ],
+        "cta": {"url": "/signup?plan=pro&ref=lp", "label": "Start now"},
+    }
+    page = render_page(content)
+    assert "<title>Ship &amp; Grow</title>" in page
+    assert "Faster &lt;launches&gt;" in page
+    assert page.count('<article class="feature">') == 2
+    assert "&lt;b&gt;seconds&lt;/b&gt;" in page
+    assert "&quot;built in&quot;" in page
+    assert 'href="/signup?plan=pro&amp;ref=lp"' in page
+    assert unescape("&amp;") == "&"
+    import tempfile, os, json as _json
+    d = tempfile.mkdtemp()
+    src = os.path.join(d, "content.json")
+    dest = os.path.join(d, "index.html")
+    with open(src, "w", encoding="utf-8") as fh:
+        _json.dump(content, fh)
+    main(src, dest)
+    with open(dest, encoding="utf-8") as fh:
+        assert fh.read() == page
+    print("ok")

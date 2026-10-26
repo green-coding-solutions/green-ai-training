@@ -1,0 +1,136 @@
+id: gen-2-00018-multi-turn
+category: multi-turn
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    We're moving our model-serving repo to GitLab CI, and I need the review part of `.gitlab-ci.yml`. Setup:
+
+    - An earlier `build` stage builds the image and pushes it as `$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA`
+    - The helm chart is in `deploy/chart`. It takes `image.tag` and `ingress.host`. Prod values are in `deploy/chart/values-prod.yaml` (3 replicas, Redis feature cache, drift-monitor sidecar)
+    - We use the GitLab agent. The context name is in `$KUBE_CONTEXT`
+    - The runner image with helm and kubectl is `registry.example.com/platform/deployer:1.4`
+
+    Requirements: every MR that touches `models/` or `serving/` gets its own namespace and deployment. The URL `https://mr-<iid>.models.staging.example.com` must show up in the MR, so the data scientists can point their eval notebooks at it. Other MRs (docs, CI changes) should not deploy anything.
+- role: assistant
+  content: |
+    Add these two jobs to your `.gitlab-ci.yml`. They assume `stages` already lists `build` and `review`.
+
+    ```yaml
+    deploy_review:
+      stage: review
+      image: registry.example.com/platform/deployer:1.4
+      variables:
+        RELEASE: model-api-mr-$CI_MERGE_REQUEST_IID
+        NAMESPACE: review-mr-$CI_MERGE_REQUEST_IID
+        HOST: mr-$CI_MERGE_REQUEST_IID.models.staging.example.com
+      before_script:
+        - kubectl config use-context "$KUBE_CONTEXT"
+      script:
+        - >
+          helm upgrade --install "$RELEASE" deploy/chart
+          --namespace "$NAMESPACE" --create-namespace
+          -f deploy/chart/values-prod.yaml
+          --set image.tag="$CI_COMMIT_SHORT_SHA"
+          --set ingress.host="$HOST"
+          --set replicaCount=1
+          --wait --timeout 10m
+      environment:
+        name: review/mr-$CI_MERGE_REQUEST_IID
+        url: https://mr-$CI_MERGE_REQUEST_IID.models.staging.example.com
+        on_stop: stop_review
+        auto_stop_in: 2 days
+      rules:
+        - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+          changes:
+            - models/**/*
+            - serving/**/*
+
+    stop_review:
+      stage: review
+      image: registry.example.com/platform/deployer:1.4
+      variables:
+        GIT_STRATEGY: none
+        RELEASE: model-api-mr-$CI_MERGE_REQUEST_IID
+        NAMESPACE: review-mr-$CI_MERGE_REQUEST_IID
+      before_script:
+        - kubectl config use-context "$KUBE_CONTEXT"
+      script:
+        - helm uninstall "$RELEASE" --namespace "$NAMESPACE" || true
+        - kubectl delete namespace "$NAMESPACE" --ignore-not-found
+      environment:
+        name: review/mr-$CI_MERGE_REQUEST_IID
+        action: stop
+      rules:
+        - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+          changes:
+            - models/**/*
+            - serving/**/*
+          when: manual
+    ```
+
+    Both jobs use the same `rules`. Because of this, `stop_review` exists in every pipeline that deploys. `GIT_STRATEGY: none` lets the stop job run after the source branch has been deleted.
+
+    **Green Notes**
+    - **Stop on merge or close** (reduces E, M): in merge request pipelines, GitLab runs `stop_review` on its own when the MR is merged or closed. The namespace, the Redis cache and the loaded model are removed then. They don't sit idle until someone remembers them.
+    - **`auto_stop_in: 2 days`** (reduces E, M): this catches MRs that stay open while nobody evaluates them. Each new deploy resets the timer, and anyone can bring the environment back by rerunning the job.
+    - **`replicaCount=1`** (reduces M): notebook eval calls don't need prod capacity, and every replica holds its own copy of the model in memory. Redis and the drift monitor stay on, so the review environment still behaves like prod.
+- role: user
+  content: |
+    Sorry, should have said this: replicas need to stay at 3. Part of the review is a locust run at prod concurrency to check the p95 latency of the new model. With one pod that number means nothing.
+- role: assistant
+  content: |
+    Makes sense. A latency check needs the prod pod count. Remove the override, so `values-prod.yaml` sets the 3 replicas:
+
+    ```yaml
+      script:
+        - >
+          helm upgrade --install "$RELEASE" deploy/chart
+          --namespace "$NAMESPACE" --create-namespace
+          -f deploy/chart/values-prod.yaml
+          --set image.tag="$CI_COMMIT_SHORT_SHA"
+          --set ingress.host="$HOST"
+          --wait --timeout 10m
+    ```
+
+    The replica count was the smaller lever anyway. In Green Metrics Tool measurements of an idle preview environment, 3 app replicas with extra services used only about 3% more CPU energy than 1 replica with a database. What matters most is how many hours the environment exists. The stop on merge and `auto_stop_in` still handle that.
+- role: user
+  content: |
+    ok next problem. After an MR is merged, the model team wants to compare the merged model with the next candidate for a day or two. But the review env is gone right after the merge. How do we handle that?
+- role: assistant
+  content: |
+    Compare against the default branch instead of the old MR. After the merge, that model is on `main`. Deploy `main` to one shared, long-lived staging environment, and the MR environments can still stop on merge:
+
+    ```yaml
+    deploy_staging:
+      stage: review
+      image: registry.example.com/platform/deployer:1.4
+      before_script:
+        - kubectl config use-context "$KUBE_CONTEXT"
+      script:
+        - >
+          helm upgrade --install model-api-staging deploy/chart
+          --namespace model-staging --create-namespace
+          -f deploy/chart/values-prod.yaml
+          --set image.tag="$CI_COMMIT_SHORT_SHA"
+          --set ingress.host="staging.models.example.com"
+          --wait --timeout 10m
+      environment:
+        name: staging
+        url: https://staging.models.example.com
+      rules:
+        - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+          changes:
+            - models/**/*
+            - serving/**/*
+    ```
+
+    This needs your `build` job to run on the default branch too, so the image for the merge commit's `$CI_COMMIT_SHORT_SHA` exists in the registry.
+
+    The notebooks then use `https://staging.models.example.com` as the baseline. It always holds the latest merged model, which is the one a new candidate has to beat. So one environment covers every comparison, and you don't need to keep the namespace of each merged MR.
+verify:
+  static_only: GitLab CI configuration; needs a GitLab runner with the Kubernetes agent, helm and a cluster

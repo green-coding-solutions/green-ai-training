@@ -1,0 +1,144 @@
+id: gen-2-00240-refactor
+category: refactor
+language: html
+patterns:
+- lazy-load-images
+facts:
+- F-LAZY-IMG
+messages:
+- role: user
+  content: |
+    `logsweep` (our log retention job) uses this Jinja template to write a monthly archive page. The page opens slowly, especially over the VPN. Each heatmap PNG is 150-250 KB, and there are 28-31 of them per month. Most people open the page for the storage chart and the totals table. Then they jump to one or two days via the links in the table, or via links like `archive/2026-09/index.html#day-2026-09-12` that we paste in Slack.
+
+    Requirements:
+    - no JavaScript (the page is served from an S3 bucket with a strict CSP)
+    - the storage chart at the top must still show up right away
+    - the `#day-...` links must still land on the right section
+    - don't change file names or paths, the generator writes them
+    - the generator renders the storage chart at 1200x400 px and every heatmap at 960x240 px
+
+    Can you clean it up?
+
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>logsweep archive – {{ month_label }}</title>
+      <link rel="stylesheet" href="../assets/report.css">
+    </head>
+    <body>
+      <header class="topbar">
+        <img src="../assets/logsweep-logo.png" alt="logsweep" height="32">
+        <span class="cluster">{{ cluster }}</span>
+        <span class="generated">generated {{ generated_at }}</span>
+      </header>
+
+      <main>
+        <section class="summary">
+          <h1>Archive {{ month_label }}</h1>
+          <img src="charts/storage-{{ month }}.png" alt="Archived storage per day, {{ month_label }}" class="chart-wide">
+          <table class="totals">
+            <thead>
+              <tr><th>Day</th><th>Ingested</th><th>Archived</th><th>Deleted</th><th>Ratio</th></tr>
+            </thead>
+            <tbody>
+            {% for day in days %}
+              <tr>
+                <td><a href="#day-{{ day.date }}">{{ day.date }}</a></td>
+                <td>{{ day.ingested | filesizeformat }}</td>
+                <td>{{ day.archived | filesizeformat }}</td>
+                <td>{{ day.deleted | filesizeformat }}</td>
+                <td>{{ "%.2f" | format(day.ratio) }}</td>
+              </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        </section>
+
+        {% for day in days %}
+        <section class="day" id="day-{{ day.date }}">
+          <h2>{{ day.date }}</h2>
+          <img src="heatmaps/{{ day.date }}.png" alt="Ingest volume by hour and source, {{ day.date }}" class="heatmap">
+          <h3>Noisiest sources</h3>
+          <ol>
+          {% for src in day.top_sources %}
+            <li><code>{{ src.name }}</code> — {{ src.lines }} lines</li>
+          {% endfor %}
+          </ol>
+        </section>
+        {% endfor %}
+      </main>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>logsweep archive – {{ month_label }}</title>
+      <link rel="stylesheet" href="../assets/report.css">
+    </head>
+    <body>
+      <header class="topbar">
+        <img src="../assets/logsweep-logo.png" alt="logsweep" height="32">
+        <span class="cluster">{{ cluster }}</span>
+        <span class="generated">generated {{ generated_at }}</span>
+      </header>
+
+      <main>
+        <section class="summary">
+          <h1>Archive {{ month_label }}</h1>
+          <!-- above the fold: loads eagerly -->
+          <img src="charts/storage-{{ month }}.png" alt="Archived storage per day, {{ month_label }}"
+               class="chart-wide" width="1200" height="400">
+          <table class="totals">
+            <thead>
+              <tr><th>Day</th><th>Ingested</th><th>Archived</th><th>Deleted</th><th>Ratio</th></tr>
+            </thead>
+            <tbody>
+            {% for day in days %}
+              <tr>
+                <td><a href="#day-{{ day.date }}">{{ day.date }}</a></td>
+                <td>{{ day.ingested | filesizeformat }}</td>
+                <td>{{ day.archived | filesizeformat }}</td>
+                <td>{{ day.deleted | filesizeformat }}</td>
+                <td>{{ "%.2f" | format(day.ratio) }}</td>
+              </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        </section>
+
+        {% for day in days %}
+        <section class="day" id="day-{{ day.date }}">
+          <h2>{{ day.date }}</h2>
+          <!-- below the totals table: only fetched when the reader gets near it -->
+          <img src="heatmaps/{{ day.date }}.png" alt="Ingest volume by hour and source, {{ day.date }}"
+               class="heatmap" width="960" height="240" loading="lazy">
+          <h3>Noisiest sources</h3>
+          <ol>
+          {% for src in day.top_sources %}
+            <li><code>{{ src.name }}</code> — {{ src.lines }} lines</li>
+          {% endfor %}
+          </ol>
+        </section>
+        {% endfor %}
+      </main>
+    </body>
+    </html>
+    ```
+
+    **Green Notes**
+    - **`loading="lazy"` on the daily heatmaps** (reduces E, network): before, every visit downloaded and decoded all heatmaps, even when the reader stopped at the totals table. Now the browser only fetches the heatmaps near the part of the page the reader is looking at. A jump to `#day-2026-09-12` loads that day and its neighbours, not the whole month. In Green Metrics Tool measurements of an article with 15 photos, loaded 20 times without scrolling, lazy-loading the images below the fold used about 12% less CPU energy. When visitors scrolled to the end, there was no difference. So the saving comes from how your team uses the page: most visits never reach most of the days.
+    - **Storage chart stays eager:** it is above the fold. Lazy-loading it would only delay the first thing people want to see. The logo is left unchanged for the same reason.
+    - **`width`/`height` on the charts:** the browser now reserves the space before an image arrives. This is what keeps the `#day-...` links reliable. Without the sizes, lazy images above the target would load after the jump, and the page would shift away from the linked section. This is about correctness, not energy.
+
+    `loading="lazy"` is a plain HTML attribute, so it works with your no-JS CSP. Browsers that don't support it simply load the images eagerly, as before. File names and paths are unchanged. If `report.css` sets `max-width: 100%` on `.chart-wide` or `.heatmap`, also set `height: auto` there, or the images get stretched on narrow screens.
+verify:
+  static_only: HTML/Jinja template, no runnable Python or JavaScript

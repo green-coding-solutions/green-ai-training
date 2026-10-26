@@ -1,0 +1,126 @@
+id: gen-1-00105-review
+category: review
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    from datetime import date
+
+    PAGE_HEAD = "<!doctype html><html><head><title>Loved by teams</title></head><body>"
+
+
+    def render_testimonial(t):
+        stars = "★" * t["rating"] + "☆" * (5 - t["rating"])
+        return (
+            '<article class="card">'
+            + '<p class="quote">' + t["quote"] + '</p>'
+            + '<footer>' + t["name"] + ', ' + t["company"]
+            + ' <span class="stars">' + stars + '</span></footer>'
+            + '</article>'
+        )
+
+
+    def render_wall(testimonials):
+        body = ""
+        for t in testimonials:
+            body += render_testimonial(t)
+        return body
+
+
+    def render_logos(logos):
+        row = ""
+        for name, url in logos:
+            row += f'<li><img src="{url}" alt="{name}" width="120" height="40"></li>'
+        return '<ul class="logos">' + row + "</ul>"
+
+
+    def render_landing(testimonials, logos):
+        page = PAGE_HEAD
+        page += "<h1>Loved by teams</h1>"
+        page += render_logos(logos)
+        page += '<section class="wall">' + render_wall(testimonials) + '</section>'
+        page += f"<footer>&copy; {date.today().year} Acme</footer></body></html>"
+        return page
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (server-rendered landing page, runs on every request)
+
+    #### [Security] Submitted text goes into the HTML unescaped
+    - **Where:** `render_testimonial` (`quote`, `name`, `company`) and `render_logos` (`url`, `name`)
+    - **Issue:** if any of these values come from a form, a CMS or a partner feed, a value like `<script>...</script>` or `"><img onerror=...>` is served to every visitor as live markup. This is stored XSS.
+    - **Fix:** escape every value with `html.escape` before it goes into the markup (see the code below). Text that contains `<`, `>`, `&` or quotes will now show as text instead of being parsed as HTML. That is the intended change.
+    - **Impact:** not an energy issue, but it should be fixed first.
+
+    #### [High] Strings grown with `+=` inside loops
+    - **Where:** `body += render_testimonial(t)` in `render_wall`, `row += f'...'` in `render_logos`
+    - **Issue:** each `+=` builds a new, longer string, so the work grows faster than the number of cards and logos. An f-string `+=` in a loop behaves the same. This runs on every page view, so it adds up with traffic. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces with `+=` used about 469 J of CPU energy, and `"".join()` used about 1.8 J, roughly 260× less. A page with a few hundred cards is far smaller than that test, so the absolute gain per request is smaller. It still repeats on every request and grows with the number of items.
+    - **Fix:** build the pieces in a generator and join once.
+    - **Impact:** E on every render. Output is byte-for-byte the same for text without special characters.
+
+    ```python
+    from datetime import date
+    from html import escape
+
+    PAGE_HEAD = "<!doctype html><html><head><title>Loved by teams</title></head><body>"
+
+
+    def render_testimonial(t):
+        stars = "★" * t["rating"] + "☆" * (5 - t["rating"])
+        return (
+            '<article class="card">'
+            f'<p class="quote">{escape(t["quote"])}</p>'
+            f'<footer>{escape(t["name"])}, {escape(t["company"])} '
+            f'<span class="stars">{stars}</span></footer>'
+            '</article>'
+        )
+
+
+    def render_wall(testimonials):
+        return "".join(render_testimonial(t) for t in testimonials)
+
+
+    def render_logos(logos):
+        items = "".join(
+            f'<li><img src="{escape(url)}" alt="{escape(name)}" width="120" height="40"></li>'
+            for name, url in logos
+        )
+        return '<ul class="logos">' + items + "</ul>"
+
+
+    def render_landing(testimonials, logos):
+        page = PAGE_HEAD
+        page += "<h1>Loved by teams</h1>"
+        page += render_logos(logos)
+        page += '<section class="wall">' + render_wall(testimonials) + '</section>'
+        page += f"<footer>&copy; {date.today().year} Acme</footer></body></html>"
+        return page
+    ```
+
+    **Already good:** the `+=` calls in `render_landing` join only five fixed pieces, so they are fine and I left them as they are. `render_testimonial` builds one small string per card, which is also fine.
+verify:
+  equivalence:
+    driver: |
+      testimonials = [
+          {"quote": "Setup took ten minutes.", "name": "Ana Silva", "company": "Northwind", "rating": 5},
+          {"quote": "Support answers fast.", "name": "Tom Berg", "company": "Contoso", "rating": 4},
+          {"quote": "Does what it says.", "name": "Mei Lin", "company": "Globex", "rating": 3},
+      ] * 40
+      logos = [("Northwind", "/img/northwind.svg"), ("Contoso", "/img/contoso.svg")] * 10
+      print(render_landing(testimonials, logos))
+  test: |-
+    out = render_landing(
+        [{"quote": "<script>alert(1)</script>", "name": 'A "B"', "company": "C & D", "rating": 2}],
+        [("X", "/x.svg")],
+    )
+    assert "<script>" not in out
+    assert "&lt;script&gt;" in out
+    assert "C &amp; D" in out
+    assert out.count("<article") == 1

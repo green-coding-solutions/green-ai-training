@@ -1,0 +1,88 @@
+id: gen-1-00250-estimate
+category: estimate
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    hi, im not sure what is wrong with my script. its a step in our CI pipeline for the firmware tests. it turns the voltage log from the test rig into 8 bit codes, and it runs on every push. the logs have around 10 million samples. the step is slow and someone said numba would fix it and also save energy. how much energy would it save? is it worth it?
+
+    ```python
+    import sys
+    import numpy as np
+
+    V_MIN = 0.0
+    V_MAX = 3.3
+    LEVELS = 256
+
+
+    def quantize(samples):
+        codes = []
+        scale = (LEVELS - 1) / (V_MAX - V_MIN)
+        for v in samples:
+            if v < V_MIN:
+                v = V_MIN
+            elif v > V_MAX:
+                v = V_MAX
+            codes.append(int((v - V_MIN) * scale + 0.5))
+        return codes
+
+
+    if __name__ == "__main__":
+        data = np.load(sys.argv[1])
+        codes = quantize(data)
+        np.save(sys.argv[2], np.array(codes, dtype=np.uint8))
+        print("done", len(codes))
+    ```
+- role: assistant
+  content: |
+    Your code is fine. It is just a plain Python loop over every sample, and that is the slow part. This is the case Numba is made for: a hot numeric loop over a NumPy array.
+
+    In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples in a pure Python loop used ~40 J. The same loop with Numba `@njit` used ~9.5 J, about 4× less. Your job has the same shape and about the same size.
+
+    ```python
+    import sys
+    import numpy as np
+    from numba import njit
+
+    V_MIN = 0.0
+    V_MAX = 3.3
+    LEVELS = 256
+
+
+    @njit(cache=True)
+    def quantize(samples):
+        codes = np.empty(samples.shape[0], dtype=np.uint8)
+        scale = (LEVELS - 1) / (V_MAX - V_MIN)
+        for i in range(samples.shape[0]):
+            v = samples[i]
+            if v < V_MIN:
+                v = V_MIN
+            elif v > V_MAX:
+                v = V_MAX
+            codes[i] = int((v - V_MIN) * scale + 0.5)
+        return codes
+
+
+    if __name__ == "__main__":
+        data = np.load(sys.argv[1])
+        codes = quantize(data)
+        np.save(sys.argv[2], codes)
+        print("done", len(codes))
+    ```
+
+    **Green Notes**
+    - **JIT for a hot numeric loop** (reduces E): the loop runs once per sample, so compiled code cuts the per-sample work. The output is the same as before.
+    - **Preallocated output array** (reduces E, M): `np.empty` replaces the growing Python list of ints, so no list of 10 million objects is built.
+    - *Not applied:* nothing else. Don't scale the 4× to your CI. Your saving depends on the runner and the data.
+
+    Two things to check before you commit this:
+    - Numba compiles on the first call. On a fresh CI runner, `cache=True` only helps if the cache folder is kept between runs. Otherwise every push pays the compile time. For a 10 million sample file this is usually still a good trade. For small files it is not.
+    - It adds a dependency to your CI image. That is only worth it if this step runs often.
+
+    To measure, run the old and new script on the same file with `perf stat` or `time` and compare CPU time. For energy, run both in a Green Metrics Tool usage scenario.
+verify:
+  static_only: needs numba, which is not in stdlib + numpy

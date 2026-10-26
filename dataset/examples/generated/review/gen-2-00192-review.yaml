@@ -1,0 +1,120 @@
+id: gen-2-00192-review
+category: review
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    Can you review this script? It runs on our Postfix relay from logrotate's postrotate. It reads yesterday's mail.log (about 400k lines on a busy day) and writes delivery stats per recipient domain. A Zabbix item parses the output file.
+
+    Requirements:
+    - Only bash, coreutils, grep and awk on the box (it's mawk, not gawk). No Python or Perl.
+    - The output format must stay exactly the same, because the Zabbix regex depends on it.
+    - On busy days it runs for more than 20 minutes and logrotate is blocked the whole time.
+
+    ```bash
+    #!/bin/bash
+    # mailstats.sh - delivery stats per recipient domain for yesterday's log
+    # called from logrotate postrotate (runs as root)
+
+    LOG=${1:-/var/log/mail.log.1}
+    OUT=/var/lib/zabbix/mailstats.txt
+    TMP=/tmp/mailstats.tmp
+
+    sent=0
+    deferred=0
+    bounced=0
+
+    > $TMP
+
+    grep 'postfix/smtp\[' "$LOG" | grep ' to=<' | while read line; do
+        domain=$(echo "$line" | grep -o 'to=<[^>]*>' | cut -d'@' -f2 | tr -d '>' | tr 'A-Z' 'a-z')
+        status=$(echo "$line" | grep -o 'status=[a-z]*' | cut -d'=' -f2)
+
+        case $status in
+            sent)     sent=$(expr $sent + 1) ;;
+            deferred) deferred=$(expr $deferred + 1) ;;
+            bounced)  bounced=$(expr $bounced + 1) ;;
+            *)        continue ;;
+        esac
+
+        echo "$domain $status" >> $TMP
+    done
+
+    {
+        echo "# mailstats $(date +%F)"
+        sort $TMP | uniq -c | awk '{ print $2, $3, $1 }' | sort -k3,3nr | head -n 50
+        echo "TOTAL sent=$sent deferred=$deferred bounced=$bounced"
+    } > "$OUT"
+
+    rm -f $TMP
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (daily log processing)
+
+    #### [Bug] The TOTAL line is always zero
+    - **Where:** the `grep ... | while read line` loop and the final `echo "TOTAL ..."`
+    - **Issue:** every part of a pipeline runs in a subshell. The loop increments its own copies of `sent`, `deferred` and `bounced`, and those copies are gone when the loop ends. Zabbix always gets `TOTAL sent=0 deferred=0 bounced=0`.
+    - **Fix:** count in the same process that prints the totals. The awk version below does this. If you keep a loop, feed it with `done < <(grep ...)` so it runs in the main shell.
+
+    #### [Security] Fixed temp file in /tmp, written as root
+    - **Where:** `TMP=/tmp/mailstats.tmp`, `> $TMP`, `>> $TMP`
+    - **Issue:** any local user can create `/tmp/mailstats.tmp` as a symlink to a system file before logrotate runs. Root then truncates that file and appends to it.
+    - **Fix:** `tmp=$(mktemp) || exit 1` and `trap 'rm -f "$tmp"' EXIT`.
+
+    #### [High] About nine new processes for every log line
+    - **Where:** the two `$(echo "$line" | grep | cut | tr ...)` substitutions and `$(expr ...)` inside the loop
+    - **Issue:** each line starts `echo`, `grep`, `cut` and two `tr` for the domain, `echo`, `grep` and `cut` for the status, and one `expr`. Then it opens `$TMP` again to append. At 400k lines, process startup is almost the whole runtime, which is why logrotate waits so long.
+    - **Fix:** one `awk` pass over the file. It does the filtering, the field extraction, the per-domain counts and the totals. Sorting and the top 50 stay as before.
+    - **Impact:** E, scales with every line of the log. In Green Metrics Tool micro-benchmarks summarizing a 20,000-line access log, a `while read` loop running `$(echo | cut)` and `$(expr)` for every field used ~1302 J of CPU energy. The same loop with bash builtins only used ~4.3 J (about 300× less). One `awk` pass used ~1.0 J, over 1000× less than the subprocess loop.
+
+    Fixed script, plain POSIX awk, so it works with mawk:
+
+    ```bash
+    #!/bin/bash
+    # mailstats.sh - delivery stats per recipient domain for yesterday's log
+    # called from logrotate postrotate (runs as root)
+
+    LOG=${1:-/var/log/mail.log.1}
+    OUT=/var/lib/zabbix/mailstats.txt
+
+    tmp=$(mktemp) || exit 1
+    trap 'rm -f "$tmp"' EXIT
+
+    totals=$(awk -v out="$tmp" '
+    /postfix\/smtp\[/ && / to=</ {
+        if (!match($0, /status=[a-z]+/)) next
+        status = substr($0, RSTART + 7, RLENGTH - 7)
+        if (status ~ /^sent$/) ns++
+        else if (status ~ /^deferred$/) nd++
+        else if (status ~ /^bounced$/) nb++
+        else next
+        match($0, /to=<[^>]*>/)
+        split(substr($0, RSTART + 4, RLENGTH - 5), part, /@/)
+        count[tolower(part[2]), status]++
+    }
+    END {
+        for (k in count) {
+            split(k, kk, SUBSEP)
+            print kk[1], kk[2], count[k] > out
+        }
+        close(out)
+        printf "TOTAL sent=%d deferred=%d bounced=%d\n", ns, nd, nb
+    }' "$LOG")
+
+    {
+        echo "# mailstats $(date +%F)"
+        sort -k3,3nr "$tmp" | head -n 50
+        printf '%s\n' "$totals"
+    } > "$OUT"
+    ```
+
+    The output format is unchanged. The domain lines are `domain status count` with the same sort order and the same top 50. The only difference is that the TOTAL line now has the real counts.
+
+    **Already good:** the final aggregation uses one `sort | uniq -c` over the whole file and does not grep once per domain. `"$LOG"` and `"$OUT"` are quoted.
+verify:
+  static_only: bash script that reads a Postfix mail.log and writes to /var/lib/zabbix

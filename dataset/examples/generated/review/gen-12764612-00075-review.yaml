@@ -1,0 +1,96 @@
+id: gen-12764612-00075-review
+category: review
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    Hello, can you make review of this script? It run at the end of every pipeline in our CI (around 150 builds per day). It save the build output to our artifact server and we keep it 30 days. The out folder have test reports, coverage html, logs, and also some jar, png and zip files. I think maybe it is slow but not sure whats wrong.
+
+    ```bash
+    #!/bin/bash
+    # ci-archive.sh <build id>
+    BUILD_ID=$1
+    SRC=/var/ci/workspace/$BUILD_ID/out
+    DEST=/mnt/artifacts
+    KEEP_DAYS=30
+
+    mkdir -p $DEST
+    cd $SRC
+    tar -cf - . | xz -9e > $DEST/build-$BUILD_ID.tar.xz
+
+    # cleanup old
+    find $DEST -name "build-*.tar.xz" -mtime +$KEEP_DAYS -exec rm {} \;
+
+    echo "archived build $BUILD_ID"
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (CI, ~150 runs per day)
+
+    #### [Bug] Failures are not caught
+    - **Where:** `cd $SRC` and `tar ... | xz ... > file`
+    - **Issue:** if `cd` fails, `tar` archives the current directory instead of the build output. If `tar` fails, the pipe still ends with `xz` success, so you get a broken archive and the script prints "archived build". The archive is also written directly to its final name, so a half-written file can be picked up.
+    - **Fix:** use `set -euo pipefail`, quote all variables, write to a temp file and `mv` it when done.
+
+    #### [Security] Build id is used in paths without a check
+    - **Where:** `BUILD_ID=$1`
+    - **Issue:** a value like `../../etc` changes which folder is read and where the file is written. Unquoted variables also break on spaces.
+    - **Fix:** accept only simple characters (see the `case` check below).
+
+    #### [High] Strongest xz level on every build
+    - **Where:** `xz -9e`
+    - **Issue:** this is compression that runs about 150 times per day on a shared CI box, so the CPU cost repeats with every build. `xz` is one of the most expensive codecs. In Green Metrics Tool micro-benchmarks on 100 MB of English text with default settings, `xz` used about 458 J and `zstd` about 16 J, so about 29× more for `xz`. `-9e` is even more costly than the default level that was measured.
+    - **Fix:** use `zstd` at its default level.
+    - **Impact:** reduces E on the CI machine, and every build pays it. Those figures compare energy only, not file size. `xz` gives smaller files. If storage is tight, measure a higher `zstd` level on your own artifacts first.
+
+    #### [Medium] Already-compressed files are compressed again
+    - **Where:** the `jar`, `png` and `zip` files in `out`
+    - **Issue:** these formats are already compressed. A second pass costs CPU and gains almost nothing.
+    - **Fix:** put them in a plain tar and compress only the text files (reports, logs, coverage html).
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    BUILD_ID=${1:?build id missing}
+    case $BUILD_ID in
+        *[!A-Za-z0-9._-]*|.*) echo 'bad build id' >&2; exit 1 ;;
+    esac
+
+    SRC=/var/ci/workspace/$BUILD_ID/out
+    DEST=/mnt/artifacts
+    KEEP_DAYS=30
+
+    mkdir -p -- "$DEST"
+    cd -- "$SRC"
+
+    tmp_text=$(mktemp "$DEST/.text.XXXXXX")
+    tmp_bin=$(mktemp "$DEST/.bin.XXXXXX")
+    trap 'rm -f -- "$tmp_text" "$tmp_bin"' EXIT
+
+    # text files: compress with zstd
+    find . -type f ! \( -name '*.jar' -o -name '*.png' -o -name '*.zip' \) -print0 \
+        | tar --null -T - -cf - | zstd -q > "$tmp_text"
+    mv -- "$tmp_text" "$DEST/build-$BUILD_ID.tar.zst"
+
+    # already compressed files: store as they are
+    if [ -n "$(find . -type f \( -name '*.jar' -o -name '*.png' -o -name '*.zip' \) -print -quit)" ]; then
+        find . -type f \( -name '*.jar' -o -name '*.png' -o -name '*.zip' \) -print0 \
+            | tar --null -T - -cf "$tmp_bin"
+        mv -- "$tmp_bin" "$DEST/build-$BUILD_ID-bin.tar"
+    fi
+
+    # cleanup old (also removes the old .xz archives)
+    find "$DEST" -type f \( -name 'build-*.tar.xz' -o -name 'build-*.tar.zst' -o -name 'build-*-bin.tar' \) \
+        -mtime +"$KEEP_DAYS" -delete
+
+    echo "archived build $BUILD_ID"
+    ```
+
+    One difference: a build now makes two files (`.tar.zst` and `-bin.tar`) instead of one. Check that your download or restore step knows both. Compressing the stored text is still right for 30 days of retention. The change is the cheaper codec and skipping files that cannot shrink.
+verify:
+  static_only: needs GNU tar, zstd and a CI workspace layout under /var/ci and /mnt

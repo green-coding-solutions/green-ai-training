@@ -1,0 +1,81 @@
+id: gen-1-00286-review
+category: review
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    hi, im not sure what is wrong but my script is slow and the results look a bit different every time I run it. I am physics student, this simulates heat in a metal plate. A teacher gave me a trained pytorch model (HeatNet) that gives the temperature change for each grid point, and I call it for every time step. First I got error "Can't call numpy() on Tensor that requires grad" and then I added detach() and it worked. can you look?
+
+    ```python
+    import numpy as np
+    import torch
+    from surrogate import HeatNet
+
+    model = HeatNet()
+    model.load_state_dict(torch.load("heatnet.pt", map_location="cpu"))
+
+
+    def predict_field(temps, conductivity):
+        x = torch.tensor(np.stack([temps, conductivity], axis=-1),
+                         dtype=torch.float32)
+        out = model(x)
+        return out.detach().numpy().squeeze(-1)
+
+
+    def run(temps, conductivity, steps):
+        history = [temps]
+        for _ in range(steps):
+            temps = temps + 0.1 * predict_field(temps, conductivity)
+            history.append(temps)
+        return np.array(history)
+
+
+    if __name__ == "__main__":
+        grid = np.full((256, 256), 20.0)
+        grid[100:150, 100:150] = 200.0
+        k = np.full((256, 256), 0.8)
+        result = run(grid, k, steps=5000)
+        np.save("plate_history.npy", result)
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (scientific computing, 5000 model calls per run)
+
+    #### [Bug] Model is still in training mode
+    - **Where:** `model = HeatNet()` and `model.load_state_dict(...)`, no `model.eval()`
+    - **Issue:** a freshly built model starts in training mode. If HeatNet has dropout or batch norm layers, dropout randomly zeroes values on every call, and batch norm uses the statistics of the current grid. This is why your results differ between runs. The errors also add up over 5000 steps.
+    - **Fix:** call `model.eval()` once after loading the weights.
+
+    #### [High] Autograd graph is built on every step
+    - **Where:** `out = model(x)` in `predict_field`
+    - **Issue:** by default PyTorch records every operation so it can run a backward pass later. You never train here, so this is wasted work and memory. 5000 steps on a 256×256 grid means 5000 graphs that are built and thrown away. The `.detach()` you added was a symptom: the error told you the tensor still carries a graph.
+    - **Fix:** run the prediction under `torch.inference_mode()`. Then `.detach()` is not needed.
+    - **Impact:** reduces E (CPU) and M (memory) on every step. In Green Metrics Tool micro-benchmarks, 100,000 PyTorch CPU inferences used about 14% less energy with `torch.no_grad()` than without it. Your saving depends on the model size.
+
+    ```python
+    import numpy as np
+    import torch
+    from surrogate import HeatNet
+
+    model = HeatNet()
+    model.load_state_dict(torch.load("heatnet.pt", map_location="cpu"))
+    model.eval()
+
+
+    @torch.inference_mode()
+    def predict_field(temps, conductivity):
+        x = torch.from_numpy(
+            np.stack([temps, conductivity], axis=-1).astype(np.float32)
+        )
+        return model(x).numpy().squeeze(-1)
+    ```
+
+    `run` and the `__main__` block can stay as they are. The outputs now come from a fixed model, so the same input gives the same result every time.
+
+    **Already good:** the model is loaded once, outside the loop, and not on every step.
+verify:
+  static_only: needs torch and a local surrogate module

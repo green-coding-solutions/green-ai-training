@@ -1,0 +1,119 @@
+id: gen-12764612-00206-review
+category: review
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    Review. Runs hourly from cron on the app log (~20k lines per run). Diff only please, no rewrite of the whole file.
+
+    ```bash
+    #!/usr/bin/env bash
+    # count log lines per hour and level
+    LOG=${1:-/var/log/app/app.log}
+    declare -A count
+    total=0
+
+    while read line; do
+        ts=$(echo $line | cut -d' ' -f1)
+        level=$(echo $line | cut -d' ' -f2)
+        hour=$(echo $ts | cut -c12-13)
+        n=$(expr ${count[$hour:$level]:-0} + 1)
+        count[$hour:$level]=$n
+        total=$(expr $total + 1)
+    done < "$LOG"
+
+    for key in "${!count[@]}"; do
+        echo "$key ${count[$key]}"
+    done | sort
+    echo "total $total"
+    ```
+
+    Lines look like `2026-10-26T14:03:11 ERROR payments card declined for order 8812`.
+- role: assistant
+  content: |
+    **Workload:** script (hourly cron, log processing)
+
+    #### [High] About 10 process starts per log line
+    - **Where:** the four `$(...)` substitutions inside the `while read` loop
+    - **Issue:** each `$(echo ... | cut ...)` starts a subshell and two processes, and each `$(expr ...)` starts one more. At 20k lines that is roughly 200k process starts per run for work that bash does itself. Splitting fields, taking a substring and adding one are all builtin.
+    - **Fix:** let `read` split the fields, use substring expansion for the hour and `$(( ))` for the counters.
+    - **Impact:** reduces E. In Green Metrics Tool micro-benchmarks on a 20,000-line access log, a loop with `$(echo | cut)` and `$(expr)` per line used about 1302 J. The same loop with builtins only used about 4.3 J, about 300× less, with identical output. One `awk` pass was about 4× less again, if you want to drop the bash loop later.
+
+    #### [Bug] Unquoted `$line` and `$ts`
+    - **Where:** `echo $line`, `echo $ts`
+    - **Issue:** the shell word-splits and globs the value. A line that starts with `*` expands to file names in the current directory and shifts the fields. `read` without `-r` also eats backslashes.
+    - **Fix:** `read -r`, and no `echo` of the line at all. The diff below removes both problems.
+
+    ```diff
+    -while read line; do
+    -    ts=$(echo $line | cut -d' ' -f1)
+    -    level=$(echo $line | cut -d' ' -f2)
+    -    hour=$(echo $ts | cut -c12-13)
+    -    n=$(expr ${count[$hour:$level]:-0} + 1)
+    -    count[$hour:$level]=$n
+    -    total=$(expr $total + 1)
+    -done < "$LOG"
+    +while read -r ts level _; do
+    +    hour=${ts:11:2}
+    +    count[$hour:$level]=$(( ${count[$hour:$level]:-0} + 1 ))
+    +    total=$(( total + 1 ))
+    +done < "$LOG"
+    ```
+
+    Output is the same. Keys, counts and the total are unchanged, and the final `sort` still fixes the order.
+
+    **Already good:** the associative array keeps the counting in one pass over the file, and the final `sort` runs once, not per line.
+verify:
+  lang: bash
+  setup: |
+    d="$(mktemp -d)"
+    cd "$d"
+    cat > app.log <<'EOF'
+    2026-10-26T14:03:11 ERROR payments card declined for order 8812
+    2026-10-26T14:05:41 INFO  payments order 8813 paid
+    2026-10-26T14:59:59 WARN  search slow query 1200ms
+    2026-10-26T15:00:02 INFO  search ok
+    2026-10-26T15:10:10 ERROR payments timeout
+    2026-10-26T15:11:00 ERROR payments timeout
+
+    2026-10-26T16:01:01 INFO  web GET /health
+    EOF
+  original_code: |
+    LOG=app.log
+    declare -A count
+    total=0
+
+    while read line; do
+        ts=$(echo $line | cut -d' ' -f1)
+        level=$(echo $line | cut -d' ' -f2)
+        hour=$(echo $ts | cut -c12-13)
+        n=$(expr ${count[$hour:$level]:-0} + 1)
+        count[$hour:$level]=$n
+        total=$(expr $total + 1)
+    done < "$LOG"
+
+    for key in "${!count[@]}"; do
+        echo "$key ${count[$key]}"
+    done | sort
+    echo "total $total"
+  green_code: |
+    LOG=app.log
+    declare -A count
+    total=0
+
+    while read -r ts level _; do
+        hour=${ts:11:2}
+        count[$hour:$level]=$(( ${count[$hour:$level]:-0} + 1 ))
+        total=$(( total + 1 ))
+    done < "$LOG"
+
+    for key in "${!count[@]}"; do
+        echo "$key ${count[$key]}"
+    done | sort
+    echo "total $total"
+  equivalence:
+    driver: 'true'

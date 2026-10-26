@@ -1,0 +1,76 @@
+id: gen-12764612-00159-generation
+category: generation
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    Catalog API vhost, nginx 1.24 on Debian. JSON responses from the upstream are uncompressed right now, and the Swagger UI under /docs is served as plain files. Diff only please.
+
+    ```nginx
+    server {
+        listen 443 ssl;
+        server_name api.example.com;
+
+        ssl_certificate     /etc/ssl/api/fullchain.pem;
+        ssl_certificate_key /etc/ssl/api/privkey.pem;
+
+        location /docs/ {
+            alias /srv/api-docs/;
+            expires 1h;
+        }
+
+        location /v1/ {
+            proxy_pass http://127.0.0.1:8000;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_read_timeout 30s;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    ```text
+     server {
+         listen 443 ssl;
+         server_name api.example.com;
+
+         ssl_certificate     /etc/ssl/api/fullchain.pem;
+         ssl_certificate_key /etc/ssl/api/privkey.pem;
+
+    +    gzip on;
+    +    gzip_comp_level 5;
+    +    gzip_min_length 1024;
+    +    gzip_vary on;
+    +    gzip_types application/json text/css application/javascript image/svg+xml;
+    +
+         location /docs/ {
+             alias /srv/api-docs/;
+    +        gzip_static on;
+             expires 1h;
+         }
+
+         location /v1/ {
+             proxy_pass http://127.0.0.1:8000;
+             proxy_set_header Host $host;
+             proxy_set_header X-Real-IP $remote_addr;
+             proxy_read_timeout 30s;
+         }
+     }
+    ```
+
+    Precompress the docs once when you deploy them:
+
+    ```bash
+    find /srv/api-docs -type f \( -name '*.js' -o -name '*.css' -o -name '*.html' -o -name '*.json' -o -name '*.svg' \) -exec gzip -k -9 -f {} +
+    ```
+
+    **Green Notes**
+    - **Precompressed static files** (reduces E and network): `gzip_static` serves the `.gz` copy made at deploy time, so `/docs` is never compressed per request. In Green Metrics Tool measurements of nginx serving 2,000 text requests, per-request gzip at level 5 used ~54 J and precompressed files ~14 J, about 4× less. Both sent about 10× fewer bytes than no compression. `-9` is fine because it runs once.
+    - **Per-request gzip for `/v1` JSON** (reduces network): API responses are dynamic, so they can't be precompressed. Level 5 keeps the CPU cost moderate, and `gzip_min_length` skips tiny responses where compression gains nothing. Don't raise the level for dynamic responses.
+    - `gzip_vary on` stops caches from handing compressed bodies to clients that didn't ask for them.
+verify:
+  static_only: nginx config and shell command

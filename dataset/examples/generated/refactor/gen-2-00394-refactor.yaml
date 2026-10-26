@@ -1,0 +1,222 @@
+id: gen-2-00394-refactor
+category: refactor
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    hi, we have one dev server (32 GB RAM) where every developer start his own copy of our booking API for test feature branches. Command is `STACK=anna PG_PORT=5433 docker compose -p anna up -d`. Now we are 9 devs and the server run out of memory almost every week, my boss ask if we need a bigger VM. Can you clean up this compose file? Real load on it is never more then one or two persons clicking.
+
+    ```yaml
+    services:
+      api:
+        image: registry.internal/booking-api:${TAG:-develop}
+        restart: always
+        deploy:
+          replicas: 3
+        environment:
+          DATABASE_URL: postgresql://booking:booking@db:5432/booking
+          REDIS_URL: redis://redis:6379/0
+          SMTP_HOST: mailhog
+          SMTP_PORT: "1025"
+          GUNICORN_WORKERS: "4"
+        depends_on: [db, redis]
+        labels:
+          - traefik.enable=true
+          - traefik.http.routers.${STACK}-api.rule=Host(`${STACK}.dev.booking.internal`)
+          - traefik.http.services.${STACK}-api.loadbalancer.server.port=8000
+        networks: [default, proxy]
+
+      worker:
+        image: registry.internal/booking-api:${TAG:-develop}
+        command: celery -A booking.tasks worker --concurrency=4
+        restart: always
+        deploy:
+          replicas: 2
+        environment:
+          DATABASE_URL: postgresql://booking:booking@db:5432/booking
+          REDIS_URL: redis://redis:6379/0
+          SMTP_HOST: mailhog
+          SMTP_PORT: "1025"
+        depends_on: [db, redis]
+
+      scheduler:
+        image: registry.internal/booking-api:${TAG:-develop}
+        command: celery -A booking.tasks beat
+        restart: always
+        environment:
+          DATABASE_URL: postgresql://booking:booking@db:5432/booking
+          REDIS_URL: redis://redis:6379/0
+        depends_on: [redis]
+
+      db:
+        image: postgres:16
+        restart: always
+        environment:
+          POSTGRES_USER: booking
+          POSTGRES_PASSWORD: booking
+          POSTGRES_DB: booking
+        ports:
+          - "${PG_PORT}:5432"
+        volumes:
+          - pgdata:/var/lib/postgresql/data
+
+      redis:
+        image: redis:7
+        restart: always
+
+      mailhog:
+        image: mailhog/mailhog
+        restart: always
+        labels:
+          - traefik.enable=true
+          - traefik.http.routers.${STACK}-mail.rule=Host(`mail.${STACK}.dev.booking.internal`)
+          - traefik.http.services.${STACK}-mail.loadbalancer.server.port=8025
+        networks: [default, proxy]
+
+      pgadmin:
+        image: dpage/pgadmin4
+        restart: always
+        environment:
+          PGADMIN_DEFAULT_EMAIL: admin@booking.internal
+          PGADMIN_DEFAULT_PASSWORD: admin
+        volumes:
+          - pgadmin:/var/lib/pgadmin
+        labels:
+          - traefik.enable=true
+          - traefik.http.routers.${STACK}-pgadmin.rule=Host(`pgadmin.${STACK}.dev.booking.internal`)
+          - traefik.http.services.${STACK}-pgadmin.loadbalancer.server.port=80
+        networks: [default, proxy]
+
+      flower:
+        image: mher/flower
+        restart: always
+        command: celery --broker=redis://redis:6379/0 flower
+        labels:
+          - traefik.enable=true
+          - traefik.http.routers.${STACK}-flower.rule=Host(`flower.${STACK}.dev.booking.internal`)
+          - traefik.http.services.${STACK}-flower.loadbalancer.server.port=5555
+        networks: [default, proxy]
+
+    volumes:
+      pgdata:
+      pgadmin:
+
+    networks:
+      proxy:
+        external: true
+    ```
+- role: assistant
+  content: |
+    ```yaml
+    x-app-env: &app-env
+      DATABASE_URL: postgresql://booking:booking@db:5432/booking
+      REDIS_URL: redis://redis:6379/0
+      SMTP_HOST: mailhog
+      SMTP_PORT: "1025"
+
+    services:
+      api:
+        image: registry.internal/booking-api:${TAG:-develop}
+        restart: unless-stopped
+        environment:
+          <<: *app-env
+          GUNICORN_WORKERS: "2"
+        depends_on: [db, redis]
+        labels:
+          - traefik.enable=true
+          - traefik.http.routers.${STACK}-api.rule=Host(`${STACK}.dev.booking.internal`)
+          - traefik.http.services.${STACK}-api.loadbalancer.server.port=8000
+        networks: [default, proxy]
+
+      worker:
+        image: registry.internal/booking-api:${TAG:-develop}
+        command: celery -A booking.tasks worker --concurrency=2
+        restart: unless-stopped
+        environment: *app-env
+        depends_on: [db, redis]
+
+      scheduler:
+        image: registry.internal/booking-api:${TAG:-develop}
+        command: celery -A booking.tasks beat
+        restart: unless-stopped
+        environment:
+          DATABASE_URL: postgresql://booking:booking@db:5432/booking
+          REDIS_URL: redis://redis:6379/0
+        depends_on: [redis]
+
+      db:
+        image: postgres:16
+        restart: unless-stopped
+        environment:
+          POSTGRES_USER: booking
+          POSTGRES_PASSWORD: booking
+          POSTGRES_DB: booking
+        ports:
+          - "127.0.0.1:${PG_PORT}:5432"
+        volumes:
+          - pgdata:/var/lib/postgresql/data
+
+      redis:
+        image: redis:7
+        restart: unless-stopped
+
+      mailhog:
+        image: mailhog/mailhog
+        restart: unless-stopped
+        labels:
+          - traefik.enable=true
+          - traefik.http.routers.${STACK}-mail.rule=Host(`mail.${STACK}.dev.booking.internal`)
+          - traefik.http.services.${STACK}-mail.loadbalancer.server.port=8025
+        networks: [default, proxy]
+
+      # Optional tools: start with --profile tools only when you need them
+      pgadmin:
+        image: dpage/pgadmin4
+        profiles: [tools]
+        restart: unless-stopped
+        environment:
+          PGADMIN_DEFAULT_EMAIL: admin@booking.internal
+          PGADMIN_DEFAULT_PASSWORD: admin
+        volumes:
+          - pgadmin:/var/lib/pgadmin
+        labels:
+          - traefik.enable=true
+          - traefik.http.routers.${STACK}-pgadmin.rule=Host(`pgadmin.${STACK}.dev.booking.internal`)
+          - traefik.http.services.${STACK}-pgadmin.loadbalancer.server.port=80
+        networks: [default, proxy]
+
+      flower:
+        image: mher/flower
+        profiles: [tools]
+        restart: unless-stopped
+        command: celery --broker=redis://redis:6379/0 flower
+        labels:
+          - traefik.enable=true
+          - traefik.http.routers.${STACK}-flower.rule=Host(`flower.${STACK}.dev.booking.internal`)
+          - traefik.http.services.${STACK}-flower.loadbalancer.server.port=5555
+        networks: [default, proxy]
+
+    volumes:
+      pgdata:
+      pgadmin:
+
+    networks:
+      proxy:
+        external: true
+    ```
+
+    **Green Notes**
+    - **One replica per service** (reduces M): one or two testers don't need load balancing. The old file ran 3 API containers with 4 Gunicorn workers each and 2 Celery workers with 4 processes each, in every stack. Now each stack runs one API with 2 workers and one Celery worker with 2 processes. If a test needs more parallel tasks, raise `--concurrency` for that stack.
+    - **Optional tools behind a profile** (reduces M): pgAdmin and Flower start only with `docker compose -p anna --profile tools up -d`. I kept MailHog in the default set, because the app sends mail to `SMTP_HOST: mailhog`.
+    - **Stacks that don't run** (reduces E, M): this is the biggest lever. In Green Metrics Tool measurements, a preview environment idling for 60 seconds with 3 app replicas, Postgres, Redis and a polling worker used ~269 J CPU energy, and one with 1 replica and Postgres ~262 J, about 3% less. Machine energy differed by less than 1%. Trimming services mostly frees RAM. The energy saving comes from removing idle hours: run `docker compose -p anna stop` in the evening (or from a nightly cron job), and `docker compose -p anna down -v` when the branch is merged. Note that `-v` deletes that stack's database.
+    - **`restart: unless-stopped`** (reduces E, M): with `always`, stopped stacks start again whenever the Docker daemon restarts, for example after a server reboot. Now a stopped stack stays stopped.
+
+    *Also fixed:* Postgres with password `booking` was published on all interfaces of the shared server. It now binds to `127.0.0.1` only. From a laptop, use an SSH tunnel: `ssh -L 5433:localhost:5433 <dev-server>`.
+
+    Before you buy a bigger VM, compare `docker stats` for one stack before and after this change, and count how many stacks are still running for old branches.
+verify:
+  static_only: Docker Compose file, needs Docker and the Traefik proxy network to run

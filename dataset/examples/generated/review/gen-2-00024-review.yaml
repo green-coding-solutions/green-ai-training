@@ -1,0 +1,151 @@
+id: gen-2-00024-review
+category: review
+language: html
+patterns:
+- dom-size
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    Hi, I made a small status page for our IoT gateway. The gateway serves it itself, it is a small ARM box in the factory hall. The page shows the sensor readings from the last 24 hours, that is around 12000 entries. When I open it the browser freezes for a few seconds and my laptop fan starts. After some minutes it gets even slower. I don't know if the gateway is too weak or if my page is wrong. Can you review it?
+
+    ```html
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>Gateway GW-07 – Readings</title>
+      <style>
+        .row { display: flex; border-bottom: 1px solid #ddd; }
+        .cell { flex: 1; padding: 4px; }
+        .cell-inner span { font-family: monospace; }
+        .alarm { background: #fdd; }
+      </style>
+    </head>
+    <body>
+      <h1>Sensor readings (last 24 h)</h1>
+      <div id="readings"></div>
+
+      <script>
+        const container = document.getElementById('readings');
+
+        function cell(text) {
+          const c = document.createElement('div');
+          c.className = 'cell';
+          const inner = document.createElement('div');
+          inner.className = 'cell-inner';
+          inner.innerHTML = '<span>' + text + '</span>';
+          c.appendChild(inner);
+          return c;
+        }
+
+        async function load() {
+          const res = await fetch('/api/readings?hours=24');
+          const readings = await res.json();
+          for (const r of readings) {
+            const row = document.createElement('div');
+            row.className = 'row';
+            if (r.value > r.threshold) row.classList.add('alarm');
+            row.appendChild(cell(new Date(r.ts * 1000).toLocaleString()));
+            row.appendChild(cell(r.sensor_name));
+            row.appendChild(cell(r.value.toFixed(2) + ' ' + r.unit));
+            row.appendChild(cell(r.status));
+            container.appendChild(row);
+          }
+        }
+
+        load();
+        setInterval(load, 30000);
+      </script>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (local gateway UI)
+
+    #### [Bug] Every refresh adds all rows again
+    - **Where:** `load()`, called by `setInterval(load, 30000)`
+    - **Issue:** `load()` appends rows but never removes the old ones. After 30 seconds you have every reading twice, after 5 minutes eleven times. That is why the page gets slower over time.
+    - **Fix:** replace the old rows instead of appending to them (`tbody.replaceChildren(...)` in the version below).
+
+    #### [Security] Sensor data goes into `innerHTML`
+    - **Where:** `cell()`, `inner.innerHTML = '<span>' + text + '</span>'`
+    - **Issue:** `sensor_name` and `status` come from the devices. A device name like `<img src=x onerror=...>` runs script in the browser of whoever opens the page.
+    - **Fix:** set `textContent` instead. The browser then shows the text as text.
+
+    #### [High] About 156,000 elements for one page view
+    - **Where:** the loop in `load()` and `cell()`
+    - **Issue:** the freeze happens in your browser, not on the gateway. Each reading creates 13 elements (1 row div + 4 × div, div, span). With about 12,000 readings that is about 156,000 elements, and each row goes into the live DOM on its own. Nobody can read 12,000 rows on one screen anyway.
+    - **Fix:** show 100 rows per page in a plain `<table>`, build them in a `DocumentFragment`, and swap them in with one call. Use `textContent` for the cell values:
+      ```html
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <title>Gateway GW-07 – Readings</title>
+        <style>
+          table { border-collapse: collapse; width: 100%; }
+          td { padding: 4px; border-bottom: 1px solid #ddd; font-family: monospace; }
+          tr.alarm { background: #fdd; }
+        </style>
+      </head>
+      <body>
+        <h1>Sensor readings (last 24 h)</h1>
+        <table>
+          <tbody id="readings"></tbody>
+        </table>
+        <p>
+          <button id="prev">Previous</button>
+          <span id="page-info"></span>
+          <button id="next">Next</button>
+        </p>
+
+        <script>
+          const PAGE_SIZE = 100;
+          const tbody = document.getElementById('readings');
+          const info = document.getElementById('page-info');
+          let readings = [];
+          let page = 0;
+
+          function render() {
+            const pages = Math.max(1, Math.ceil(readings.length / PAGE_SIZE));
+            page = Math.min(page, pages - 1);
+            const frag = document.createDocumentFragment();
+            for (const r of readings.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)) {
+              const tr = frag.appendChild(document.createElement('tr'));
+              if (r.value > r.threshold) tr.className = 'alarm';
+              for (const text of [
+                new Date(r.ts * 1000).toLocaleString(),
+                r.sensor_name,
+                r.value.toFixed(2) + ' ' + r.unit,
+                r.status,
+              ]) {
+                tr.appendChild(document.createElement('td')).textContent = text;
+              }
+            }
+            tbody.replaceChildren(frag);
+            info.textContent = `Page ${page + 1} of ${pages} (${readings.length} readings)`;
+          }
+
+          async function load() {
+            const res = await fetch('/api/readings?hours=24');
+            readings = await res.json();
+            render();
+          }
+
+          document.getElementById('prev').onclick = () => { if (page > 0) { page--; render(); } };
+          document.getElementById('next').onclick = () => { page++; render(); };
+
+          load();
+          setInterval(load, 30000);
+        </script>
+      </body>
+      </html>
+      ```
+    - **Impact:** reduces E and M on every client that opens the page. A page has 100 rows × 5 elements instead of 12,000 × 13. Green Metrics Tool page-load benchmarks tested a 10,000-row table with 14 elements per row, appended one by one. Paginated to 100 rows per page as a plain `<table>` built in a `DocumentFragment`, it used about 56% less CPU energy.
+
+    **Already good:** alarm rows are styled with a CSS class instead of inline styles, and the page needs only one request per refresh.
+verify:
+  static_only: browser page; needs a DOM and the gateway's /api/readings endpoint

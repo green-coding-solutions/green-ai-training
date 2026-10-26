@@ -1,0 +1,91 @@
+id: gen-1-00198-review
+category: review
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    review pls, thread endpoint for our support tool. thread_id comes from the URL
+
+    ```python
+    def thread_feed(conn, thread_id):
+        rows = conn.execute(
+            f"SELECT id, author, body, created_at FROM messages "
+            f"WHERE thread_id = {thread_id} ORDER BY created_at ASC"
+        ).fetchall()
+
+        feed = []
+        for row in rows:
+            body = row[2]
+            if body is None or body.strip() == "":
+                continue
+            feed.insert(0, {
+                "id": row[0],
+                "author": row[1],
+                "body": body.strip(),
+                "created_at": row[3],
+            })
+        return feed
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (REST API endpoint)
+
+    #### [Security] SQL injection through `thread_id`
+    - **Where:** the f-string in `conn.execute(...)`
+    - **Issue:** `thread_id` comes from the URL and is pasted into the SQL text. A crafted value can change the query.
+    - **Fix:** pass it as a parameter, as in the code below.
+
+    #### [High] Front insert on every row
+    - **Where:** `feed.insert(0, {...})`
+    - **Issue:** each `insert(0, ...)` shifts every item already in the list. For n messages that is O(n²) work for the request. Long threads cost the most, and every request pays it. In Green Metrics Tool micro-benchmarks, 1,000,000 front inserts used about 1515 J of CPU energy. The same number of `append` calls used about 1.2 J.
+    - **Fix:** the rows are already in order, so walk them backwards with `reversed(rows)` and use `append`. That is O(n) and gives the same order, including for rows with equal `created_at`.
+    - **Impact:** E per request, growing with thread length.
+
+    ```python
+    def thread_feed(conn, thread_id):
+        rows = conn.execute(
+            "SELECT id, author, body, created_at FROM messages "
+            "WHERE thread_id = ? ORDER BY created_at ASC",
+            (thread_id,),
+        ).fetchall()
+
+        feed = []
+        for row in reversed(rows):
+            body = row[2]
+            if body is None or body.strip() == "":
+                continue
+            feed.append({
+                "id": row[0],
+                "author": row[1],
+                "body": body.strip(),
+                "created_at": row[3],
+            })
+        return feed
+    ```
+
+    **Already good:** blank messages are skipped inside the loop, so no second pass over the list is needed.
+verify:
+  equivalence:
+    driver: |-
+      import sqlite3
+      conn = sqlite3.connect(":memory:")
+      conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, thread_id INTEGER, author TEXT, body TEXT, created_at INTEGER)")
+      data = [
+          (1, 1, "ann", "hello", 100),
+          (2, 1, "bob", "  hi there  ", 101),
+          (3, 1, "ann", "", 102),
+          (4, 1, "cy", None, 103),
+          (5, 1, "bob", "same time a", 104),
+          (6, 1, "ann", "same time b", 104),
+          (7, 2, "dee", "other thread", 50),
+          (8, 1, "eve", "last", 110),
+      ]
+      conn.executemany("INSERT INTO messages VALUES (?, ?, ?, ?, ?)", data)
+      for tid in (1, 2, 3):
+          for item in thread_feed(conn, tid):
+              print(item)
+          print("--")

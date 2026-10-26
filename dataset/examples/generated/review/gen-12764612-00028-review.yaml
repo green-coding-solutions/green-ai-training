@@ -1,0 +1,78 @@
+id: gen-12764612-00028-review
+category: review
+language: bash
+patterns:
+- compress-transmitted
+- bash-builtins
+facts:
+- F-COMPRESS
+- F-COMPRESS-CODECS
+- F-TEXT-COMPRESS
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    fix this, landing page pricing endpoint is slow
+
+    ```bash
+    #!/bin/bash
+    # pricing.cgi - plans for the landing page
+    DATA=/var/www/landing/data/plans.json
+
+    echo "Content-Type: application/json"
+    echo "Vary: Accept-Encoding"
+    if echo $HTTP_ACCEPT_ENCODING | grep -q br; then
+      echo "Content-Encoding: br"
+      echo
+      brotli -q 11 -c $DATA
+    else
+      echo
+      cat $DATA
+    fi
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (runs on every page view)
+
+    #### [High] Brotli quality 11 on every request
+    - **Where:** `brotli -q 11 -c $DATA`
+    - **Issue:** the plans file only changes when you edit it, but it is compressed again for every visitor with the most expensive setting. Quality 11 is meant for files compressed once and served many times.
+    - **Fix:** compress once at deploy time and serve the `.br` file. Run `brotli -q 11 -k -f plans.json` in your deploy step.
+    - **Impact:** reduces E on the server for every request. In Green Metrics Tool micro-benchmarks on text, brotli at its default quality 11 used about 45× the energy of gzip when compressing 100 MB. Compressing per request with gzip level 5 in nginx cost about 4× the CPU energy of serving precompressed files. The byte saving for the visitor stays the same. These figures compare energy, not compression ratio.
+
+    #### [Bug] `br;q=0` counts as "supports brotli"
+    - **Where:** `grep -q br`
+    - **Issue:** the match is a substring search. A client that sends `br;q=0` (brotli not accepted) still gets brotli and cannot read the response.
+    - **Fix:** match the token properly, as in the code below.
+
+    #### [Bug] Unquoted variables
+    - **Where:** `$HTTP_ACCEPT_ENCODING`, `$DATA`
+    - **Issue:** the header comes from the client. Unquoted, it is word-split and glob-expanded. Quote variables always.
+
+    #### [Low] Two extra processes for a string check
+    - **Where:** `echo ... | grep -q`
+    - **Issue:** this starts a `grep` process (and a pipe) on every request. In Green Metrics Tool micro-benchmarks, process starts in shell loops dominated the cost. A `case` pattern is a builtin.
+    - **Impact:** reduces E per request, a small amount.
+
+    ```bash
+    #!/bin/bash
+    # Build step (once per deploy): brotli -q 11 -k -f /var/www/landing/data/plans.json
+    DATA=/var/www/landing/data/plans.json
+    enc=",${HTTP_ACCEPT_ENCODING// /},"
+
+    printf '%s\r\n' 'Content-Type: application/json' 'Vary: Accept-Encoding'
+    case $enc in
+      *,br,*|*,br\;q=1*|*,br\;q=0.[1-9]*)
+        printf '%s\r\n\r\n' 'Content-Encoding: br'
+        cat "$DATA.br" ;;
+      *)
+        printf '\r\n'
+        cat "$DATA" ;;
+    esac
+    ```
+
+    If nginx sits in front, you can drop the script. With the brotli module and `brotli_static on;` (plus `gzip_static on;`), it serves the precompressed files directly.
+
+    **Already good:** the `Vary: Accept-Encoding` header is set, so caches keep the variants apart.
+verify:
+  static_only: bash CGI script that needs a web server environment and the brotli CLI

@@ -1,0 +1,61 @@
+id: gen-12764612-00213-estimate
+category: estimate
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    hi, im not sure if something is wrong with my Dockerfile. its for our image classifier service (resnet, runs on cpu). it works but the build takes very long in CI and a colleague said the image is "too fat". how much energy would we save if i fix it? here is the file
+
+    ```dockerfile
+    FROM python:3.12
+
+    RUN apt-get update && apt-get install -y build-essential git curl vim
+
+    WORKDIR /app
+    COPY . /app
+
+    RUN pip install pytest black mypy ipython
+    RUN pip install -r requirements.txt
+
+    ENV MODEL_PATH=/app/models/resnet50.onnx
+    EXPOSE 8080
+    CMD ["python", "serve.py"]
+    ```
+
+    requirements.txt has onnxruntime, numpy, pillow and fastapi/uvicorn. CI builds it on every push.
+- role: assistant
+  content: |
+    Your colleague is right, and the build is where the saving is. In Green Metrics Tool micro-benchmarks, building a small Flask app image on the full `python:3.12` base with compilers, `git`, `curl`, `vim` and dev tools used ~885 J and 157 s. A `python:3.12-slim` image with runtime dependencies only used ~124 J and 25 s, about 7× less. Serving requests afterwards cost the same with both images, so the saving is in builds, pulls and stored copies, not in inference.
+
+    Here is a leaner version:
+
+    ```dockerfile
+    FROM python:3.12-slim
+
+    WORKDIR /app
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY . .
+
+    ENV MODEL_PATH=/app/models/resnet50.onnx
+    EXPOSE 8080
+    CMD ["python", "serve.py"]
+    ```
+
+    What changed:
+    - **Slim base:** `python:3.12-slim` instead of `python:3.12`.
+    - **Runtime only:** I removed `build-essential`, `git`, `curl`, `vim`, `pytest`, `black`, `mypy` and `ipython`. Put test and lint tools in a separate CI step or a dev image.
+    - **Dependency layer first:** `requirements.txt` is copied before the source, so a code change reuses the cached install layer.
+    - **`--no-cache-dir`:** pip does not keep its download cache in the image.
+
+    If one of your packages has no prebuilt wheel and needs a compiler, the build will fail. Then add only that tool, or use a multi-stage build. `onnxruntime`, `numpy` and `pillow` normally ship wheels. Your `models/` folder is copied into the image too, so a `.dockerignore` for files you don't need at runtime helps.
+
+    Don't scale the 7× to your project. Your dependencies, CI cache and push rate are different, and the benchmark app was small. The saving repeats with every push, so it adds up in CI. To measure it, build both versions without cache and compare them with `perf stat` or a Green Metrics Tool usage scenario. Image size (`docker images`) and build time are a good quick proxy.
+verify:
+  static_only: Dockerfile, needs Docker build

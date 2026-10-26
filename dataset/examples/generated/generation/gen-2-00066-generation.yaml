@@ -1,0 +1,51 @@
+id: gen-2-00066-generation
+category: generation
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    Need a Dockerfile for our nightly ETL job. Layout:
+
+    ```text
+    src/etl/__init__.py
+    src/etl/run.py          # entry point: python -m etl.run --date YYYY-MM-DD
+    src/etl/extract.py
+    src/etl/load.py
+    requirements.txt        # pandas, pyarrow, psycopg[binary], boto3
+    requirements-dev.txt    # pytest, ruff, mypy, moto
+    tests/
+    ```
+
+    Runs as a k8s CronJob, `--date` is passed as container args. GitLab CI builds the image on every MR. Just the file, no essay.
+- role: assistant
+  content: |
+    ```dockerfile
+    FROM python:3.12-slim
+
+    ENV PYTHONDONTWRITEBYTECODE=1 \
+        PYTHONUNBUFFERED=1 \
+        PIP_DISABLE_PIP_VERSION_CHECK=1 \
+        PYTHONPATH=/app/src
+
+    RUN useradd --create-home --uid 10001 etl
+    WORKDIR /app
+
+    # dependency layer first: reused as long as requirements.txt is unchanged
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY src/ ./src/
+
+    USER etl
+    ENTRYPOINT ["python", "-m", "etl.run"]
+    ```
+
+    **Green Notes**
+    - **Slim base, runtime deps only** (reduces E): `python:3.12-slim` with `requirements.txt` only. pytest, ruff, mypy, moto and `tests/` stay out. pandas, pyarrow and `psycopg[binary]` ship as wheels, so you don't need a compiler. In Green Metrics Tool measurements of a small Flask app built without cache, a slim, runtime-only image with the dependency layer first took about 7× less energy to build than `python:3.12` with build tools and dev deps. Runtime cost was the same for both.
+    - **Dependency layer before source** (reduces E): an MR that only changes `src/` reuses the cached pip layer. This only works if your GitLab runners keep layers between jobs (`--cache-from` with the last pushed image). `--no-cache-dir` keeps pip's download cache out of the image. The saving repeats on every MR build, every pull and every stored copy.
+verify:
+  static_only: Dockerfile, needs docker build and the project's requirements

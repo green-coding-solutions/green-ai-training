@@ -1,0 +1,112 @@
+id: gen-2-00149-generation
+category: generation
+language: python
+patterns:
+- simple-conditions
+facts:
+- F-COND
+messages:
+- role: user
+  content: |
+    hi, i'm pretty new to python. our garden club has a weather station on the roof and it exports a csv every year (columns are timestamp,temp_c, one row every 10 minutes, so it's a big file). i want a little script i can run like `python seasons.py weather_2025.csv` that prints the average temperature for each season.
+
+    i tried to write the season part myself but winter never shows up in my output and autumn comes out way too cold, i don't get why:
+
+    ```python
+    def get_season(month):
+        if month >= 12 and month <= 2:
+            return "winter"
+        elif month % 12 >= 3 and month % 12 <= 5:
+            return "spring"
+        elif month % 12 >= 6 and month % 12 <= 8:
+            return "summer"
+        else:
+            return "autumn"
+    ```
+
+    timestamps look like `2025-01-01T00:10:00`. can you write the whole script properly? oh and some rows have an empty temp_c when the sensor glitched.
+- role: assistant
+  content: |
+    Here is the bug: no number is both `>= 12` and `<= 2`, so the winter branch never runs. December, January and February all fall through to `else` and get counted as autumn.
+
+    ```python
+    import argparse
+    import csv
+    from datetime import datetime
+
+    # Meteorological seasons, northern hemisphere
+    SEASON_BY_MONTH = {
+        12: "winter", 1: "winter", 2: "winter",
+        3: "spring", 4: "spring", 5: "spring",
+        6: "summer", 7: "summer", 8: "summer",
+        9: "autumn", 10: "autumn", 11: "autumn",
+    }
+    SEASON_ORDER = ("winter", "spring", "summer", "autumn")
+
+
+    def season(month: int) -> str:
+        return SEASON_BY_MONTH[month]
+
+
+    def season_averages(path: str) -> dict[str, float]:
+        totals = dict.fromkeys(SEASON_ORDER, 0.0)
+        counts = dict.fromkeys(SEASON_ORDER, 0)
+        with open(path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                temp = (row["temp_c"] or "").strip()
+                if not temp:  # sensor glitch, skip the row
+                    continue
+                s = season(datetime.fromisoformat(row["timestamp"]).month)
+                totals[s] += float(temp)
+                counts[s] += 1
+        return {s: totals[s] / counts[s] for s in SEASON_ORDER if counts[s]}
+
+
+    def main() -> None:
+        parser = argparse.ArgumentParser(description="Average temperature per season.")
+        parser.add_argument("csv_file", help="weather station export (timestamp,temp_c)")
+        args = parser.parse_args()
+        for s, avg in season_averages(args.csv_file).items():
+            print(f"{s:<7} {avg:6.1f} °C")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    Seasons come out in a fixed order (winter, spring, summer, autumn). A season with no valid readings is left out.
+
+    **Green Notes**
+    - **Simple equality lookup instead of range/modulo conditions** (reduces E): the season is worked out for every row of the file. Now it is one direct month → season lookup, with no `%` and no range checks. In Green Metrics Tool micro-benchmarks over 10,000,000 classifications, simple equality branches used about 16% less CPU energy than complex range/modulo conditions. For one file a year the absolute saving is small. The bigger win here is that you can check the table by eye, which is how the winter bug got past you.
+verify:
+  module: true
+  test: |-
+    import os
+    import tempfile
+
+    assert [season(m) for m in range(1, 13)] == (
+        ["winter"] * 2 + ["spring"] * 3 + ["summer"] * 3 + ["autumn"] * 3 + ["winter"]
+    )
+
+    data = (
+        "timestamp,temp_c\n"
+        "2025-01-05T00:00:00,-2.0\n"
+        "2025-02-01T00:10:00,0.0\n"
+        "2025-07-01T12:00:00,25.5\n"
+        "2025-07-02T12:00:00,\n"
+        "2025-08-02T12:00:00, \n"
+        "2025-12-24T18:00:00,1.0\n"
+        "2025-10-03T08:00:00,9.0\n"
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False, encoding="utf-8") as f:
+        f.write(data)
+        path = f.name
+    try:
+        res = season_averages(path)
+    finally:
+        os.remove(path)
+
+    assert list(res) == ["winter", "summer", "autumn"], res
+    assert abs(res["winter"] - (-1.0 / 3)) < 1e-9, res
+    assert res["summer"] == 25.5, res
+    assert res["autumn"] == 9.0, res

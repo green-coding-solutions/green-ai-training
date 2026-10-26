@@ -1,0 +1,105 @@
+id: gen-2-00308-generation
+category: generation
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    ```python
+    import math
+
+    # gateway access log, tab-separated:
+    # ts \t client_ip \t method \t path \t status \t bytes \t request_time (seconds)
+
+    def latency_histogram(lines, base_ms=1.0, max_bucket=20):
+        """Log2 latency histogram for one day of gateway logs (~30M lines).
+
+        lines: iterable of raw log lines.
+        Bucket i counts requests with base_ms * 2**i <= latency < base_ms * 2**(i+1).
+        Latencies below base_ms go into bucket 0, anything above the top into max_bucket.
+        Lines where request_time is '-', missing or not a number are skipped and counted.
+        Returns (list of bucket counts, skipped).
+        """
+        # TODO
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```python
+    import math
+
+    # gateway access log, tab-separated:
+    # ts \t client_ip \t method \t path \t status \t bytes \t request_time (seconds)
+
+    def latency_histogram(lines, base_ms=1.0, max_bucket=20):
+        """Log2 latency histogram for one day of gateway logs (~30M lines).
+
+        lines: iterable of raw log lines.
+        Bucket i counts requests with base_ms * 2**i <= latency < base_ms * 2**(i+1).
+        Latencies below base_ms go into bucket 0, anything above the top into max_bucket.
+        Lines where request_time is '-', missing or not a number are skipped and counted.
+        Returns (list of bucket counts, skipped).
+        """
+        counts = [0] * (max_bucket + 1)
+        skipped = 0
+        to_units = 1000.0 / base_ms   # seconds -> multiples of base_ms
+        log2 = math.log2              # looked up once, not once per line
+        inf = math.inf
+
+        for line in lines:
+            # last field; float() ignores the trailing newline
+            field = line.rpartition("\t")[2]
+            try:
+                ratio = float(field) * to_units
+            except ValueError:        # '-', empty, garbage
+                skipped += 1
+                continue
+            if not 0.0 <= ratio < inf:  # negative, nan, inf
+                skipped += 1
+                continue
+            if ratio < 1.0:
+                counts[0] += 1
+            else:
+                b = int(log2(ratio))
+                counts[b if b < max_bucket else max_bucket] += 1
+
+        return counts, skipped
+    ```
+
+    Pass the open file directly (`latency_histogram(open(path))`). The lines are then streamed and never held in memory all at once. A line without any tab is taken whole as the field. It fails to parse and counts as skipped.
+
+    **Green Notes**
+    - **Hoist loop-invariant lookups** (reduces E, slightly): `math.log2` and `math.inf` are bound to locals before the loop. The loop body then does fast local reads instead of a global plus an attribute lookup on every line. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local before a 10,000,000-iteration loop saved about 4-5%. So this is a small win that only shows up in a loop this tight. Parsing the float is still the main cost per line.
+verify:
+  test: |-
+    lines = [
+        "2026-10-01T00:00:00Z\t10.0.0.1\tGET\t/a\t200\t512\t0.0004\n",
+        "2026-10-01T00:00:01Z\t10.0.0.2\tGET\t/b\t200\t512\t0.001\n",
+        "2026-10-01T00:00:02Z\t10.0.0.3\tGET\t/c\t200\t512\t0.003\n",
+        "2026-10-01T00:00:03Z\t10.0.0.4\tGET\t/d\t200\t512\t0.0625\n",
+        "2026-10-01T00:00:04Z\t10.0.0.5\tGET\t/e\t499\t0\t-\n",
+        "2026-10-01T00:00:05Z\t10.0.0.6\tGET\t/f\t200\t512\tnan\n",
+        "2026-10-01T00:00:06Z\t10.0.0.7\tGET\t/g\t200\t512\t-0.5\n",
+        "2026-10-01T00:00:07Z\t10.0.0.8\tGET\t/h\t504\t0\t5000\n",
+        "garbage line without tabs\n",
+        "2026-10-01T00:00:08Z\t10.0.0.9\tGET\t/i\t200\t512\tinf\n",
+    ]
+    counts, skipped = latency_histogram(lines)
+    assert skipped == 5, skipped
+    assert len(counts) == 21
+    assert counts[0] == 2, counts
+    assert counts[1] == 1, counts
+    assert counts[5] == 1, counts
+    assert counts[20] == 1, counts
+    assert sum(counts) == 5
+    c10, s10 = latency_histogram(lines, base_ms=10.0, max_bucket=5)
+    assert s10 == 5
+    assert len(c10) == 6
+    assert c10[0] == 3, c10
+    assert c10[2] == 1, c10
+    assert c10[5] == 1, c10
+    assert latency_histogram([]) == ([0] * 21, 0)

@@ -1,0 +1,59 @@
+id: gen-2-00040-generation
+category: generation
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    I need a Dockerfile for our internal CLI tool `feedctl`. It downloads product feeds from suppliers, normalizes them to CSV and uploads them to S3. Requirements:
+
+    - Python 3.12
+    - Repo layout: `pyproject.toml` (hatchling backend, `readme = "README.md"`), `requirements.lock` (pinned with pip-compile: click, httpx, pyyaml, boto3), `src/feedctl/`, `tests/`
+    - The console script is `feedctl` (defined in `[project.scripts]`). `docker run feedctl:latest sync --supplier acme` should just work, and with no args it should print the help
+    - Must run as non-root
+    - Output files go to `/data`, which we mount from the host
+    - Tests and ruff run in a separate CI job, the image is only for running the tool
+    - GitLab CI builds and pushes the image on every push to main, and about 40 Kubernetes CronJobs across our clusters pull it
+- role: assistant
+  content: |
+    ```dockerfile
+    FROM python:3.12-slim
+
+    ENV PYTHONDONTWRITEBYTECODE=1 \
+        PYTHONUNBUFFERED=1 \
+        PIP_DISABLE_PIP_VERSION_CHECK=1
+
+    # Rarely changes, so this layer stays cached
+    RUN useradd --create-home --uid 10001 feedctl \
+        && mkdir /data && chown feedctl /data
+
+    WORKDIR /app
+
+    # Dependencies first: reused until requirements.lock changes
+    COPY requirements.lock .
+    RUN pip install --no-cache-dir -r requirements.lock
+
+    # Source last: a code change only rebuilds from here
+    COPY pyproject.toml README.md ./
+    COPY src/ ./src/
+    RUN pip install --no-cache-dir --no-deps .
+
+    USER feedctl
+    WORKDIR /data
+
+    ENTRYPOINT ["feedctl"]
+    CMD ["--help"]
+    ```
+
+    The host directory you mount at `/data` must be writable by UID 10001, or pass `--user` to match your host user.
+
+    **Green Notes**
+    - **Small container image** (reduces E and network): slim base, runtime dependencies only, and `pip --no-cache-dir`, so no compilers, editors or pip cache end up in the image. In Green Metrics Tool measurements, building a small Python app this way used about 7× less energy than a full `python:3.12` image with build tools and dev tools. Runtime cost was the same, so the saving comes from builds, pulls and stored copies. Here that means every push to main and every node that pulls the image for your CronJobs.
+    - **Dependency layer before the source** (reduces E): most commits only touch `src/`, so the `pip install -r requirements.lock` layer gets reused. On GitLab runners without a local layer cache, build with `--cache-from` pointing at the last pushed image so this still works.
+    - **No test tooling in the image**: pytest and ruff stay in your CI job, as you planned. `--no-deps` makes sure the second install pulls in nothing beyond the lock file.
+    - *Not applied:* multi-stage build. click, httpx, pyyaml and boto3 all ship prebuilt wheels, so nothing needs compiling. If you later add a dependency without a wheel, compile it in a builder stage so gcc never reaches the final image.
+verify:
+  static_only: Dockerfile, needs docker build

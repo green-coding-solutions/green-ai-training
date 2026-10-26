@@ -1,0 +1,90 @@
+id: gen-2-00158-generation
+category: generation
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    Hi, I am new to backend work so sorry if this is a basic question. We have a REST API with FastAPI. Customers can register webhook URLs, and when an order is created we POST the event to all of their URLs. Right now I do it like this inside the create order endpoint:
+
+    ```python
+    for url in webhook_urls:
+        try:
+            requests.post(url, json=event)
+        except Exception:
+            failed.append(url)
+    ```
+
+    Usually a customer has 5 to 40 URLs. The create order request is very slow, and when one customer server is down it can take 30 seconds or more. I don't really understand what is wrong. Can you write me a function that sends the event to all webhook URLs and tells me which ones failed?
+- role: assistant
+  content: |
+    The loop has two problems. It waits for each webhook to finish before it starts the next one, so the slow ones add up. And `requests.post` has no timeout by default, so a dead server can block the loop for a long time. Inside an `async def` endpoint, a blocking `requests` call also stalls every other request on that worker.
+
+    This version sends all POSTs at the same time. It uses a timeout and a cap on parallel connections:
+
+    ```python
+    import asyncio
+
+    import httpx
+
+    TIMEOUT = httpx.Timeout(5.0, connect=3.0)
+    MAX_PARALLEL = 10
+
+
+    async def _post_one(
+        client: httpx.AsyncClient,
+        sem: asyncio.Semaphore,
+        url: str,
+        payload: dict,
+    ) -> tuple[str, str | None]:
+        async with sem:
+            try:
+                resp = await client.post(url, json=payload)
+            except httpx.HTTPError as exc:
+                return url, f"error: {type(exc).__name__}"
+        if resp.is_success:
+            return url, None
+        return url, f"HTTP {resp.status_code}"
+
+
+    async def deliver_webhooks(urls: list[str], payload: dict) -> dict[str, str]:
+        """POST payload to every URL concurrently.
+
+        Returns {url: reason} for every delivery that failed.
+        """
+        if not urls:
+            return {}
+        sem = asyncio.Semaphore(MAX_PARALLEL)
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            results = await asyncio.gather(
+                *(_post_one(client, sem, url, payload) for url in urls)
+            )
+        return {url: reason for url, reason in results if reason is not None}
+    ```
+
+    Use it in the endpoint with `await`. The endpoint must be `async def`:
+
+    ```python
+    @app.post("/orders")
+    async def create_order(order: OrderIn):
+        saved = await save_order(order)
+        failed = await deliver_webhooks(
+            await get_webhook_urls(saved.customer_id),
+            {"event": "order.created", "order_id": saved.id},
+        )
+        if failed:
+            logger.warning("webhook delivery failed: %s", failed)
+        return saved
+    ```
+
+    Now the request waits about as long as the slowest webhook. A dead server can block it at most until the timeout. Non-2xx answers count as failures. Redirects are not followed. If the same URL is registered twice, it gets the event twice but shows up only once in the result.
+
+    **Green Notes**
+    - **Concurrent HTTP calls** (reduces E): the webhooks wait in parallel, so the worker and its connections are held for the slowest call instead of the sum of all calls. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. With small request counts, most of the gain is wall time.
+    - **Timeout and parallel cap**: a dead customer server no longer keeps the request and its resources busy for a long time, and a customer with many URLs can't open an unlimited number of connections.
+    - *Not applied:* a customer with a single webhook gains nothing from the concurrency. For them, the timeout is the part that helps.
+verify:
+  static_only: needs httpx, FastAPI and network access to webhook URLs

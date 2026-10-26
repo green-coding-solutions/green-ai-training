@@ -1,0 +1,135 @@
+id: gen-12764612-00189-refactor
+category: refactor
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    Our nightly log report is slow and I would like to make it faster. It reads the application logs from stdin (about 40 million lines per night) and counts ERROR and WARN lines per minute.
+
+    Requirements:
+    - Output must stay exactly the same, byte for byte, including the "malformed" line at the end.
+    - Python 3.8 only, the log box is old. No new packages.
+    - Memory must stay small. We pipe 5 GB files through it, so no reading everything into a list.
+    - Keep it a plain script with the same command line.
+
+    ```python
+    #!/usr/bin/env python3
+    """Count ERROR/WARN lines per minute from app logs on stdin."""
+    import sys
+    from collections import Counter
+    from datetime import datetime, timezone
+
+    LEVELS = ("ERROR", "WARN")
+
+
+    def minute_bucket(stamp):
+        # stamp looks like "2026-10-26 14:03"
+        dt = datetime.strptime(stamp, "%Y-%m-%d %H:%M")
+        return int(dt.replace(tzinfo=timezone.utc).timestamp())
+
+
+    def main():
+        counts = Counter()
+        bad = 0
+        for line in sys.stdin:
+            parts = line.split(" ", 4)
+            if len(parts) < 4 or parts[2] not in LEVELS:
+                continue
+            try:
+                bucket = minute_bucket(line[:16])
+            except ValueError:
+                bad += 1
+                continue
+            counts[(bucket, parts[2])] += 1
+        for (bucket, level), n in sorted(counts.items()):
+            print(bucket, level, n)
+        print("malformed", bad)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    The slow part is `minute_bucket`. It runs `strptime` for every ERROR and WARN line, but all lines from the same minute give the same answer. Cache it, keyed on the 16-character minute string.
+
+    ```python
+    #!/usr/bin/env python3
+    """Count ERROR/WARN lines per minute from app logs on stdin."""
+    import sys
+    from collections import Counter
+    from datetime import datetime, timezone
+    from functools import lru_cache
+
+    LEVELS = ("ERROR", "WARN")
+
+
+    @lru_cache(maxsize=4096)
+    def minute_bucket(stamp):
+        # stamp looks like "2026-10-26 14:03"
+        dt = datetime.strptime(stamp, "%Y-%m-%d %H:%M")
+        return int(dt.replace(tzinfo=timezone.utc).timestamp())
+
+
+    def main():
+        counts = Counter()
+        bad = 0
+        for line in sys.stdin:
+            parts = line.split(" ", 4)
+            if len(parts) < 4 or parts[2] not in LEVELS:
+                continue
+            try:
+                bucket = minute_bucket(line[:16])
+            except ValueError:
+                bad += 1
+                continue
+            counts[(bucket, parts[2])] += 1
+        for (bucket, level), n in sorted(counts.items()):
+            print(bucket, level, n)
+        print("malformed", bad)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **Memoize repeated pure computations** (reduces E): `minute_bucket` is pure, and its input repeats heavily because many lines share one minute. Each distinct minute is now parsed once instead of once per line. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations with only 200 distinct inputs used ~43 J uncached and ~4.7 J with `lru_cache`, about 9× less. Your saving depends on how many lines share a minute, so measure it on a real night's log.
+    - **Bounded cache:** `maxsize=4096` is well above the number of distinct minutes in a normal file, so memory stays tiny. Streaming from stdin is unchanged.
+
+    Behavior is identical. The function returns an `int`, so sharing the cached value is safe. Malformed stamps raise `ValueError`, and `lru_cache` does not store exceptions, so the `malformed` count stays the same.
+
+    This only helps because the same minute string comes back again and again. If a log had about one line per minute, the cache would add overhead and give nothing.
+verify:
+  module: true
+  test: |
+    a = minute_bucket('2026-10-26 14:03')
+    b = minute_bucket('2026-10-26 14:03')
+    assert a == b and a % 60 == 0
+    assert minute_bucket.cache_info().hits >= 1
+    try:
+        minute_bucket('garbage')
+        assert False
+    except ValueError:
+        pass
+  equivalence:
+    driver: |-
+      import io, sys
+      sample = (
+          "2026-10-26 14:03:01 ERROR payment timeout\n"
+          "2026-10-26 14:03:07 WARN payment slow response\n"
+          "2026-10-26 14:03:59 ERROR payment timeout\n"
+          "2026-10-26 14:04:00 INFO payment ok\n"
+          "2026-10-26 14:04:12 ERROR cart failed to load\n"
+          "2026-13-40 10:00:00 ERROR cart bad stamp\n"
+          "short line\n"
+          "2026-10-26 14:03:30 WARN payment retry\n"
+          "2026-10-27 00:00:00 ERROR cart midnight\n"
+          "2026-13-40 10:00:05 WARN cart bad stamp\n"
+      )
+      sys.stdin = io.StringIO(sample)
+      main()

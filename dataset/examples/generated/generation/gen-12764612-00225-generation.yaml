@@ -1,0 +1,85 @@
+id: gen-12764612-00225-generation
+category: generation
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    I need a small Python module for the backend of our marketing landing page. Requirements:
+
+    - The page sends a hit to `/collect` on every visit, with the `Referer` header value as a string (can be empty or missing).
+    - We keep a spam referrer list in `spam_referrers.txt`, one domain per line, about 15k lines. Lines starting with `#` are comments, blank lines are possible.
+    - Write `load_spam_domains(path)` and `is_spam_referrer(referrer, spam_domains)`.
+    - `is_spam_referrer` should return True if the referrer host or any parent domain is on the list. So `a.b.spam.example` matches if `spam.example` is listed.
+    - The list is loaded once when the server starts. `/collect` gets a few hundred hits per second during campaigns.
+    - Only the standard library, please. The function must not crash on weird referrer strings.
+- role: assistant
+  content: |
+    ```python
+    from urllib.parse import urlsplit
+
+
+    def load_spam_domains(path):
+        """Read the list once at startup and return an immutable set."""
+        domains = set()
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip().lower()
+                if line and not line.startswith("#"):
+                    domains.add(line)
+        return frozenset(domains)
+
+
+    def is_spam_referrer(referrer, spam_domains):
+        """True if the referrer host or any parent domain is listed."""
+        if not referrer:
+            return False
+        try:
+            host = urlsplit(referrer.strip()).hostname
+        except ValueError:
+            return False
+        if not host:
+            return False
+
+        parts = host.lower().rstrip(".").split(".")
+        # a.b.spam.example -> a.b.spam.example, b.spam.example, spam.example, example
+        return any(".".join(parts[i:]) in spam_domains for i in range(len(parts)))
+    ```
+
+    Load the set once and pass it in on every hit:
+
+    ```python
+    SPAM_DOMAINS = load_spam_domains("spam_referrers.txt")   # at startup, not per request
+
+    # in the /collect handler
+    if is_spam_referrer(request.headers.get("Referer"), SPAM_DOMAINS):
+        return "", 204
+    ```
+
+    **Green Notes**
+    - **Set for repeated membership tests** (reduces E): the list is read once into a `frozenset`, so each hit costs a few hash lookups, one per domain level. A list would scan up to 15k entries per lookup, on every hit. That is O(n) → O(1) per lookup.
+    - *Not applied:* converting the list per call. A set only pays off when you look up many times. In Green Metrics Tool micro-benchmarks, one membership test on a 10,000,000-element list used about 6.9 J. Converting it to a set first and testing once used about 10.5 J. That is why the set is built at startup and reused, not inside `is_spam_referrer`.
+
+    The `ValueError` guard covers malformed URLs such as `http://[bad`, which `urlsplit` rejects. If the list file changes while the server runs, reload it into a new set and swap the variable, so you never mutate a set that requests are reading.
+verify:
+  test: |-
+    import os, tempfile
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "spam.txt")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("# comment\n\nSpam.Example\nbad.org\n")
+    s = load_spam_domains(p)
+    assert isinstance(s, frozenset)
+    assert s == frozenset({"spam.example", "bad.org"})
+    assert is_spam_referrer("https://spam.example/x?y=1", s)
+    assert is_spam_referrer("http://a.b.SPAM.example:8080/", s)
+    assert is_spam_referrer("https://bad.org", s)
+    assert not is_spam_referrer("https://notspam.example/", s)
+    assert not is_spam_referrer("https://good.com/bad.org", s)
+    assert not is_spam_referrer("", s)
+    assert not is_spam_referrer(None, s)
+    assert not is_spam_referrer("http://[bad", s)
+    assert not is_spam_referrer("not a url", s)

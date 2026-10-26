@@ -1,0 +1,79 @@
+id: gen-12764612-00143-estimate
+category: estimate
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    how much energy would numba save here? perf gate in CI, runs on every push, ~3M timing samples per run
+
+    ```python
+    import json
+    import sys
+    import numpy as np
+
+    def load_samples(path):
+        with open(path) as f:
+            data = json.load(f)
+        return np.array(data["durations_ms"], dtype=np.float64)
+
+    def drift_flags(samples, alpha=0.05, k=3.0):
+        flags = np.zeros(len(samples), dtype=np.bool_)
+        mean = samples[0]
+        var = 0.0
+        for i in range(1, len(samples)):
+            x = samples[i]
+            diff = x - mean
+            if var > 0 and abs(diff) > k * var ** 0.5:
+                flags[i] = True
+            mean += alpha * diff
+            var = (1 - alpha) * (var + alpha * diff * diff)
+        return flags
+
+    if __name__ == "__main__":
+        samples = load_samples(sys.argv[1])
+        flags = drift_flags(samples)
+        print(int(flags.sum()), "drift points")
+        sys.exit(1 if flags[-100:].any() else 0)
+    ```
+- role: assistant
+  content: |
+    Probably a clear saving on the loop itself. This is the case JIT is made for: a pure Python loop over a numeric array, where each step depends on the previous one (the running mean and variance), so you can't vectorize it with plain numpy.
+
+    **Measured reference:** in Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples in a pure Python loop used ~40 J. The same loop with Numba `@njit` used ~9.5 J, about 4× less. That was a different loop on a different machine, so I can't turn it into a number for your gate. Your factor depends on the work per iteration and on the sample count.
+
+    Two things can eat the saving in CI:
+    - **Compile time.** Numba compiles on the first call. Every push starts a fresh process, so you pay this each run. With `cache=True` the compiled code is written to `__pycache__`, so keep that directory in your CI cache.
+    - **Import cost.** Importing Numba itself costs something per run. With few samples, the pure Python version may be cheaper overall.
+
+    ```python
+    import numpy as np
+    from numba import njit
+
+    @njit(cache=True)
+    def drift_flags(samples, alpha=0.05, k=3.0):
+        flags = np.zeros(len(samples), dtype=np.bool_)
+        mean = samples[0]
+        var = 0.0
+        for i in range(1, len(samples)):
+            x = samples[i]
+            diff = x - mean
+            if var > 0 and abs(diff) > k * var ** 0.5:
+                flags[i] = True
+            mean += alpha * diff
+            var = (1 - alpha) * (var + alpha * diff * diff)
+        return flags
+    ```
+
+    The body is unchanged, and the results are the same. `load_samples` can stay as it is, because it already returns a float64 array.
+
+    **How to measure your saving:**
+    1. Run the whole gate step (not just the function) on a real samples file, both versions, with a warm and a cold Numba cache. Use `perf stat` or `time` as a CPU-time proxy, or a Green Metrics Tool usage scenario for energy.
+    2. Compare the totals. If the cold-cache run is not faster, Numba doesn't pay off at your sample count unless you persist the cache.
+
+    **Not applied:** nothing else. The JSON parsing is not a numeric loop, so Numba would not help there.
+verify:
+  static_only: needs numba, which is not in stdlib + numpy

@@ -1,0 +1,75 @@
+id: gen-2-00138-generation
+category: generation
+language: bash
+patterns:
+- bash-quoting
+- bash-builtins
+facts:
+- F-BASH-QUOTES
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    hi, my team lead wants a html page every morning with the errors from our nginx error.log (some days it has a lot of lines). i tried something like
+
+    ```bash
+    echo "<tr class="error"><td>$line</td></tr>" >> report.html
+    ```
+
+    but the quotes get messed up and the output looks weird, and sometimes the table breaks completely. i dont really understand when to use ' and when " in bash. can you write the script for me? one table row per log line with date, time, level and message. input file and output file as arguments would be nice.
+- role: assistant
+  content: |
+    In your attempt, the `"` inside `class="error"` closes the string early. Simple rule: `'...'` keeps text exactly as written, and `"..."` expands `$variables`. Fixed HTML goes in single quotes. Values are passed to `printf` as separate double-quoted arguments.
+
+    ```bash
+    #!/usr/bin/env bash
+    # Usage: ./error-report.sh /var/log/nginx/error.log [report.html]
+    set -euo pipefail
+
+    log=${1:?usage: error-report.sh ERROR_LOG [OUTPUT_HTML]}
+    out=${2:-error-report.html}
+
+    {
+      printf '%s\n' \
+        '<!DOCTYPE html>' \
+        '<html lang="en">' \
+        '<head>' \
+        '<meta charset="utf-8">' \
+        '<title>nginx error report</title>' \
+        '<style>' \
+        'table { border-collapse: collapse; font-family: monospace; }' \
+        'td, th { border: 1px solid #ccc; padding: 2px 6px; text-align: left; }' \
+        'tr.warn td { background: #fff4d6; }' \
+        'tr.error td { background: #fde2e2; }' \
+        'tr.crit td, tr.alert td, tr.emerg td { background: #f8b4b4; }' \
+        '</style>' \
+        '</head>' \
+        '<body>' \
+        "<h1>Errors from ${log##*/}</h1>" \
+        '<table>' \
+        '<tr><th>Date</th><th>Time</th><th>Level</th><th>Message</th></tr>'
+
+      # nginx format: 2026/10/22 13:45:01 [error] 1234#1234: *5678 open() ... failed
+      while read -r day time level msg || [[ -n ${day:-} ]]; do
+        [[ -n $day ]] || continue          # skip empty lines
+        level=${level#'['}
+        level=${level%']'}
+        msg=${msg//'&'/'&amp;'}            # escape & first, then < and >
+        msg=${msg//'<'/'&lt;'}
+        msg=${msg//'>'/'&gt;'}
+        printf '<tr class="%s"><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n' \
+          "$level" "$day" "$time" "$level" "$msg"
+      done < "$log"
+
+      printf '%s\n' '</table>' '</body>' '</html>'
+    } > "$out"
+    ```
+
+    The table broke because log messages contain `<` and `>` (for example in request lines). The script now escapes them. The `'&'` in the replacement is quoted on purpose. In bash 5.2, an unquoted `&` there stands for the matched text.
+
+    **Green Notes**
+    - **Single quotes for fixed text** (reduces E): bash scans double-quoted text for `$`, backticks and backslashes, but takes single-quoted text as is. The row template runs once per log line. In Green Metrics Tool micro-benchmarks, assigning a long literal in a loop used about 24% less CPU energy with single quotes. The saving per line is small and grows with the number of lines. Keep the double quotes around variables like `"$log"` and `"$msg"`.
+    - **Only builtins inside the loop** (reduces E): `read -r` splits the fields, and parameter expansion strips the brackets and escapes the HTML. No `cut`, `sed` or `echo |` process starts for each line. In Green Metrics Tool micro-benchmarks on a log summary, a loop using only builtins used about 300× less CPU energy than one that ran `$(echo | cut)` and `$(expr)` for every field.
+    - **One redirect for the whole file:** `{ ... } > "$out"` opens the output once. It doesn't reopen it with `>>` for every row.
+verify:
+  static_only: bash script that reads an nginx error log; not executed by the python/javascript verifier

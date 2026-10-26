@@ -1,0 +1,112 @@
+id: gen-12764612-00032-review
+category: review
+language: python
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    Please review this admin endpoint of our landing page backend (Flask, psycopg 3, Postgres 16). Marketing uploads the lead lists they collect at trade shows and webinars, as CSV with an `email` column and an optional `name` column. Usually 10k-50k rows, a few uploads per week.
+
+    Requirements: invalid emails are skipped and counted, the endpoint returns how many rows were imported and skipped, and the files must not be loaded fully into memory. Please look at correctness and security too, not only style.
+
+    ```python
+    import csv
+    import io
+
+    from flask import Blueprint, jsonify, request
+
+    from db import get_conn
+
+    bp = Blueprint("lead_import", __name__)
+
+
+    @bp.post("/admin/campaigns/<int:campaign_id>/leads/import")
+    def import_leads(campaign_id):
+        upload = request.files["file"]
+        reader = csv.DictReader(io.TextIOWrapper(upload.stream, encoding="utf-8"))
+
+        conn = get_conn()
+        imported = 0
+        skipped = 0
+        for row in reader:
+            email = row["email"].strip().lower()
+            if "@" not in email:
+                skipped += 1
+                continue
+            name = row.get("name", "").strip()
+            conn.execute(
+                f"INSERT INTO leads (campaign_id, email, name, source) "
+                f"VALUES ({campaign_id}, '{email}', '{name}', 'import')"
+            )
+            conn.commit()
+            imported += 1
+
+        return jsonify(imported=imported, skipped=skipped)
+    ```
+- role: assistant
+  content: |
+    **Workload:** web backend (admin upload, per-row database work)
+
+    #### [Security] SQL injection through CSV values
+    - **Where:** the f-string in `conn.execute(...)`
+    - **Issue:** `email` and `name` come from an uploaded file and go straight into the SQL text. A name like `O'Brien` breaks the statement. A crafted value can run arbitrary SQL.
+    - **Fix:** never build SQL from values. Pass them as parameters, or as row data with `COPY` (see below).
+
+    #### [Bug] Connection is never closed, and a failure leaves a partial import
+    - **Where:** `conn = get_conn()`
+    - **Issue:** the connection is not closed, so it leaks on every request. If row 30,000 fails, the first 29,999 rows are already committed and the user gets a 500 with no idea what was imported.
+    - **Fix:** use the connection as a context manager, so the whole file is one transaction. It either imports completely or not at all. This is a behavior change, but it is the safer one.
+
+    #### [Bug] Crash on rows with a missing name
+    - **Where:** `row.get("name", "").strip()`
+    - **Issue:** when a row is shorter than the header, `DictReader` sets the value to `None`, not the default. `.strip()` then raises `AttributeError`. The same applies to `row["email"]`.
+    - **Fix:** use `(row.get("name") or "")`.
+
+    #### [High] One INSERT and one commit per row
+    - **Where:** `conn.execute(...)` and `conn.commit()` inside the loop
+    - **Issue:** 50k rows mean 50k statements, 50k round trips and 50k commits, each with its own WAL flush. The work grows with every row you import.
+    - **Fix:** stream the rows into one `COPY ... FROM STDIN`. It keeps memory flat and uses a single commit.
+    - **Impact:** reduces E on the app and database server, and request time. In Green Metrics Tool micro-benchmarks (Postgres 16, 500,000 rows in batches of 5,000), `COPY` used about 22× less CPU energy than one `execute()` per row. At around 100 rows per batch the difference was small. Your 10k-50k row files are in the range where batching pays off.
+
+    ```python
+    import csv
+    import io
+
+    from flask import Blueprint, jsonify, request
+
+    from db import get_conn
+
+    bp = Blueprint("lead_import", __name__)
+
+
+    @bp.post("/admin/campaigns/<int:campaign_id>/leads/import")
+    def import_leads(campaign_id):
+        upload = request.files["file"]
+        reader = csv.DictReader(io.TextIOWrapper(upload.stream, encoding="utf-8"))
+
+        imported = 0
+        skipped = 0
+        with get_conn() as conn, conn.cursor() as cur:
+            with cur.copy(
+                "COPY leads (campaign_id, email, name, source) FROM STDIN"
+            ) as copy:
+                for row in reader:
+                    email = (row.get("email") or "").strip().lower()
+                    if "@" not in email:
+                        skipped += 1
+                        continue
+                    name = (row.get("name") or "").strip()
+                    copy.write_row((campaign_id, email, name, "import"))
+                    imported += 1
+
+        return jsonify(imported=imported, skipped=skipped)
+    ```
+
+    `COPY` has no `ON CONFLICT`. If you later need to ignore duplicate emails, copy into a temporary table and run one `INSERT ... SELECT ... ON CONFLICT DO NOTHING` from it. Your current code has no duplicate handling, so I left it out.
+
+    **Already good:** the file is read as a stream, not loaded into memory. Invalid rows are counted, not silently dropped.
+verify:
+  static_only: needs a running Postgres and Flask app

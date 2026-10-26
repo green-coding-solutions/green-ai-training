@@ -1,0 +1,96 @@
+id: gen-2-00275-refactor
+category: refactor
+language: sql
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+messages:
+- role: user
+  content: |
+    We run the warehouse side of our shop on Postgres. The query below feeds the pick list for our Berlin warehouse. A worker runs it every 2 minutes during shifts. Each picker tablet also runs it on refresh. One run usually returns 300-800 order lines. Our DBA says it is "heavy" and asked us to clean it up.
+
+    Requirements:
+    - same rows, same order
+    - still one query, no schema changes and no new indexes (we have a migration freeze until the end of the month)
+    - rows come from psycopg 3 with `row_factory=dict_row`. The Jinja pick list template reads the keys directly, and I don't want to touch it. It uses `order_number`, `shipping_method`, `gift_message`, `ship_name`, `ship_street`, `ship_city`, `ship_zip`, `ship_country`, `sku`, `name`, `bin_location`, `weight_g` and `quantity`
+
+    Table background: `products` has ~55 columns, including `description`, `description_html`, `specs` (jsonb), `seo_text` and `image_urls`. `orders` has ~40 columns, including `payment_payload` (jsonb, the raw PSP response) and the full billing address. `order_items` has a `product_snapshot` jsonb with the whole product as it was at checkout.
+
+    ```sql
+    -- pick_list.sql
+    SELECT *
+    FROM orders o
+    JOIN order_items oi ON oi.order_id = o.id
+    JOIN products p ON p.id = oi.product_id
+    WHERE o.status = 'ready_to_pick'
+      AND o.warehouse_id = 'BER-1'
+      AND oi.fulfillment_state = 'open'
+    ORDER BY o.created_at, o.id, p.bin_location, oi.id;
+    ```
+- role: assistant
+  content: |
+    ```sql
+    -- pick_list.sql
+    SELECT
+        o.order_number,
+        o.shipping_method,
+        o.gift_message,
+        o.ship_name,
+        o.ship_street,
+        o.ship_city,
+        o.ship_zip,
+        o.ship_country,
+        p.sku,
+        p.name,
+        p.bin_location,
+        p.weight_g,
+        oi.quantity
+    FROM orders o
+    JOIN order_items oi ON oi.order_id = o.id
+    JOIN products p ON p.id = oi.product_id
+    WHERE o.status = 'ready_to_pick'
+      AND o.warehouse_id = 'BER-1'
+      AND oi.fulfillment_state = 'open'
+    ORDER BY o.created_at, o.id, p.bin_location, oi.id;
+    ```
+
+    **Green Notes**
+    - **Name only the columns the template prints** (reduces E and network): `SELECT *` across three wide tables read, sent and decoded `description`, `description_html`, `specs`, `seo_text`, `payment_payload`, `product_snapshot` and the billing address. It did this for every order line, on every worker run and every tablet refresh. None of these columns reach the pick list. Postgres stores large text and jsonb values out of line, so a query that doesn't select them also doesn't fetch them. In Green Metrics Tool micro-benchmarks, naming the 10 needed columns of a 52-column products table with large text columns used about 5.5× to 7× less CPU energy than `SELECT *`. For a join of orders and order items with smaller columns, the gap was about 2.3× to 4×.
+    - **Same rows, same order, same keys:** the joins, filters and `ORDER BY` are unchanged. `ORDER BY` can use `o.created_at`, `o.id` and `oi.id` without selecting them. The output columns keep their original names, so the template works as is. There are no schema changes and no new indexes.
+    - **Duplicate keys are gone:** `SELECT *` returned `id`, `created_at` and `updated_at` once per table, and `dict_row` keeps only the last value for each name. If any code outside the template reads `row["id"]`, it was getting `products.id`, not the order id. If you need the order id, add `o.id AS order_id`.
+verify:
+  sql:
+    setup: |
+      CREATE TABLE products (
+        id INTEGER PRIMARY KEY, sku TEXT, name TEXT, bin_location TEXT, weight_g INTEGER,
+        description TEXT, description_html TEXT, specs TEXT, seo_text TEXT, image_urls TEXT,
+        created_at TEXT, updated_at TEXT
+      );
+      CREATE TABLE orders (
+        id INTEGER PRIMARY KEY, order_number TEXT, status TEXT, warehouse_id TEXT,
+        created_at TEXT, updated_at TEXT, ship_name TEXT, ship_street TEXT, ship_city TEXT,
+        ship_zip TEXT, ship_country TEXT, shipping_method TEXT, gift_message TEXT,
+        payment_payload TEXT, billing_street TEXT, billing_city TEXT
+      );
+      CREATE TABLE order_items (
+        id INTEGER PRIMARY KEY, order_id INTEGER, product_id INTEGER, quantity INTEGER,
+        fulfillment_state TEXT, product_snapshot TEXT, created_at TEXT
+      );
+      INSERT INTO products VALUES
+        (1, 'MUG-001', 'Enamel Mug Blue', 'A-03-2', 310, 'long text', '<p>long</p>', '{"color":"blue"}', 'seo', '["a.jpg"]', '2026-01-01', '2026-02-01'),
+        (2, 'TEE-114', 'Organic Tee M', 'C-11-4', 180, 'long text', '<p>long</p>', '{"size":"M"}', 'seo', '["b.jpg"]', '2026-01-02', '2026-02-02'),
+        (3, 'BAG-020', 'Canvas Tote', 'B-07-1', 240, 'long text', '<p>long</p>', '{}', 'seo', '["c.jpg"]', '2026-01-03', '2026-02-03');
+      INSERT INTO orders VALUES
+        (10, 'SO-50010', 'ready_to_pick', 'BER-1', '2026-10-20 08:00', '2026-10-20 08:05', 'Lena Vogt', 'Torstr. 12', 'Berlin', '10119', 'DE', 'dhl_standard', NULL, '{"psp":"ok"}', 'Torstr. 12', 'Berlin'),
+        (11, 'SO-50011', 'ready_to_pick', 'BER-1', '2026-10-20 08:02', '2026-10-20 08:06', 'Jonas Brandt', 'Kaiserdamm 3', 'Berlin', '14057', 'DE', 'dhl_express', 'Happy birthday!', '{"psp":"ok"}', 'Kaiserdamm 3', 'Berlin'),
+        (12, 'SO-50012', 'shipped', 'BER-1', '2026-10-19 17:00', '2026-10-20 07:00', 'Mia Kurz', 'Hauptstr. 1', 'Potsdam', '14467', 'DE', 'dhl_standard', NULL, '{"psp":"ok"}', 'Hauptstr. 1', 'Potsdam'),
+        (13, 'SO-50013', 'ready_to_pick', 'HAM-1', '2026-10-20 08:01', '2026-10-20 08:04', 'Tim Ross', 'Elbchaussee 9', 'Hamburg', '22763', 'DE', 'dhl_standard', NULL, '{"psp":"ok"}', 'Elbchaussee 9', 'Hamburg');
+      INSERT INTO order_items VALUES
+        (100, 10, 2, 1, 'open', '{"snap":1}', '2026-10-20 08:00'),
+        (101, 10, 1, 2, 'open', '{"snap":1}', '2026-10-20 08:00'),
+        (102, 11, 3, 1, 'open', '{"snap":1}', '2026-10-20 08:02'),
+        (103, 11, 1, 1, 'picked', '{"snap":1}', '2026-10-20 08:02'),
+        (104, 12, 2, 3, 'open', '{"snap":1}', '2026-10-19 17:00'),
+        (105, 13, 1, 1, 'open', '{"snap":1}', '2026-10-20 08:01');
+    compare: false

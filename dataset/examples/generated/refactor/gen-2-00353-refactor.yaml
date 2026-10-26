@@ -1,0 +1,82 @@
+id: gen-2-00353-refactor
+category: refactor
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    landing page image (vite, static output). GH Actions builds + pushes it on every push to main and on every PR. just the diff pls
+
+    ```dockerfile
+    FROM node:20
+
+    RUN apt-get update && apt-get install -y \
+        git curl vim python3 build-essential
+
+    WORKDIR /app
+    COPY . .
+
+    RUN npm install
+    # e2e in container
+    RUN npx playwright install --with-deps chromium
+
+    ENV VITE_PLAUSIBLE_DOMAIN=getlumen.io
+    ENV VITE_FORM_ENDPOINT=https://forms.getlumen.io/waitlist
+    RUN npm run build
+
+    RUN npm install -g serve
+    EXPOSE 3000
+    CMD ["serve", "-s", "dist", "-l", "3000"]
+    ```
+- role: assistant
+  content: |
+    Almost every line changes, so here is the whole file instead of a diff.
+
+    ```dockerfile
+    # syntax=docker/dockerfile:1
+    FROM node:20-slim AS build
+    WORKDIR /app
+
+    COPY package.json package-lock.json ./
+    RUN npm ci
+
+    COPY . .
+    ENV VITE_PLAUSIBLE_DOMAIN=getlumen.io
+    ENV VITE_FORM_ENDPOINT=https://forms.getlumen.io/waitlist
+    RUN npm run build
+
+    FROM nginx:1.27-alpine
+    COPY <<'EOF' /etc/nginx/conf.d/default.conf
+    server {
+        listen 3000;
+        root /usr/share/nginx/html;
+        location / {
+            try_files $uri $uri.html $uri/ /index.html;
+        }
+    }
+    EOF
+    COPY --from=build /app/dist /usr/share/nginx/html
+    EXPOSE 3000
+    ```
+
+    New `.dockerignore`:
+
+    ```text
+    node_modules
+    dist
+    .git
+    playwright-report
+    test-results
+    ```
+
+    **Green Notes**
+    - **Runtime contents only** (reduces E, storage, network): the shipped image is now nginx plus the static `dist/` files. Node, `node_modules`, Chromium, the compilers and the editors stay in the build stage or are gone. In Green Metrics Tool measurements of a similar change for a small Flask app, the image build used ~124 J instead of ~885 J, about 7× less, and serving requests cost the same. You build on every push and every PR, so that saving repeats with every build, push and pull.
+    - **Dependency layer before the source** (reduces E): `COPY . .` used to come before `npm install`, so every content edit reinstalled all packages. Now `npm ci` only runs again when `package*.json` changes. You need the `.dockerignore` for this: without it, the host's `node_modules` would overwrite the clean install.
+    - **Playwright out of the image**: run the e2e tests as a separate CI job on the official Playwright image. Chromium and its system libraries were the heaviest part of the old build, and the page doesn't need them at runtime.
+
+    Behavior: it still listens on 3000. The `try_files` line covers what `serve -s` did, meaning clean URLs (`/about` → `about.html`) and falling back to `index.html`. `npm ci` needs a committed `package-lock.json`. If it fails on a native module, install `python3 build-essential` in the build stage only.
+verify:
+  static_only: Dockerfile with multi-stage build; needs Docker BuildKit and npm packages

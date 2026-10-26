@@ -1,0 +1,65 @@
+id: gen-12764612-00349-generation
+category: generation
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    I need a Python function `classify_batch(texts: list[str]) -> list[str | None]` for our nightly content moderation job. It runs after the day's user comments are collected, usually 30 to 50 texts per call.
+
+    Each text goes to our internal model server with `POST http://inference.internal:8080/v1/classify`, JSON body `{"text": "..."}`. The response is JSON like `{"label": "ok"}` or `{"label": "spam"}`.
+
+    Requirements:
+    - Result order must match the input order.
+    - Use `httpx`, we already depend on it.
+    - Timeout of 5 seconds per request.
+    - The model server only has a few workers, so no more than 8 requests in flight at the same time.
+    - If one text fails (timeout, HTTP error, bad JSON), return `None` for that text and log a warning. The rest of the batch must still work.
+- role: assistant
+  content: |
+    ```python
+    import asyncio
+    import logging
+
+    import httpx
+
+    BASE_URL = "http://inference.internal:8080"
+    MAX_IN_FLIGHT = 8
+    TIMEOUT_S = 5.0
+
+    log = logging.getLogger(__name__)
+
+
+    async def _classify_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, index: int, text: str) -> str | None:
+        async with sem:
+            try:
+                resp = await client.post("/v1/classify", json={"text": text})
+                resp.raise_for_status()
+                return resp.json()["label"]
+            except (httpx.HTTPError, KeyError, ValueError) as exc:
+                log.warning("classify failed for text %d: %r", index, exc)
+                return None
+
+
+    async def classify_batch(texts: list[str]) -> list[str | None]:
+        sem = asyncio.Semaphore(MAX_IN_FLIGHT)
+        async with httpx.AsyncClient(base_url=BASE_URL, timeout=TIMEOUT_S) as client:
+            results = await asyncio.gather(
+                *(_classify_one(client, sem, i, t) for i, t in enumerate(texts))
+            )
+        return list(results)
+    ```
+
+    From synchronous code, call it with `labels = asyncio.run(classify_batch(texts))`. Do not call `asyncio.run` from inside a running event loop.
+
+    `gather` returns results in input order, so the output lines up with `texts`. A failed text only turns into `None`, it does not cancel the others.
+
+    **Green Notes**
+    - **Concurrent requests** (reduces E, idle time): the calls overlap, so the job waits for roughly one round trip per group of 8 instead of one per text. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. For small batches the gain is mostly wall time, not CPU.
+    - **Bounded concurrency** (reduces E): the semaphore keeps the load within what the model server can handle, so you avoid timeouts and retries that would waste work. One shared client serves the whole batch.
+    *Not applied:* async for a single text. With one request there is nothing to overlap, so a plain sync call is simpler.
+verify:
+  static_only: needs httpx and a live inference server

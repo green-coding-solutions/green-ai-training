@@ -1,0 +1,68 @@
+id: gen-12764612-00017-generation
+category: generation
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    I'm working on the serving layer for our LLM inference service. The model backend gives me an iterator of decoded token strings (one short string per generated token). I need a function `collect_completion(pieces, stop=(), max_chars=8192)` that builds the full completion text.
+
+    Requirements:
+    - Stop reading as soon as one of the stop sequences appears. The stop text itself must not be in the result.
+    - A stop sequence can be split over several pieces (e.g. `"##"` then `"#"`).
+    - Stop reading when the text reaches `max_chars`, and cut the result to `max_chars`.
+    - It runs once per request, and some completions are a few thousand tokens long.
+    - Plain Python, no dependencies.
+- role: assistant
+  content: |
+    ```python
+    from typing import Iterable, Sequence
+
+
+    def collect_completion(
+        pieces: Iterable[str],
+        stop: Sequence[str] = (),
+        max_chars: int = 8192,
+    ) -> str:
+        stops = [s for s in stop if s]
+        keep = max((len(s) for s in stops), default=1) - 1
+
+        parts: list[str] = []
+        total = 0
+        tail = ""  # last few characters, enough to catch a stop split over pieces
+
+        for piece in pieces:
+            parts.append(piece)
+            total += len(piece)
+
+            window = tail + piece
+            if any(s in window for s in stops) or total >= max_chars:
+                break
+            tail = window[max(0, len(window) - keep):] if keep else ""
+
+        text = "".join(parts)
+
+        cut = len(text)
+        for s in stops:
+            i = text.find(s)
+            if i != -1 and i < cut:
+                cut = i
+        return text[:cut][:max_chars]
+    ```
+
+    **Green Notes**
+    - **Join instead of `+=`** (reduces E): pieces go into a list and are joined once at the end. Repeated `text += piece` copies the growing string again and again. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces used about 469 J with `+=` and about 1.8 J with `"".join()`, roughly 260× less CPU energy. Your completions are much shorter, so the saving per call is smaller, but it repeats on every request.
+    - The stop check looks only at a short tail plus the new piece, not at the whole text. This keeps the per-token work constant. The full string is built and cut once, after the loop ends.
+    - An f-string in the loop (`text = f"{text}{piece}"`) behaves like `+=`, so it would not help.
+verify:
+  test: |-
+    assert collect_completion(["Hel", "lo wor", "ld\n", "###", " extra"], stop=("###",)) == "Hello world\n"
+    assert collect_completion(["a", "b#", "#", "#c"], stop=("###",)) == "ab"
+    assert collect_completion(["abc"] * 10, max_chars=7) == "abcabca"
+    assert collect_completion(["x", "y", "z"]) == "xyz"
+    assert collect_completion([]) == ""
+    assert collect_completion(iter(["foo", "</s>", "bar"]), stop=("\n\n", "</s>")) == "foo"
+    assert collect_completion(["one", "\n", "\ntwo"], stop=("\n\n",)) == "one"

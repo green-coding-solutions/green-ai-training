@@ -1,0 +1,228 @@
+id: gen-2-00344-refactor
+category: refactor
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    Hi, we have a small CLI tool on our storage box. It reads a `find` listing and sums disk usage per team, using an ownership rules file (glob pattern + team, last match wins like CODEOWNERS). It runs every night:
+
+    `find /srv/data -type f -printf '%s\t%p\n' | team_usage.py --rules owners.txt --top 20`
+
+    The listing has about 3M files in about 40k directories, and owners.txt has about 300 rules. It is very slow now. Please optimize it. Requirements:
+    - stdlib only, the box has Python 3.8 and no pip
+    - output must stay byte-identical, a dashboard parses it
+    - keep the CLI flags and the last-match-wins logic
+    - keep it readable, other people maintain it
+
+    ```python
+    #!/usr/bin/env python3
+    """Sum disk usage per owning team.
+
+    Usage: find /srv/data -type f -printf '%s\t%p\n' | team_usage.py --rules owners.txt [--top N]
+    """
+    import argparse
+    import fnmatch
+    import posixpath
+    import sys
+    from collections import defaultdict
+
+
+    def load_rules(path):
+        rules = []
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                pattern, team = line.split()
+                rules.append((pattern, team))
+        return rules
+
+
+    def resolve_owner(directory, rules):
+        # last matching rule wins, like CODEOWNERS
+        owner = "unowned"
+        for pattern, team in rules:
+            if fnmatch.fnmatchcase(directory, pattern):
+                owner = team
+        return owner
+
+
+    def human(n):
+        for unit in ("B", "K", "M", "G", "T"):
+            if n < 1024:
+                return f"{n:.1f}{unit}"
+            n /= 1024
+        return f"{n:.1f}P"
+
+
+    def main(argv=None):
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--rules", required=True)
+        ap.add_argument("--top", type=int, default=20)
+        args = ap.parse_args(argv)
+
+        rules = load_rules(args.rules)
+        usage = defaultdict(int)
+        files = defaultdict(int)
+
+        for line in sys.stdin:
+            size, path = line.rstrip("\n").split("\t", 1)
+            directory = posixpath.dirname(path)
+            team = resolve_owner(directory, rules)
+            usage[team] += int(size)
+            files[team] += 1
+
+        ranked = sorted(usage.items(), key=lambda kv: kv[1], reverse=True)
+        for team, total in ranked[: args.top]:
+            print(f"{team:<20} {human(total):>8} {files[team]:>9} files")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    ```python
+    #!/usr/bin/env python3
+    """Sum disk usage per owning team.
+
+    Usage: find /srv/data -type f -printf '%s\t%p\n' | team_usage.py --rules owners.txt [--top N]
+    """
+    import argparse
+    import fnmatch
+    import functools
+    import posixpath
+    import sys
+    from collections import defaultdict
+
+    # Comfortably above the number of distinct directories in one listing.
+    OWNER_CACHE_SIZE = 65536
+
+
+    def load_rules(path):
+        rules = []
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                pattern, team = line.split()
+                rules.append((pattern, team))
+        return rules
+
+
+    def resolve_owner(directory, rules):
+        # last matching rule wins, like CODEOWNERS
+        owner = "unowned"
+        for pattern, team in rules:
+            if fnmatch.fnmatchcase(directory, pattern):
+                owner = team
+        return owner
+
+
+    def make_resolver(rules, cache_size=OWNER_CACHE_SIZE):
+        """Return resolve_owner bound to these rules, cached per directory."""
+        rules = tuple(rules)
+
+        @functools.lru_cache(maxsize=cache_size)
+        def owner_of(directory):
+            return resolve_owner(directory, rules)
+
+        return owner_of
+
+
+    def human(n):
+        for unit in ("B", "K", "M", "G", "T"):
+            if n < 1024:
+                return f"{n:.1f}{unit}"
+            n /= 1024
+        return f"{n:.1f}P"
+
+
+    def main(argv=None):
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--rules", required=True)
+        ap.add_argument("--top", type=int, default=20)
+        args = ap.parse_args(argv)
+
+        owner_of = make_resolver(load_rules(args.rules))
+        usage = defaultdict(int)
+        files = defaultdict(int)
+
+        for line in sys.stdin:
+            size, path = line.rstrip("\n").split("\t", 1)
+            team = owner_of(posixpath.dirname(path))
+            usage[team] += int(size)
+            files[team] += 1
+
+        ranked = sorted(usage.items(), key=lambda kv: kv[1], reverse=True)
+        for team, total in ranked[: args.top]:
+            print(f"{team:<20} {human(total):>8} {files[team]:>9} files")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **Memoize the owner lookup per directory** (reduces E): the owner depends only on the directory and the fixed rules. Before, every one of the ~3M lines ran all ~300 `fnmatchcase` checks. Now each of the ~40k directories runs them once, and every other file in that directory is a dictionary hit. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations drawn from only 200 distinct inputs used ~43 J uncached and ~4.7 J with `@functools.lru_cache`, about 9× less. Your input repeats in the same way, with many files per directory.
+    - **The cache is built after the rules are loaded:** `make_resolver` binds one rules tuple to one cache, so a cached owner can never come from a different rules file. `lru_cache` needs hashable arguments, so the list of rules is not part of the cache key. The cache lives only for one run, and the next night starts fresh with the current `owners.txt`.
+    - **Bounded cache:** `maxsize=65536` is above your directory count. If a listing ever has more directories, old entries are evicted. `find` lists the files of a directory together, so hits stay high. `lru_cache(maxsize=...)` works on Python 3.8.
+
+    `resolve_owner`, the CLI flags, the last-match-wins logic and the output format are unchanged. The output is byte-identical. To check the hit rate on a real listing, print `owner_of.cache_info()` to stderr at the end of `main`.
+verify:
+  module: true
+  test: |
+    r = make_resolver([("/a*", "x"), ("/a/b", "y")])
+    assert r("/a/b") == "y"
+    assert r("/a/b") == "y"
+    assert r("/a/c") == "x"
+    assert r("/z") == "unowned"
+    assert r.cache_info().hits == 1
+    assert r.cache_info().misses == 3
+  equivalence:
+    driver: |
+      import io, os, sys, tempfile
+      rules_text = (
+          "# owners\n"
+          "* platform\n"
+          "/srv/data/ml* ml-team\n"
+          "/srv/data/ml/raw data-eng\n"
+          "/srv/data/shop/* shop\n"
+          "/srv/data/shop/tmp shop-tmp\n"
+      )
+      fd, rules_path = tempfile.mkstemp(suffix=".txt")
+      with os.fdopen(fd, "w", encoding="utf-8") as fh:
+          fh.write(rules_text)
+      dirs = ["/srv/data/ml", "/srv/data/ml/raw", "/srv/data/ml/models",
+              "/srv/data/shop/images", "/srv/data/shop/tmp", "/srv/data/logs", "/other"]
+      lines = []
+      for i in range(3000):
+          d = dirs[(i * 7 + i // 5) % len(dirs)]
+          lines.append(f"{(i * 7919) % 500000}\t{d}/file{i}.bin\n")
+      sys.stdin = io.StringIO("".join(lines))
+      main(["--rules", rules_path, "--top", "10"])
+      sys.stdin = io.StringIO("".join(lines[:50]))
+      main(["--rules", rules_path, "--top", "2"])
+      os.remove(rules_path)
+  benchmark:
+    driver: |
+      import io, os, sys, tempfile
+      fd, rules_path = tempfile.mkstemp(suffix=".txt")
+      with os.fdopen(fd, "w", encoding="utf-8") as fh:
+          fh.write("* platform\n")
+          for i in range(200):
+              fh.write(f"/srv/data/p{i}/* team{i % 17}\n")
+      lines = []
+      for i in range(20000):
+          d = f"/srv/data/p{(i // 50) % 200}/sub{(i // 50) % 2}"
+          lines.append(f"{(i * 104729) % 900000}\t{d}/f{i}.dat\n")
+      sys.stdin = io.StringIO("".join(lines))
+      main(["--rules", rules_path, "--top", "5"])
+      os.remove(rules_path)
+    min_speedup: 1.5

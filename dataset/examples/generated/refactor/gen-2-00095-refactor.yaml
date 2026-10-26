@@ -1,0 +1,129 @@
+id: gen-2-00095-refactor
+category: refactor
+language: python
+patterns:
+- batch-db-writes
+- regex-precompile
+facts:
+- F-PG-INSERT
+- F-REGEX
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import re
+    import sys
+
+    import psycopg
+
+    DSN = "postgresql://ci_ingest@metrics-db.internal:5432/ci"
+
+
+    def parse_log(path):
+        results = []
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                line = re.sub(r"\x1b\[[0-9;]*m", "", raw).rstrip()
+                m = re.match(r"^TEST (\S+)::(\S+) (PASSED|FAILED|SKIPPED|ERROR) ([0-9.]+)s$", line)
+                if m is None:
+                    continue
+                module, test, status, duration = m.groups()
+                results.append((module, test, status, float(duration)))
+        return results
+
+
+    def store(pipeline_id, job, results):
+        with psycopg.connect(DSN) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO job_runs (pipeline_id, job, total, failed) "
+                    "VALUES (%s, %s, %s, %s) RETURNING id",
+                    (pipeline_id, job, len(results),
+                     sum(1 for r in results if r[2] in ("FAILED", "ERROR"))),
+                )
+                run_id = cur.fetchone()[0]
+                for module, test, status, duration in results:
+                    cur.execute(
+                        "INSERT INTO test_results (run_id, module, test, status, duration_s) "
+                        "VALUES (%s, %s, %s, %s, %s)",
+                        (run_id, module, test, status, duration),
+                    )
+
+
+    def main():
+        pipeline_id, job, log_path = sys.argv[1], sys.argv[2], sys.argv[3]
+        results = parse_log(log_path)
+        store(int(pipeline_id), job, results)
+        failed = [r for r in results if r[2] in ("FAILED", "ERROR")]
+        print(f"{job}: {len(results)} tests, {len(failed)} failed")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    The per-test `INSERT` is the main cost. The regexes are a small cleanup.
+
+    ```python
+    import re
+    import sys
+
+    import psycopg
+
+    DSN = "postgresql://ci_ingest@metrics-db.internal:5432/ci"
+
+    ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+    RESULT_RE = re.compile(r"^TEST (\S+)::(\S+) (PASSED|FAILED|SKIPPED|ERROR) ([0-9.]+)s$")
+
+
+    def parse_log(path):
+        results = []
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                line = ANSI_RE.sub("", raw).rstrip()
+                m = RESULT_RE.match(line)
+                if m is None:
+                    continue
+                module, test, status, duration = m.groups()
+                results.append((module, test, status, float(duration)))
+        return results
+
+
+    def store(pipeline_id, job, results):
+        with psycopg.connect(DSN) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO job_runs (pipeline_id, job, total, failed) "
+                    "VALUES (%s, %s, %s, %s) RETURNING id",
+                    (pipeline_id, job, len(results),
+                     sum(1 for r in results if r[2] in ("FAILED", "ERROR"))),
+                )
+                run_id = cur.fetchone()[0]
+                with cur.copy(
+                    "COPY test_results (run_id, module, test, status, duration_s) FROM STDIN"
+                ) as copy:
+                    for module, test, status, duration in results:
+                        copy.write_row((run_id, module, test, status, duration))
+
+
+    def main():
+        pipeline_id, job, log_path = sys.argv[1], sys.argv[2], sys.argv[3]
+        results = parse_log(log_path)
+        store(int(pipeline_id), job, results)
+        failed = [r for r in results if r[2] in ("FAILED", "ERROR")]
+        print(f"{job}: {len(results)} tests, {len(failed)} failed")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **COPY instead of one INSERT per test** (reduces E): the old loop made one statement and one round trip for every test result. Now all results for a job go through one `COPY` stream. In Green Metrics Tool micro-benchmarks with 5,000-row batches, `COPY` used about 22× less CPU energy than one `execute()` per row, and about 8× less than `executemany()`. With batches of only around 100 rows the differences were small. So the gain is real for big suites and minor for small jobs.
+    - **Regexes compiled once at module level** (reduces E, small): Python's `re` already caches compiled patterns, so this is a minor win. In Green Metrics Tool micro-benchmarks with 1,000,000 matches, a precompiled pattern used about 18% less than inline `re.match`. It also gives the patterns a name.
+    - Behavior is unchanged. The rows, the stdout line and the transaction are the same: the `job_runs` row and its results still commit together when the connection block exits, and a failed `COPY` rolls back both.
+verify:
+  static_only: needs a running PostgreSQL server and the psycopg package

@@ -1,0 +1,182 @@
+id: gen-2-00097-multi-turn
+category: multi-turn
+language: javascript
+patterns:
+- dom-size
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    fix this, tab freezes when the nightly job output loads
+
+    ```javascript
+    // predictions.js — results viewer for batch scoring jobs
+    const API = '/api/batch-jobs';
+
+    function scoreClass(score) {
+      if (score >= 0.9) return 'high';
+      if (score >= 0.5) return 'mid';
+      return 'low';
+    }
+
+    async function loadPredictions(jobId) {
+      const res = await fetch(`${API}/${jobId}/predictions`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const preds = await res.json(); // nightly job: ~30k rows
+
+      const list = document.getElementById('pred-list');
+      list.innerHTML = '';
+
+      for (const p of preds) {
+        const row = document.createElement('div');
+        row.className = 'pred-row';
+        const fields = [p.id, p.input_preview, p.label, p.score.toFixed(3), `${p.latency_ms} ms`];
+        for (const f of fields) {
+          const cell = document.createElement('div');
+          cell.className = 'pred-cell';
+          const text = document.createElement('span');
+          text.className = 'cell-text';
+          text.innerHTML = f;
+          cell.appendChild(text);
+          row.appendChild(cell);
+        }
+        const badge = document.createElement('span');
+        badge.className = `badge ${scoreClass(p.score)}`;
+        row.children[3].appendChild(badge);
+        list.appendChild(row);
+      }
+
+      document.getElementById('pred-count').textContent = `${preds.length} predictions`;
+    }
+
+    document.getElementById('job-select').addEventListener('change', (e) => {
+      loadPredictions(e.target.value).catch(console.error);
+    });
+    ```
+- role: assistant
+  content: |
+    The page builds about 30k rows with 12 elements each and adds them to the live DOM one at a time. This version shows 100 rows per page in a plain table:
+
+    ```html
+    <table id="pred-table">
+      <thead><tr><th>ID</th><th>Input</th><th>Label</th><th>Score</th><th>Latency</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <button id="prev">Prev</button> <span id="page-info"></span> <button id="next">Next</button>
+    ```
+
+    ```javascript
+    // predictions.js — results viewer for batch scoring jobs
+    const API = '/api/batch-jobs';
+    const PAGE_SIZE = 100;
+
+    let preds = [];
+    let page = 0;
+
+    function scoreClass(score) {
+      if (score >= 0.9) return 'high';
+      if (score >= 0.5) return 'mid';
+      return 'low';
+    }
+
+    function buildRow(p) {
+      const tr = document.createElement('tr');
+      const cells = [p.id, p.input_preview, p.label, p.score.toFixed(3), `${p.latency_ms} ms`];
+      for (const value of cells) {
+        const td = document.createElement('td');
+        td.textContent = value;
+        tr.appendChild(td);
+      }
+      tr.children[3].className = `score ${scoreClass(p.score)}`;
+      return tr;
+    }
+
+    function renderPage() {
+      const frag = document.createDocumentFragment();
+      const start = page * PAGE_SIZE;
+      for (const p of preds.slice(start, start + PAGE_SIZE)) {
+        frag.appendChild(buildRow(p));
+      }
+      document.querySelector('#pred-table tbody').replaceChildren(frag);
+
+      const pages = Math.max(1, Math.ceil(preds.length / PAGE_SIZE));
+      document.getElementById('page-info').textContent = `Page ${page + 1} of ${pages}`;
+      document.getElementById('prev').disabled = page === 0;
+      document.getElementById('next').disabled = page >= pages - 1;
+    }
+
+    async function loadPredictions(jobId) {
+      const res = await fetch(`${API}/${jobId}/predictions`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      preds = await res.json();
+      page = 0;
+      document.getElementById('pred-count').textContent = `${preds.length} predictions`;
+      renderPage();
+    }
+
+    document.getElementById('prev').addEventListener('click', () => { page--; renderPage(); });
+    document.getElementById('next').addEventListener('click', () => { page++; renderPage(); });
+    document.getElementById('job-select').addEventListener('change', (e) => {
+      loadPredictions(e.target.value).catch(console.error);
+    });
+    ```
+
+    **Green Notes**
+    - **Avoid excessive DOM size** (reduces E): only 100 rows are in the DOM at a time instead of the whole job. Each row now has 6 elements instead of 12, and the rows are built in a `DocumentFragment` and inserted in one step. In Green Metrics Tool browser benchmarks, a 10,000-row table with wrappers around every cell, appended row by row, used about 56% less CPU energy over 30 page loads when it was split into pages of 100 rows and built as a plain table in a fragment.
+
+    **Security fix:** `innerHTML` put `input_preview` into the page as HTML, so any markup in a model input would run in the viewer. `textContent` shows it as plain text.
+
+    **Behavior change:** the badge `<span>` is now a class on the score cell (`td.score.high`, `.mid`, `.low`). Move your badge CSS to those selectors.
+- role: user
+  content: |
+    no paging. ops ctrl+f the whole job for ids
+- role: assistant
+  content: |
+    OK, all rows on one page then. The table stays flat and is inserted in one step, so Ctrl+F finds every ID:
+
+    ```javascript
+    // predictions.js — results viewer for batch scoring jobs
+    const API = '/api/batch-jobs';
+
+    function scoreClass(score) {
+      if (score >= 0.9) return 'high';
+      if (score >= 0.5) return 'mid';
+      return 'low';
+    }
+
+    function buildRow(p) {
+      const tr = document.createElement('tr');
+      const cells = [p.id, p.input_preview, p.label, p.score.toFixed(3), `${p.latency_ms} ms`];
+      for (const value of cells) {
+        const td = document.createElement('td');
+        td.textContent = value;
+        tr.appendChild(td);
+      }
+      tr.children[3].className = `score ${scoreClass(p.score)}`;
+      return tr;
+    }
+
+    async function loadPredictions(jobId) {
+      const res = await fetch(`${API}/${jobId}/predictions`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const preds = await res.json();
+
+      const frag = document.createDocumentFragment();
+      for (const p of preds) {
+        frag.appendChild(buildRow(p));
+      }
+      document.querySelector('#pred-table tbody').replaceChildren(frag);
+      document.getElementById('pred-count').textContent = `${preds.length} predictions`;
+    }
+
+    document.getElementById('job-select').addEventListener('change', (e) => {
+      loadPredictions(e.target.value).catch(console.error);
+    });
+    ```
+
+    Remove the prev/next buttons and `page-info` from the HTML. Each row still has half as many elements, the page reflows once instead of 30k times, and the `textContent` fix stays.
+
+    If loading still feels slow, an ID search box over `preds` that jumps to the matching row would let you bring paging back without losing the lookup.
+verify:
+  static_only: needs a browser DOM and the batch-jobs API

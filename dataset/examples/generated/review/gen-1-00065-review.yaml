@@ -1,0 +1,101 @@
+id: gen-1-00065-review
+category: review
+language: bash
+patterns:
+- bash-builtins
+- bash-quoting
+facts:
+- F-BASH-SUBPROC
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    hello, I am physics student and make this script for summary of our solver runs. every night the cluster write many .log files in one folder, each have maybe 50k lines, like `run42 1800 CONVERGED 5230` (run, iterations, status, milliseconds). it work but is very slow, I start it in the evening and in the morning it is not finish somtimes. can you give me feedback please?
+
+    ```bash
+    #!/bin/bash
+    # summary of solver runs
+    LOGDIR=$1
+    OUT="summary.txt"
+
+    conv=0
+    div=0
+    maxit=0
+    total_ms=0
+    lines=0
+
+    for f in $(ls $LOGDIR/*.log); do
+      while read line; do
+        run=$(echo $line | cut -d' ' -f1)
+        status=$(echo $line | cut -d' ' -f3)
+        ms=$(echo $line | cut -d' ' -f4)
+        if [ "$status" = "CONVERGED" ]; then
+          conv=$(expr $conv + 1)
+        elif [ "$status" = "DIVERGED" ]; then
+          div=$(expr $div + 1)
+        elif [ "$status" = "MAXITER" ]; then
+          maxit=$(expr $maxit + 1)
+        fi
+        total_ms=$(expr $total_ms + $ms)
+        lines=$(expr $lines + 1)
+      done < $f
+    done
+
+    echo "runs: $lines" > $OUT
+    echo "converged: $conv" >> $OUT
+    echo "diverged: $div" >> $OUT
+    echo "maxiter: $maxit" >> $OUT
+    echo "total ms: $total_ms" >> $OUT
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (nightly data pipeline over log files)
+
+    #### [Bug] `expr` fails on short or odd lines
+    - **Where:** `total_ms=$(expr $total_ms + $ms)`
+    - **Issue:** if a line is blank or has fewer than 4 fields, `$ms` is empty and `expr` stops with a syntax error. The line is not counted in the total, and you get error messages in the output. `read line` without `-r` also eats backslashes.
+    - **Fix:** only count lines that have a numeric 4th field (done in the awk version below).
+    - **Impact:** correctness of the totals.
+
+    #### [Bug] `for f in $(ls ...)` and unquoted paths
+    - **Where:** `for f in $(ls $LOGDIR/*.log)`, `done < $f`, `> $OUT`
+    - **Issue:** a file name or folder with a space breaks into several words. If `$1` is empty, the glob looks in the wrong place without any warning.
+    - **Fix:** loop over the glob directly and quote the variables: `"$LOGDIR"/*.log`, `< "$f"`, `> "$OUT"`. Check that `$1` is a directory.
+    - **Impact:** correctness.
+
+    #### [High] Several processes started for every line
+    - **Where:** the `$(echo $line | cut ...)` lines and every `$(expr ...)`
+    - **Issue:** each command substitution forks a subshell, and `cut` and `expr` are new processes. With 50k lines per file, that is hundreds of thousands of process starts per file, and process starts are what make this slow. In Green Metrics Tool micro-benchmarks, a log summary loop of this kind over a 20,000-line file (about 10 processes per line) used ~1302 J and 238 s. The same loop with only builtins (`read -r`, `$(( ))`, `case`) used ~4.3 J and 0.72 s, about 300× less. One `awk` pass used ~1.0 J and 0.21 s, over 1000× less than the subprocess loop.
+    - **Fix:** one `awk` call over all files. The output is the same:
+      ```bash
+      #!/bin/bash
+      logdir=${1:?usage: summary.sh LOGDIR}
+      out=summary.txt
+
+      awk '
+        $3 == "CONVERGED" { conv++ }
+        $3 == "DIVERGED"  { div++ }
+        $3 == "MAXITER"   { maxit++ }
+        $4 ~ /^[0-9]+$/   { total_ms += $4 }
+        NF >= 4           { lines++ }
+        END {
+          printf "runs: %d\n", lines
+          printf "converged: %d\n", conv
+          printf "diverged: %d\n", div
+          printf "maxiter: %d\n", maxit
+          printf "total ms: %d\n", total_ms
+        }
+      ' "$logdir"/*.log > "$out"
+      ```
+      If you want to stay in pure bash, use `while read -r run iters status ms`, `case "$status"` and `(( conv++ ))`. This needs no `cut` or `expr` and is still far cheaper than the original, but `awk` is the cheapest.
+    - **Impact:** E, by orders of magnitude, on every nightly run. The run time should drop from hours to seconds.
+
+    #### [Low] Double quotes on literals without expansion
+    - **Where:** `"CONVERGED"`, `"DIVERGED"`, `"MAXITER"` inside the loop
+    - **Issue:** Bash scans double-quoted text for `$`, backticks and backslashes. Single quotes are taken as they are. In Green Metrics Tool micro-benchmarks, a 6,200-character literal in a loop used about 24% less CPU energy with single quotes. For short words like these, the saving is tiny, so this only matters if you keep the loop.
+    - **Fix:** use `'CONVERGED'` and so on. Keep the double quotes around `"$status"`, `"$f"` and the other variables, because those need them.
+    - **Impact:** E, low.
+
+    **Already good:** the counters are initialised to 0, and the status checks use quoted variables.
+verify:
+  static_only: bash script that needs a directory of log files

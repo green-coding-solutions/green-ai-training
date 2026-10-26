@@ -1,0 +1,88 @@
+id: gen-12764612-00392-generation
+category: generation
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    I need a small Python CLI for our release checklist that finds unused static assets. Requirements:
+
+    - Two positional args: `inventory.txt` (every file under `static/`, one relative path per line, usually around 500k lines) and `references.txt` (every asset path found in our templates and CSS by an earlier grep step, around 30k lines, with many duplicates).
+    - Print every path from the inventory that is not in the references, one per line, in the same order as the inventory.
+    - Ignore blank lines and trailing whitespace in both files.
+    - Optional `--output FILE` to write the result there instead of stdout.
+    - Exit code 1 if anything unused was found, 0 otherwise, so CI can use it.
+    - Only the standard library.
+- role: assistant
+  content: |
+    ```python
+    #!/usr/bin/env python3
+    """List inventory paths that no template or stylesheet references."""
+    import argparse
+    import sys
+
+
+    def load_lines(path):
+        with open(path, encoding="utf-8") as fh:
+            return [line.strip() for line in fh if line.strip()]
+
+
+    def find_unused(inventory, references):
+        used = set(references)  # built once, O(1) per lookup
+        return [path for path in inventory if path not in used]
+
+
+    def main(argv=None):
+        parser = argparse.ArgumentParser(description="Find unused static assets.")
+        parser.add_argument("inventory", help="file with all asset paths, one per line")
+        parser.add_argument("references", help="file with referenced asset paths, one per line")
+        parser.add_argument("--output", help="write the result here instead of stdout")
+        args = parser.parse_args(argv)
+
+        unused = find_unused(load_lines(args.inventory), load_lines(args.references))
+        text = "".join(path + "\n" for path in unused)
+
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as fh:
+                fh.write(text)
+        else:
+            sys.stdout.write(text)
+
+        return 1 if unused else 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+
+    **Green Notes**
+    - **Set for repeated membership tests** (reduces E): the references go into a set once. Each of the ~500k inventory paths is then one hash lookup. With a list, each lookup would scan up to ~30k entries. The duplicates in the references also disappear when the set is built. Output order still follows the inventory, because the loop runs over the inventory list and not over the set.
+    - **Why it fits here:** a set only pays off when you look up many times. In Green Metrics Tool micro-benchmarks, one membership test on a 10,000,000-element list used ~6.9 J, while converting it to a set first and testing once used ~10.5 J. This tool does hundreds of thousands of lookups, so the one-time build cost is small by comparison.
+    - The inventory stays a list, since it is only read once, in order.
+verify:
+  module: true
+  test: |-
+    import os, tempfile, io, contextlib
+    inv = ["a.png", "b.css", "c.js", "b.css", "d.svg"]
+    refs = ["c.js", "a.png", "c.js"]
+    assert find_unused(inv, refs) == ["b.css", "b.css", "d.svg"]
+    assert find_unused(inv, inv) == []
+    d = tempfile.mkdtemp()
+    p1 = os.path.join(d, "inv.txt")
+    p2 = os.path.join(d, "ref.txt")
+    out = os.path.join(d, "out.txt")
+    with open(p1, "w") as f:
+        f.write("a.png  \n\nb.css\nc.js\n")
+    with open(p2, "w") as f:
+        f.write("c.js\n\na.png\n")
+    assert load_lines(p1) == ["a.png", "b.css", "c.js"]
+    rc = main([p1, p2, "--output", out])
+    assert rc == 1
+    assert open(out).read() == "b.css\n"
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = main([p1, p1])
+    assert rc == 0 and buf.getvalue() == ""

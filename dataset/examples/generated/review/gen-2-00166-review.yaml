@@ -1,0 +1,147 @@
+id: gen-2-00166-review
+category: review
+language: python
+patterns:
+- deque-or-append
+- string-join
+facts:
+- F-LISTINS
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    review this, monthly order export times out for our bigger shops
+
+    ```python
+    from decimal import Decimal
+
+    FIELDS = ["order_id", "created_at", "customer_email", "items", "total", "status"]
+
+
+    def export_filename(shop_slug, year, month):
+        return f"orders-{shop_slug}-{year}-{month:02d}.csv"
+
+
+    def _escape(value):
+        s = str(value)
+        if any(c in s for c in ',"\n'):
+            s = '"' + s.replace('"', '""') + '"'
+        return s
+
+
+    def format_order(order):
+        items = ""
+        for line in order["lines"]:
+            items += f"{line['sku']}x{line['qty']};"
+        total = sum(Decimal(l["unit_price"]) * l["qty"] for l in order["lines"])
+        return [
+            order["id"],
+            order["created_at"].isoformat(),
+            order["email"],
+            items,
+            str(total),
+            order["status"],
+        ]
+
+
+    def build_export(orders, include_cancelled=False):
+        # orders come from the DB oldest first, export must be newest first
+        rows = []
+        for order in orders:
+            if order["status"] == "cancelled" and not include_cancelled:
+                continue
+            rows.insert(0, format_order(order))
+
+        out = ",".join(FIELDS) + "\n"
+        for row in rows:
+            out += ",".join(_escape(v) for v in row) + "\n"
+        return out
+    ```
+- role: assistant
+  content: |
+    **Workload:** web backend (order export endpoint)
+
+    #### [High] `rows.insert(0, ...)` makes the export quadratic
+    - **Where:** `build_export`, the loop over `orders`
+    - **Issue:** every front insert shifts all the rows already in the list. With n orders that is O(n²) element moves, and it gets much worse as shops grow, which fits the timeouts you see. In Green Metrics Tool micro-benchmarks, 1,000,000 × `list.insert(0, x)` used ~1515 J, while 1,000,000 × `list.append(x)` used ~1.2 J, over 1000× less.
+    - **Fix:** use `rows.append(format_order(order))` in the loop and write `reversed(rows)` afterwards. You still get newest first, and the total work is O(n).
+    - **Impact:** E per export. This is the biggest cost for large shops.
+
+    #### [High] CSV built with `+=`
+    - **Where:** `out += ...` in `build_export`, `items += ...` in `format_order`
+    - **Issue:** each `+=` can copy the whole string built so far, and `out` grows by one row per order. An f-string inside a `+=` loop behaves the same way. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces with `+=` used ~469 J, and `"".join()` used ~1.8 J, roughly 260× less.
+    - **Fix:** collect the lines in a list and call `"".join()` once at the end. `items` keeps the trailing `;` after each line, so the column format stays the same.
+    - **Impact:** E and M per export. One final string instead of repeated copies. The `out` loop is the part that grows. `items` only has a few lines per order.
+
+    Both fixes together. The output is byte-for-byte the same:
+
+    ```python
+    from decimal import Decimal
+
+    FIELDS = ["order_id", "created_at", "customer_email", "items", "total", "status"]
+
+
+    def export_filename(shop_slug, year, month):
+        return f"orders-{shop_slug}-{year}-{month:02d}.csv"
+
+
+    def _escape(value):
+        s = str(value)
+        if any(c in s for c in ',"\n'):
+            s = '"' + s.replace('"', '""') + '"'
+        return s
+
+
+    def format_order(order):
+        items = "".join(f"{line['sku']}x{line['qty']};" for line in order["lines"])
+        total = sum(Decimal(line["unit_price"]) * line["qty"] for line in order["lines"])
+        return [
+            order["id"],
+            order["created_at"].isoformat(),
+            order["email"],
+            items,
+            str(total),
+            order["status"],
+        ]
+
+
+    def build_export(orders, include_cancelled=False):
+        # orders come from the DB oldest first, export must be newest first
+        rows = []
+        for order in orders:
+            if order["status"] == "cancelled" and not include_cancelled:
+                continue
+            rows.append(format_order(order))
+
+        parts = [",".join(FIELDS) + "\n"]
+        for row in reversed(rows):
+            parts.append(",".join(_escape(v) for v in row) + "\n")
+        return "".join(parts)
+    ```
+
+    **Already good:** `Decimal` for money, correct quote doubling in `_escape`.
+verify:
+  equivalence:
+    driver: |-
+      from datetime import datetime, timedelta
+      base = datetime(2026, 9, 1, 8, 0)
+      orders = []
+      for i in range(50):
+          orders.append({
+              "id": 1000 + i,
+              "created_at": base + timedelta(hours=i),
+              "email": f"c{i}@shop.example",
+              "status": "cancelled" if i % 7 == 0 else "paid",
+              "lines": [
+                  {
+                      "sku": f"SKU-{j}" if j else 'TEE,"RED"',
+                      "qty": j + 1,
+                      "unit_price": f"{(i + j) % 30}.99",
+                  }
+                  for j in range(i % 4)
+              ],
+          })
+      print(export_filename("acme", 2026, 9))
+      print(build_export(orders), end="")
+      print(build_export(iter(orders), include_cancelled=True), end="")
+      print(repr(build_export([])))

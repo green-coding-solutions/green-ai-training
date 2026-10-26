@@ -1,0 +1,76 @@
+id: gen-2-00045-generation
+category: generation
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    hi, i need a function for our ETL. every night we get a csv export from the weather stations (around 1 milion rows), columns are ts, station_id, status, value. I need to drop the rows where station_id is not in the active station list (we get it from our registry API as python list, ~5000 ids, they are int) and also rows where status is ERR, MAINT or CAL. the rest should be write to a new csv and the function give back how many rows was kept and dropped. thx
+- role: assistant
+  content: |
+    ```python
+    import csv
+
+    BAD_STATUSES = ("ERR", "MAINT", "CAL")
+
+
+    def filter_readings(in_path, out_path, active_station_ids):
+        """Copy rows from active stations with a good status. Returns (kept, dropped)."""
+        # CSV values are strings, the registry ids are ints: normalize once.
+        active = {str(sid) for sid in active_station_ids}
+        kept = dropped = 0
+
+        with open(in_path, newline="", encoding="utf-8") as src, \
+             open(out_path, "w", newline="", encoding="utf-8") as dst:
+            reader = csv.DictReader(src)
+            writer = csv.DictWriter(dst, fieldnames=reader.fieldnames)
+            writer.writeheader()
+
+            for row in reader:
+                if row["station_id"] in active and row["status"] not in BAD_STATUSES:
+                    writer.writerow(row)
+                    kept += 1
+                else:
+                    dropped += 1
+
+        return kept, dropped
+    ```
+
+    Usage:
+
+    ```python
+    kept, dropped = filter_readings("stations_2026-10-22.csv", "stations_clean.csv", active_ids)
+    print(f"kept={kept} dropped={dropped}")
+    ```
+
+    **Green Notes**
+    - **Set for repeated membership tests** (reduces E): the 5,000 ids are turned into a set once, so each of the ~1M rows costs one hash lookup instead of a scan through a 5,000-element list. Building the set only pays off because you look up many times. In Green Metrics Tool micro-benchmarks, building a set from a 10,000,000-element list for a *single* test used about 50% more energy than one scan of the list. Here the set is built once and used for every row.
+    - **Correctness:** the CSV gives `station_id` as a string and the API gives ints. Without the `str()` step, `"101" in {101}` is always `False` and every row would be dropped.
+    - *Not applied:* a set for the three bad statuses. With three items, a set changes little, so a tuple constant keeps it simple.
+verify:
+  green_block: 0
+  test: |-
+    import os, tempfile, csv
+    d = tempfile.mkdtemp()
+    src = os.path.join(d, "in.csv")
+    dst = os.path.join(d, "out.csv")
+    with open(src, "w", newline="", encoding="utf-8") as f:
+        f.write(
+            "ts,station_id,status,value\n"
+            "2026-10-01T00:00,101,OK,1.5\n"
+            "2026-10-01T00:00,102,ERR,2.0\n"
+            "2026-10-01T00:00,999,OK,3.1\n"
+            "2026-10-01T00:01,101,MAINT,1.6\n"
+            "2026-10-01T00:01,103,OK,0.4\n"
+            "2026-10-01T00:02,102,CAL,2.2\n"
+        )
+    kept, dropped = filter_readings(src, dst, [101, 102, 103])
+    assert (kept, dropped) == (2, 4), (kept, dropped)
+    with open(dst, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    assert [r["station_id"] for r in rows] == ["101", "103"]
+    assert list(rows[0].keys()) == ["ts", "station_id", "status", "value"]
+    assert rows[1]["value"] == "0.4"

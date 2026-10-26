@@ -1,0 +1,115 @@
+id: gen-2-00153-refactor
+category: refactor
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    Profiler puts find_slow_requests at the top of our nightly latency-anomaly job (~120M access-log rows per day). Hoist whatever is invariant out of the loop. Just the diff, no lecture.
+
+    ```python
+    import csv
+    import json
+    import math
+    from dataclasses import dataclass, field
+
+
+    @dataclass
+    class RouteBaseline:
+        mean_log: float
+        std_log: float
+
+
+    @dataclass
+    class DetectorConfig:
+        z_limit: float = 3.5
+        baselines: dict = field(default_factory=dict)
+
+
+    def load_config(path):
+        with open(path) as f:
+            raw = json.load(f)
+        baselines = {
+            route: RouteBaseline(b["mean_log"], b["std_log"])
+            for route, b in raw["routes"].items()
+        }
+        return DetectorConfig(z_limit=raw.get("z_limit", 3.5), baselines=baselines)
+
+
+    def find_slow_requests(rows, cfg):
+        """rows: (ts, route, duration_ms) tuples from the parsed access log."""
+        hits = []
+        for ts, route, duration_ms in rows:
+            base = cfg.baselines.get(route)
+            if base is None or base.std_log == 0:
+                continue
+            z = (math.log(duration_ms) - base.mean_log) / base.std_log
+            if z > cfg.z_limit:
+                hits.append((ts, route, duration_ms, round(z, 2)))
+        return hits
+
+
+    def write_report(hits, path):
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["ts", "route", "duration_ms", "z"])
+            w.writerows(sorted(hits, key=lambda h: -h[3]))
+    ```
+- role: assistant
+  content: |
+    Only `find_slow_requests` changes:
+
+    ```python
+    import math
+
+
+    def find_slow_requests(rows, cfg):
+        """rows: (ts, route, duration_ms) tuples from the parsed access log."""
+        hits = []
+        get_base = cfg.baselines.get
+        z_limit = cfg.z_limit
+        log = math.log
+        add_hit = hits.append
+        for ts, route, duration_ms in rows:
+            base = get_base(route)
+            if base is None or base.std_log == 0 or duration_ms <= 0:
+                continue
+            z = (log(duration_ms) - base.mean_log) / base.std_log
+            if z > z_limit:
+                add_hit((ts, route, duration_ms, round(z, 2)))
+        return hits
+    ```
+
+    **Green Notes**
+    - **Hoist loop-invariant lookups** (reduces E): `cfg.baselines.get`, `cfg.z_limit`, `math.log` and `hits.append` are resolved once instead of once per row. Expect a small gain. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local before a 10,000,000-iteration loop saved about 4-5%. Check it on one day's log with `perf stat` or `time`, before and after.
+    - **Behavior:** `cfg` is now read once per call. If something hot-reloads the baselines or `z_limit` while the loop runs, this version keeps the old values until the next call.
+    - **Bug fix:** `math.log(0)` raises `ValueError`, so one 0 ms row (cache hits, aborted requests) killed the whole run. Rows with `duration_ms <= 0` are now skipped. They can't be slow outliers anyway. Clamp to 1 ms instead if you want them in the stats.
+verify:
+  test: |
+    from types import SimpleNamespace as NS
+    _cfg = NS(baselines={"/a": NS(mean_log=1.0, std_log=0.5)}, z_limit=1.0)
+    _res = find_slow_requests([(1, "/a", 0), (2, "/a", 100), (3, "/b", 900)], _cfg)
+    assert _res == [(2, "/a", 100, round((math.log(100) - 1.0) / 0.5, 2))], _res
+  equivalence:
+    driver: |-
+      import random
+      from types import SimpleNamespace as NS
+
+      rng = random.Random(7)
+      routes = ["/api/cart", "/api/search", "/login", "/static/app.js", "/unknown"]
+      baselines = {
+          "/api/cart": NS(mean_log=4.2, std_log=0.5),
+          "/api/search": NS(mean_log=5.0, std_log=0.8),
+          "/login": NS(mean_log=3.9, std_log=0.0),
+          "/static/app.js": NS(mean_log=1.5, std_log=0.3),
+      }
+      cfg = NS(baselines=baselines, z_limit=2.0)
+      rows = [(i, rng.choice(routes), rng.randint(1, 5000)) for i in range(20000)]
+      hits = find_slow_requests(rows, cfg)
+      print(len(hits))
+      for h in hits[:20]:
+          print(h)
+      print(sum(h[2] for h in hits))

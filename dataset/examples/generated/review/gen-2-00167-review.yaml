@@ -1,0 +1,114 @@
+id: gen-2-00167-review
+category: review
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    hi, this is the rotate script for our ingest cli tool, it run from cron every 15 min. the logs are around 5-8 MB each time when they rotate, and we keep the archives 30 days. my colleague say xz -9e is best because smallest files. can you review it please? also something feel wrong with the old archives, we have much less files then expected
+
+    ```bash
+    #!/bin/bash
+    # rotate-logs.sh - rotate logs of the ingest CLI, run from cron */15
+    set -euo pipefail
+
+    LOGDIR=/var/log/ingest
+    ARCHIVE=/data/archive/ingest-logs
+    LATEST=/tmp/ingest-latest.log.bz2
+    MAX_SIZE=$((5 * 1024 * 1024))   # rotate when bigger then 5 MB
+    KEEP_DAYS=30
+
+    mkdir -p "$ARCHIVE"
+
+    for f in "$LOGDIR"/*.log; do
+        [ -e "$f" ] || continue
+        size=$(stat -c %s "$f")
+        if [ "$size" -lt "$MAX_SIZE" ]; then
+            continue
+        fi
+
+        name=$(basename "$f" .log)
+        stamp=$(date +%H%M)
+        dest="$ARCHIVE/$name-$stamp.log"
+
+        cp "$f" "$dest"
+        : > "$f"
+        xz -9e -f "$dest"
+        echo "rotated $f -> $dest.xz"
+    done
+
+    # dashboard shows the last rotated chunk of the main log
+    if ls "$ARCHIVE"/ingest-*.log.xz >/dev/null 2>&1; then
+        last=$(ls -t "$ARCHIVE"/ingest-*.log.xz | head -n 1)
+        xz -dc "$last" | bzip2 -9 > "$LATEST"
+    fi
+
+    find "$ARCHIVE" -name '*.log.xz' -mtime +"$KEEP_DAYS" -delete
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (cron, every 15 minutes)
+
+    #### [Bug] Archives get overwritten every day
+    - **Where:** `stamp=$(date +%H%M)` together with `xz -9e -f`
+    - **Issue:** the archive name only has the hour and minute. The next day at the same time the name is the same, and `-f` overwrites yesterday's archive without a warning. That is why you have fewer files than expected: you keep about one day of logs, not 30, and the `find -mtime +30` cleanup almost never finds anything.
+    - **Fix:** put the date in the name: `stamp=$(date +%Y%m%d-%H%M)`. Then you don't need `-f` either.
+
+    #### [High] `xz -9e` on logs that rotate every 15 minutes
+    - **Where:** `xz -9e -f "$dest"` in the loop
+    - **Issue:** xz is one of the most expensive codecs, and `-9e` is its slowest setting. You pay that cost up to 96 times a day. In Green Metrics Tool measurements with default settings on 100 MB of text, zstd used ~16 J of CPU energy and xz ~458 J, about 29× more. `-9e` costs more than the default xz level that was measured. Gzip came in at ~67 J.
+    - **Fix:** `zstd -q --rm "$dest"`. The default level is fast, and `--rm` deletes the uncompressed copy, the same way xz does now. Update the `find` pattern so the old `.xz` files still expire.
+    - **Impact:** E, on every rotation, so the cost keeps adding up. Compressing is still the right call here. Green Coding Solutions estimates that zstd output only has to be kept about 0.15 days before compression pays off. That is an estimate, not a measurement, and you keep these files for 30 days. Note that the measurements compare energy only, not file size. Your colleague is right that `xz -9e` usually gives smaller files. If disk space is tight, compare `du -sh` after one day with zstd before you decide.
+
+    #### [Medium] Temporary dashboard file compressed with bzip2 every run
+    - **Where:** `xz -dc "$last" | bzip2 -9 > "$LATEST"`
+    - **Issue:** this file lives in `/tmp` and gets overwritten 15 minutes later, so compressing it saves nothing. bzip2 is also expensive in both directions. In the same measurements it used ~106 J to compress 100 MB and ~52 J to decompress it, against ~5.3 J for zstd decompression. The dashboard pays the decompress cost on every read.
+    - **Fix:** write plain text: `zstd -dcq "$last" > /tmp/ingest-latest.log`, and point the dashboard at the new path. Or let the dashboard read the newest `.zst` directly.
+
+    **Already good:** `set -euo pipefail`, a glob loop instead of parsing `ls`, rotating only above a size limit, and `find -delete` for retention.
+
+    ```bash
+    #!/bin/bash
+    # rotate-logs.sh - rotate logs of the ingest CLI, run from cron */15
+    set -euo pipefail
+
+    LOGDIR=/var/log/ingest
+    ARCHIVE=/data/archive/ingest-logs
+    LATEST=/tmp/ingest-latest.log
+    MAX_SIZE=$((5 * 1024 * 1024))   # rotate when bigger than 5 MB
+    KEEP_DAYS=30
+
+    mkdir -p "$ARCHIVE"
+
+    for f in "$LOGDIR"/*.log; do
+        [ -e "$f" ] || continue
+        size=$(stat -c %s "$f")
+        if [ "$size" -lt "$MAX_SIZE" ]; then
+            continue
+        fi
+
+        name=$(basename "$f" .log)
+        stamp=$(date +%Y%m%d-%H%M)
+        dest="$ARCHIVE/$name-$stamp.log"
+
+        cp "$f" "$dest"
+        : > "$f"
+        zstd -q --rm "$dest"
+        echo "rotated $f -> $dest.zst"
+    done
+
+    # dashboard shows the last rotated chunk of the main log (plain text, overwritten every run)
+    if ls "$ARCHIVE"/ingest-*.log.zst >/dev/null 2>&1; then
+        last=$(ls -t "$ARCHIVE"/ingest-*.log.zst | head -n 1)
+        zstd -dcq "$last" > "$LATEST"
+    fi
+
+    # .xz covers archives from before the switch
+    find "$ARCHIVE" \( -name '*.log.xz' -o -name '*.log.zst' \) -mtime +"$KEEP_DAYS" -delete
+    ```
+verify:
+  static_only: needs xz, bzip2 and zstd binaries and writes to /var/log, /data and /tmp

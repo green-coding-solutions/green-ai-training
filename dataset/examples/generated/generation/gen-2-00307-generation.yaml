@@ -1,0 +1,117 @@
+id: gen-2-00307-generation
+category: generation
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    ```python
+    import math
+
+    # raw head output from the NPU driver binding (array('f')), flattened:
+    # [x, y, w, h, obj_logit, cls0_logit, ..., clsN_logit] per anchor
+    # ~25k anchors per frame, called for every frame of every camera
+
+    def decode_detections(raw, num_classes, conf_thresh=0.25, temperature=1.0):
+        """Return list of (anchor_idx, class_id, score) where
+        sigmoid(obj/T) * sigmoid(cls/T) >= conf_thresh.
+        stdlib only, numpy is not in this image (size limit).
+        """
+        # TODO
+        ...
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```python
+    import math
+
+
+    def decode_detections(raw, num_classes, conf_thresh=0.25, temperature=1.0):
+        """Return list of (anchor_idx, class_id, score) where
+        sigmoid(obj/T) * sigmoid(cls/T) >= conf_thresh.
+        stdlib only, numpy is not in this image (size limit).
+        """
+        if temperature <= 0:
+            raise ValueError("temperature must be > 0")
+        stride = 5 + num_classes
+        n = len(raw)
+        if n % stride:
+            raise ValueError(f"raw length {n} is not a multiple of {stride}")
+
+        # Loop invariants: looked up or computed once per frame, not per value.
+        exp = math.exp
+        inv_t = 1.0 / temperature
+        detections = []
+        add = detections.append
+
+        for anchor, base in enumerate(range(0, n, stride)):
+            # Stable sigmoid: exp() only ever gets a value <= 0, so it cannot overflow.
+            z = raw[base + 4] * inv_t
+            e = exp(-abs(z))
+            obj = 1.0 / (1.0 + e) if z >= 0 else e / (1.0 + e)
+            if obj < conf_thresh:
+                continue  # sigmoid(cls) <= 1, so no class of this anchor can pass
+
+            off = base + 5
+            for c in range(num_classes):
+                z = raw[off + c] * inv_t
+                e = exp(-abs(z))
+                cls_p = 1.0 / (1.0 + e) if z >= 0 else e / (1.0 + e)
+                score = obj * cls_p
+                if score >= conf_thresh:
+                    add((anchor, c, score))
+        return detections
+    ```
+
+    The sigmoid uses `exp(-abs(z))` on purpose. A plain `1 / (1 + exp(-z))` raises `OverflowError` for very negative logits, especially with a small temperature.
+
+    **Green Notes**
+    - **Hoist loop invariants** (reduces E): `math.exp`, `detections.append` and `1 / temperature` are resolved once per frame instead of once per logit. This loop runs for every value of every frame, which is the only kind of place where this matters. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local variable before a 10,000,000-iteration loop saved about 4-5%. So it is a small win here, and not worth doing in cold code.
+verify:
+  test: |-
+    import random
+    from array import array
+
+    def _sig(z):
+        e = math.exp(-abs(z))
+        return 1.0 / (1.0 + e) if z >= 0 else e / (1.0 + e)
+
+    def _reference(raw, num_classes, conf_thresh=0.25, temperature=1.0):
+        stride = 5 + num_classes
+        inv_t = 1.0 / temperature
+        out = []
+        for a in range(len(raw) // stride):
+            b = a * stride
+            obj = _sig(raw[b + 4] * inv_t)
+            for c in range(num_classes):
+                s = obj * _sig(raw[b + 5 + c] * inv_t)
+                if s >= conf_thresh:
+                    out.append((a, c, s))
+        return out
+
+    random.seed(0)
+    nc = 3
+    raw = array('f', [random.gauss(0, 3) for _ in range(2000 * (5 + nc))])
+    for t in (1.0, 0.7, 2.0):
+        for th in (0.0, 0.25, 0.6):
+            assert decode_detections(raw, nc, th, t) == _reference(raw, nc, th, t)
+
+    extreme = array('f', [0, 0, 0, 0, -5000.0, -5000.0, 5000.0, 0, 0, 0, 0, 5000.0, 5000.0, -5000.0])
+    res = decode_detections(extreme, 2, 0.25, 0.5)
+    assert res == [(1, 0, 1.0)], res
+
+    try:
+        decode_detections(array('f', [0.0] * 8), 2)
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+    try:
+        decode_detections(raw, nc, temperature=0)
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass

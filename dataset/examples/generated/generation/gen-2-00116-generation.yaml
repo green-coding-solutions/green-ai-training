@@ -1,0 +1,147 @@
+id: gen-2-00116-generation
+category: generation
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    hi, im pretty new to kubernetes. we have a namespace `etl-staging` on our cloud k8s cluster where the staging copy of our Airflow pipeline runs. we only use it to test DAG changes during the day, Mon-Fri, Berlin time. the node pool has autoscaling on (min 0, max 4).
+
+    my team lead said staging "burns money and power all night for nothing" and I should "make it sleep at night". I dont really understand what that means in k8s. is it a setting in the deployment? this is what is running:
+
+    ```text
+    $ kubectl get deploy,sts -n etl-staging
+    NAME                                READY   UP-TO-DATE   AVAILABLE   AGE
+    deployment.apps/airflow-flower      1/1     1            1           214d
+    deployment.apps/airflow-scheduler   1/1     1            1           214d
+    deployment.apps/airflow-webserver   1/1     1            1           214d
+    deployment.apps/airflow-worker      2/2     2            2           214d
+    deployment.apps/redis               1/1     1            1           214d
+
+    NAME                        READY   AGE
+    statefulset.apps/postgres   1/1     214d
+    ```
+
+    can you write the yaml for this? we use kubernetes 1.30
+- role: assistant
+  content: |
+    It is not a setting in the Deployment. You add two CronJobs. One scales everything in `etl-staging` to 0 in the evening. The other scales it back up in the morning. A small ServiceAccount gets permission to do only that.
+
+    ```yaml
+    apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: staging-sleeper
+      namespace: etl-staging
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: Role
+    metadata:
+      name: staging-sleeper
+      namespace: etl-staging
+    rules:
+      - apiGroups: ["apps"]
+        resources: ["deployments", "statefulsets"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["apps"]
+        resources: ["deployments/scale", "statefulsets/scale"]
+        verbs: ["get", "patch", "update"]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata:
+      name: staging-sleeper
+      namespace: etl-staging
+    subjects:
+      - kind: ServiceAccount
+        name: staging-sleeper
+        namespace: etl-staging
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: Role
+      name: staging-sleeper
+    ---
+    # 19:00 Mon-Fri: everything to 0 (stays off over the weekend)
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata:
+      name: staging-sleep
+      namespace: etl-staging
+    spec:
+      schedule: "0 19 * * 1-5"
+      timeZone: "Europe/Berlin"
+      concurrencyPolicy: Forbid
+      jobTemplate:
+        spec:
+          backoffLimit: 3
+          ttlSecondsAfterFinished: 86400
+          template:
+            spec:
+              serviceAccountName: staging-sleeper
+              restartPolicy: OnFailure
+              containers:
+                - name: scale-down
+                  image: registry.k8s.io/kubectl:v1.30.0
+                  command: ["kubectl"]
+                  args: ["scale", "deployment,statefulset", "--all",
+                         "--replicas=0", "-n", "etl-staging"]
+    ---
+    # 07:00 Mon-Fri: Postgres first, then Redis and Airflow
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata:
+      name: staging-wake
+      namespace: etl-staging
+    spec:
+      schedule: "0 7 * * 1-5"
+      timeZone: "Europe/Berlin"
+      concurrencyPolicy: Forbid
+      jobTemplate:
+        spec:
+          backoffLimit: 3
+          ttlSecondsAfterFinished: 86400
+          template:
+            spec:
+              serviceAccountName: staging-sleeper
+              restartPolicy: OnFailure
+              initContainers:
+                - name: start-db
+                  image: registry.k8s.io/kubectl:v1.30.0
+                  command: ["kubectl"]
+                  args: ["scale", "statefulset/postgres", "--replicas=1",
+                         "-n", "etl-staging"]
+                - name: wait-db
+                  image: registry.k8s.io/kubectl:v1.30.0
+                  command: ["kubectl"]
+                  args: ["rollout", "status", "statefulset/postgres",
+                         "--timeout=10m", "-n", "etl-staging"]
+              containers:
+                - name: start-airflow
+                  image: registry.k8s.io/kubectl:v1.30.0
+                  command: ["kubectl"]
+                  args: ["scale", "deployment/redis", "deployment/airflow-scheduler",
+                         "deployment/airflow-webserver", "deployment/airflow-flower",
+                         "--replicas=1", "-n", "etl-staging"]
+                - name: start-workers
+                  image: registry.k8s.io/kubectl:v1.30.0
+                  command: ["kubectl"]
+                  args: ["scale", "deployment/airflow-worker", "--replicas=2",
+                         "-n", "etl-staging"]
+    ```
+
+    Apply it with `kubectl apply -f staging-sleep.yaml`. Things to know:
+    - **Your data stays.** Scaling Postgres to 0 keeps its PersistentVolumeClaim. It comes back with the same data.
+    - **Missed DAG runs.** When the scheduler starts at 07:00, it schedules the latest run it missed overnight. DAGs with `catchup=True` get every missed interval, so set `catchup=False` on staging DAGs with short intervals.
+    - **Running tasks get killed at 19:00.** Pick a time after your team stops testing.
+    - **Need it early or on a holiday?** Run `kubectl create job --from=cronjob/staging-wake wake-now -n etl-staging`.
+    - The morning job only starts the deployments listed here. If you add a new one, add it to `staging-wake` too.
+
+    **Green Notes**
+    - **Minimize deployed environments** (reduces E and M): staging now runs 60 of the week's 168 hours. Switching it off works better than trimming it. In Green Metrics Tool measurements of a preview environment idling for 60 seconds, cutting it from 3 app replicas, Postgres, Redis and a worker down to 1 replica and Postgres saved only about 3% CPU energy. Machine energy differed by less than 1%, because the idle machine uses most of the power anyway. The real saving is the hours when the environment does not run.
+    - **Let the nodes go too** (reduces E and M): the saving only counts if the autoscaler removes the empty nodes. Run `kubectl get nodes` around 19:30. If a node stays up, some other pod is still scheduled on it.
+    - *Not applied:* removing Flower. When idle it costs little per minute. If nobody opens it in staging, remove it from `staging-wake`. That mostly frees memory.
+verify:
+  static_only: Kubernetes manifests, need a cluster with CronJob timeZone support

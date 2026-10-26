@@ -1,0 +1,81 @@
+id: gen-1-00231-review
+category: review
+language: sql
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    Can you review this? It is the nightly stock sync for our web shop (Postgres 16). The warehouse export job writes this .sql file at about 01:50 and cron runs `psql -d shop -f nightly_stock_load.sql` at 02:00. The real file has about 8,000 INSERT lines, I pasted only the start and the end.
+
+    Requirements: the shop stays online during the load, the stock numbers must be correct when the script is done, and it must be finished long before the 03:00 report job. The export job is our own code, so the file format can change if needed. I did not write the script, I only maintain it now.
+
+    ```sql
+    -- nightly_stock_load.sql (generated)
+    TRUNCATE stock_levels;
+
+    INSERT INTO stock_levels (sku, warehouse_id, qty, updated_at) VALUES ('AB-1001', 3, 42, now());
+    INSERT INTO stock_levels (sku, warehouse_id, qty, updated_at) VALUES ('AB-1002', 3, 0, now());
+    INSERT INTO stock_levels (sku, warehouse_id, qty, updated_at) VALUES ('AB-1003', 3, 17, now());
+    INSERT INTO stock_levels (sku, warehouse_id, qty, updated_at) VALUES ('AB-1004', 3, 5, now());
+    INSERT INTO stock_levels (sku, warehouse_id, qty, updated_at) VALUES ('CX-2210', 1, 120, now());
+    INSERT INTO stock_levels (sku, warehouse_id, qty, updated_at) VALUES ('CX-2211', 1, 98, now());
+    -- ... about 8,000 more lines like this ...
+    INSERT INTO stock_levels (sku, warehouse_id, qty, updated_at) VALUES ('ZT-9040', 2, 7, now());
+
+    UPDATE products p
+    SET in_stock = EXISTS (
+      SELECT 1 FROM stock_levels s WHERE s.sku = p.sku AND s.qty > 0
+    );
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly load into a live shop database)
+
+    #### [Bug] Not atomic: a failure leaves the shop with empty or partial stock
+    - **Where:** `TRUNCATE stock_levels;` followed by the loose `INSERT` lines
+    - **Issue:** `psql -f` runs without a transaction and keeps going after an error by default. The table is already emptied. If one line fails, the rest still run and the `UPDATE` marks products as out of stock from half the data. Nobody is told.
+    - **Fix:** wrap everything in one transaction and stop on the first error (see the script below). `TRUNCATE` is transactional in Postgres, so readers see the old data until `COMMIT`.
+    - **Impact:** correctness. Be aware that `TRUNCATE` holds a lock on `stock_levels` until the commit, so queries on that table wait. This is one more reason to keep the load short.
+
+    #### [High] One INSERT statement per row
+    - **Where:** the generated `INSERT ... VALUES (...)` lines
+    - **Issue:** every row is parsed, planned and sent as its own statement. That is about 8,000 statements per night where one is enough. The cost is per row, so it grows with your catalog.
+    - **Fix:** change the export job to write a CSV file and load it with one `\copy`. The file is a single batch of thousands of rows, which is the case where batching pays off.
+    - **Impact:** E on the database server, and shorter lock time on `stock_levels`. In Green Metrics Tool micro-benchmarks (Postgres 16, 500,000 rows written in batches of 5,000 rows from a Python client), `COPY` used about 22× less CPU energy than one `INSERT` per row. With batches of only 100 rows the differences were small. Your load is closer to the large-batch case. That benchmark did not use `psql -f`, so measure your own file before you quote a number.
+
+    ```sql
+    \set ON_ERROR_STOP on
+    BEGIN;
+
+    TRUNCATE stock_levels;
+
+    \copy stock_levels (sku, warehouse_id, qty) FROM 'nightly_stock.csv' WITH (FORMAT csv, HEADER true)
+
+    UPDATE products p
+    SET in_stock = EXISTS (
+      SELECT 1 FROM stock_levels s WHERE s.sku = p.sku AND s.qty > 0
+    );
+
+    COMMIT;
+    ```
+
+    This assumes `updated_at` has `DEFAULT now()`. If it does not, add it with the default or set it with one `UPDATE` after the copy. Because of `ON_ERROR_STOP`, a bad CSV line aborts the transaction and the old stock data stays in place.
+
+    If you cannot change the export format yet, a smaller step is multi-row inserts of about 1,000 rows each:
+
+    ```sql
+    INSERT INTO stock_levels (sku, warehouse_id, qty, updated_at) VALUES
+      ('AB-1001', 3, 42, now()),
+      ('AB-1002', 3, 0, now()),
+      ('AB-1003', 3, 17, now());
+    ```
+
+    Keep the transaction around them. This removes most of the per-statement work, but `COPY` is still cheaper.
+
+    **Already good:** the `UPDATE` runs once as a set operation, not per product, and `EXISTS` stops at the first matching row.
+verify:
+  static_only: Postgres-specific psql script (\copy, TRUNCATE in transaction), not runnable in SQLite

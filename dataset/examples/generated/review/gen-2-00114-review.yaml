@@ -1,0 +1,237 @@
+id: gen-2-00114-review
+category: review
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    Can you review my little CLI tool? It computes the Flesch reading ease for every document in the text dumps from our docs crawler. Each line is one document, and a dump has a few million lines. Right now one dump takes a long time on the build box.
+
+    Requirements:
+    - stdlib only (it runs on a locked-down box, no pip)
+    - stdout must stay byte-for-byte the same, because a downstream script parses the `lineno<TAB>score` lines
+    - Python 3.10
+
+    Please look for speed problems and for anything that is broken.
+
+    ```python
+    #!/usr/bin/env python3
+    """readstat: Flesch reading ease for large text dumps (one document per line)."""
+    import argparse
+    import re
+    import sys
+
+    VOWELS = "aeiouy"
+    WORD_RE = re.compile(r"[A-Za-z']+")
+    SENT_RE = re.compile(r"[.!?]+")
+
+
+    def count_syllables(word):
+        w = word.lower().strip("'")
+        if len(w) <= 3:
+            return 1
+        if w.endswith("es") or w.endswith("ed"):
+            w = w[:-2]
+        elif w.endswith("e") and not w.endswith("le"):
+            w = w[:-1]
+        count = 0
+        prev_vowel = False
+        for ch in w:
+            is_vowel = ch in VOWELS
+            if is_vowel and not prev_vowel:
+                count += 1
+            prev_vowel = is_vowel
+        return max(count, 1)
+
+
+    def score_line(line):
+        words = WORD_RE.findall(line)
+        sentences = len(SENT_RE.findall(line)) or 1
+        syllables = 0
+        for w in words:
+            syllables += count_syllables(w)
+        wps = len(words) / sentences
+        spw = syllables / len(words)
+        return 206.835 - 1.015 * wps - 84.6 * spw, len(words)
+
+
+    def main():
+        ap = argparse.ArgumentParser()
+        ap.add_argument("path")
+        ap.add_argument("--min-words", type=int, default=20)
+        args = ap.parse_args()
+
+        total = 0.0
+        n = 0
+        with open(args.path) as f:
+            for lineno, line in enumerate(f, 1):
+                score, nwords = score_line(line)
+                if nwords < args.min_words:
+                    continue
+                print(f"{lineno}\t{score:.1f}")
+                total += score
+                n += 1
+        print(f"mean\t{total / n:.1f}", file=sys.stderr)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (CLI over large text dumps)
+
+    #### [Bug] Crash on lines without words
+    - **Where:** `score_line`, `syllables / len(words)`; `main`, `total / n`
+    - **Issue:** a blank line, or a line with only digits or punctuation, has no words. That raises `ZeroDivisionError` and stops the whole run. Crawler dumps almost always contain such lines. `total / n` also crashes when no line reaches `--min-words`.
+    - **Fix:** return early when there are no words, and only print the mean when `n > 0`. Lines with words get exactly the same output as before. Empty lines are then skipped by the default `--min-words` filter.
+
+    ```python
+    def score_line(line):
+        words = WORD_RE.findall(line)
+        if not words:
+            return 0.0, 0
+        ...
+    ```
+
+    #### [Bug] File opened with the locale encoding
+    - **Where:** `open(args.path)`
+    - **Issue:** without `encoding=`, Python uses the locale of the box. With a C or POSIX locale, the first non-ASCII byte in a UTF-8 dump raises `UnicodeDecodeError`.
+    - **Fix:** `open(args.path, encoding="utf-8")`.
+
+    #### [High] Syllables recomputed for every word occurrence
+    - **Where:** `count_syllables`, called once per word in every document
+    - **Issue:** the function is pure. Its result depends only on the word. Natural text repeats the same words constantly ("the", "and", "documentation", ...), so across millions of documents almost every call recomputes a result you already had.
+    - **Fix:** memoize it with a bounded cache from the stdlib:
+
+    ```python
+    from functools import lru_cache
+
+
+    @lru_cache(maxsize=65536)
+    def count_syllables(word):
+        ...
+    ```
+
+    - **Impact:** reduces E (CPU time) in proportion to the cache hit rate. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations with inputs drawn from only 200 distinct values used ~43 J uncached and ~4.7 J with `lru_cache`, about 9× less. Your vocabulary is larger than that and your function differs, so the gain depends on how often words repeat. With mostly unique inputs, a cache only adds overhead. Check it on a real dump: print `count_syllables.cache_info()` at the end and compare `time` before and after. The bounded `maxsize` keeps memory flat. If misses stay high, raise it.
+
+    **Already good:** the regexes are compiled once at module level, and the file is streamed line by line instead of read into memory.
+
+    Revised script (stdout unchanged for every line that has words):
+
+    ```python
+    #!/usr/bin/env python3
+    """readstat: Flesch reading ease for large text dumps (one document per line)."""
+    import argparse
+    import re
+    import sys
+    from functools import lru_cache
+
+    VOWELS = "aeiouy"
+    WORD_RE = re.compile(r"[A-Za-z']+")
+    SENT_RE = re.compile(r"[.!?]+")
+
+
+    @lru_cache(maxsize=65536)
+    def count_syllables(word):
+        w = word.lower().strip("'")
+        if len(w) <= 3:
+            return 1
+        if w.endswith("es") or w.endswith("ed"):
+            w = w[:-2]
+        elif w.endswith("e") and not w.endswith("le"):
+            w = w[:-1]
+        count = 0
+        prev_vowel = False
+        for ch in w:
+            is_vowel = ch in VOWELS
+            if is_vowel and not prev_vowel:
+                count += 1
+            prev_vowel = is_vowel
+        return max(count, 1)
+
+
+    def score_line(line):
+        words = WORD_RE.findall(line)
+        if not words:
+            return 0.0, 0
+        sentences = len(SENT_RE.findall(line)) or 1
+        syllables = 0
+        for w in words:
+            syllables += count_syllables(w)
+        wps = len(words) / sentences
+        spw = syllables / len(words)
+        return 206.835 - 1.015 * wps - 84.6 * spw, len(words)
+
+
+    def main():
+        ap = argparse.ArgumentParser()
+        ap.add_argument("path")
+        ap.add_argument("--min-words", type=int, default=20)
+        args = ap.parse_args()
+
+        total = 0.0
+        n = 0
+        with open(args.path, encoding="utf-8") as f:
+            for lineno, line in enumerate(f, 1):
+                score, nwords = score_line(line)
+                if nwords < args.min_words:
+                    continue
+                print(f"{lineno}\t{score:.1f}")
+                total += score
+                n += 1
+        if n:
+            print(f"mean\t{total / n:.1f}", file=sys.stderr)
+        else:
+            print("mean\tn/a (no line had enough words)", file=sys.stderr)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    One behavior note: with `--min-words 0`, empty lines now print a score of `0.0` instead of crashing the run.
+verify:
+  module: true
+  test: |
+    assert score_line("") == (0.0, 0)
+    assert score_line("   \n") == (0.0, 0)
+    assert score_line("1234 ... !!!") == (0.0, 0)
+    assert count_syllables("table") == 2
+    count_syllables.cache_clear()
+    for _ in range(3):
+        count_syllables("readability")
+    info = count_syllables.cache_info()
+    assert info.hits == 2 and info.misses == 1
+    assert info.maxsize == 65536
+  equivalence:
+    driver: |-
+      import os
+      import sys
+      import tempfile
+
+      for w in ["table", "fire", "jumped", "boxes", "a", "I", "readable", "'tis", "queueing", "rhythm", "The", "the"]:
+          print(w, count_syllables(w))
+
+      docs = [
+          "The quick brown fox jumped over the lazy dog. Simple sentences are easy to read!",
+          "Readability metrics estimate how hard a text is. They count words, sentences and syllables.",
+          "Configure the deployment pipeline before you merge the documentation branch into main.",
+          "Short one.",
+          "No terminal punctuation here so the whole line counts as a single sentence of words",
+      ]
+      for d in docs:
+          print(score_line(d))
+
+      fd, p = tempfile.mkstemp(suffix=".txt")
+      with os.fdopen(fd, "w", encoding="utf-8") as f:
+          for d in docs * 3:
+              f.write(d + "\n")
+      sys.argv = ["readstat", p, "--min-words", "5"]
+      try:
+          main()
+      finally:
+          os.remove(p)

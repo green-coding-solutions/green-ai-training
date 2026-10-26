@@ -1,0 +1,55 @@
+id: gen-1-00133-estimate
+category: estimate
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    does a set save energy here? ~40k known rsIDs, ~8M variants per run
+
+    ```python
+    def novel_variants(variants, known_ids):
+        return [v for v in variants if v["id"] not in known_ids]
+    ```
+- role: assistant
+  content: |
+    Yes, in this case. `known_ids` is a list, so each `not in` scans it from the start. A variant that is not in the list scans all of it. Over millions of variants that is the dominant cost. A set makes each lookup O(1) on average instead of O(n).
+
+    A set is not always cheaper. In Green Metrics Tool micro-benchmarks, one membership test on a 10,000,000-element list used less energy than building a set from it and testing once. The set only pays off when you look up many times. You do 8M lookups against the same collection, so building it once is a small, one-time cost.
+
+    ```python
+    def novel_variants(variants, known_ids):
+        known = set(known_ids)
+        return [v for v in variants if v["id"] not in known]
+    ```
+
+    The output is the same, including order and duplicates. The only requirement is that the IDs are hashable, and strings are.
+
+    I can't give you a joule figure for your run. It depends on how many variants hit early in the list and on your hardware. To measure it, time both versions on a sample:
+
+    ```python
+    import timeit
+    setup = (
+        "from mod import novel_variants\n"
+        "known = [f'rs{i}' for i in range(40_000)]\n"
+        "variants = [{'id': f'rs{i}'} for i in range(0, 200_000, 7)]"
+    )
+    print(timeit.timeit("novel_variants(variants, known)", setup=setup, number=1))
+    ```
+
+    Run it once with the list version and once with the set version. CPU time is a good proxy. For real energy, run both as Green Metrics Tool usage scenarios.
+verify:
+  green_block: 0
+  test: |
+    ids = ["rs1", "rs2", "rs3"]
+    vs = [{"id": "rs2"}, {"id": "rs9"}, {"id": "rs1"}, {"id": "rs9"}]
+    assert novel_variants(vs, ids) == [{"id": "rs9"}, {"id": "rs9"}]
+    assert novel_variants([], ids) == []
+  equivalence:
+    driver: |-
+      ids = [f"rs{i}" for i in range(0, 500, 3)]
+      vs = [{"id": f"rs{i}"} for i in range(0, 600, 2)]
+      print(novel_variants(vs, ids))

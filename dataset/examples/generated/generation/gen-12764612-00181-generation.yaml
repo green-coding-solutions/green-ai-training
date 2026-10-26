@@ -1,0 +1,60 @@
+id: gen-12764612-00181-generation
+category: generation
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    gha workflow for our etl integration tests (pytest, needs postgres 16). right now they hit a staging db that runs 24/7
+- role: assistant
+  content: |-
+    Run Postgres as a service container inside the job. It starts with the run and is gone when the run ends:
+
+    ```yaml
+    name: etl-integration
+
+    on:
+      pull_request:
+        paths:
+          - 'etl/**'
+          - 'tests/**'
+          - 'requirements*.txt'
+      workflow_dispatch:
+
+    jobs:
+      integration:
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        services:
+          postgres:
+            image: postgres:16
+            env:
+              POSTGRES_USER: etl
+              POSTGRES_PASSWORD: etl_test
+              POSTGRES_DB: etl_test
+            ports:
+              - 5432:5432
+            options: >-
+              --health-cmd "pg_isready -U etl -d etl_test"
+              --health-interval 5s
+              --health-timeout 5s
+              --health-retries 10
+        env:
+          DATABASE_URL: postgresql://etl:etl_test@localhost:5432/etl_test
+        steps:
+          - uses: actions/checkout@v4
+          - uses: actions/setup-python@v5
+            with:
+              python-version: '3.12'
+          - run: pip install --no-cache-dir -r requirements.txt -r requirements-dev.txt
+          - run: pytest tests/integration -q
+    ```
+
+    The tests must create their own schema and load their own fixtures, because the database starts empty on every run. Once this works, delete the staging database.
+
+    **Green Notes**
+    - **Minimize deployed environments** (reduces E and M): the database exists only for the minutes a run needs it, not all week. In Green Metrics Tool micro-benchmarks, an idle preview environment with extra services used only about 3% more CPU energy than a minimal one over 60 seconds, and machine energy differed by less than 1%. So the saving is not in trimming services, it is in the hours when no environment runs at all.
+    - **Run only when it matters:** the `paths` filter and `timeout-minutes` keep runs from starting for unrelated changes or hanging for hours.

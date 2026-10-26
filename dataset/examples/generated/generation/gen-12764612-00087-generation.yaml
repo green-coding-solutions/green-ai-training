@@ -1,0 +1,79 @@
+id: gen-12764612-00087-generation
+category: generation
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    hi, im not sure if i do this right. on our landing page there is a small quiz (6 numbers: team size, projects, monthly visitors, integrations, support level, budget) and then we show the plan that fits (starter, team or business). a friend trained a pytorch model for it and gave me the file models/plan_net.pt, its a state_dict of a small network, 6 inputs, 32 hidden, 3 outputs. can you write the flask endpoint for the quiz? the page sends json with the 6 values. we only have a cpu server
+- role: assistant
+  content: |
+    ```python
+    import torch
+    from flask import Flask, jsonify, request
+    from torch import nn
+
+    FEATURES = ["team_size", "projects", "monthly_visitors",
+                "integrations", "support_level", "budget"]
+    PLANS = ["starter", "team", "business"]
+    SCALE = torch.tensor([50.0, 20.0, 100000.0, 10.0, 3.0, 500.0])
+
+
+    class PlanNet(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(6, 32),
+                nn.ReLU(),
+                nn.Linear(32, 3),
+            )
+
+        def forward(self, x):
+            return self.net(x)
+
+
+    # Load once when the server starts, not on every request.
+    model = PlanNet()
+    model.load_state_dict(
+        torch.load("models/plan_net.pt", map_location="cpu", weights_only=True)
+    )
+    model.eval()
+
+    app = Flask(__name__)
+
+
+    @torch.no_grad()
+    def recommend(values):
+        x = torch.tensor([values], dtype=torch.float32) / SCALE
+        probs = torch.softmax(model(x), dim=1)[0]
+        best = int(probs.argmax())
+        return PLANS[best], float(probs[best])
+
+
+    @app.post("/api/recommend-plan")
+    def recommend_plan():
+        data = request.get_json(silent=True) or {}
+        try:
+            values = [float(data[name]) for name in FEATURES]
+        except (KeyError, TypeError, ValueError):
+            return jsonify(error=f"send numbers for: {', '.join(FEATURES)}"), 400
+
+        plan, confidence = recommend(values)
+        return jsonify(plan=plan, confidence=round(confidence, 3))
+
+
+    if __name__ == "__main__":
+        app.run(port=8000)
+    ```
+
+    The page can send `{"team_size": 8, "projects": 3, ...}` and gets back something like `{"plan": "team", "confidence": 0.82}`. The `SCALE` values are my guess for the input ranges. Use the same scaling your friend used in training, or the answers will be wrong.
+
+    **Green Notes**
+    - **No gradient tracking for inference** (reduces E): `@torch.no_grad()` on `recommend` stops PyTorch from building the autograd graph, which this endpoint never needs because it only predicts. This runs on every quiz submit, so it adds up. In Green Metrics Tool micro-benchmarks, 100,000 CPU inferences used ~157 J without `torch.no_grad()` and ~135 J with it, about 14% less.
+
+    Two more things that help correctness: the model is loaded once at startup, and `model.eval()` is called so layers behave in prediction mode. `weights_only=True` makes `torch.load` refuse to run arbitrary code from the file.
+verify:
+  static_only: needs PyTorch, Flask and a trained weights file

@@ -1,0 +1,101 @@
+id: gen-2-00012-refactor
+category: refactor
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    hi, I'm new in the ML team. This script runs from cron every 15 min on our inference box (gpu-infer-02, it serves a text classifier). Two problems and I don't know if the script is the reason:
+    1. every time it runs, p99 latency of the model API goes up a lot for some minutes
+    2. the labeling team says sometimes the lowconf archive is broken and they can't open it
+
+    Request logs are one file per hour, named like requests-2026102414.jsonl, about 1.5 GB each. The low_conf folder gets small JSON files (input text + model scores) from the server. Can you clean it up? I'm not sure what is wrong.
+
+    ```bash
+    #!/bin/bash
+    # archive_inference.sh - cron every 15 min on gpu-infer-02
+    # compress request logs + prepare low confidence samples for labeling team
+
+    LOG_DIR=/srv/infer/logs
+    HANDOFF_DIR=/srv/infer/handoff
+    ARCHIVE_DIR=/mnt/archive/infer-logs
+    SAMPLES_DIR=/srv/infer/low_conf
+
+    # 1. compress request logs (we keep 90 days for retraining)
+    for f in "$LOG_DIR"/requests-*.jsonl; do
+        [ -e "$f" ] || continue
+        xz -9e -T1 "$f"
+        mv "$f.xz" "$ARCHIVE_DIR"/
+    done
+
+    # 2. pack low confidence samples for the labeling sync
+    #    (sync job picks them up within ~10 min and deletes them)
+    ts=$(date +%Y%m%d-%H%M)
+    if [ -n "$(ls -A "$SAMPLES_DIR")" ]; then
+        tar -cf - -C "$SAMPLES_DIR" . | xz -9e > "$HANDOFF_DIR/lowconf-$ts.tar.xz"
+        rm -rf "$SAMPLES_DIR"/*
+    fi
+
+    # 3. delete old archives
+    find "$ARCHIVE_DIR" -name "*.xz" -mtime +90 -delete
+    ```
+- role: assistant
+  content: |
+    ```bash
+    #!/bin/bash
+    # archive_inference.sh - cron every 15 min on gpu-infer-02
+    # compress request logs + prepare low confidence samples for labeling team
+
+    LOG_DIR=/srv/infer/logs
+    HANDOFF_DIR=/srv/infer/handoff
+    ARCHIVE_DIR=/mnt/archive/infer-logs
+    SAMPLES_DIR=/srv/infer/low_conf
+    WORK_DIR=/srv/infer/low_conf.packing   # same filesystem as SAMPLES_DIR, so mv is instant
+
+    # 1. compress finished request logs (kept 90 days for retraining)
+    current="requests-$(date +%Y%m%d%H).jsonl"   # the server is still writing this one
+    for f in "$LOG_DIR"/requests-*.jsonl; do
+        [ -e "$f" ] || continue
+        if [ "${f##*/}" = "$current" ]; then
+            continue
+        fi
+        zstd -q --rm -T1 "$f" -o "$ARCHIVE_DIR/${f##*/}.zst"
+    done
+
+    # 2. hand low confidence samples to the labeling sync
+    #    (picked up within ~10 min and deleted, so no compression)
+    if [ -n "$(ls -A "$SAMPLES_DIR")" ]; then
+        ts=$(date +%Y%m%d-%H%M)
+        mkdir -p "$WORK_DIR"
+        mv "$SAMPLES_DIR"/* "$WORK_DIR"/   # new samples now land in an empty folder
+        tar -cf "$HANDOFF_DIR/.lowconf-$ts.tar.part" -C "$WORK_DIR" . &&
+            mv "$HANDOFF_DIR/.lowconf-$ts.tar.part" "$HANDOFF_DIR/lowconf-$ts.tar" &&
+            rm -rf "$WORK_DIR"
+    fi
+
+    # 3. delete archives older than 90 days (old .xz files included)
+    find "$ARCHIVE_DIR" \( -name '*.zst' -o -name '*.xz' \) -mtime +90 -delete
+    ```
+
+    Yes, the script causes both problems. `xz -9e` is the latency problem. The broken archives come from three bugs, listed below.
+
+    **Green Notes**
+    - **zstd instead of `xz -9e` for the request logs** (reduces E): you compress these every hour and keep them 90 days, so compressing them is right. The codec is the problem. In Green Metrics Tool measurements on 100 MB of text with default settings, zstd used ~16 J and xz ~458 J, about 29× more. `-9e` is slower still than xz's default. While cron runs, all that CPU work competes with the inference server. Reading the logs back for retraining is also cheaper: ~5.3 J for zstd vs ~11.7 J for xz to decompress 100 MB.
+    - **Size trade-off:** those measurements compare energy, not file size. `xz -9e` usually gives somewhat smaller files. If the archive disk is tight, compress one hourly log with both and compare the sizes before you switch.
+    - **No compression for the handoff tar** (reduces E): the file lives about 10 minutes. Green Coding Solutions estimates that compressed data has to be stored for about 0.15 days with zstd, and about 7 days with xz, before the compression energy pays off. For a file that lives minutes, compressing is pure CPU cost.
+
+    **Bugs fixed**
+    - **Current log compressed while still being written:** the loop also took the current hour's file. xz deletes the original after compressing, so every line the server wrote after that went into a deleted file and was lost. The current hour is now skipped by name.
+    - **Half-written archives:** the sync job could grab `lowconf-*.tar.xz` while `xz -9e` was still writing it. That is your "broken archive". The tar is now written as a hidden `.part` file and renamed only when it is complete. The rename happens in the same folder, so it is atomic.
+    - **Lost samples:** samples that arrived between `tar` and `rm -rf` were deleted without being packed. They are now moved to a work folder first, and that folder is only deleted after `tar` and the rename succeed.
+
+    **Before you deploy**
+    - Install zstd (`apt install zstd`). Note that `--rm` is needed because zstd keeps the source file by default.
+    - Retraining scripts: use `zstdcat` for the new `.zst` files. Old `.xz` files still open with `xzcat` until they age out after 90 days.
+    - Labeling sync: GNU `tar -xf` detects compression by itself, so a plain `.tar` unpacks with the same command. If the job looks for `*.tar.xz`, change that to `*.tar`.
+verify:
+  static_only: bash script that needs zstd, xz and the inference server's directories

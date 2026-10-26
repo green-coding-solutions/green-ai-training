@@ -1,0 +1,53 @@
+id: gen-1-00085-generation
+category: generation
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    hello, i have a script `publish-docs.sh` what run every night from cron. It build our API reference with mkdocs in to /srv/refdocs/site (html, css, js, search_index.json, some svg files and a few png). I need nginx server block for docs.internal.example, only port 80, the people open it over VPN so it must be fast. Files change only one time in the night. Also tell me what i must add to the script, pls
+- role: assistant
+  content: |
+    Compress the files once in the script, and let nginx serve the ready `.gz` files.
+
+    ```nginx
+    server {
+        listen 80;
+        server_name docs.internal.example;
+
+        root /srv/refdocs/site;
+        index index.html;
+
+        # serve file.html.gz when the client accepts gzip
+        gzip_static on;
+        gzip_vary on;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+    }
+    ```
+
+    Add this to `publish-docs.sh`, right after the build:
+
+    ```bash
+    mkdocs build --clean -d /srv/refdocs/site
+
+    find /srv/refdocs/site -type f \
+        \( -name '*.html' -o -name '*.css' -o -name '*.js' -o -name '*.json' -o -name '*.svg' -o -name '*.xml' \) \
+        -exec gzip -9 -kf {} +
+    ```
+
+    `-k` keeps the original file, so clients without gzip still get it. `--clean` removes the old site first, so there are no old `.gz` files left over. The PNG files are skipped on purpose, because they are already compressed.
+
+    **Green Notes**
+    - **Precompress static text assets** (reduces E and network): the files change once per night, so they are compressed once and not on every request. In Green Metrics Tool micro-benchmarks with nginx and text assets, compressing on every request used about 4× the CPU energy of serving precompressed files, and compression sent about 10× fewer bytes. The benchmark ran on a local network, so it shows the CPU side only.
+    - **Level 9 in the script** (reduces network): it is slow, but it runs once per night, so the cost is paid once. Many readers then download the smaller files.
+    - **No `gzip on` for PNG** (reduces E): already-compressed formats gain nothing from compression.
+
+    *Not applied:* on-the-fly `gzip on` — there is no dynamic content here, so it would only add CPU work per request.
+verify:
+  static_only: nginx config and shell commands need nginx, mkdocs and a filesystem

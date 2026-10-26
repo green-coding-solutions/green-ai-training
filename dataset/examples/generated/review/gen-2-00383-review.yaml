@@ -1,0 +1,165 @@
+id: gen-2-00383-review
+category: review
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import csv
+    import logging
+    from collections import Counter
+
+    log = logging.getLogger("etl.orders")
+
+
+    def load_fx(path):
+        rates = {}
+        with open(path, newline="") as f:
+            for r in csv.DictReader(f):
+                rates[r["currency"]] = float(r["eur_rate"])
+        return rates
+
+
+    def enrich(rows, customers, fx_rates):
+        """Attach segment, country and EUR amount to each order line.
+
+        Nightly run over all order lines of the day. About half of them are
+        guest checkouts (empty customer_id, not in `customers`).
+        """
+        out = []
+        misses = Counter()
+        for row in rows:
+            try:
+                cust = customers[row["customer_id"]]
+                segment = cust["segment"]
+                country = cust["country"]
+            except KeyError:
+                segment = "guest"
+                country = row.get("ship_country", "??")
+                misses["customer"] += 1
+            try:
+                rate = fx_rates[row["currency"]]
+            except KeyError:
+                rate = None
+                misses["fx"] += 1
+            amount_eur = round(float(row["amount"]) * rate, 2) if rate else None
+            out.append({
+                "order_id": row["order_id"],
+                "segment": segment,
+                "country": country,
+                "amount_eur": amount_eur,
+            })
+        for k, v in misses.items():
+            log.info("%s lookups missed: %d", k, v)
+        return out
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly ETL, per-row work)
+
+    #### [Bug] Incomplete customer records are counted as guests
+    - **Where:** the first `try` block in `enrich`
+    - **Issue:** the `except KeyError` covers three lookups. If a known customer has no `segment` or `country` in its record, it is labeled `"guest"`, gets the shipping country, and counts as a customer miss. Your segment numbers end up wrong and nothing shows it.
+    - **Fix:** look up the customer alone. Read `segment` and `country` outside the miss handling. Then an incomplete record fails loudly. Use `cust.get("segment", "unknown")` if you would rather keep going and flag it.
+
+    #### [Medium] Exceptions as the normal path for guest checkouts
+    - **Where:** `customers[row["customer_id"]]` inside `try/except KeyError`
+    - **Issue:** about half of the lines are guests, so half the rows raise and catch an exception. Raising is the expensive part of `try/except`. Here it is the common case, not the exception.
+    - **Fix:** `cust = customers.get(row["customer_id"])` and branch on `cust is None`.
+    - **Impact:** E, on every row of every run. In Green Metrics Tool micro-benchmarks with about half of the keys missing, `dict.get` used about 12% less CPU energy than `try/except KeyError`. An `if key in d` check performed like `dict.get`.
+
+    **Already good:**
+    - The currency lookup can stay as `try/except`. Unknown currencies should be rare, and when misses are rare, `try/except` is cheap.
+    - One pass over the rows, and the miss counts are logged once at the end instead of per row.
+
+    ```python
+    import csv
+    import logging
+    from collections import Counter
+
+    log = logging.getLogger("etl.orders")
+
+
+    def load_fx(path):
+        rates = {}
+        with open(path, newline="") as f:
+            for r in csv.DictReader(f):
+                rates[r["currency"]] = float(r["eur_rate"])
+        return rates
+
+
+    def enrich(rows, customers, fx_rates):
+        """Attach segment, country and EUR amount to each order line.
+
+        Nightly run over all order lines of the day. About half of them are
+        guest checkouts (empty customer_id, not in `customers`).
+        """
+        out = []
+        misses = Counter()
+        for row in rows:
+            cust = customers.get(row["customer_id"])
+            if cust is None:
+                segment = "guest"
+                country = row.get("ship_country", "??")
+                misses["customer"] += 1
+            else:
+                # an incomplete customer record raises here instead of becoming a guest
+                segment = cust["segment"]
+                country = cust["country"]
+            try:
+                rate = fx_rates[row["currency"]]
+            except KeyError:  # rare: unknown currency
+                rate = None
+                misses["fx"] += 1
+            amount_eur = round(float(row["amount"]) * rate, 2) if rate else None
+            out.append({
+                "order_id": row["order_id"],
+                "segment": segment,
+                "country": country,
+                "amount_eur": amount_eur,
+            })
+        for k, v in misses.items():
+            log.info("%s lookups missed: %d", k, v)
+        return out
+    ```
+
+    Behavior change: a known customer with a missing `segment` or `country` now raises `KeyError` instead of being reported as a guest. The output for complete records is the same.
+verify:
+  equivalence:
+    driver: |
+      import logging, sys
+      logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(message)s")
+      customers = {
+          str(i): {"segment": "b2b" if i % 3 == 0 else "b2c", "country": "DE" if i % 2 else "AT"}
+          for i in range(1, 50)
+      }
+      fx = {"EUR": 1.0, "USD": 0.92, "GBP": 1.17}
+      cur = ["EUR", "USD", "GBP", "CHF"]
+      rows = []
+      for i in range(200):
+          rows.append({
+              "order_id": f"O{i}",
+              "customer_id": str(i % 100) if i % 2 else "",
+              "currency": cur[i % 4],
+              "amount": f"{(i * 7) % 300 + 0.5:.2f}",
+              "ship_country": "NL" if i % 5 else "FR",
+          })
+      for r in enrich(rows, customers, fx):
+          print(r)
+  test: |-
+    _cust = {"7": {"segment": "b2b"}}
+    _rows = [{"order_id": "X", "customer_id": "7", "currency": "EUR", "amount": "1.00"}]
+    try:
+        enrich(_rows, _cust, {"EUR": 1.0})
+        raise AssertionError("incomplete customer record must not be treated as guest")
+    except KeyError:
+        pass
+    _g = enrich([{"order_id": "G", "customer_id": "", "currency": "EUR", "amount": "2.00", "ship_country": "FR"}],
+                {}, {"EUR": 1.0})
+    assert _g == [{"order_id": "G", "segment": "guest", "country": "FR", "amount_eur": 2.0}]

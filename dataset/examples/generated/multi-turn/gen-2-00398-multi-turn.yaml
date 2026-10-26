@@ -1,0 +1,120 @@
+id: gen-2-00398-multi-turn
+category: multi-turn
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    We run a results portal for our ocean model ensemble and I need a new nginx server block (nginx 1.24, Ubuntu VM). Requirements:
+
+    - Static site in `/srv/oceanportal/site`: HTML reports, CSS, JS, and summary tables as JSON. Some of the JSON files are big, up to ~40 MB.
+    - PNG plots in `/srv/oceanportal/site/plots/`.
+    - `/api/` goes to a FastAPI app on `127.0.0.1:8000`. It returns JSON time-series subsets for whatever region and variables the user asks for.
+    - Collaborators at partner institutes download the summaries over the internet, so bandwidth matters.
+    - TLS is terminated at the institute's central reverse proxy, so plain `listen 80` is fine.
+
+    Hostname is `oceanportal.example.org`. Please write the server block.
+- role: assistant
+  content: |
+    ```nginx
+    server {
+        listen 80;
+        server_name oceanportal.example.org;
+
+        root /srv/oceanportal/site;
+        index index.html;
+
+        # On-the-fly gzip: used for /api/ and as a fallback for static files without a .gz copy
+        gzip on;
+        gzip_comp_level 5;
+        gzip_min_length 1024;
+        gzip_proxied any;
+        gzip_vary on;
+        gzip_types text/css application/javascript application/json;
+
+        location / {
+            # Serve report.html.gz / summary.json.gz if they exist next to the original
+            gzip_static on;
+            try_files $uri $uri/ =404;
+        }
+
+        location /api/ {
+            proxy_pass http://127.0.0.1:8000;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+        }
+    }
+    ```
+
+    Create the `.gz` copies at the end of the step that publishes the site:
+
+    ```bash
+    find /srv/oceanportal/site -type f \( -name '*.html' -o -name '*.css' -o -name '*.js' -o -name '*.json' \) \
+        -exec gzip -kf {} +
+    ```
+
+    `-k` keeps the originals, `-f` overwrites old `.gz` files. Run it every time the files change, or nginx will serve a stale `.gz`.
+
+    **Green Notes**
+    - **Precompressed static files** (reduces E and network): the 40 MB summaries are compressed once per publish, not once per download. In Green Metrics Tool nginx benchmarks with text assets, compressing on every request cost about 4× the CPU energy of serving precompressed files, and compression sent about 10× fewer bytes than none.
+    - **On-the-fly gzip only where needed** (reduces network): the API responses are different for every query, so they can't be precompressed. A moderate level keeps the per-response CPU work low.
+    - **PNG plots are not in `gzip_types`:** PNG is already compressed, so gzip would cost CPU for no byte saving.
+
+    `gzip_proxied any` matters here: requests arrive through your central proxy, and without it nginx skips compression for proxied requests that carry a `Via` header.
+- role: user
+  content: |
+    Problem: the site directory gets rewritten by the post-processing job on the HPC cluster every time an ensemble run finishes (several times a day), via rsync. The cluster team owns that pipeline and I don't want to add steps to it. Can you make it work without the .gz files?
+- role: assistant
+  content: |
+    Yes. Remove `gzip_static on;`, and nginx compresses the text files on the fly with the server-level settings:
+
+    ```nginx
+        location / {
+            try_files $uri $uri/ =404;
+        }
+    ```
+
+    Everything else stays the same. Partners still get compressed JSON, and the cluster pipeline doesn't change.
+
+    The trade-off is that every download of a big summary is compressed again. If downloads grow later, the `find ... gzip -kf` line can run on the VM after each rsync, for example from a systemd path unit, without touching the cluster side.
+- role: user
+  content: |
+    Change of plans: partners will get the data through the new institute data-sharing platform. The portal is now only for our group, about 8 people, on the institute LAN. Does compression still make sense at all?
+- role: assistant
+  content: |
+    On the LAN, I'd turn it off.
+
+    Compression pays off by saving bytes on slow or metered links. On a fast local network those bytes cost almost nothing, so you mostly pay CPU on both ends: nginx compresses, the browser decompresses. In Green Metrics Tool nginx benchmarks on a local network, 2,000 requests for text assets used ~7.3 J with no compression, ~14 J with precompressed files and ~54 J with gzip per request. Per-request gzip cost about 7× no compression, and even precompressed files cost about 2×, because of the decompression on the client.
+
+    Ubuntu's default `nginx.conf` sets `gzip on;` in the `http` block, so disable it explicitly:
+
+    ```nginx
+    server {
+        listen 80;
+        server_name oceanportal.example.org;
+
+        root /srv/oceanportal/site;
+        index index.html;
+
+        gzip off;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location /api/ {
+            proxy_pass http://127.0.0.1:8000;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+        }
+    }
+    ```
+
+    One exception: if people open the portal from home over the VPN, the 40 MB summaries become slow again. In that case, put back the `gzip on;` block from the first version for those users.
+verify:
+  static_only: nginx configuration and a shell one-liner that operate on server paths; nothing to execute

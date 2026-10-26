@@ -1,0 +1,43 @@
+id: gen-1-00104-generation
+category: generation
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    dockerfile for fastapi app. app/main.py, requirements.txt, port 8000. CI builds it on every push
+- role: assistant
+  content: |
+    ```dockerfile
+    FROM python:3.12-slim
+
+    ENV PYTHONDONTWRITEBYTECODE=1 \
+        PYTHONUNBUFFERED=1
+
+    WORKDIR /srv
+
+    # dependency layer first, so it is reused until requirements.txt changes
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY app/ ./app/
+
+    RUN useradd --system --no-create-home appuser
+    USER appuser
+
+    EXPOSE 8000
+    CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ```
+
+    Add a `.dockerignore` with `.git`, `__pycache__`, `.venv` and `tests/`, so they don't end up in the build context.
+
+    **Green Notes**
+    - **Slim base image** (reduces E, M): `python:3.12-slim` has no compilers or dev tools. In Green Metrics Tool micro-benchmarks of a small Flask app, building on a slim base with runtime dependencies only used about 7× less energy than a full `python:3.12` image with build tools and dev packages. Serving requests cost the same, so the saving is in every build, pull and stored copy. That adds up with a build on every push.
+    - **Dependency layer before the source** (reduces E): code changes only rebuild the `COPY app/` layer. The `pip install` layer comes from the build cache.
+    - **Runtime dependencies only** (reduces E, M): keep `pytest`, `black` and similar in a separate `requirements-dev.txt`. If a package needs a compiler, prefer a binary wheel (for example `psycopg[binary]`) over adding `build-essential` to the image.
+    - **`--no-cache-dir`** (reduces M): pip's download cache is not kept in the image layer.
+verify:
+  static_only: Dockerfile, needs docker build

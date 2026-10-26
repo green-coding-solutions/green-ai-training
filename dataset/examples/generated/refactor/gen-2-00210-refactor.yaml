@@ -1,0 +1,170 @@
+id: gen-2-00210-refactor
+category: refactor
+language: python
+patterns:
+- async-concurrent-io
+- select-columns
+facts:
+- F-HTTP
+- F-PG-SELECT
+- F-PG-COLUMNS
+messages:
+- role: user
+  content: |
+    This script builds the nightly observing log for our telescope. It reads the reduced frames of one night from Postgres, looks up each target in the institute's object catalog service and writes a CSV that the night astronomers check in the morning.
+
+    Some context:
+    - `observations` has ~60 columns, including the full FITS header as text, the reduction pipeline log and a base64 preview thumbnail. We don't need any of those here.
+    - Usually 150-400 frames per night, 40-80 unique targets.
+    - A run takes about 3 minutes, and almost all of that is waiting on the catalog.
+
+    Requirements for a refactor:
+    1. The CSV output must stay byte-identical (same rows, same order).
+    2. Keep psycopg 3. httpx is already installed in the pipeline env, so it can be used.
+    3. The catalog team asked us to keep it to max 8 concurrent requests.
+    4. 404 means "unknown target" -> empty catalog columns. Any other error must still fail the run.
+
+    ```python
+    import csv
+    import json
+    import sys
+    import urllib.parse
+    import urllib.request
+    from datetime import date
+
+    import psycopg
+
+    CATALOG_URL = "https://catalog.obs.internal/api/v1/objects"
+    DSN = "postgresql://pipeline@db.obs.internal/observatory"
+
+
+    def load_observations(conn, night):
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM observations WHERE night = %s AND status = 'reduced' ORDER BY obs_id",
+                (night,),
+            )
+            cols = [d.name for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+    def fetch_catalog_entry(target):
+        url = f"{CATALOG_URL}?name={urllib.parse.quote(target)}"
+        try:
+            with urllib.request.urlopen(url, timeout=20) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return None
+            raise
+
+
+    def main(night):
+        with psycopg.connect(DSN) as conn:
+            observations = load_observations(conn, night)
+
+        catalog = {}
+        for obs in observations:
+            target = obs["target_name"]
+            if target not in catalog:
+                catalog[target] = fetch_catalog_entry(target)
+
+        out = csv.writer(sys.stdout)
+        out.writerow(["obs_id", "target", "filter", "exptime_s", "airmass",
+                      "ra_deg", "dec_deg", "vmag", "spectral_type"])
+        for obs in observations:
+            entry = catalog[obs["target_name"]] or {}
+            out.writerow([
+                obs["obs_id"], obs["target_name"], obs["filter_band"], obs["exptime_s"], obs["airmass"],
+                entry.get("ra_deg", ""), entry.get("dec_deg", ""),
+                entry.get("vmag", ""), entry.get("spectral_type", ""),
+            ])
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1] if len(sys.argv) > 1 else date.today().isoformat())
+    ```
+- role: assistant
+  content: |
+    ```python
+    import asyncio
+    import csv
+    import sys
+    import urllib.parse
+    from datetime import date
+
+    import httpx
+    import psycopg
+
+    CATALOG_URL = "https://catalog.obs.internal/api/v1/objects"
+    DSN = "postgresql://pipeline@db.obs.internal/observatory"
+    MAX_CONCURRENT = 8  # limit agreed with the catalog team
+
+
+    def load_observations(conn, night):
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT obs_id, target_name, filter_band, exptime_s, airmass"
+                " FROM observations"
+                " WHERE night = %s AND status = 'reduced'"
+                " ORDER BY obs_id",
+                (night,),
+            )
+            cols = [d.name for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+    async def fetch_catalog_entry(client, sem, target):
+        url = f"{CATALOG_URL}?name={urllib.parse.quote(target)}"
+        async with sem:
+            resp = await client.get(url)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()
+
+
+    async def fetch_catalog(targets):
+        sem = asyncio.Semaphore(MAX_CONCURRENT)
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            async with asyncio.TaskGroup() as tg:
+                tasks = {t: tg.create_task(fetch_catalog_entry(client, sem, t)) for t in targets}
+        return {t: task.result() for t, task in tasks.items()}
+
+
+    def main(night):
+        with psycopg.connect(DSN) as conn:
+            observations = load_observations(conn, night)
+
+        targets = dict.fromkeys(obs["target_name"] for obs in observations)
+        catalog = asyncio.run(fetch_catalog(targets))
+
+        out = csv.writer(sys.stdout)
+        out.writerow(["obs_id", "target", "filter", "exptime_s", "airmass",
+                      "ra_deg", "dec_deg", "vmag", "spectral_type"])
+        for obs in observations:
+            entry = catalog[obs["target_name"]] or {}
+            out.writerow([
+                obs["obs_id"], obs["target_name"], obs["filter_band"], obs["exptime_s"], obs["airmass"],
+                entry.get("ra_deg", ""), entry.get("dec_deg", ""),
+                entry.get("vmag", ""), entry.get("spectral_type", ""),
+            ])
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1] if len(sys.argv) > 1 else date.today().isoformat())
+    ```
+
+    **Green Notes**
+    - **Select only the needed columns** (reduces E, M): `SELECT *` read the FITS header, the pipeline log and the base64 thumbnail for every frame. All of it was transferred, decoded into Python strings and then thrown away. Now the query reads only the five columns the CSV uses. In Green Metrics Tool micro-benchmarks on a 52-column table with large text columns, naming 10 columns instead of `SELECT *` used about 5.5-7× less energy. The saving grows with the size of the skipped columns, and yours are large.
+    - **Concurrent catalog lookups** (reduces wall time, resource holding time): each unique target is still requested once, but up to 8 requests now run at the same time instead of one after another. Most of the waiting overlaps, so the run finishes much sooner. Don't expect a large CPU saving from this part. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`.
+
+    Behavior against your requirements:
+    - **CSV:** unchanged. Rows are written in `obs_id` order from the query, and the catalog dict is only used for lookups.
+    - **Concurrency:** the semaphore caps requests in flight at 8.
+    - **404:** still gives empty catalog columns.
+    - **Other errors still fail the run:** HTTP errors, timeouts and connection errors all do. `TaskGroup` also cancels the remaining lookups as soon as one fails. The exception now arrives wrapped in an `ExceptionGroup`, and HTTP errors are `httpx.HTTPStatusError` instead of `urllib.error.HTTPError`. Adjust any wrapper that catches the old exception types.
+    - **Redirects:** `follow_redirects=True` keeps urllib's redirect behavior.
+    - **Python version:** `asyncio.TaskGroup` needs Python 3.11 or newer.
+verify:
+  static_only: needs a PostgreSQL server, network access to the catalog service and the httpx package

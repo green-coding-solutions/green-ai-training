@@ -1,0 +1,112 @@
+id: gen-12764612-00270-refactor
+category: refactor
+language: python
+patterns:
+- keep-star-imports
+- hoist-invariants
+facts:
+- F-IMPORT
+- F-ATTR
+messages:
+- role: user
+  content: |
+    I'm new to python. I made this script that draws the starry background for our landing page hero section. It works but I think something is wrong or slow, I don't know what. Can you make it better?
+
+    ```python
+    from math import *
+    import random
+
+    WIDTH = 1200
+    HEIGHT = 630
+    COLORS = ["#ff6b6b", "#feca57", "#48dbfb", "#1dd1a1", "#5f27cd"]
+
+
+    def make_stars(count, seed=42):
+        rng = random.Random(seed)
+        out = []
+        for i in range(count):
+            x = rng.random() * WIDTH
+            y = rng.random() * HEIGHT
+            r = 1 + rng.random() * 2
+            color = COLORS[int(rng.random() * len(COLORS))]
+            angle = i * pi / 180
+            drift = sin(angle) * 3
+            out.append('<circle cx="%.1f" cy="%.1f" r="%.1f" fill="%s"/>' % (x + drift, y, r, color))
+        return out
+
+
+    def render_hero(title, count=3000):
+        stars = "".join(make_stars(count))
+        return (
+            '<section class="hero">'
+            '<svg viewBox="0 0 %d %d" aria-hidden="true">%s</svg>'
+            '<h1>%s</h1>'
+            '</section>' % (WIDTH, HEIGHT, stars, title)
+        )
+    ```
+- role: assistant
+  content: |
+    Your script is correct. Only the loop in `make_stars` is worth a small change.
+
+    ```python
+    from math import *
+    import random
+
+    WIDTH = 1200
+    HEIGHT = 630
+    COLORS = ["#ff6b6b", "#feca57", "#48dbfb", "#1dd1a1", "#5f27cd"]
+
+
+    def make_stars(count, seed=42):
+        rng = random.Random(seed)
+        rand = rng.random
+        out = []
+        add = out.append
+        n_colors = len(COLORS)
+        for i in range(count):
+            x = rand() * WIDTH
+            y = rand() * HEIGHT
+            r = 1 + rand() * 2
+            color = COLORS[int(rand() * n_colors)]
+            angle = i * pi / 180
+            drift = sin(angle) * 3
+            add('<circle cx="%.1f" cy="%.1f" r="%.1f" fill="%s"/>' % (x + drift, y, r, color))
+        return out
+
+
+    def render_hero(title, count=3000):
+        stars = "".join(make_stars(count))
+        return (
+            '<section class="hero">'
+            '<svg viewBox="0 0 %d %d" aria-hidden="true">%s</svg>'
+            '<h1>%s</h1>'
+            '</section>' % (WIDTH, HEIGHT, stars, title)
+        )
+    ```
+
+    **Green Notes**
+    - **Lookups moved out of the loop** (reduces E): `rng.random`, `out.append` and `len(COLORS)` were looked up again on every pass. Now they are looked up once. The random numbers come in the same order, so the output is identical. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local variable before a 10,000,000-iteration loop saved about 4-5%. That is a small gain and it only counts in very tight loops. Here it is a low-priority tidy-up that costs no readability.
+    - **Star import left as is:** `from math import *` looks suspicious to beginners, but switching to `import math` makes no measurable energy difference in micro-benchmarks. So I did not change it. Your `pi` and `sin` calls stay as they are.
+    - **Already good:** you build the string with `"".join(...)` and not with `+=` in a loop. That is the right choice for 3000 circles.
+    - If the page is built once per deploy, the generated SVG will cost far more bytes on the network than this loop costs in CPU. Do not spend more time on the script itself.
+  verify:
+    equivalence:
+      driver: |
+        stars = make_stars(2500)
+        print(len(stars))
+        print(stars[0])
+        print(stars[1234])
+        print(stars[-1])
+        page = render_hero("Hello & welcome", 500)
+        print(len(page))
+        print(hash(page) == hash(render_hero("Hello & welcome", 500)))
+        print(page[:120])
+        print(page[-80:])
+    test: |-
+      s = make_stars(10)
+      assert len(s) == 10
+      assert s[0].startswith('<circle')
+      assert make_stars(10, seed=1) == make_stars(10, seed=1)
+      assert make_stars(10, seed=1) != make_stars(10, seed=2)
+      assert render_hero("Hi", 3).count('<circle') == 3
+      assert render_hero("Hi", 3).endswith('<h1>Hi</h1></section>')

@@ -1,0 +1,103 @@
+id: gen-2-00384-refactor
+category: refactor
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    hi, our nightly batch inference job writes a results.csv with one row per image (around 60k rows). I wrote this script to make a small summary for the team. It works but it takes like 20 minutes, the model itself was faster lol. Is something wrong with it? I'm not really good at bash.
+
+    ```bash
+    #!/bin/bash
+    # summary of nightly batch inference results
+    # results.csv: image_path,label,confidence,latency_ms
+
+    RESULTS=${1:-/data/inference/results.csv}
+    THRESHOLD=0.5
+
+    total=0
+    low_conf=0
+    latency_sum=0
+    max_latency=0
+    declare -A per_label
+
+    tail -n +2 "$RESULTS" > /tmp/rows.csv
+
+    while read line; do
+        label=$(echo $line | cut -d',' -f2)
+        conf=$(echo $line | cut -d',' -f3)
+        latency=$(echo $line | cut -d',' -f4)
+
+        total=$(expr $total + 1)
+        latency_sum=$(expr $latency_sum + $latency)
+        if [ $latency -gt $max_latency ]; then
+            max_latency=$latency
+        fi
+
+        is_low=$(echo "$conf < $THRESHOLD" | bc)
+        if [ "$is_low" -eq 1 ]; then
+            low_conf=$(expr $low_conf + 1)
+            echo "$line" >> low_confidence.csv
+        fi
+
+        count=${per_label[$label]:-0}
+        per_label[$label]=$(expr $count + 1)
+    done < /tmp/rows.csv
+
+    echo "rows:          $total"
+    echo "avg latency:   $(expr $latency_sum / $total) ms"
+    echo "max latency:   $max_latency ms"
+    echo "low conf (<$THRESHOLD): $low_conf"
+    for label in "${!per_label[@]}"; do
+        echo "  $label: ${per_label[$label]}"
+    done
+    ```
+- role: assistant
+  content: |
+    The script itself is fine. The problem is that every row starts several new processes: `cut` three times, `expr` two or three times, and `bc`. Each one is a full process start for a tiny piece of work. With 60k rows, that adds up to hundreds of thousands of process starts. One `awk` pass does the same work in a single process. It also handles the decimal confidence values itself, so `bc` is no longer needed.
+
+    ```bash
+    #!/bin/bash
+    # summary of nightly batch inference results
+    # results.csv: image_path,label,confidence,latency_ms
+    set -euo pipefail
+
+    results=${1:-/data/inference/results.csv}
+    threshold=0.5
+    low_file='low_confidence.csv'
+
+    : > "$low_file"   # start fresh every night
+
+    awk -F',' -v thr="$threshold" -v low_file="$low_file" '
+    NR == 1 { next }                      # skip header
+    {
+        total++
+        lat_sum += $4
+        if ($4 > max_lat) max_lat = $4
+        if ($3 + 0 < thr + 0) { low++; print > low_file }
+        per_label[$2]++
+    }
+    END {
+        printf "rows:          %d\n", total
+        if (total > 0) printf "avg latency:   %d ms\n", int(lat_sum / total)
+        printf "max latency:   %d ms\n", max_lat
+        printf "low conf (<%s): %d\n", thr, low + 0
+        for (l in per_label) printf "  %s: %d\n", l, per_label[l]
+    }' "$results"
+    ```
+
+    **Green Notes**
+    - **One `awk` pass instead of subprocesses per row** (reduces E): the loop started a handful of processes for every row. Now the whole file is read by one process. In Green Metrics Tool micro-benchmarks that summarized a 20,000-line access log, the `$(echo | cut)` / `$(expr)` loop used ~1302 J, and one `awk` pass with the same output used ~1.0 J, over 1000× less. A pure-builtin bash loop was about 300× cheaper than the subprocess loop. Here `awk` is the better choice, because bash cannot compare decimals like `0.43 < 0.5` without `bc`.
+    - **No temp copy** (reduces E, disk): `tail` into `/tmp/rows.csv` wrote the whole file a second time. `awk` skips the header with `NR == 1` instead. The fixed `/tmp` name also broke when two runs overlapped.
+
+    Bugs fixed along the way:
+    - `low_confidence.csv` was only ever appended to, so it collected the low-confidence rows of every past night. It is now emptied at the start of each run.
+    - `read` without `-r` and the unquoted `echo $line` could mangle image paths that contain backslashes or `*`. `awk` reads each line as it is.
+    - An empty results file made `expr` fail with a division by zero. The avg line is now skipped in that case.
+
+    The per-label lines still come out in no fixed order, same as with the bash associative array before.
+verify:
+  static_only: bash script; reads a results.csv from the batch inference job

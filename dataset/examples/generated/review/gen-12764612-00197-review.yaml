@@ -1,0 +1,102 @@
+id: gen-12764612-00197-review
+category: review
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    fix this, gateway CPU is always high
+
+    ```python
+    import json
+    import time
+
+    import paho.mqtt.client as mqtt
+    import torch
+
+    from spoilage import SpoilGRU
+
+    WINDOW = 24
+    THRESHOLD = 0.8
+
+    model = SpoilGRU(n_features=3, hidden=32, dropout=0.2)
+    model.load_state_dict(torch.load("/opt/gw/spoil_gru.pt"))
+
+    buffers = {}
+
+
+    def on_message(client, userdata, msg):
+        data = json.loads(msg.payload)
+        logger_id = data["id"]
+        buf = buffers.setdefault(logger_id, [])
+        buf.append([data["temp"], data["hum"], data["door"]])
+        if len(buf) < WINDOW:
+            return
+        del buf[:-WINDOW]
+
+        x = torch.tensor([buf], dtype=torch.float32)
+        risk = torch.sigmoid(model(x)).item()
+        if risk > THRESHOLD:
+            client.publish(
+                f"alerts/{logger_id}",
+                json.dumps({"risk": risk, "ts": time.time()}),
+            )
+
+
+    client = mqtt.Client()
+    client.on_message = on_message
+    client.connect("localhost", 1883)
+    client.subscribe("coldchain/+/reading")
+    client.loop_forever()
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (always-on IoT gateway, CPU inference per MQTT message)
+
+    #### [Bug] Model is still in training mode
+    - **Where:** model setup, before `on_message`
+    - **Issue:** there is no `model.eval()`. With `dropout=0.2`, dropout stays active, so the same window can give different risk scores. Alerts near the threshold can flip at random.
+    - **Fix:** call `model.eval()` once after loading the weights.
+    - **Impact:** correctness. Scores will change a little after the fix, and they become repeatable.
+
+    #### [High] Autograd graph built for every inference
+    - **Where:** `model(x)` in `on_message`
+    - **Issue:** outside `torch.no_grad()`, PyTorch records the graph for a backward pass that never happens. This runs for every message once a logger has a full window. In Green Metrics Tool micro-benchmarks of 100,000 PyTorch CPU inferences, ~157 J without `torch.no_grad()` and ~135 J with it, about 14% less.
+    - **Fix:**
+      ```python
+      model = SpoilGRU(n_features=3, hidden=32, dropout=0.2)
+      model.load_state_dict(torch.load("/opt/gw/spoil_gru.pt", weights_only=True))
+      model.eval()
+
+
+      def on_message(client, userdata, msg):
+          data = json.loads(msg.payload)
+          logger_id = data["id"]
+          buf = buffers.setdefault(logger_id, [])
+          buf.append([data["temp"], data["hum"], data["door"]])
+          if len(buf) < WINDOW:
+              return
+          del buf[:-WINDOW]
+
+          with torch.no_grad():
+              x = torch.tensor([buf], dtype=torch.float32)
+              risk = torch.sigmoid(model(x)).item()
+          if risk > THRESHOLD:
+              client.publish(
+                  f"alerts/{logger_id}",
+                  json.dumps({"risk": risk, "ts": time.time()}),
+              )
+      ```
+    - **Impact:** E on the gateway, per message, for the whole uptime. Less work per message and less memory held for the graph. The output values are the same.
+
+    #### [Security] `torch.load` unpickles the file
+    - **Where:** `torch.load("/opt/gw/spoil_gru.pt")`
+    - **Issue:** a full pickle load can run code from a tampered model file. For a plain state dict you don't need that.
+    - **Fix:** `weights_only=True`, as in the snippet above. Also keep the file writable only by root.
+
+    **Already good:** the rolling window is trimmed to `WINDOW`, so memory per logger stays fixed, and alerts are only published above the threshold.
+verify:
+  static_only: needs paho-mqtt, a trained model file and an MQTT broker

@@ -1,0 +1,109 @@
+id: gen-1-00097-review
+category: review
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    review pls, our raw lidar dumps are big
+
+    ```python
+    import sys
+    import numpy as np
+
+
+    def to_u8(samples, lo, hi):
+        out = np.empty(len(samples), dtype=np.uint8)
+        scale = 255.0 / (hi - lo)
+        for i in range(len(samples)):
+            v = samples[i]
+            if v < lo:
+                v = lo
+            elif v > hi:
+                v = hi
+            out[i] = int((v - lo) * scale + 0.5)
+        return out
+
+
+    def main():
+        src, dst = sys.argv[1], sys.argv[2]
+        lo, hi = float(sys.argv[3]), float(sys.argv[4])
+        data = np.fromfile(src, dtype=np.float32)
+        out = to_u8(data, lo, hi)
+        out.tofile(dst)
+        print(f"{len(out)} samples, min={out.min()} max={out.max()}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (CLI, large input files)
+
+    #### [Bug] NaN in the input crashes the run
+    - **Where:** `to_u8`, `int(...)`
+    - **Issue:** a NaN passes both range checks, so `int(nan)` raises `ValueError` after the whole file was already scanned up to that point. Raw lidar dumps often contain NaN for "no return".
+    - **Fix:** check once before the loop and stop with a clear message (see the code below).
+
+    #### [Bug] `hi <= lo` and empty files
+    - **Where:** `scale = 255.0 / (hi - lo)`, `out.min()`
+    - **Issue:** `hi == lo` gives `ZeroDivisionError`, and `hi < lo` silently produces a reversed, wrong mapping. An empty input file makes `out.min()` raise.
+    - **Fix:** validate the arguments and the sample count in `main`.
+
+    #### [High] Pure Python loop over every sample
+    - **Where:** `to_u8`
+    - **Issue:** each sample goes through the interpreter: indexing, two comparisons, arithmetic and a boxed `int`. This is a CPU-bound numeric loop, and it runs once per sample on big files. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples in a pure Python loop used ~40 J, with Numba `@njit` ~9.5 J, about 4× less.
+    - **Fix:** compile the loop with Numba. The loop body stays the same.
+    - **Impact:** E, a constant factor per sample. It grows with file size and with how often the tool runs.
+
+    ```python
+    import sys
+    import numpy as np
+    from numba import njit
+
+
+    @njit(cache=True)
+    def to_u8(samples, lo, hi):
+        out = np.empty(samples.shape[0], dtype=np.uint8)
+        scale = 255.0 / (hi - lo)
+        for i in range(samples.shape[0]):
+            v = samples[i]
+            if v < lo:
+                v = lo
+            elif v > hi:
+                v = hi
+            out[i] = np.uint8((v - lo) * scale + 0.5)
+        return out
+
+
+    def main():
+        src, dst = sys.argv[1], sys.argv[2]
+        lo, hi = float(sys.argv[3]), float(sys.argv[4])
+        if not hi > lo:
+            sys.exit("hi must be greater than lo")
+        data = np.fromfile(src, dtype=np.float32)
+        if data.size == 0:
+            sys.exit("input file is empty")
+        if np.isnan(data).any():
+            sys.exit("input contains NaN; clean it first")
+        out = to_u8(data, lo, hi)
+        out.tofile(dst)
+        print(f"{len(out)} samples, min={out.min()} max={out.max()}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    #### [Low] Compile time and a small numeric difference
+    - **Where:** first call of `to_u8`
+    - **Issue:** Numba compiles on the first call, and `cache=True` stores the result so later runs skip it. For tiny files the compile cost is higher than the loop, so Numba only pays off on large inputs. Inside the compiled loop, float32 values are computed in float64, so a value exactly on a rounding edge can land one level away from the old output.
+    - **Fix:** none needed for large dumps. If you also run it on small files, keep the plain version for those.
+
+    **Already good:** `np.fromfile` reads the data in one call, and the output array is preallocated with the right dtype.
+verify:
+  static_only: requires numba, which is not in the stdlib + numpy environment; the code needs input files and sys.argv

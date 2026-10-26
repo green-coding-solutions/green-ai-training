@@ -1,0 +1,195 @@
+id: gen-2-00144-refactor
+category: refactor
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    Hi, I'm new to DevOps at my company. I set up preview links for our marketing landing page so the designers can check changes before merge. Now my lead says the preview cluster costs too much and is "full of zombies". There are around 40 namespaces, and some are from branches that were merged months ago. Also, deploys from some branches fail and I don't know why. I copied the helm values from production because I wasn't sure what preview needs. I'm not sure what's wrong with my workflow. Can you clean it up?
+
+    ```yaml
+    name: preview
+
+    on:
+      push:
+        branches-ignore: [main]
+
+    jobs:
+      deploy:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+
+          - uses: actions/setup-node@v4
+            with:
+              node-version: 20
+              cache: npm
+
+          - run: npm ci
+          - run: npm run build
+
+          - name: Build and push image
+            run: |
+              docker build -t ghcr.io/acme/landing:${{ github.sha }} .
+              echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+              docker push ghcr.io/acme/landing:${{ github.sha }}
+
+          - name: Set up kubeconfig
+            run: |
+              mkdir -p ~/.kube
+              echo "${{ secrets.KUBECONFIG_PREVIEW }}" > ~/.kube/config
+
+          - name: Deploy preview
+            run: |
+              NS=preview-${{ github.ref_name }}
+              kubectl create namespace $NS || true
+              helm upgrade --install landing ./chart \
+                --namespace $NS \
+                --set image.tag=${{ github.sha }} \
+                --set replicaCount=3 \
+                --set cms.enabled=true \
+                --set postgres.enabled=true \
+                --set redis.enabled=true \
+                --set imageWorker.enabled=true \
+                --set ingress.host=$NS.preview.acme.dev
+    ```
+- role: assistant
+  content: |
+    The main problem is that nothing ever deletes a preview. Every branch gets one on its first push, and it runs until someone removes it by hand. Here is the cleaned-up workflow, `.github/workflows/preview.yml`:
+
+    ```yaml
+    name: preview
+
+    on:
+      pull_request:
+        types: [opened, synchronize, reopened, closed]
+
+    permissions:
+      contents: read
+      packages: write
+
+    # deploy and teardown of the same PR never run at the same time
+    concurrency:
+      group: preview-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+
+    env:
+      NS: preview-pr-${{ github.event.pull_request.number }}
+
+    jobs:
+      deploy:
+        if: github.event.action != 'closed'
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+
+          - uses: actions/setup-node@v4
+            with:
+              node-version: 20
+              cache: npm
+
+          - run: npm ci
+          - run: npm run build
+
+          - name: Build and push image
+            run: |
+              docker build -t ghcr.io/acme/landing:${{ github.sha }} .
+              echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+              docker push ghcr.io/acme/landing:${{ github.sha }}
+
+          - name: Set up kubeconfig
+            run: |
+              mkdir -p ~/.kube
+              echo "${{ secrets.KUBECONFIG_PREVIEW }}" > ~/.kube/config
+
+          - name: Deploy preview
+            run: |
+              helm upgrade --install landing ./chart \
+                --namespace "$NS" --create-namespace \
+                --set image.tag=${{ github.sha }} \
+                --set replicaCount=1 \
+                --set cms.enabled=true \
+                --set postgres.enabled=true \
+                --set redis.enabled=true \
+                --set imageWorker.enabled=true \
+                --set ingress.host="$NS.preview.acme.dev"
+              kubectl label namespace "$NS" preview=true --overwrite
+
+      teardown:
+        if: github.event.action == 'closed'
+        runs-on: ubuntu-latest
+        steps:
+          - name: Set up kubeconfig
+            run: |
+              mkdir -p ~/.kube
+              echo "${{ secrets.KUBECONFIG_PREVIEW }}" > ~/.kube/config
+
+          - name: Delete preview
+            run: kubectl delete namespace "$NS" --ignore-not-found
+    ```
+
+    Nobody looks at previews at night or on weekends. This second workflow, `.github/workflows/preview-night.yml`, scales them to zero after work and back up in the morning on weekdays. The times are in UTC, so adjust them to your team's hours:
+
+    ```yaml
+    name: preview-night
+
+    on:
+      schedule:
+        - cron: '0 19 * * 1-5'   # scale down every weekday evening, stays down over the weekend
+        - cron: '0 6 * * 1-5'    # scale up on weekday mornings
+      workflow_dispatch:
+        inputs:
+          replicas:
+            description: 'Replicas for all previews (0 = sleep, 1 = wake)'
+            default: '1'
+
+    jobs:
+      scale:
+        runs-on: ubuntu-latest
+        steps:
+          - name: Set up kubeconfig
+            run: |
+              mkdir -p ~/.kube
+              echo "${{ secrets.KUBECONFIG_PREVIEW }}" > ~/.kube/config
+
+          - name: Scale previews
+            env:
+              SCHEDULE: ${{ github.event.schedule }}
+              MANUAL: ${{ inputs.replicas }}
+            run: |
+              case "$SCHEDULE" in
+                '0 19 * * 1-5') replicas=0 ;;
+                '0 6 * * 1-5')  replicas=1 ;;
+                *)              replicas="$MANUAL" ;;
+              esac
+              for ns in $(kubectl get namespaces -l preview=true -o jsonpath='{.items[*].metadata.name}'); do
+                kubectl -n "$ns" scale deployment --all --replicas="$replicas"
+                kubectl -n "$ns" scale statefulset --all --replicas="$replicas"
+              done
+    ```
+
+    Postgres keeps its volume while scaled to zero, so CMS content is still there in the morning.
+
+    The new workflow does not remove the zombies that already exist. All the old ones are named `preview-<branch>`, so you can list them first and delete them after a check:
+
+    ```bash
+    kubectl get namespaces -o name | grep '^namespace/preview-' | grep -v '^namespace/preview-pr-'
+    # if the list looks right:
+    kubectl get namespaces -o name | grep '^namespace/preview-' | grep -v '^namespace/preview-pr-' | xargs kubectl delete
+    ```
+
+    **Green Notes**
+    - **Tear down on merge or close** (reduces E, M): a preview now exists only while its pull request is open, so its hours are gone. Before, every preview kept running for months.
+    - **Scale to zero outside working hours** (reduces E, M): sleeping previews hold no CPU or memory during nights and weekends, and the cluster needs fewer nodes for them.
+    - **Previews only for pull requests** (reduces E, M): branches without a PR no longer get an environment. This changes behavior. Designers now need a PR, which can be a draft, to get a link.
+    - **One replica instead of three** (reduces M): a preview has a few viewers, so one pod is enough. In Green Metrics Tool measurements, an idle preview with 3 app replicas, Postgres, Redis and a polling worker used only about 3% more CPU energy over 60 seconds than one with 1 replica and Postgres. Trimming services saves memory and node space, but most of the saving comes from the hours above. If the landing page works without Redis and the image worker, you can also set `redis.enabled=false` and `imageWorker.enabled=false`. Try that on one preview first.
+
+    Other changes:
+    - **Bug, failing deploys:** namespace names come from the branch name, so `feature/new-hero` became `preview-feature/new-hero`. That is not a valid Kubernetes name, and `|| true` hid the error. The PR number always gives a valid name like `preview-pr-42`.
+    - **Security:** `${{ github.ref_name }}` was pasted straight into a shell script. A branch name with shell syntax in it could run commands on the runner, which has your kubeconfig. The PR number cannot do that.
+    - `permissions: packages: write` is required, because pull request runs get a read-only token by default and the image push would fail. Note that PRs from forks get no secrets, so they get no preview.
+verify:
+  static_only: GitHub Actions workflows, need a Kubernetes cluster, Helm and the chart

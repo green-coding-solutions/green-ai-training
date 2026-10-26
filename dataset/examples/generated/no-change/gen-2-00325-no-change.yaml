@@ -1,0 +1,86 @@
+id: gen-2-00325-no-change
+category: no-change
+language: python
+patterns:
+- select-columns
+- context-tradeoff
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+messages:
+- role: user
+  content: |
+    Our static analysis bot flagged the `SELECT *` below as a perf issue. Just send me the diff.
+
+    ```python
+    from dataclasses import dataclass
+    from decimal import Decimal
+
+    import psycopg
+    from psycopg.rows import dict_row
+
+
+    @dataclass(frozen=True)
+    class ShippingZone:
+        code: str
+        country: str
+        postcode_prefixes: tuple[str, ...]
+        carrier: str
+        base_fee: Decimal
+        free_above: Decimal | None
+        eta_days: int
+
+
+    def load_zones(dsn: str) -> dict[str, list[ShippingZone]]:
+        """Called once at checkout worker start. shipping_zones: 8 cols, ~40 rows."""
+        with psycopg.connect(dsn, row_factory=dict_row) as conn:
+            rows = conn.execute("SELECT * FROM shipping_zones WHERE active").fetchall()
+
+        zones: dict[str, list[ShippingZone]] = {}
+        for r in rows:
+            zone = ShippingZone(
+                code=r["code"],
+                country=r["country"],
+                postcode_prefixes=tuple(r["postcode_prefixes"]),
+                carrier=r["carrier"],
+                base_fee=r["base_fee"],
+                free_above=r["free_above"],
+                eta_days=r["eta_days"],
+            )
+            zones.setdefault(zone.country, []).append(zone)
+        return zones
+
+
+    def zone_for(zones, country, postcode):
+        best, best_len = None, -1
+        for zone in zones.get(country, ()):
+            for prefix in zone.postcode_prefixes:
+                if postcode.startswith(prefix) and len(prefix) > best_len:
+                    best, best_len = zone, len(prefix)
+        return best
+
+
+    def shipping_fee(zone, subtotal):
+        if zone.free_above is not None and subtotal >= zone.free_above:
+            return Decimal("0.00")
+        return zone.base_fee
+    ```
+- role: assistant
+  content: |
+    No diff. The bot is wrong in this case, and I'd leave the query as it is.
+
+    - **Cold path:** it runs once per worker start and reads about 40 rows. After that, checkout only touches the in-memory dict.
+    - **Nothing to skip:** you use 7 of the 8 columns. The 8th is the `active` boolean you filter on. Naming the columns only pays off when you skip large ones. In Green Metrics Tool benchmarks, reading a 52-column products table with large text columns 1,000 times used about 5.5× to 7× less energy when the query named only the 10 needed columns. The cost scaled with the data each column carried. This table has no such columns.
+
+    Naming the columns makes sense here for a different reason: schema drift. If someone later adds a wide column to `shipping_zones`, `SELECT *` would load it silently. If you want to guard against that and silence the bot, the change is one line:
+
+    ```python
+    rows = conn.execute(
+        "SELECT code, country, postcode_prefixes, carrier, base_fee, free_above, eta_days "
+        "FROM shipping_zones WHERE active"
+    ).fetchall()
+    ```
+
+    Behavior is the same, because the code reads every field by name.
+verify:
+  static_only: needs a PostgreSQL server and psycopg 3

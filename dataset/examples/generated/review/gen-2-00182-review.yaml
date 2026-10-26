@@ -1,0 +1,147 @@
+id: gen-2-00182-review
+category: review
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    Hi, I am quite new to Python and wrote this check for our deploy pipeline. Before every deploy we render the helm charts for all 14 clusters (around 9000 yaml docs). This script checks that every container image comes from a registry we allow and does not use a tag like latest. It works, but the job got really slow since we added more clusters. Yesterday it also crashed on one manifest with "ValueError: not enough values to unpack". I don't really know what is wrong. Can you review it please?
+
+    ```python
+    import sys
+    import yaml
+    from fnmatch import fnmatch
+    from pathlib import Path
+
+    ALLOWED = [
+        "registry.internal:5000/platform/*",
+        "registry.internal:5000/payments/*",
+        "ghcr.io/our-org/*",
+        "docker.io/library/nginx",
+        "docker.io/library/redis",
+        # ... about 60 more
+    ]
+    BLOCKED_TAGS = {"latest", "dev", "main"}
+
+
+    def parse_image(ref):
+        if "@" in ref:
+            name, digest = ref.split("@", 1)
+            return name, None, digest
+        name, tag = ref.rsplit(":", 1)
+        return name, tag, None
+
+
+    def check_image(ref):
+        problems = []
+        name, tag, digest = parse_image(ref)
+        if "/" not in name:
+            name = "docker.io/library/" + name
+        if not any(fnmatch(name, pattern) for pattern in ALLOWED):
+            problems.append(f"registry not allowed: {name}")
+        if digest is None and tag in BLOCKED_TAGS:
+            problems.append(f"mutable tag: {tag}")
+        return problems
+
+
+    def images_in(doc):
+        spec = doc.get("spec", {})
+        pod = spec.get("template", {}).get("spec", spec)
+        for c in pod.get("containers", []) + pod.get("initContainers", []):
+            yield c["image"]
+
+
+    def main(root):
+        failed = False
+        for path in sorted(Path(root).rglob("*.yaml")):
+            for doc in yaml.safe_load_all(path.read_text()):
+                if not doc:
+                    continue
+                for ref in images_in(doc):
+                    for problem in check_image(ref):
+                        print(f"{path}: {problem}")
+                        failed = True
+        return 1 if failed else 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main(sys.argv[1]))
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (CI job, runs before every deploy)
+
+    #### [Bug] `parse_image` crashes or misreads untagged images
+    - **Where:** `name, tag = ref.rsplit(":", 1)`
+    - **Issue:** an image without a tag (`redis`) has no `:`, so the unpack raises your `ValueError`. With a registry port and no tag (`registry.internal:5000/platform/api`), the split cuts at the port: the name becomes `registry.internal` and the tag becomes `5000/platform/api`. A ref with both tag and digest (`nginx:1.25@sha256:...`) keeps `:1.25` in the name, so it never matches `ALLOWED`.
+    - **Fix:** split off the digest first. Only treat a `:` in the last path segment as a tag. A missing tag means `latest`, the same as Docker does. Untagged images are now reported as `mutable tag: latest` instead of crashing. See the fixed `parse_image` below.
+
+    #### [Security] CronJob images skip the policy check
+    - **Where:** `images_in`
+    - **Issue:** a CronJob keeps its pod spec under `spec.jobTemplate.spec.template.spec`. The function only looks at `spec.template.spec`, so CronJob containers are never checked. Any image can go through that way.
+    - **Fix:**
+
+    ```python
+    def images_in(doc):
+        spec = doc.get("spec") or {}
+        if "jobTemplate" in spec:  # CronJob
+            spec = spec["jobTemplate"].get("spec") or {}
+        pod = (spec.get("template") or {}).get("spec", spec)
+        for c in pod.get("containers", []) + pod.get("initContainers", []):
+            yield c["image"]
+    ```
+
+    #### [High] The same image is checked thousands of times
+    - **Where:** `check_image`, called once for every container in every rendered doc
+    - **Issue:** each cluster render has the same images, and many deployments share them. So the script sees only a small set of distinct image strings, but it parses each occurrence again and runs `fnmatch` against every allowed pattern. This repeated work grows with every cluster you add.
+    - **Fix:** the result depends only on `ref`, because `ALLOWED` and `BLOCKED_TAGS` are constants. That makes `check_image` safe to memoize with `functools.lru_cache`. Return a tuple, so a caller can't change a cached result by accident. `maxsize` keeps the cache bounded.
+    - **Impact:** reduces E. Each distinct image is checked once, and every repeat becomes a dictionary lookup. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over only 200 distinct inputs used about 9× less CPU energy with `lru_cache`. Your inputs repeat in the same way. The YAML parsing stays the same. Run `python -m cProfile -s cumtime check_images.py <dir>` to see how much of the job time the checks take.
+
+    ```python
+    from fnmatch import fnmatch
+    from functools import lru_cache
+
+
+    def parse_image(ref):
+        name, _, digest = ref.partition("@")
+        last = name.rsplit("/", 1)[-1]
+        tag = None
+        if ":" in last:
+            name, tag = name.rsplit(":", 1)
+        elif not digest:
+            tag = "latest"
+        return name, tag, digest or None
+
+
+    @lru_cache(maxsize=4096)
+    def check_image(ref):
+        # Result depends only on ref: ALLOWED and BLOCKED_TAGS never change during a run.
+        problems = []
+        name, tag, digest = parse_image(ref)
+        if "/" not in name:
+            name = "docker.io/library/" + name
+        if not any(fnmatch(name, pattern) for pattern in ALLOWED):
+            problems.append(f"registry not allowed: {name}")
+        if digest is None and tag in BLOCKED_TAGS:
+            problems.append(f"mutable tag: {tag}")
+        return tuple(problems)
+    ```
+
+    **Already good:** `yaml.safe_load_all` instead of `yaml.load`, sorted file order for stable output, and a non-zero exit code that fails the pipeline.
+verify:
+  test: |-
+    ALLOWED = ("registry.internal:5000/platform/*", "docker.io/library/nginx")
+    BLOCKED_TAGS = {"latest", "dev", "main"}
+    assert check_image("nginx:1.25") == ()
+    assert check_image("registry.internal:5000/platform/api") == ("mutable tag: latest",)
+    assert check_image("registry.internal:5000/platform/api:1.4.2") == ()
+    assert check_image("nginx:1.25@sha256:abc") == ()
+    assert check_image("redis") == ("registry not allowed: docker.io/library/redis", "mutable tag: latest")
+    assert check_image("quay.io/x/y:dev") == ("registry not allowed: quay.io/x/y", "mutable tag: dev")
+    for _ in range(1000):
+        check_image("nginx:1.25")
+    assert check_image.cache_info().hits >= 1000
+    assert parse_image("registry.internal:5000/payments/api@sha256:ff") == ("registry.internal:5000/payments/api", None, "sha256:ff")

@@ -1,0 +1,129 @@
+id: gen-2-00248-generation
+category: generation
+language: python
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    I need a new endpoint for our newsletter backend (Flask, psycopg 3 with psycopg_pool, Postgres). Customers migrating from Mailchimp upload their whole subscriber list as JSON. Requirements:
+
+    - `POST /api/lists/<list_id>/subscribers/import`
+    - body: `{"subscribers": [{"email": "...", "name": "..."}, ...]}`, up to 50,000 entries, name is optional
+    - emails get trimmed and lowercased (existing rows are already lowercase)
+    - invalid emails are skipped, not an error. Return how many and their indexes in the array (first 50 is enough)
+    - duplicates in the file and emails already on the list are skipped too
+    - all or nothing: if anything fails, nothing from the import is written
+    - 404 if the list doesn't exist
+    - response with counts: received, inserted, already subscribed, duplicates in file, invalid
+
+    Tables:
+
+    ```sql
+    CREATE TABLE mailing_lists (
+        id   bigserial PRIMARY KEY,
+        name text NOT NULL
+    );
+
+    CREATE TABLE subscribers (
+        id         bigserial PRIMARY KEY,
+        list_id    bigint NOT NULL REFERENCES mailing_lists(id),
+        email      text NOT NULL,
+        name       text,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        UNIQUE (list_id, email)
+    );
+    ```
+- role: assistant
+  content: |
+    The rows are streamed into a temporary table with `COPY`. One `INSERT ... SELECT ... ON CONFLICT DO NOTHING` then moves them into `subscribers` and skips emails that are already on the list.
+
+    ```python
+    import re
+
+    from flask import Flask, jsonify, request
+    from psycopg_pool import ConnectionPool
+
+    app = Flask(__name__)
+    pool = ConnectionPool("postgresql://app@localhost/newsletter", open=True)
+
+    MAX_SUBSCRIBERS = 50_000
+    MAX_INVALID_REPORTED = 50
+    EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+    def clean_rows(items):
+        """Validate and normalize. Returns (rows, invalid_indexes, duplicates_in_file)."""
+        rows, invalid, seen = [], [], set()
+        duplicates = 0
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                invalid.append(index)
+                continue
+            email = str(item.get("email") or "").strip().lower()
+            if len(email) > 254 or not EMAIL_RE.match(email):
+                invalid.append(index)
+                continue
+            if email in seen:
+                duplicates += 1
+                continue
+            seen.add(email)
+            name = str(item.get("name") or "").strip() or None
+            rows.append((email, name))
+        return rows, invalid, duplicates
+
+
+    @app.post("/api/lists/<int:list_id>/subscribers/import")
+    def import_subscribers(list_id):
+        payload = request.get_json(silent=True)
+        items = payload.get("subscribers") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            return jsonify(error="body must contain a 'subscribers' array"), 400
+        if len(items) > MAX_SUBSCRIBERS:
+            return jsonify(error=f"at most {MAX_SUBSCRIBERS} subscribers per import"), 413
+
+        rows, invalid, duplicates = clean_rows(items)
+
+        # One transaction: commit when the block ends normally, rollback on any exception.
+        with pool.connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM mailing_lists WHERE id = %s", (list_id,))
+            if cur.fetchone() is None:
+                return jsonify(error="list not found"), 404
+
+            cur.execute(
+                "CREATE TEMP TABLE import_rows (email text, name text) ON COMMIT DROP"
+            )
+            with cur.copy("COPY import_rows (email, name) FROM STDIN") as copy:
+                for row in rows:
+                    copy.write_row(row)
+
+            cur.execute(
+                """
+                INSERT INTO subscribers (list_id, email, name)
+                SELECT %s, email, name FROM import_rows
+                ON CONFLICT (list_id, email) DO NOTHING
+                """,
+                (list_id,),
+            )
+            inserted = cur.rowcount
+
+        return jsonify(
+            received=len(items),
+            inserted=inserted,
+            already_subscribed=len(rows) - inserted,
+            duplicates_in_file=duplicates,
+            invalid=len(invalid),
+            invalid_indexes=invalid[:MAX_INVALID_REPORTED],
+        ), 200
+    ```
+
+    Validation happens before the database is touched. A bad request never opens a transaction.
+
+    **Green Notes**
+    - **Batch database writes with COPY** (reduces E): an import of 50,000 subscribers becomes one `COPY` stream and one set-based `INSERT`, not 50,000 statements and round trips. In Green Metrics Tool micro-benchmarks, inserting 500,000 rows in batches of 5,000 used ~384 J with one `execute()` per row and ~17 J with `COPY`, about 22× less.
+    - **Staging table for "skip existing"**: `COPY` has no `ON CONFLICT`. The temp table keeps the duplicate check inside the database in a single statement, and `ON COMMIT DROP` removes it with the transaction.
+    - *Not applied:* splitting the import into several commits. Your all-or-nothing rule needs one transaction, and one `COPY` handles 50,000 rows fine. Small imports with a few dozen rows go through the same path. The measured gap is small there, with only 100 rows per batch, but the code stays simple.
+verify:
+  static_only: needs Flask, psycopg_pool and a running PostgreSQL server

@@ -1,0 +1,39 @@
+id: gen-12764612-00104-generation
+category: generation
+language: sql
+sql_dialect: postgres
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    hi, im not good with databases. our gift card provider sends me a csv file every month with about 60000 new gift card codes. columns are code, amount_cents, expires_on and it has a header line. I need to put them in our table gift_cards (same 3 columns, plus an id that fills itself). Before, a friend made a script that does one INSERT for each line, but it takes very long and I think something is wrong with it. I use psql. What do I write?
+- role: assistant
+  content: |
+    Nothing is wrong with the logic. One `INSERT` per line is just slow for 60,000 rows. Use `\copy`, which loads the whole file in one go:
+
+    ```sql
+    BEGIN;
+
+    \copy gift_cards (code, amount_cents, expires_on) FROM 'gift_cards.csv' WITH (FORMAT csv, HEADER true)
+
+    COMMIT;
+    ```
+
+    Save it as `load_gift_cards.sql` and run it from the folder with the CSV:
+
+    ```bash
+    psql -d your_database -f load_gift_cards.sql
+    ```
+
+    The `id` column fills itself, because it is not in the column list. If one line is bad, the whole load fails and `BEGIN`/`COMMIT` leaves the table unchanged, so you can fix the file and run it again.
+
+    If some codes may already be in the table, `\copy` stops with an error on the first duplicate. In that case load into a temporary table first, then run `INSERT INTO gift_cards (code, amount_cents, expires_on) SELECT code, amount_cents, expires_on FROM tmp_import ON CONFLICT (code) DO NOTHING;`. This needs a unique constraint on `code`.
+
+    **Green Notes**
+    - **`COPY` instead of one `INSERT` per row** (reduces E): 60,000 statements and round trips become one streaming bulk load. In Green Metrics Tool micro-benchmarks with PostgreSQL, COPY used about 22× less CPU energy than one `execute()` per row when writing in batches of 5,000 rows.
+    - **One transaction:** one commit for the whole file instead of work per row.
+verify:
+  static_only: PostgreSQL dialect and psql meta-command

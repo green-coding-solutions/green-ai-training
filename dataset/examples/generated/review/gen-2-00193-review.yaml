@@ -1,0 +1,109 @@
+id: gen-2-00193-review
+category: review
+language: bash
+patterns:
+- bash-quoting
+facts:
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```bash
+    #!/bin/bash
+    # flush buffered sensor readings as influx line protocol, cron every minute
+    SPOOL="/var/spool/sensors/readings.txt"
+    OUT="/var/lib/gateway/outbox/batch.lp"
+    TMP="/var/lib/gateway/outbox/batch.lp.tmp"
+
+    count=0
+    skipped=0
+
+    while read ts device metric value; do
+        if [[ -z $value ]]; then
+            echo "skipping incomplete reading from $device" >&2
+            skipped=$((skipped + 1))
+            continue
+        fi
+        case $metric in
+            temp)  unit="celsius" ;;
+            hum)   unit="percent" ;;
+            press) unit="hectopascal" ;;
+            co2)   unit="ppm" ;;
+            *)     unit="unknown" ;;
+        esac
+        echo "sensor_reading,site=plant-3,gateway=gw-07,region=eu-central,fw=2.4.1,uplink=lte-backup,device=$device,unit=$unit $metric=$value ${ts}000000000"
+        count=$((count + 1))
+    done < $SPOOL > $TMP
+
+    mv $TMP $OUT
+    rm $SPOOL
+    echo "flushed $count readings, skipped $skipped"
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (cron job on an IoT gateway)
+
+    #### [Bug] Readings that arrive during the run are deleted
+    - **Where:** `rm $SPOOL` at the end
+    - **Issue:** the collector keeps appending to `readings.txt` while the loop runs. Any line written after `read` reached the end of the file is removed by `rm` and never sent.
+    - **Fix:** rename the spool file first and process the renamed copy. A rename on the same filesystem is atomic, and a collector that opens the file for each append (the usual `>>`) starts a new file. Also exit early when there is nothing to flush. Right now a missing spool file makes the redirect fail, an empty batch still gets moved, and `rm` fails.
+
+    #### [Bug] A batch the uploader has not sent yet gets overwritten
+    - **Where:** `mv $TMP $OUT`
+    - **Issue:** every run writes to the same `batch.lp`. If the uplink is down for a few minutes, each new batch replaces the previous one, and those readings are lost.
+    - **Fix:** give each batch its own name, e.g. `batch-<epoch>.lp`, and let the uploader pick up `batch-*.lp`.
+
+    #### [Low] Double quotes on literals that need no expansion
+    - **Where:** the `unit="..."` branches and the static part of the `echo` line, both run once per reading. The path constants at the top too.
+    - **Issue:** bash scans double-quoted text for `$`, backticks and backslashes. Single-quoted text is taken as is. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal in a loop used about 24% less CPU energy with single quotes (about 14% less at 10,000 iterations). Your literals are much shorter, so the absolute saving is small. It grows with the number of readings per flush.
+    - **Fix:** single-quote the unit names. Build the output line with `printf` and a single-quoted format string, and keep double quotes around the variables. The output stays byte-for-byte the same.
+    - **Impact:** E, minor. It applies to every reading, every minute.
+
+    ```bash
+    #!/bin/bash
+    # flush buffered sensor readings as influx line protocol, cron every minute
+    SPOOL='/var/spool/sensors/readings.txt'
+    OUTBOX='/var/lib/gateway/outbox'
+
+    [[ -s $SPOOL ]] || exit 0
+
+    printf -v now '%(%s)T' -1
+    WORK="$SPOOL.$now"
+    mv "$SPOOL" "$WORK"
+
+    TMP="$OUTBOX/batch-$now.lp.tmp"
+    OUT="$OUTBOX/batch-$now.lp"
+
+    count=0
+    skipped=0
+
+    while read -r ts device metric value; do
+        if [[ -z $value ]]; then
+            echo "skipping incomplete reading from $device" >&2
+            skipped=$((skipped + 1))
+            continue
+        fi
+        case $metric in
+            temp)  unit='celsius' ;;
+            hum)   unit='percent' ;;
+            press) unit='hectopascal' ;;
+            co2)   unit='ppm' ;;
+            *)     unit='unknown' ;;
+        esac
+        printf 'sensor_reading,site=plant-3,gateway=gw-07,region=eu-central,fw=2.4.1,uplink=lte-backup,device=%s,unit=%s %s=%s %s000000000\n' \
+            "$device" "$unit" "$metric" "$value" "$ts"
+        count=$((count + 1))
+    done < "$WORK" > "$TMP"
+
+    mv "$TMP" "$OUT"
+    rm "$WORK"
+    echo "flushed $count readings, skipped $skipped"
+    ```
+
+    I also added `read -r`, so backslashes in device IDs are kept. The uploader now has to match `batch-*.lp` instead of `batch.lp`.
+
+    **Already good:** the loop uses only builtins (`read`, `case`, `$(( ))`) and redirects the output once for the whole loop. No process starts per reading.
+verify:
+  static_only: bash cron script that reads and writes fixed paths under /var on the gateway

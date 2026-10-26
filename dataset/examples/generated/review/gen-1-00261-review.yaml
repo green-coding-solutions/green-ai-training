@@ -1,0 +1,115 @@
+id: gen-1-00261-review
+category: review
+language: bash
+patterns:
+- bash-builtins
+- compress-stored
+- bash-quoting
+facts:
+- F-BASH-SUBPROC
+- F-COMPRESS-CODECS
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    review pls, nightly cron on the shop server
+
+    ```bash
+    #!/bin/bash
+    # nightly shipment report + backup of the export
+    EXPORT_DIR=/var/shop/exports
+    BACKUP_DIR=/var/backups/shop
+    DAY=$(date +%F)
+    IN=$EXPORT_DIR/shipments-$DAY.psv
+
+    total_g=0
+    count=0
+    declare -A per_carrier
+
+    while read line; do
+      carrier=$(echo $line | cut -d'|' -f2)
+      weight=$(echo $line | cut -d'|' -f3)
+      status=$(echo $line | cut -d'|' -f4)
+      if [ "$status" = "shipped" ]; then
+        total_g=$(expr $total_g + $weight)
+        count=$(expr $count + 1)
+        per_carrier[$carrier]=$(expr ${per_carrier[$carrier]:-0} + 1)
+      fi
+    done < $IN
+
+    for c in "${!per_carrier[@]}"; do
+      echo "$c: ${per_carrier[$c]}"
+    done
+    echo "shipped: $count, total weight: $total_g g"
+
+    xz -9e -k $IN
+    mv $IN.xz $BACKUP_DIR/
+    find $BACKUP_DIR -name '*.xz' -mtime +14 -delete
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (nightly cron, data pipeline)
+
+    #### [Bug] Unquoted variables and `read` without `-r`
+    - **Where:** `echo $line`, `done < $IN`, `xz ... $IN`, `mv $IN.xz`, `find $BACKUP_DIR`
+    - **Issue:** `echo $line` is unquoted, so a field with `*` is expanded as a glob against the current directory. Plain `read` also eats backslashes. A path with a space in `EXPORT_DIR` would break the redirect, `xz` and `mv`.
+    - **Fix:** read the fields with `IFS='|' read -r` (see below) and quote every path as `"$IN"`, `"$BACKUP_DIR"`.
+    - **Impact:** correctness. Wrong counts or a failed backup that nobody notices.
+
+    #### [High] Up to 7 processes per input line
+    - **Where:** the `while read` loop, the `$(echo | cut)` and `$(expr)` calls
+    - **Issue:** every line starts three `echo | cut` pipelines and up to three `expr` processes. Process starts dominate the cost of the loop, not the arithmetic. In Green Metrics Tool micro-benchmarks on a 20,000-line log, a loop with `$(echo | cut)` and `$(expr)` per field used about 300× more CPU energy than the same loop with shell builtins (`read -r` field splitting and `$(( ))`), with identical output.
+    - **Fix:** split the line once with `read` and do the math in the shell. For a pure summary, one `awk` pass is cheaper still, but this keeps your structure.
+    - **Impact:** E, on every line of every nightly run. Largest term in this script.
+
+    #### [Medium] `xz -9e` for a backup that is written every night
+    - **Where:** `xz -9e -k $IN`
+    - **Issue:** this compresses a new file every day and keeps it for 14 days. In Green Metrics Tool micro-benchmarks on 100 MB of text at default levels, xz used about 29× the energy of zstd to compress (about 458 J vs about 16 J). `-9e` costs more than the default. A pure energy comparison: xz usually gives smaller files, which matters for long-term storage or slow links, not for 14 days of local backups.
+    - **Fix:** `zstd -q -- "$IN" -o "$BACKUP_DIR/shipments-$DAY.psv.zst"`. Restore with `zstd -d`.
+    - **Impact:** E, once per night. Expect somewhat larger backup files.
+
+    #### [Low] Double quotes on literals that need no expansion
+    - **Where:** `"shipped"`
+    - **Issue:** bash scans double-quoted text for `$`, backticks and backslashes. For a short literal like this the saving is tiny.
+    - **Fix:** `'shipped'`. Keep the double quotes around variables.
+    - **Impact:** E, minor. It only grows with long literals in big loops.
+
+    Fixed script:
+
+    ```bash
+    #!/bin/bash
+    # nightly shipment report + backup of the export
+    EXPORT_DIR=/var/shop/exports
+    BACKUP_DIR=/var/backups/shop
+    DAY=$(date +%F)
+    IN=$EXPORT_DIR/shipments-$DAY.psv
+
+    total_g=0
+    count=0
+    declare -A per_carrier
+
+    while IFS='|' read -r _ carrier weight status _; do
+      if [ "$status" = 'shipped' ]; then
+        total_g=$((total_g + weight))
+        count=$((count + 1))
+        per_carrier[$carrier]=$(( ${per_carrier[$carrier]:-0} + 1 ))
+      fi
+    done < "$IN"
+
+    for c in "${!per_carrier[@]}"; do
+      echo "$c: ${per_carrier[$c]}"
+    done
+    echo "shipped: $count, total weight: $total_g g"
+
+    zstd -q -- "$IN" -o "$BACKUP_DIR/shipments-$DAY.psv.zst"
+    find "$BACKUP_DIR" -name 'shipments-*' -mtime +14 -delete
+    ```
+
+    **Notes on behavior:**
+    - `$(( ))` treats an empty or non-numeric weight as 0, while `expr` printed an error. Check that the export always has integer weights.
+    - The cleanup pattern now matches `.xz` and `.zst`, so the old `.xz` backups still age out.
+    - The carrier order in the report is still hash order, as before.
+
+    **Already good:** an associative array for the per-carrier counts, and a retention cleanup with `find -mtime`.
+verify:
+  static_only: bash script that reads files under /var and calls xz/zstd; not runnable in the sandbox

@@ -1,0 +1,83 @@
+id: gen-12764612-00354-no-change
+category: no-change
+language: python
+patterns:
+- string-join
+- none
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    Reviewer flagged string building in `render()` as a perf issue. Diff only please.
+
+    ```python
+    #!/usr/bin/env python3
+    """Print a per-extension size summary for a directory tree."""
+    import argparse
+    import os
+    from collections import defaultdict
+
+
+    def scan(root):
+        sizes = defaultdict(int)
+        counts = defaultdict(int)
+        for dirpath, _dirs, files in os.walk(root):
+            for name in files:
+                ext = os.path.splitext(name)[1].lower() or "(none)"
+                try:
+                    size = os.path.getsize(os.path.join(dirpath, name))
+                except OSError:
+                    continue
+                sizes[ext] += size
+                counts[ext] += 1
+        return sizes, counts
+
+
+    def human(n):
+        for unit in ("B", "KB", "MB"):
+            if n < 1024:
+                return f"{n:.0f}{unit}"
+            n /= 1024
+        return f"{n:.0f}GB"
+
+
+    def render(sizes, counts, top):
+        rows = sorted(sizes, key=sizes.get, reverse=True)[:top]
+        lines = [f"{'ext':<10}{'files':>8}{'size':>12}"]
+        for ext in rows:
+            lines.append(f"{ext:<10}{counts[ext]:>8}{human(sizes[ext]):>12}")
+        return "\n".join(lines)
+
+
+    def main():
+        ap = argparse.ArgumentParser()
+        ap.add_argument("root")
+        ap.add_argument("--top", type=int, default=15)
+        args = ap.parse_args()
+        sizes, counts = scan(args.root)
+        print(render(sizes, counts, args.top))
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    No diff. `render()` is already the efficient form.
+
+    - It collects the lines in a list and builds the string once with `"\n".join(lines)`. That is the pattern the reviewer wants. There is no `+=` on a string anywhere in the file.
+    - The only `+=` are on integer counters in `scan()`, which is fine.
+    - The output is at most `--top` lines plus a header. In Green Metrics Tool micro-benchmarks, `+=` only became costly at around a million pieces (roughly 260× the CPU energy of `join`). At this size the string building is negligible next to `os.walk()` and the `getsize` calls.
+
+    If you want to speed up the script, the cost is in `scan()`, which does one `stat` call per file. Using `os.scandir()` can reuse the directory entry data. I would not change it without a measured need.
+verify:
+  module: true
+  test: |-
+    out = render({".py": 2048, ".md": 10}, {".py": 2, ".md": 1}, 1)
+    lines = out.split("\n")
+    assert len(lines) == 2
+    assert lines[0].startswith("ext")
+    assert lines[1].startswith(".py")
+    assert "2KB" in lines[1]
+    assert human(5) == "5B"

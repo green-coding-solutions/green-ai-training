@@ -1,0 +1,178 @@
+id: gen-2-00005-refactor
+category: refactor
+language: python
+patterns:
+- simple-conditions
+- memoize
+facts:
+- F-COND
+- F-LRU
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    # ci_cost_report.py - runs nightly, builds the CI cost / failure dashboard
+    # from the job export (~400k jobs for the last 90 days)
+    import json
+    import re
+    import sys
+    from collections import defaultdict
+
+    RATE_PER_MIN = {"ubuntu": 0.008, "windows": 0.016, "macos": 0.08}
+    SIZE_FACTOR = {None: 1, "large": 2, "xlarge": 4}
+    ARM_DISCOUNT = 0.625
+    LABEL_RE = r"(ubuntu|windows|macos)-(\d+(?:\.\d+)?|latest)-(x64|arm64)(?:-(large|xlarge))?"
+
+
+    def runner_rate(label):
+        m = re.fullmatch(LABEL_RE, label)
+        if m is None:
+            raise ValueError(f"unknown runner label: {label!r}")
+        os_name, _version, arch, size = m.groups()
+        rate = RATE_PER_MIN[os_name] * SIZE_FACTOR[size]
+        if arch == "arm64":
+            rate *= ARM_DISCOUNT
+        return round(rate, 5)
+
+
+    def classify(exit_code):
+        if exit_code > 128 and exit_code % 128 == 9:       # SIGKILL, mostly the OOM killer
+            return "oom_killed"
+        elif exit_code > 128 and exit_code % 128 == 15:    # SIGTERM, someone hit cancel
+            return "cancelled"
+        elif exit_code % 128 == 124:                        # coreutils timeout
+            return "timeout"
+        elif exit_code > 0 and exit_code < 124:
+            return "failed"
+        elif exit_code == 0:
+            return "passed"
+        else:
+            return "infra_error"
+
+
+    def summarize(jobs):
+        cost = defaultdict(float)
+        outcomes = defaultdict(lambda: defaultdict(int))
+        for job in jobs:
+            minutes = -(-job["duration_s"] // 60)  # billed per started minute
+            cost[job["repo"]] += minutes * runner_rate(job["runner"])
+            outcomes[job["repo"]][classify(job["exit_code"])] += 1
+        return cost, outcomes
+
+
+    if __name__ == "__main__":
+        with open(sys.argv[1]) as f:
+            jobs = [json.loads(line) for line in f if line.strip()]
+        cost, outcomes = summarize(jobs)
+        for repo in sorted(cost):
+            counts = ", ".join(f"{k}={v}" for k, v in sorted(outcomes[repo].items()))
+            print(f"{repo:30} ${cost[repo]:9.2f}  {counts}")
+    ```
+- role: assistant
+  content: |
+    ```python
+    # ci_cost_report.py - runs nightly, builds the CI cost / failure dashboard
+    # from the job export (~400k jobs for the last 90 days)
+    import json
+    import re
+    import sys
+    from collections import defaultdict
+    from functools import lru_cache
+
+    RATE_PER_MIN = {"ubuntu": 0.008, "windows": 0.016, "macos": 0.08}
+    SIZE_FACTOR = {None: 1, "large": 2, "xlarge": 4}
+    ARM_DISCOUNT = 0.625
+    LABEL_RE = r"(ubuntu|windows|macos)-(\d+(?:\.\d+)?|latest)-(x64|arm64)(?:-(large|xlarge))?"
+
+
+    @lru_cache(maxsize=256)
+    def runner_rate(label):
+        m = re.fullmatch(LABEL_RE, label)
+        if m is None:
+            raise ValueError(f"unknown runner label: {label!r}")
+        os_name, _version, arch, size = m.groups()
+        rate = RATE_PER_MIN[os_name] * SIZE_FACTOR[size]
+        if arch == "arm64":
+            rate *= ARM_DISCOUNT
+        return round(rate, 5)
+
+
+    def classify(exit_code):
+        if exit_code == 0:
+            return "passed"
+        elif 0 < exit_code < 124:
+            return "failed"
+        elif exit_code == 137:   # 128 + SIGKILL, mostly the OOM killer
+            return "oom_killed"
+        elif exit_code == 143:   # 128 + SIGTERM, someone hit cancel
+            return "cancelled"
+        elif exit_code == 124:   # coreutils timeout
+            return "timeout"
+        else:
+            return "infra_error"
+
+
+    def summarize(jobs):
+        cost = defaultdict(float)
+        outcomes = defaultdict(lambda: defaultdict(int))
+        for job in jobs:
+            minutes = -(-job["duration_s"] // 60)  # billed per started minute
+            cost[job["repo"]] += minutes * runner_rate(job["runner"])
+            outcomes[job["repo"]][classify(job["exit_code"])] += 1
+        return cost, outcomes
+
+
+    if __name__ == "__main__":
+        with open(sys.argv[1]) as f:
+            jobs = [json.loads(line) for line in f if line.strip()]
+        cost, outcomes = summarize(jobs)
+        for repo in sorted(cost):
+            counts = ", ".join(f"{k}={v}" for k, v in sorted(outcomes[repo].items()))
+            print(f"{repo:30} ${cost[repo]:9.2f}  {counts}")
+    ```
+
+    **Green Notes**
+    - **Memoized `runner_rate`** (reduces E): you have about 400k jobs but only a few dozen runner labels. Before, the regex parse and the rate math ran once per job and gave the same answer over and over. Now each label is computed once. In Green Metrics Tool micro-benchmarks, 1,000,000 calls drawn from 200 distinct inputs used ~4.7 J with `lru_cache` instead of ~43 J, about 9× less. The cache is bounded (`maxsize=256`). `lru_cache` does not cache exceptions, so an unknown label still raises `ValueError` every time it shows up.
+    - **Simple equality checks in `classify`** (reduces E): passing jobs are the most common case. Before, each one went through four range/modulo tests before it reached `== 0`. Now it is the first check. Exit statuses are 0-255, so `> 128 and % 128 == 9` could only ever match 137, and `% 128 == 15` only 143. In Green Metrics Tool micro-benchmarks over 10,000,000 classifications, simple equality branches used about 16% less CPU energy than range/modulo conditions.
+    - **Bug fix:** `exit_code % 128 == 124` also matched 252, so those jobs were counted as timeouts. Now only 124 counts as a timeout, and 252 goes to `infra_error`. Every other code gets the same class as before.
+verify:
+  module: true
+  test: |
+    assert classify(252) == "infra_error"
+    assert classify(124) == "timeout"
+    assert classify(137) == "oom_killed"
+    assert classify(143) == "cancelled"
+    assert classify(0) == "passed"
+    assert classify(1) == "failed"
+    runner_rate.cache_clear()
+    summarize([{"repo": "a", "runner": "ubuntu-22.04-x64", "duration_s": 61, "exit_code": 0}] * 3)
+    assert runner_rate.cache_info().hits >= 2
+    try:
+        runner_rate("self-hosted-gpu")
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+  equivalence:
+    driver: |-
+      import random
+      random.seed(7)
+      labels = ["ubuntu-22.04-x64", "ubuntu-24.04-x64-large", "ubuntu-latest-x64",
+                "windows-2022-x64", "macos-14-arm64", "macos-13-x64-xlarge",
+                "ubuntu-22.04-arm64-xlarge"]
+      codes = [0] * 20 + [1] * 5 + [2, 124, 125, 126, 127, 128, 137, 143, 255]
+      repos = ["api", "web", "infra", "ml-pipeline"]
+      jobs = [{"repo": random.choice(repos), "runner": random.choice(labels),
+               "duration_s": random.randint(0, 3600), "exit_code": random.choice(codes)}
+              for _ in range(5000)]
+      cost, outcomes = summarize(jobs)
+      for repo in sorted(cost):
+          print(repo, round(cost[repo], 4), sorted(outcomes[repo].items()))
+      for code in list(range(0, 252)) + [253, 254, 255]:
+          print(code, classify(code))
+      for _ in range(2):
+          try:
+              runner_rate("self-hosted-gpu")
+          except ValueError as e:
+              print("ValueError", e)

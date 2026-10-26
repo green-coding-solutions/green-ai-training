@@ -1,0 +1,57 @@
+id: gen-12764612-00052-no-change
+category: no-change
+language: python
+patterns:
+- vectorize-or-jit
+- context-tradeoff
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    ```python
+    from decimal import Decimal, ROUND_HALF_UP
+    from flask import Flask, request, jsonify
+
+    app = Flask(__name__)
+
+    MAX_CART_LINES = 50
+    TAX_RATES = {"DE": Decimal("0.19"), "FR": Decimal("0.20"), "NL": Decimal("0.21")}
+    FREE_SHIPPING_FROM = Decimal("60.00")
+
+
+    def line_total(unit_price, qty, discount_pct):
+        gross = Decimal(unit_price) * qty
+        return gross * (Decimal(100) - Decimal(discount_pct)) / Decimal(100)
+
+
+    @app.post("/cart/quote")
+    def quote():
+        body = request.get_json()
+        lines = body["lines"][:MAX_CART_LINES]
+        country = body.get("country", "DE")
+
+        net = Decimal("0")
+        for line in lines:
+            net += line_total(line["unit_price"], line["qty"], line.get("discount_pct", 0))
+
+        tax = net * TAX_RATES[country]
+        shipping = Decimal("0.00") if net >= FREE_SHIPPING_FROM else Decimal("4.90")
+        total = (net + tax + shipping).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        return jsonify({"net": str(net.quantize(Decimal("0.01"))), "total": str(total)})
+    ```
+
+    ?
+- role: assistant
+  content: |
+    This is already fine. I would not change it.
+
+    - **The loop is tiny.** A cart has at most 50 lines, and each line is a few arithmetic operations. A request spends far more time on JSON parsing and Flask than on this loop.
+    - **Numba would not pay off.** It compiles the function on first call, and that cost repeats in every worker process. It also does not support `Decimal`, so you would have to switch to floats. That risks rounding errors in money, which is a bigger problem than any energy saving.
+    - **The pattern needs a big numeric loop.** In Green Metrics Tool micro-benchmarks, Numba cut a pure Python loop over 10,000,000 samples from about 40 J to about 9.5 J (about 4× less). That is a hot loop with millions of float operations. A 50-line cart is nowhere near it.
+    - **`Decimal` is the right choice here.** Exact cents matter more than speed on this path.
+
+    If quotes ever get slow, measure first. Look at what happens around this function, such as price lookups, before touching the arithmetic.
+verify:
+  static_only: no-change answer, contains no code block to run

@@ -1,0 +1,93 @@
+id: gen-2-00282-generation
+category: generation
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    hi, we have REST api where our thermostat devices upload raw thermistor readings in batch. every hour each device do one POST with a lot of ADC values (12 bit, 0..4095). i need a function that convert them to celsius with Steinhart-Hart and give back min/max/mean plus the converted list, rounded to 2 decimal.
+
+    values 0 or 4095 mean the sensor is broken (open or short circuit). this ones should be skiped but counted.
+    the divider is 10k fixed resistor on top, thermistor to ground. coefficients from datasheet:
+
+    ```python
+    SH_A = 1.009249522e-03
+    SH_B = 2.378405444e-04
+    SH_C = 2.019202697e-07
+    ```
+
+    flask handler i have already, only need the function pls. input is list of int, already validated.
+- role: assistant
+  content: |
+    ```python
+    import math
+
+    # Steinhart-Hart coefficients for the 10k NTC (datasheet)
+    SH_A = 1.009249522e-03
+    SH_B = 2.378405444e-04
+    SH_C = 2.019202697e-07
+    KELVIN_OFFSET = 273.15
+
+
+    def convert_readings(raw_values, adc_max=4095, r_fixed=10_000.0):
+        """Convert raw ADC readings to degrees Celsius.
+
+        Divider: fixed resistor on top, thermistor to ground.
+        Readings of 0 or adc_max (open/short sensor) are skipped and counted as invalid.
+        """
+        # Loop-invariant lookups, resolved once instead of once per reading
+        log = math.log
+        a, b, c, k = SH_A, SH_B, SH_C, KELVIN_OFFSET
+        celsius = []
+        append = celsius.append
+        invalid = 0
+
+        for adc in raw_values:
+            if not 0 < adc < adc_max:
+                invalid += 1
+                continue
+            ln_r = log(r_fixed * adc / (adc_max - adc))
+            append(1.0 / (a + b * ln_r + c * ln_r * ln_r * ln_r) - k)
+
+        if not celsius:
+            return {"count": 0, "invalid": invalid,
+                    "min_c": None, "max_c": None, "mean_c": None, "celsius": []}
+
+        return {
+            "count": len(celsius),
+            "invalid": invalid,
+            "min_c": round(min(celsius), 2),
+            "max_c": round(max(celsius), 2),
+            "mean_c": round(sum(celsius) / len(celsius), 2),
+            "celsius": [round(t, 2) for t in celsius],
+        }
+    ```
+
+    Min, max and mean are computed from the unrounded values, so the mean is not skewed by rounding. An upload with only broken readings returns `None` for the stats, so your handler can send that as `null`.
+
+    **Green Notes**
+    - **Hoist loop-invariant lookups** (reduces E): `math.log`, `celsius.append` and the module constants are bound to locals once before the loop. Without that, Python resolves them again for every reading. The loop body is only a few float operations, so these lookups are a visible share of its work. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local before a 10,000,000-iteration loop saved about 4-5%. The win is small, but this loop runs on every upload and the change costs no readability.
+    - **One pass over the batch:** validation, conversion and collection happen in the same loop. The batch is never copied or filtered first.
+verify:
+  test: |-
+    r = convert_readings([2048, 0, 4095, 1000, 3000])
+    assert r["count"] == 3
+    assert r["invalid"] == 2
+    t = r["celsius"]
+    assert len(t) == 3
+    assert 24.0 < t[0] < 26.0
+    # NTC: higher ADC value -> higher resistance -> lower temperature
+    assert t[1] > t[0] > t[2]
+    import math as _m
+    ln = _m.log(10_000.0 * 1000 / (4095 - 1000))
+    expected = 1.0 / (SH_A + SH_B * ln + SH_C * ln ** 3) - 273.15
+    assert abs(t[1] - round(expected, 2)) < 1e-9
+    assert r["max_c"] == t[1] or abs(r["max_c"] - t[1]) < 0.011
+    assert r["min_c"] == t[2] or abs(r["min_c"] - t[2]) < 0.011
+    assert t[2] - 0.011 < r["mean_c"] < t[1] + 0.011
+    e = convert_readings([0, 4095])
+    assert e == {"count": 0, "invalid": 2, "min_c": None, "max_c": None, "mean_c": None, "celsius": []}
+    assert convert_readings([])["count"] == 0

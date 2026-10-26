@@ -1,0 +1,70 @@
+id: gen-2-00155-no-change
+category: no-change
+language: python
+patterns:
+- torch-no-grad
+- context-tradeoff
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    Review comment on my PR says "wrap the forward pass in torch.no_grad(), it burns CPU building the autograd graph". Runs nightly over the product catalog. Diff only.
+
+    ```python
+    # etl/steps/embed_titles.py
+    import logging
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import torch
+
+    from etl.models import load_encoder
+    from etl.text import tokenize_batch
+
+    log = logging.getLogger(__name__)
+    BATCH_SIZE = 256
+
+    _model = None
+
+
+    def get_model():
+        global _model
+        if _model is None:
+            _model = load_encoder("models/title-encoder-v3.pt")
+            _model.eval()
+        return _model
+
+
+    @torch.inference_mode()
+    def embed_titles(titles: list[str]) -> list[list[float]]:
+        model = get_model()
+        out = []
+        for start in range(0, len(titles), BATCH_SIZE):
+            batch = tokenize_batch(titles[start:start + BATCH_SIZE])
+            vecs = model(**batch)
+            out.extend(vecs.tolist())
+        return out
+
+
+    def run(in_path: str, out_path: str) -> None:
+        table = pq.read_table(in_path, columns=["sku", "title"])
+        titles = table.column("title").to_pylist()
+        vectors = embed_titles(titles)
+        table = table.append_column(
+            "title_vec", pa.array(vectors, type=pa.list_(pa.float32()))
+        )
+        pq.write_table(table, out_path)
+        log.info("embedded %d titles -> %s", len(vectors), out_path)
+    ```
+- role: assistant
+  content: |
+    No diff. Autograd is already off here.
+
+    - `@torch.inference_mode()` on `embed_titles` covers every forward pass in the loop. It is a stricter version of `no_grad()`: no graph gets recorded, and it also skips version counter tracking. Putting `torch.no_grad()` inside the function adds nothing.
+    - In Green Metrics Tool micro-benchmarks, 100,000 PyTorch CPU inferences used about 14% less CPU energy with `torch.no_grad()` than without it. This step already gets that saving.
+    - `model.eval()` runs once when the model loads, and inputs are batched, so the forward passes aren't doing extra work either.
+
+    Suggested reply on the PR: "Already covered by `@torch.inference_mode()` on `embed_titles`." The reviewer probably missed it because it's a decorator and not a `with` block.
+verify:
+  static_only: needs torch, pyarrow and the project's encoder model; no code change in the answer

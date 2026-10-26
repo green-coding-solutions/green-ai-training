@@ -1,0 +1,147 @@
+id: gen-1-00052-review
+category: review
+language: css
+patterns:
+- css-animations
+facts:
+- F-ANIM
+messages:
+- role: user
+  content: |
+    ?
+
+    ```css
+    .chat { max-width: 640px; margin: 0 auto; font-family: system-ui, sans-serif; }
+    .msg { padding: 10px 14px; border-radius: 12px; margin: 8px 0; white-space: pre-wrap; }
+    .msg.user { background: #e8f0fe; align-self: flex-end; }
+    .msg.bot { background: #f4f4f5; }
+
+    .thinking { display: inline-flex; gap: 4px; padding: 6px 0; }
+    .thinking span {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #6b7280;
+      opacity: 0.3;
+    }
+    ```
+
+    ```js
+    const chat = document.getElementById('chat');
+    const indicator = document.getElementById('thinking'); // <div id="thinking" class="thinking" hidden><span></span><span></span><span></span></div>
+    const dots = indicator.querySelectorAll('span');
+    let rafId;
+
+    function pulse(t) {
+      dots.forEach((dot, i) => {
+        const phase = (t / 400 - i * 0.25) % 1;
+        const v = 0.3 + 0.7 * Math.abs(Math.sin(Math.PI * phase));
+        dot.style.opacity = v;
+        dot.style.transform = `translateY(${-4 * v}px)`;
+      });
+      rafId = requestAnimationFrame(pulse);
+    }
+
+    function addMessage(role, text) {
+      const div = document.createElement('div');
+      div.className = `msg ${role}`;
+      div.innerHTML = text;
+      chat.appendChild(div);
+      return div;
+    }
+
+    async function ask(prompt) {
+      addMessage('user', prompt);
+      indicator.hidden = false;
+      rafId = requestAnimationFrame(pulse);
+
+      const res = await fetch('/api/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt }),
+      });
+      const data = await res.json();
+
+      cancelAnimationFrame(rafId);
+      indicator.hidden = true;
+      addMessage('bot', data.text);
+    }
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (chat UI in front of a model endpoint)
+
+    #### [Security] Model and user text is inserted as HTML
+    - **Where:** `addMessage`, `div.innerHTML = text`
+    - **Issue:** both the prompt and the model output go into the page as markup. A prompt like `<img src=x onerror=...>`, or model output that repeats it, runs script in your page.
+    - **Fix:** use `div.textContent = text`. The `white-space: pre-wrap` in your CSS already keeps line breaks.
+
+    #### [Bug] The dots never hide
+    - **Where:** `.thinking { display: inline-flex; }`
+    - **Issue:** a CSS `display` value overrides the browser's rule for the `hidden` attribute. The three dots are visible all the time, also before the first question.
+    - **Fix:** add `.thinking[hidden] { display: none; }`.
+
+    #### [Bug] A failed request leaves the loop running
+    - **Where:** `ask()`, after `fetch`
+    - **Issue:** if the request fails or the response is not JSON, the code throws before `cancelAnimationFrame`. The dots keep animating forever and the user gets no error message.
+    - **Fix:** put the cleanup in `finally` (see the code below).
+
+    #### [Medium] The dots are animated by a JavaScript frame loop
+    - **Where:** `pulse()` with `requestAnimationFrame`
+    - **Issue:** while the model works, which can take seconds, your script runs on the main thread every frame and writes inline styles for three elements. Opacity and transform changes can run as a CSS animation without any script. In Green Metrics Tool micro-benchmarks of a 20-second animation in a real browser, a `requestAnimationFrame` loop with style updates used ~161 J CPU energy and CSS `@keyframes` ~145 J, about 10% less.
+    - **Fix:** move the motion into CSS, and let JS only toggle `hidden`:
+      ```css
+      .thinking { display: inline-flex; gap: 4px; padding: 6px 0; }
+      .thinking[hidden] { display: none; }
+      .thinking span {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #6b7280;
+        opacity: 0.3;
+        animation: bounce 1.2s ease-in-out infinite;
+      }
+      .thinking span:nth-child(2) { animation-delay: 0.15s; }
+      .thinking span:nth-child(3) { animation-delay: 0.3s; }
+
+      @keyframes bounce {
+        0%, 100% { opacity: 0.3; transform: translateY(0); }
+        50%      { opacity: 1;   transform: translateY(-4px); }
+      }
+      ```
+      ```js
+      const chat = document.getElementById('chat');
+      const indicator = document.getElementById('thinking');
+
+      function addMessage(role, text) {
+        const div = document.createElement('div');
+        div.className = `msg ${role}`;
+        div.textContent = text;
+        chat.appendChild(div);
+        return div;
+      }
+
+      async function ask(prompt) {
+        addMessage('user', prompt);
+        indicator.hidden = false;
+        try {
+          const res = await fetch('/api/generate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt }),
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = await res.json();
+          addMessage('bot', data.text);
+        } catch (err) {
+          addMessage('bot', 'Sorry, the request failed. Please try again.');
+        } finally {
+          indicator.hidden = true;
+        }
+      }
+      ```
+    - **Impact:** E on the client, per user and per waiting request. The saving is modest (about 10% in that benchmark), but the per-frame script work is gone. A hidden element (`display: none`) does not animate, so nothing runs when no request is pending. The motion is a smooth ease instead of the sine curve, so it looks very close but not identical.
+
+    **Already good:** the dots only animate `opacity` and `transform`, and the rest of the CSS is simple.
+verify:
+  static_only: browser DOM and fetch code, CSS and JS snippets cannot run under stdlib Python

@@ -1,0 +1,102 @@
+id: gen-1-00276-generation
+category: generation
+language: python
+patterns:
+- keep-star-imports
+- avoid-exception-flow
+facts:
+- F-IMPORT
+- F-EXC
+messages:
+- role: user
+  content: |
+    I need two helpers added to `api/pagination.py` in our REST service (Python 3.11, stdlib only).
+
+    Requirements:
+    1. `parse_pagination(params, default_size=20, max_size=100)`. `params` is the query dict (str -> str). `page` defaults to 1, `size` defaults to `default_size`. Both must be integers >= 1, otherwise raise `ValueError` with a clear message. `size` above `max_size` is clamped, not rejected. Return a frozen dataclass `Page` with `page`, `size` and an `offset` property.
+    2. `link_header(base_url, page, size, total)` that returns the value of an RFC 8288 `Link` header with `first`, `prev`, `next` and `last`. `prev` only if there is a previous page, `next` only if there is a next one. An empty result still has one page.
+
+    The file already starts with `from typing import *` and the whole team uses that style, so please keep it as it is.
+- role: assistant
+  content: |
+    ```python
+    from typing import *
+    from dataclasses import dataclass
+    from urllib.parse import urlencode
+
+
+    @dataclass(frozen=True)
+    class Page:
+        page: int
+        size: int
+
+        @property
+        def offset(self) -> int:
+            return (self.page - 1) * self.size
+
+
+    def _positive_int(raw: str, name: str) -> int:
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ValueError(f"{name} must be an integer") from None
+        if value < 1:
+            raise ValueError(f"{name} must be at least 1")
+        return value
+
+
+    def parse_pagination(
+        params: Mapping[str, str], default_size: int = 20, max_size: int = 100
+    ) -> Page:
+        raw_page = params.get("page")
+        raw_size = params.get("size")
+        page = 1 if raw_page is None else _positive_int(raw_page, "page")
+        size = default_size if raw_size is None else min(_positive_int(raw_size, "size"), max_size)
+        return Page(page, size)
+
+
+    def link_header(base_url: str, page: int, size: int, total: int) -> str:
+        last = max(1, (total + size - 1) // size)
+
+        def url(p: int) -> str:
+            return f"{base_url}?{urlencode({'page': p, 'size': size})}"
+
+        links = [(1, "first")]
+        if page > 1:
+            links.append((page - 1, "prev"))
+        if page < last:
+            links.append((page + 1, "next"))
+        links.append((last, "last"))
+        return ", ".join(f'<{url(p)}>; rel="{rel}"' for p, rel in links)
+    ```
+
+    `link_header` expects a `base_url` without a query string. If your endpoints carry other filters, merge them into the `urlencode` call.
+
+    **Green Notes**
+    - **Star import kept:** `from typing import *` stays, and `Mapping` comes from it. In Green Metrics Tool micro-benchmarks, 1,000 Python process starts used ~3103 J with `from sympy import *` and ~3093 J with `import sympy`. That is no measurable difference, so changing the style would save nothing. What costs energy is loading a heavy module, and `typing` is light.
+    - **`dict.get` for optional parameters** (reduces E): `page` and `size` are often missing, so the code uses `params.get(...)` and does not catch `KeyError`. In Green Metrics Tool micro-benchmarks of 10,000,000 lookups with about half of the keys missing, `dict.get` used ~67 J and `try/except KeyError` ~76 J, about 12% less. The `try/except` in `_positive_int` is only for bad input, which is rare.
+verify:
+  test: |-
+    assert parse_pagination({}) == Page(1, 20)
+    p = parse_pagination({"page": "3", "size": "500"})
+    assert p == Page(3, 100) and p.offset == 200
+    assert parse_pagination({"size": "5"}, default_size=10).size == 5
+    for bad in ({"page": "0"}, {"page": "x"}, {"size": "-2"}, {"size": "1.5"}):
+        try:
+            parse_pagination(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(bad)
+    h = link_header("https://api.x/items", 2, 20, 65)
+    assert h == (
+        '<https://api.x/items?page=1&size=20>; rel="first", '
+        '<https://api.x/items?page=1&size=20>; rel="prev", '
+        '<https://api.x/items?page=3&size=20>; rel="next", '
+        '<https://api.x/items?page=4&size=20>; rel="last"'
+    )
+    h0 = link_header("https://api.x/items", 1, 20, 0)
+    assert h0 == (
+        '<https://api.x/items?page=1&size=20>; rel="first", '
+        '<https://api.x/items?page=1&size=20>; rel="last"'
+    )

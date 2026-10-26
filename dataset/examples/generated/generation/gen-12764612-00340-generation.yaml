@@ -1,0 +1,87 @@
+id: gen-12764612-00340-generation
+category: generation
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    hi, im new to docker and i dont really know what i need to put in the file. i made a small api that predicts how many loaves each of our bakery shops will sell tomorrow. it uses an xgboost model that i saved as model.json. we use fastapi and uvicorn. github actions should build the image when we push. my folder looks like this:
+
+    ```text
+    forecast/
+    ├── app/
+    │   ├── __init__.py
+    │   └── main.py
+    ├── model.json
+    ├── requirements.txt
+    └── notebooks/
+    ```
+
+    requirements.txt:
+
+    ```text
+    fastapi
+    uvicorn
+    xgboost
+    pandas
+    numpy
+    ```
+
+    the app is started with `uvicorn app.main:app` and it should listen on port 8000. can you write the Dockerfile?
+- role: assistant
+  content: |-
+    Here is a Dockerfile for your layout. It assumes `app/main.py` loads `model.json` from the working directory (`/app`).
+
+    ```dockerfile
+    FROM python:3.12-slim
+
+    ENV PYTHONDONTWRITEBYTECODE=1 \
+        PYTHONUNBUFFERED=1
+
+    # xgboost needs the OpenMP runtime, which the slim image does not include
+    RUN apt-get update \
+        && apt-get install -y --no-install-recommends libgomp1 \
+        && rm -rf /var/lib/apt/lists/*
+
+    WORKDIR /app
+
+    # dependencies first, so this layer is reused when only your code changes
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY app/ app/
+    COPY model.json .
+
+    RUN useradd --system --no-create-home appuser
+    USER appuser
+
+    EXPOSE 8000
+    CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ```
+
+    Also add a `.dockerignore` next to it, so the notebooks and git history don't get sent to the build:
+
+    ```text
+    .git
+    __pycache__
+    *.pyc
+    .venv
+    notebooks/
+    ```
+
+    Build and run it with:
+
+    ```bash
+    docker build -t forecast .
+    docker run -p 8000:8000 forecast
+    ```
+
+    It is a good idea to pin versions in `requirements.txt` (for example `xgboost==2.1.1`), so a new release can't change your predictions.
+
+    **Green Notes**
+    - **Slim base image** (reduces E): `python:3.12-slim` instead of the full `python:3.12`, with only the runtime library xgboost needs (`libgomp1`) and no compilers or dev tools. In Green Metrics Tool micro-benchmarks, building a small Flask app image this way used about 7× less energy than a full base image with build tools. Serving requests cost the same.
+    - **Dependencies before source** (reduces E): the `pip install` layer is cached, so a push that only changes `app/` skips the install. This matters because CI builds on every push.
+    - **`--no-cache-dir` and `.dockerignore`**: pip's download cache and the notebooks stay out of the image, so every pull and stored copy is smaller.

@@ -1,0 +1,74 @@
+id: gen-12764612-00376-review
+category: review
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    ?
+
+    ```bash
+    #!/bin/bash
+    # push finished simulation snapshots to the analysis host
+    SRC=/scratch/sim/output
+    HOST=analysis01
+    DEST=/data/incoming/climate
+    LOG=/var/log/push_snapshots.log
+
+    cd $SRC
+    for f in $(ls *.csv); do
+        echo "$(date) sending $f" >> $LOG
+        xz -9e -c $f | ssh $HOST "cat > $DEST/$f.xz"
+        rm $f
+    done
+    echo "$(date) done" >> $LOG
+    ```
+- role: assistant
+  content: |-
+    **Workload:** script (scientific computing, nightly data transfer)
+
+    #### [Bug] Source files are deleted even when the transfer failed
+    - **Where:** `rm $f` after the `xz | ssh` pipeline
+    - **Issue:** `rm` runs no matter what. If `ssh` drops, the host is full or `xz` is killed, the only copy of the snapshot is gone. Without `pipefail`, a failed `xz` is also hidden by the status of `ssh`. `cd $SRC` has no failure check either, so a wrong path would run the loop in the wrong directory.
+    - **Fix:** delete only after the whole pipeline succeeded (full script below).
+
+    #### [Bug] Unquoted variables and `for f in $(ls ...)`
+    - **Where:** `cd $SRC`, `$(ls *.csv)`, `$f`, `>> $LOG`
+    - **Issue:** names with spaces are split into several words. If there is no `*.csv`, the loop runs once with the literal text `*.csv`.
+    - **Fix:** loop over the glob directly, skip it if nothing matched, and quote every variable.
+
+    #### [High] Maximum-effort xz on data that is sent once
+    - **Where:** `xz -9e -c $f`
+    - **Issue:** every snapshot is compressed on every run, and the compressed copy is used for one transfer only. That is the case for a fast codec. In Green Metrics Tool micro-benchmarks on 100 MB of text, compressing with xz at its default level used ~458 J, and zstd at its default level used ~16 J, about 29× less. `-9e` is slower than the default xz level. Decompressing on the analysis host is cheaper with zstd too (~5.3 J vs ~11.7 J for 100 MB).
+    - **Fix:** use zstd with its default level. The analysis host needs `zstd` installed.
+    - **Impact:** E, large on the compute node for every run. These figures compare energy only, not file size. xz usually makes smaller files. Keep xz only if the link is very slow and the transferred bytes matter more than CPU.
+
+    Fixed script:
+
+    ```bash
+    #!/bin/bash
+    # push finished simulation snapshots to the analysis host
+    set -uo pipefail
+
+    SRC=/scratch/sim/output
+    HOST=analysis01
+    DEST=/data/incoming/climate
+    LOG=/var/log/push_snapshots.log
+
+    cd "$SRC" || exit 1
+    for f in *.csv; do
+        [ -e "$f" ] || continue
+        echo "$(date) sending $f" >> "$LOG"
+        if zstd -q -c -- "$f" | ssh "$HOST" "cat > '$DEST/$f.zst'"; then
+            rm -- "$f"
+        else
+            echo "$(date) FAILED $f" >> "$LOG"
+        fi
+    done
+    echo "$(date) done" >> "$LOG"
+    ```
+
+    Files on the analysis host now end in `.zst`. Update anything there that reads `.xz`.

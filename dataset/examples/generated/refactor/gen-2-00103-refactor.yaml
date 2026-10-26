@@ -1,0 +1,148 @@
+id: gen-2-00103-refactor
+category: refactor
+language: python
+patterns:
+- set-membership
+- avoid-exception-flow
+facts:
+- F-MEMB
+- F-EXC
+messages:
+- role: user
+  content: |
+    Hi, this script make our product feed for google shopping, it run every hour by cron. We have around 180k products. The hidden list from marketing is like 25k skus, and the weight is missing for maybe half of the products (digital things and new ones, the warehouse not measure them yet). Now it take several minutes for build the feed. Can you make it more fast and more clean? The output file must stay exactly same, the merchant center is very picky.
+
+    ```python
+    import csv
+
+    SUPPORTED_COUNTRIES = ["DE", "AT", "CH", "NL", "BE", "FR"]
+
+
+    def load_hidden_skus(path):
+        hidden = []
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                hidden.append(row["sku"].strip())
+        return hidden
+
+
+    def build_feed_rows(products, hidden_skus, weights_g, country):
+        if country not in SUPPORTED_COUNTRIES:
+            raise ValueError(f"country {country} not supported")
+
+        rows = []
+        for p in products:
+            if not p["active"]:
+                continue
+            if p["sku"] in hidden_skus:
+                continue
+            try:
+                weight = weights_g[p["sku"]]
+            except KeyError:
+                weight = 500  # default for parcels without weight
+            shipping = "4.90" if weight <= 1000 else "6.90"
+            rows.append({
+                "id": p["sku"],
+                "title": p["name"][:150],
+                "price": f'{p["price"]:.2f} EUR',
+                "availability": "in_stock" if p["stock"] > 0 else "out_of_stock",
+                "shipping": f"{country}:::{shipping} EUR",
+            })
+        return rows
+
+
+    def write_feed(rows, path):
+        with open(path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["id", "title", "price", "availability", "shipping"], delimiter="\t")
+            w.writeheader()
+            w.writerows(rows)
+    ```
+- role: assistant
+  content: |
+    ```python
+    import csv
+
+    SUPPORTED_COUNTRIES = ["DE", "AT", "CH", "NL", "BE", "FR"]
+    DEFAULT_WEIGHT_G = 500  # parcels without a measured weight
+    FEED_FIELDS = ["id", "title", "price", "availability", "shipping"]
+
+
+    def load_hidden_skus(path):
+        hidden = []
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                hidden.append(row["sku"].strip())
+        return hidden
+
+
+    def build_feed_rows(products, hidden_skus, weights_g, country):
+        if country not in SUPPORTED_COUNTRIES:
+            raise ValueError(f"country {country} not supported")
+
+        hidden = set(hidden_skus)  # built once, checked for every product
+        rows = []
+        for p in products:
+            sku = p["sku"]
+            if not p["active"] or sku in hidden:
+                continue
+            weight = weights_g.get(sku, DEFAULT_WEIGHT_G)
+            shipping = "4.90" if weight <= 1000 else "6.90"
+            rows.append({
+                "id": sku,
+                "title": p["name"][:150],
+                "price": f'{p["price"]:.2f} EUR',
+                "availability": "in_stock" if p["stock"] > 0 else "out_of_stock",
+                "shipping": f"{country}:::{shipping} EUR",
+            })
+        return rows
+
+
+    def write_feed(rows, path):
+        with open(path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=FEED_FIELDS, delimiter="\t")
+            w.writeheader()
+            w.writerows(rows)
+    ```
+
+    The feed has the same rows in the same order, so the file stays byte-identical. `build_feed_rows` still accepts a list, so callers don't change.
+
+    **Green Notes**
+    - **Set for the hidden SKUs** (reduces E): `sku in hidden_skus` on a list scans up to 25k strings for each of the 180k products, every hour. This is where your minutes go. Building the set costs one O(n) pass, then each check is O(1). This only pays off because you check many times. In Green Metrics Tool micro-benchmarks, building a set for a single lookup used about 50% more energy than one scan of the list.
+    - **`dict.get` instead of `try/except KeyError`** (reduces E): about half the products have no weight, so the old loop raised and caught an exception for about every second product. In Green Metrics Tool micro-benchmarks with about half of the keys missing, `dict.get` used about 12% less CPU energy than `try/except KeyError`. This is a much smaller win than the set, but the code is also shorter.
+    - **Cleanup:** the default weight and the feed columns are named constants now. Logic is unchanged.
+    - *Not applied:* `SUPPORTED_COUNTRIES` stays a list. It has 6 entries and is checked once per call, so a set would cost more than it saves.
+verify:
+  equivalence:
+    driver: |
+      import random
+      random.seed(3)
+      products = []
+      for i in range(400):
+          products.append({
+              "sku": f"SKU-{i:05d}",
+              "name": "Produkt " * (i % 30) + str(i),
+              "price": round(random.uniform(1, 300), 2),
+              "stock": random.randint(-2, 20),
+              "active": random.random() > 0.1,
+          })
+      hidden = [f"SKU-{i:05d}" for i in random.sample(range(400), 60)] + ["SKU-99999"]
+      weights = {f"SKU-{i:05d}": random.randint(50, 3000) for i in range(0, 400, 2)}
+      weights["SKU-00011"] = 1000
+      for row in build_feed_rows(products, hidden, weights, "DE"):
+          print(row)
+      for row in build_feed_rows(products[:20], [], {}, "CH"):
+          print(row)
+      try:
+          build_feed_rows(products, hidden, weights, "US")
+      except ValueError as e:
+          print("error", e)
+  benchmark:
+    driver: |
+      import random
+      random.seed(5)
+      products = [{"sku": f"SKU-{i:06d}", "name": f"Produkt {i}", "price": 9.99 + i % 50,
+                   "stock": i % 7, "active": i % 10 != 0} for i in range(4000)]
+      hidden = [f"HID-{i:06d}" for i in range(20000)] + [f"SKU-{i:06d}" for i in range(0, 4000, 13)]
+      weights = {f"SKU-{i:06d}": 200 + i % 2000 for i in range(0, 4000, 2)}
+      build_feed_rows(products, hidden, weights, "DE")
+    min_speedup: 5

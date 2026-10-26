@@ -1,0 +1,98 @@
+id: gen-2-00236-refactor
+category: refactor
+language: bash
+patterns:
+- bash-quoting
+facts:
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    ?
+
+    ```bash
+    #!/usr/bin/env bash
+    # convert raw spectrometer dumps (*.dat, whitespace separated) to annotated csv
+    # run after each measurement campaign, ~8000 files per campaign
+
+    set -euo pipefail
+
+    indir="${1:?usage: $0 INDIR OUTDIR}"
+    outdir="${2:?usage: $0 INDIR OUTDIR}"
+    mkdir -p "$outdir"
+
+    n=0
+    skipped=0
+    for f in "$indir"/*.dat; do
+        name="${f##*/}"
+        name="${name%.dat}"
+        out="$outdir/$name.csv"
+
+        if [[ ! -s "$f" ]]; then
+            echo "WARN: empty file, skipping: $f" >&2
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        header="# Instrument: FTIR-4100 (Lab 2.17), detector DLaTGS, beamsplitter KBr
+    # Units: wavenumber in cm^-1, absorbance in AU (baseline corrected, not normalized)
+    # Processing: Happ-Genzel apodization, zero filling factor 2, resolution 4 cm^-1
+    # License: CC BY 4.0. Cite the group data paper when you reuse these spectra.
+    # Contact: spectroscopy group, see README in the campaign folder"
+        printf '%s\n' "$header" > "$out"
+        echo "# source: $name" >> "$out"
+        echo "wavenumber,absorbance" >> "$out"
+        tr -s ' \t' ',' < "$f" >> "$out"
+        n=$((n + 1))
+    done
+
+    echo "converted $n files, skipped $skipped"
+    ```
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # convert raw spectrometer dumps (*.dat, whitespace separated) to annotated csv
+    # run after each measurement campaign, ~8000 files per campaign
+
+    set -euo pipefail
+    shopt -s nullglob
+
+    indir="${1:?usage: $0 INDIR OUTDIR}"
+    outdir="${2:?usage: $0 INDIR OUTDIR}"
+    mkdir -p "$outdir"
+
+    n=0
+    skipped=0
+    for f in "$indir"/*.dat; do
+        name="${f##*/}"
+        name="${name%.dat}"
+        out="$outdir/$name.csv"
+
+        if [[ ! -s "$f" ]]; then
+            echo "WARN: empty file, skipping: $f" >&2
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        header='# Instrument: FTIR-4100 (Lab 2.17), detector DLaTGS, beamsplitter KBr
+    # Units: wavenumber in cm^-1, absorbance in AU (baseline corrected, not normalized)
+    # Processing: Happ-Genzel apodization, zero filling factor 2, resolution 4 cm^-1
+    # License: CC BY 4.0. Cite the group data paper when you reuse these spectra.
+    # Contact: spectroscopy group, see README in the campaign folder'
+        printf '%s\n' "$header" > "$out"
+        echo "# source: $name" >> "$out"
+        echo 'wavenumber,absorbance' >> "$out"
+        tr -s ' \t' ',' < "$f" >> "$out"
+        n=$((n + 1))
+    done
+
+    echo "converted $n files, skipped $skipped"
+    ```
+
+    **Green Notes**
+    - **Single quotes for fixed text** (reduces E): the header block and the column line have no variables in them. With single quotes, bash no longer scans them for `$`, backticks and backslashes on every file. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal in a loop used about 24% less CPU energy with single quotes at 1,000,000 iterations, and about 14% less at 10,000 iterations. Your header is shorter, and the `tr` process for each file costs more than the quoting, so the absolute saving here is small. If the header ever needs an apostrophe, write it as `'\''`.
+    - **Double quotes kept where something expands:** `"$f"`, `"$out"`, `"# source: $name"`, the WARN message and the usage defaults all stay double-quoted, so nothing changes with word splitting.
+    - **Bug fixed:** without `nullglob`, an input directory with no `.dat` files ran the loop once on the literal pattern `INDIR/*.dat`. It printed a bogus WARN and reported `skipped 1`. Now it reports `converted 0 files, skipped 0`. The CSV output for real files is byte-for-byte the same as before.
+verify:
+  static_only: bash script; the verifier only runs python, javascript and SQL

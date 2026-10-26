@@ -1,0 +1,76 @@
+id: gen-12764612-00195-review
+category: review
+language: sql
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+messages:
+- role: user
+  content: |
+    Please review this query. It is the feature fetch for our nightly rental price model (Postgres). A Python job runs it, and the rows go straight into the model as a feature matrix.
+
+    Requirements:
+    - Only listings that are on the current model version and have not been scored yet.
+    - Only listings changed since the start of the month.
+    - Process at most 5000 listings per run, in a stable order.
+    - The feature order must stay: price, bedrooms, bathrooms, area, age, distance, photos, review score.
+
+    `listing_features` is wide. It has about 50 columns, including `description_text`, `raw_payload_json` and `photo_urls_text`. It is rebuilt by the ingestion job.
+
+    ```sql
+    SELECT *
+    FROM listing_features
+    WHERE model_version = 'v7'
+      AND scored_at IS NULL
+      AND updated_at >= '2026-10-01'
+    ORDER BY listing_id
+    LIMIT 5000;
+    ```
+
+    The columns the model uses are `price`, `bedrooms`, `bathrooms`, `area_sqm`, `age_years`, `dist_center_km`, `n_photos` and `avg_review_score`. The job also needs `listing_id` to write the scores back.
+- role: assistant
+  content: |
+    **Workload:** AI/ML (nightly batch inference, feature fetch)
+
+    #### [Bug] Feature order depends on the table layout
+    - **Where:** `SELECT *`
+    - **Issue:** `SELECT *` returns columns in table order. If the ingestion job rebuilds the table with a different column order, or someone adds a column, the feature matrix shifts. The model then gets wrong inputs and no error is raised. Your requirement of a fixed feature order is not guaranteed by this query.
+    - **Fix:** name the columns in the order the model expects (see below).
+
+    #### [High] Reads about 40 columns the model never uses
+    - **Where:** `SELECT *`
+    - **Issue:** the query reads and ships `description_text`, `raw_payload_json`, `photo_urls_text` and all other wide columns for up to 5000 rows. Your job then drops them. The cost scales with the data each column carries, not with the column count. In Green Metrics Tool micro-benchmarks on a 52-column table with large text columns, reading 2,500 rows with the 10 needed columns used about 7× less energy than `SELECT *`.
+    - **Fix:** select only `listing_id` and the eight feature columns:
+      ```sql
+      SELECT listing_id,
+             price,
+             bedrooms,
+             bathrooms,
+             area_sqm,
+             age_years,
+             dist_center_km,
+             n_photos,
+             avg_review_score
+      FROM listing_features
+      WHERE model_version = 'v7'
+        AND scored_at IS NULL
+        AND updated_at >= '2026-10-01'
+      ORDER BY listing_id
+      LIMIT 5000;
+      ```
+    - **Impact:** E and network on the database server and the job, on every run. The rows, their order and the limit stay the same. Only the columns change. In the Python job, read the features by name or by this fixed position, not by `SELECT *` order.
+
+    **Already good:** the filter is explicit, `ORDER BY listing_id` gives a stable order, and `LIMIT` bounds the work per run.
+verify:
+  sql:
+    setup: CREATE TABLE listing_features (listing_id INTEGER PRIMARY KEY, model_version TEXT, scored_at TEXT, updated_at TEXT,
+      price REAL, bedrooms INTEGER, bathrooms INTEGER, area_sqm REAL, age_years INTEGER, dist_center_km REAL, n_photos INTEGER,
+      avg_review_score REAL, description_text TEXT, raw_payload_json TEXT, photo_urls_text TEXT); INSERT INTO listing_features
+      VALUES (3, 'v7', NULL, '2026-10-05', 1200.0, 2, 1, 55.5, 12, 3.2, 8, 4.5, 'Bright flat near the park', '{"a":1}', 'u1,u2'),
+      (1, 'v7', NULL, '2026-10-02', 900.0, 1, 1, 38.0, 30, 5.1, 4, 4.1, 'Small studio', '{"a":2}', 'u3'), (2, 'v6', NULL,
+      '2026-10-03', 1500.0, 3, 2, 80.0, 5, 1.0, 12, 4.8, 'Family home', '{"a":3}', 'u4,u5,u6'), (4, 'v7', '2026-10-06', '2026-10-04',
+      1100.0, 2, 1, 50.0, 20, 2.5, 6, 4.0, 'Already scored', '{"a":4}', 'u7'), (5, 'v7', NULL, '2026-09-20', 1000.0, 2, 1,
+      45.0, 18, 4.0, 5, 3.9, 'Old change', '{"a":5}', 'u8');
+    compare: true

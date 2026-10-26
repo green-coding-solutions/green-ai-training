@@ -1,0 +1,88 @@
+id: gen-2-00001-generation
+category: generation
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    I need a validation helper for our product API. Endpoint is `POST /api/products/visibility`, body looks like `{"skus": ["ab-1001", "AB-1002 ", ...], "visible": false}`. Shop staff use it to hide or show products in bulk.
+
+    Requirements:
+    - Catalog SKUs come from `load_catalog_skus()` (returns a list of ~150k strings). Discontinued SKUs come from `load_discontinued_skus()` (~3k strings, they are also in the catalog). Both only change on deploy.
+    - Normalize every SKU: strip whitespace, uppercase.
+    - Skip empty strings. Drop duplicates, keep the first occurrence.
+    - Return a dict with `accepted`, `unknown` and `discontinued` lists, each in input order.
+    - Max 5,000 SKUs per request, otherwise raise `ValueError`. Non-string entries also raise `ValueError` with the index.
+    - Keep it framework-agnostic. We call it from a Flask view, but I want to unit test it without Flask.
+- role: assistant
+  content: |
+    ```python
+    from collections.abc import Iterable, Sequence
+
+    MAX_BATCH = 5000
+
+
+    def _normalize(sku: str) -> str:
+        return sku.strip().upper()
+
+
+    class SkuValidator:
+        """Create once at app startup:
+        validator = SkuValidator(load_catalog_skus(), load_discontinued_skus())
+        The sets are never mutated, so one instance is safe to share between requests.
+        """
+
+        def __init__(self, catalog_skus: Iterable[str], discontinued_skus: Iterable[str]) -> None:
+            self._catalog = frozenset(_normalize(s) for s in catalog_skus)
+            self._discontinued = frozenset(_normalize(s) for s in discontinued_skus)
+
+        def validate(self, requested: Sequence[object]) -> dict[str, list[str]]:
+            if len(requested) > MAX_BATCH:
+                raise ValueError(f"at most {MAX_BATCH} SKUs per request, got {len(requested)}")
+
+            accepted: list[str] = []
+            unknown: list[str] = []
+            discontinued: list[str] = []
+            seen: set[str] = set()
+
+            for i, raw in enumerate(requested):
+                if not isinstance(raw, str):
+                    raise ValueError(f"skus[{i}] must be a string")
+                sku = _normalize(raw)
+                if not sku or sku in seen:
+                    continue
+                seen.add(sku)
+                if sku not in self._catalog:
+                    unknown.append(sku)
+                elif sku in self._discontinued:
+                    discontinued.append(sku)
+                else:
+                    accepted.append(sku)
+
+            return {"accepted": accepted, "unknown": unknown, "discontinued": discontinued}
+    ```
+
+    **Green Notes**
+    - **Sets built once, at startup** (reduces E): one request can check up to 5,000 SKUs. Each check against the 150k-entry catalog list would be a linear scan. Against a `frozenset` it is O(1).
+    - **`seen` set for duplicates** (reduces E): it removes duplicates in O(1) per SKU. Checking `sku in accepted` would rescan the result lists every time.
+    - **Don't rebuild the sets per request:** building a set costs more than one scan. In Green Metrics Tool micro-benchmarks, converting a 10,000,000-element list to a set and testing once cost about 50% more than a single linear scan of the list. Here the conversion pays off because it happens once and then serves thousands of lookups on every request.
+verify:
+  test: |-
+    v = SkuValidator(["AB-1", "ab-2 ", " CD-3", "EF-4"], ["cd-3"])
+    r = v.validate([" ab-1", "XX-9", "AB-1", "cd-3", "", "  ", "ab-2", "zz-1", "xx-9"])
+    assert r == {"accepted": ["AB-1", "AB-2"], "unknown": ["XX-9", "ZZ-1"], "discontinued": ["CD-3"]}, r
+    assert v.validate([]) == {"accepted": [], "unknown": [], "discontinued": []}
+    try:
+        v.validate(["AB-1", 42])
+        raise AssertionError("expected ValueError")
+    except ValueError as e:
+        assert "skus[1]" in str(e)
+    try:
+        v.validate(["AB-1"] * 5001)
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+    assert len(v.validate(["AB-1"] * 5000)["accepted"]) == 1

@@ -1,0 +1,68 @@
+id: gen-12764612-00372-no-change
+category: no-change
+language: python
+patterns:
+- vectorize-or-jit
+- context-tradeoff
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    We have a GitLab CI job that runs on every merge request. It reads an export of the last ~3,000 pipeline durations and flags builds that are much slower than the recent average, so we notice slow builds early. Requirements: the job should stay small, and it should not slow down the MR pipeline. We want it to be as energy efficient as possible, so I plan to add `@njit` from numba to `find_regressions`. Each job runs in a fresh container. Is that a good idea?
+
+    ```python
+    import json
+    import math
+    import sys
+
+    WINDOW = 50
+    SIGMA = 3.0
+
+
+    def load_durations(path):
+        with open(path) as f:
+            runs = json.load(f)
+        return [r["duration_s"] for r in runs if r.get("status") == "success"]
+
+
+    def find_regressions(durations, window=WINDOW, sigma=SIGMA):
+        flagged = []
+        total = 0.0
+        total_sq = 0.0
+        for i, d in enumerate(durations):
+            if i >= window:
+                mean = total / window
+                var = max(total_sq / window - mean * mean, 0.0)
+                if d > mean + sigma * math.sqrt(var):
+                    flagged.append(i)
+                old = durations[i - window]
+                total -= old
+                total_sq -= old * old
+            total += d
+            total_sq += d * d
+        return flagged
+
+
+    if __name__ == "__main__":
+        durations = load_durations(sys.argv[1])
+        bad = find_regressions(durations)
+        for i in bad:
+            print(f"slow build at index {i}: {durations[i]:.1f}s")
+        sys.exit(1 if bad and bad[-1] >= len(durations) - 10 else 0)
+    ```
+- role: assistant
+  content: |
+    No, I would not add numba here. Leave the code as it is.
+
+    - **The loop is already cheap.** It keeps a running sum, so each build costs a constant amount of work. A few thousand iterations is a tiny workload for Python. Most of the job time is starting the interpreter and parsing the JSON.
+    - **JIT has a startup cost.** Numba compiles `find_regressions` on its first call. In a fresh container for every job, that compile happens every time, and a `cache=True` file is lost when the container goes away. For a loop this short, compiling would cost more than running it.
+    - **It adds weight to the job.** You would install numba and its LLVM runtime in the CI image and import them on every run. That goes against your "keep it small" requirement.
+
+    Numba pays off for CPU-bound numeric loops with a lot of work. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples in a pure Python loop used about 40 J, and with Numba `@njit` about 9.5 J (about 4× less). That is a very different scale from a few thousand values.
+
+    If the export grows by orders of magnitude, measure first. Run `perf stat -r 5 python check_regressions.py builds.json` (or just `time`) as a CPU-time proxy, and add numba only if the loop dominates the run.
+
+    One small point about behavior, not energy: failed builds are filtered out in `load_durations`, so the window only covers successful builds. That seems intended for this check.
+verify:
+  static_only: answer contains no code to run; the verdict is that numba should not be added

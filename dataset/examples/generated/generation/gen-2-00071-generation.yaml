@@ -1,0 +1,115 @@
+id: gen-2-00071-generation
+category: generation
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    ```python
+    # collect_errors.py
+    # cron, every 5 min: pull the tail of app.log from each edge node
+    # and count ERROR lines per node. ~40 nodes, each one serves
+    # GET http://<host>:9100/tail?lines=2000  (plain text)
+
+    import json
+    import sys
+
+    NODES_FILE = "/etc/edge/nodes.txt"
+
+    def load_nodes(path):
+        with open(path) as f:
+            return [line.strip() for line in f if line.strip() and not line.startswith("#")]
+
+    def count_errors(text):
+        # TODO
+        ...
+
+    def fetch_tail(host):
+        # TODO
+        ...
+
+    def main():
+        nodes = load_nodes(NODES_FILE)
+        # TODO: fetch every node, print {"host": error_count} as json
+        # node down / timeout -> null, don't kill the whole run
+        ...
+
+    if __name__ == "__main__":
+        main()
+    ```
+    ?
+- role: assistant
+  content: |
+    Here are the TODOs filled in. The nodes are fetched concurrently instead of one after another:
+
+    ```python
+    # collect_errors.py
+    import asyncio
+    import json
+    import sys
+
+    import httpx
+
+    NODES_FILE = "/etc/edge/nodes.txt"
+    PORT = 9100
+    TAIL_LINES = 2000
+    MAX_PARALLEL = 10
+    TIMEOUT = httpx.Timeout(10.0, connect=3.0)
+
+
+    def load_nodes(path):
+        with open(path) as f:
+            return [line.strip() for line in f if line.strip() and not line.startswith("#")]
+
+
+    def count_errors(text):
+        return sum(1 for line in text.splitlines() if "ERROR" in line.split())
+
+
+    async def fetch_tail(client, sem, host):
+        async with sem:
+            resp = await client.get(
+                f"http://{host}:{PORT}/tail", params={"lines": TAIL_LINES}
+            )
+            resp.raise_for_status()
+            return resp.text
+
+
+    async def collect(nodes):
+        sem = asyncio.Semaphore(MAX_PARALLEL)
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            results = await asyncio.gather(
+                *(fetch_tail(client, sem, host) for host in nodes),
+                return_exceptions=True,
+            )
+
+        report = {}
+        for host, res in zip(nodes, results):
+            if isinstance(res, Exception):
+                print(f"{host}: {res!r}", file=sys.stderr)
+                report[host] = None
+            else:
+                report[host] = count_errors(res)
+        return report
+
+
+    def main():
+        nodes = load_nodes(NODES_FILE)
+        report = asyncio.run(collect(nodes))
+        json.dump(report, sys.stdout, indent=2)
+        print()
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **Concurrent async requests** (reduces E, mostly wall time): the tail requests overlap instead of waiting on each node in turn. A run takes a few round trips instead of the sum of all 40, so the cron job holds its process and sockets for a much shorter time. In Green Metrics Tool micro-benchmarks, 10 HTTP requests with async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. The gain is mostly wall time, and it grows with the number of nodes you wait on.
+
+    The semaphore limits the run to 10 requests in flight. A node that is down, times out or returns an error status shows up as `null` and is logged to stderr, and the other nodes are still counted. `count_errors` counts lines where `ERROR` appears as a separate word. Adjust it if your log format puts the level somewhere else, e.g. `[ERROR]`.
+verify:
+  static_only: needs httpx and live edge nodes over the network

@@ -1,0 +1,110 @@
+id: gen-1-00113-generation
+category: generation
+language: html
+patterns:
+- dom-size
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    Single-file html page for our webhook delivery log. GET /api/webhooks/deliveries returns a JSON array, ~10k objects, newest first: {id, endpoint, event, status, attempt, delivered_at}. Table, filter by status (all / failed / ok). Vanilla JS, no deps. Just the code.
+- role: assistant
+  content: |
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <title>Webhook deliveries</title>
+      <style>
+        body { font-family: system-ui, sans-serif; margin: 1.5rem; }
+        table { border-collapse: collapse; width: 100%; margin-top: .75rem; }
+        th, td { text-align: left; padding: .25rem .5rem; border-bottom: 1px solid #ddd; }
+        .failed td:nth-child(4) { color: #b00020; font-weight: 600; }
+      </style>
+    </head>
+    <body>
+      <h1>Webhook deliveries</h1>
+      <label>Status
+        <select id="filter">
+          <option value="all">all</option>
+          <option value="failed">failed</option>
+          <option value="ok">ok</option>
+        </select>
+      </label>
+      <button id="prev" type="button">Prev</button>
+      <span id="pageinfo"></span>
+      <button id="next" type="button">Next</button>
+
+      <table>
+        <thead>
+          <tr><th>ID</th><th>Endpoint</th><th>Event</th><th>Status</th><th>Attempt</th><th>Delivered at</th></tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+
+      <script>
+        const PAGE_SIZE = 100;
+        const FIELDS = ['id', 'endpoint', 'event', 'status', 'attempt', 'delivered_at'];
+        const isFailed = (d) => d.status === 0 || d.status >= 400;
+
+        const rowsEl = document.getElementById('rows');
+        const filterEl = document.getElementById('filter');
+        const prevEl = document.getElementById('prev');
+        const nextEl = document.getElementById('next');
+        const infoEl = document.getElementById('pageinfo');
+
+        let all = [];
+        let view = [];
+        let page = 0;
+
+        function applyFilter() {
+          const f = filterEl.value;
+          view = f === 'all' ? all : all.filter((d) => (f === 'failed') === isFailed(d));
+          page = 0;
+          render();
+        }
+
+        function render() {
+          const pages = Math.max(1, Math.ceil(view.length / PAGE_SIZE));
+          const frag = document.createDocumentFragment();
+          for (const d of view.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)) {
+            const tr = document.createElement('tr');
+            if (isFailed(d)) tr.className = 'failed';
+            for (const key of FIELDS) {
+              const td = document.createElement('td');
+              td.textContent = d[key] ?? '';
+              tr.appendChild(td);
+            }
+            frag.appendChild(tr);
+          }
+          rowsEl.replaceChildren(frag);
+          infoEl.textContent = `Page ${page + 1} / ${pages} (${view.length} rows)`;
+          prevEl.disabled = page === 0;
+          nextEl.disabled = page >= pages - 1;
+        }
+
+        prevEl.addEventListener('click', () => { page--; render(); });
+        nextEl.addEventListener('click', () => { page++; render(); });
+        filterEl.addEventListener('change', applyFilter);
+
+        fetch('/api/webhooks/deliveries')
+          .then((res) => {
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            return res.json();
+          })
+          .then((data) => { all = data; applyFilter(); })
+          .catch((err) => { infoEl.textContent = `Could not load deliveries: ${err.message}`; });
+      </script>
+    </body>
+    </html>
+    ```
+
+    **Green Notes**
+    - **Avoid excessive DOM size** (reduces E on the client): the page keeps all rows in a JS array but only puts 100 in the DOM. Filtering runs on the array, so the DOM never holds thousands of rows. In Green Metrics Tool browser benchmarks, 30 page loads of a 10,000-row table (14 elements per row, rows appended one by one) used ~1036 J. The same data paginated to 100 rows per page as a plain `<table>`, built in a `DocumentFragment`, used ~457 J, about 56% less.
+    - **One DOM write per page:** rows are built in a `DocumentFragment` and swapped in with `replaceChildren`. Cells are plain `<td>` elements with `textContent`, with no wrapper elements. `textContent` also avoids HTML injection from endpoint names.
+
+    Browser find (Ctrl+F) now only searches the current page. If ops needs a text search over all rows, add a search field that filters `all` instead.
+verify:
+  static_only: needs a browser DOM and a fetch endpoint

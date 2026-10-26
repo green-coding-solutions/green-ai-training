@@ -1,0 +1,56 @@
+id: gen-12764612-00386-no-change
+category: no-change
+language: python
+patterns:
+- vectorize-or-jit
+- context-tradeoff
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    numba this, diff only. it's the decode step on the gateway, shows up in the profile
+
+    ```python
+    import struct
+    import time
+
+    N_CH = 12
+    SCALE = (0.1, 0.1, 0.01, 1.0, 0.1, 0.1, 0.001, 0.01, 1.0, 0.1, 0.1, 0.5)
+    OFFSET = (-40.0, -40.0, 0.0, 0.0, -40.0, -40.0, 0.0, 0.0, 0.0, -40.0, -40.0, 0.0)
+    LIMITS = (-50.0, 150.0)
+
+    def decode_registers(raw: bytes) -> list[float]:
+        if len(raw) != N_CH * 2:
+            raise ValueError(f"expected {N_CH * 2} bytes, got {len(raw)}")
+        regs = struct.unpack(f">{N_CH}h", raw)
+        out = []
+        for i in range(N_CH):
+            v = regs[i] * SCALE[i] + OFFSET[i]
+            if v < LIMITS[0]:
+                v = LIMITS[0]
+            elif v > LIMITS[1]:
+                v = LIMITS[1]
+            out.append(round(v, 3))
+        return out
+
+    def poll_loop(client, publish, period_s=10.0):
+        while True:
+            t0 = time.monotonic()
+            raw = client.read_holding_registers(0, N_CH)
+            publish(decode_registers(raw))
+            time.sleep(max(0.0, period_s - (time.monotonic() - t0)))
+    ```
+- role: assistant
+  content: |
+    No diff. I would not add numba here.
+
+    - The loop runs 12 iterations once every 10 seconds. That is microseconds of CPU work per poll. The Modbus read and the sleep dominate, and neither gets faster with a JIT.
+    - Numba compiles on first call. For 12 values the compile step costs far more than the loop will ever save. On a small gateway it also adds a heavy dependency (LLVM) and a slower start.
+    - JIT pays off for CPU-bound numeric loops over large inputs. In Green Metrics Tool micro-benchmarks, a pure Python quantization loop over 10,000,000 samples used about 4× more CPU energy than the same loop with Numba `@njit`. That condition is nothing like 12 values per poll.
+
+    The function is already fine for this job. It checks the length, uses one `struct.unpack` call, and the poll loop corrects for the time spent reading.
+
+    If the profile shows this function high, check how the profiler counts it. It is probably a share of a very small total. Revisit numba only if you start decoding buffered waveforms with millions of samples per batch.
+verify:
+  static_only: answer contains no code; it explains why no change is made

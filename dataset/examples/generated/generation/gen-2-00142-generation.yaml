@@ -1,0 +1,103 @@
+id: gen-2-00142-generation
+category: generation
+language: python
+patterns:
+- keep-star-imports
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    pre-commit hook that fails if a staged .py file has a line over 120 chars. our other hooks all do `from hooklib import *` (gives `staged_files()` and `report(path, lineno, msg)`), keep it that way
+- role: assistant
+  content: |
+    ```python
+    import os
+    import sys
+
+    from hooklib import *
+
+    MAX_LEN = 120
+
+
+    def long_lines(path, limit=MAX_LEN):
+        hits = []
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for lineno, line in enumerate(f, 1):
+                length = len(line.rstrip("\r\n"))
+                if length > limit:
+                    hits.append((lineno, length))
+        return hits
+
+
+    def main():
+        failed = False
+        for path in staged_files():
+            # skip non-Python files and files deleted in this commit
+            if not path.endswith(".py") or not os.path.isfile(path):
+                continue
+            for lineno, length in long_lines(path):
+                report(path, lineno, f"line too long ({length} > {MAX_LEN})")
+                failed = True
+        return 1 if failed else 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+
+    This checks the working-tree copy of each staged file. If people often stage only part of a file, read the staged version instead, for example with `git show :path`.
+
+    **Green Notes**
+    - **Star import kept:** `from hooklib import *` matches your other hooks. In Green Metrics Tool micro-benchmarks, star imports and plain `import module` showed no measurable energy difference, so changing it would gain nothing.
+    - **Stdlib only** (reduces E): the hook starts a new Python process on every commit. At startup, the cost comes from loading heavy modules. In the same benchmarks, a process start that imported sympy used about 25× the energy of a start that imported only a built-in module.
+verify:
+  module: true
+  setup: |
+    import sys
+    import types
+
+    _hl = types.ModuleType("hooklib")
+    _hl.files = []
+    _hl.reports = []
+
+    def _staged_files():
+        return list(sys.modules["hooklib"].files)
+
+    def _report(path, lineno, msg):
+        sys.modules["hooklib"].reports.append((path, lineno, msg))
+
+    _hl.staged_files = _staged_files
+    _hl.report = _report
+    _hl.__all__ = ["staged_files", "report"]
+    sys.modules["hooklib"] = _hl
+  test: |-
+    import os
+    import sys
+    import tempfile
+
+    _hl = sys.modules["hooklib"]
+    _tmp = tempfile.mkdtemp()
+
+    def _write(name, text):
+        p = os.path.join(_tmp, name)
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return p
+
+    _ok = _write("ok.py", "x = 1\n" + "y" * 120 + "\n")
+    _bad = _write("bad.py", "a = 1\n" + "z" * 121 + "\n" + "b = 2\n")
+    _txt = _write("notes.md", "q" * 300 + "\n")
+
+    assert long_lines(_ok) == []
+    assert long_lines(_bad) == [(2, 121)]
+
+    _hl.files = [_ok, _bad, _txt, os.path.join(_tmp, "deleted.py")]
+    _hl.reports = []
+    assert main() == 1
+    assert _hl.reports == [(_bad, 2, "line too long (121 > 120)")], _hl.reports
+
+    _hl.files = [_ok, _txt]
+    _hl.reports = []
+    assert main() == 0
+    assert _hl.reports == []

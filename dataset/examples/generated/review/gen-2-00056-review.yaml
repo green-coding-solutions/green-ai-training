@@ -1,0 +1,113 @@
+id: gen-2-00056-review
+category: review
+language: html
+patterns:
+- remove-unused-css
+facts:
+- F-UNUSED-CSS
+messages:
+- role: user
+  content: |
+    I maintain `lintwatch`, a small Python CLI we run in CI. It collects linter output and writes `report.html` with Jinja2 (`Environment(autoescape=True)`). The report is uploaded as a build artifact on every pipeline run. People download it and open the file directly in the browser.
+
+    Requirements:
+    - it must stay one self-contained file (no CDN, no external CSS/JS, people open it offline)
+    - no build step for the template, it ships inside the wheel as is
+    - a typical report has 5-40 files and a few hundred issues at most
+
+    The `<style>` block was copied from our old internal dashboard theme and is about 15 KB. A colleague wants to strip it "for performance". Is that worth a PR? Please also flag anything else that is actually wrong. Severity-ranked if possible.
+
+    ```html
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <title>lintwatch report – {{ project }}</title>
+      <style>
+        /* theme copied from the old dashboard */
+        :root { --fg:#1d2433; --muted:#6b7280; --err:#b42318; --warn:#b54708; --ok:#067647; }
+        body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--fg); margin: 2rem; }
+        .container { max-width: 1100px; margin: 0 auto; }
+        .navbar { display: flex; align-items: center; padding: .5rem 1rem; background: #111827; }
+        .navbar-brand { color: #fff; font-weight: 700; text-decoration: none; }
+        .dropdown-menu { position: absolute; min-width: 10rem; box-shadow: 0 4px 12px rgba(0,0,0,.15); }
+        .btn { display: inline-block; padding: .4rem .9rem; border-radius: 4px; cursor: pointer; }
+        .btn-primary { background: #2563eb; color: #fff; border: 0; }
+        .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.4); }
+        .modal-dialog { max-width: 32rem; margin: 10vh auto; background: #fff; border-radius: 8px; }
+        .badge-ok { color: var(--ok); }
+        .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }
+        /* ... ~380 more lines: tooltips, carousel, form controls, .mt-1 ... .px-6 utilities ... */
+        .card { border: 1px solid #e5e7eb; border-radius: 6px; padding: 1rem; }
+        .summary { display: flex; gap: 1rem; }
+        h1 small { color: var(--muted); font-weight: 400; }
+        table { width: 100%; border-collapse: collapse; }
+        td, th { padding: .4rem .6rem; border-bottom: 1px solid #e5e7eb; text-align: left; }
+        .sev-error { color: var(--err); font-weight: 600; }
+        .sev-warning { color: var(--warn); }
+        code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9em; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <h1>{{ project }} <small>{{ commit[:8] }}</small></h1>
+        <div class="summary">
+          <div class="card">Errors: <b>{{ counts.error }}</b></div>
+          <div class="card">Warnings: <b>{{ counts.warning }}</b></div>
+          <div class="card">Files: <b>{{ files|length }}</b></div>
+        </div>
+        {% for f in files %}
+        <h2><code>{{ f.path }}</code></h2>
+        <table>
+          <tr><th>Line</th><th>Rule</th><th>Severity</th><th>Message</th></tr>
+          {% for i in f.issues %}
+          <tr>
+            <td>{{ i.line }}</td>
+            <td><code>{{ i.rule }}</code></td>
+            <td class="sev-{{ i.severity }}">{{ i.severity }}</td>
+            <td>{{ i.message | safe }}</td>
+          </tr>
+          {% endfor %}
+        </table>
+        {% endfor %}
+      </div>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (CLI report generated on every CI run)
+
+    #### [Security] Lint messages rendered without escaping
+    - **Where:** `{{ i.message | safe }}`
+    - **Issue:** `| safe` turns off autoescaping for that value. Linter messages often quote source code. A message like ``Unexpected `<img src=x onerror=...>` `` is then rendered as real markup. Anyone who can open a PR can put script into a report that reviewers open in their browser. Harmless messages break too: ``Expected `<div>` to be closed`` loses the tag.
+    - **Fix:** drop the filter and let autoescape do the work: `<td>{{ i.message }}</td>`. If you added `| safe` because messages showed up as `&lt;`, they are being escaped twice. Stop escaping them in Python before rendering.
+
+    #### [Bug] No charset declaration
+    - **Where:** `<head>`
+    - **Issue:** the file is opened from disk, so no HTTP header tells the browser the encoding. Without a declaration, the browser may guess wrong, and non-ASCII paths, messages and the `–` in the title show up garbled.
+    - **Fix:** make this the first element in `<head>`: `<meta charset="utf-8">`. Also write the file with `encoding="utf-8"` in the CLI.
+
+    #### [Low] Dashboard theme carries mostly unused CSS
+    - **Where:** the `<style>` block
+    - **Issue:** the template uses about a dozen selectors. Navbar, dropdown, buttons, modals, grid, badges and the utility classes match nothing. In Green Metrics Tool page-load measurements, a 16 KB stylesheet with mostly unused rules was compared with the same stylesheet purged and minified to 0.75 KB. Client CPU energy differed by about 2%, which is within measurement noise. So stripping it is not a performance fix. The real gain is fewer bytes in every stored artifact and download, plus a template that is easier to maintain.
+    - **Fix:** you have no build step, so delete the unused rules by hand. If you ever run a purge tool on the template, safelist `sev-*`. That class name is built at render time, so a tool would remove `.sev-error` and `.sev-warning`.
+      ```css
+      :root { --fg:#1d2433; --muted:#6b7280; --err:#b42318; --warn:#b54708; }
+      body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--fg); margin: 2rem; }
+      .container { max-width: 1100px; margin: 0 auto; }
+      h1 small { color: var(--muted); font-weight: 400; }
+      .summary { display: flex; gap: 1rem; }
+      .card { border: 1px solid #e5e7eb; border-radius: 6px; padding: 1rem; }
+      table { width: 100%; border-collapse: collapse; }
+      td, th { padding: .4rem .6rem; border-bottom: 1px solid #e5e7eb; text-align: left; }
+      .sev-error { color: var(--err); font-weight: 600; }
+      .sev-warning { color: var(--warn); }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9em; }
+      ```
+    - **Impact:** network and storage only (bytes per artifact). No measurable client energy at this size.
+
+    So the PR is fine as a cleanup, but the two fixes above matter more.
+
+    **Already good:** one self-contained file with no external requests, system font stack instead of web fonts, autoescape on by default.
+verify:
+  static_only: HTML/Jinja2 template, no executable code to test

@@ -1,0 +1,110 @@
+id: gen-1-00087-estimate
+category: estimate
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    ?
+
+    ```yaml
+    name: etl-preview
+
+    on:
+      push:
+        branches-ignore: [main]
+
+    env:
+      PREVIEW_HOST: previews.internal.example.com
+
+    jobs:
+      deploy:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+          - uses: webfactory/ssh-agent@v0.9.0
+            with:
+              ssh-private-key: ${{ secrets.PREVIEW_SSH_KEY }}
+          - name: Deploy branch stack
+            run: |
+              SLUG=$(echo "${GITHUB_REF_NAME}" | tr '/_' '--' | tr 'A-Z' 'a-z')
+              rsync -az -e "ssh -o StrictHostKeyChecking=accept-new" ./ deploy@$PREVIEW_HOST:/srv/previews/$SLUG/
+              ssh deploy@$PREVIEW_HOST "cd /srv/previews/$SLUG && \
+                docker compose -p etl-$SLUG up -d --build \
+                  --scale scheduler=2 --scale worker=3 --scale loader=2"
+          - name: Comment URL
+            run: echo "Airflow UI at https://$PREVIEW_HOST/etl-$GITHUB_REF_NAME"
+    ```
+- role: assistant
+  content: |
+    I read "?" as: how much would it save to fix how these previews live and scale.
+
+    This workflow starts a full stack for every pushed branch: 2 schedulers, 3 workers, 2 loaders and whatever else is in the compose file. Nothing ever removes it. The stacks stay up after the branch is merged or deleted.
+
+    Two things drive the footprint:
+
+    - **How many stacks exist, and for how long.** This is the big one. Every stale branch keeps its services running and its memory reserved.
+    - **How big each stack is while idle.** This is small.
+
+    Measured reference: in Green Metrics Tool micro-benchmarks, a preview environment idling for 60 seconds (3 app replicas, Postgres, Redis and a polling worker) used ~269 J CPU energy. With 1 app replica and Postgres it used ~262 J, about 3% less. Whole-machine energy differed by less than 1%, because the idle machine baseline dominates. So scaling replicas down saves little per minute. Removing environments that no one uses is where the saving is. I won't turn that into a total for you, because it depends on how many stale stacks you have and for how long.
+
+    Here is the same workflow with cleanup and a smaller footprint:
+
+    ```yaml
+    name: etl-preview
+
+    on:
+      pull_request:
+        types: [opened, synchronize, reopened, closed]
+
+    concurrency:
+      group: etl-preview-${{ github.event.number }}
+      cancel-in-progress: true
+
+    env:
+      PREVIEW_HOST: previews.internal.example.com
+      STACK: etl-pr-${{ github.event.number }}
+
+    jobs:
+      deploy:
+        if: github.event.action != 'closed'
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+          - uses: webfactory/ssh-agent@v0.9.0
+            with:
+              ssh-private-key: ${{ secrets.PREVIEW_SSH_KEY }}
+          - name: Deploy PR stack
+            run: |
+              rsync -az -e "ssh -o StrictHostKeyChecking=accept-new" ./ deploy@$PREVIEW_HOST:/srv/previews/$STACK/
+              ssh deploy@$PREVIEW_HOST "cd /srv/previews/$STACK && \
+                docker compose -p $STACK up -d --build"
+          - name: Print URL
+            run: echo "Airflow UI at https://$PREVIEW_HOST/$STACK"
+
+      teardown:
+        if: github.event.action == 'closed'
+        runs-on: ubuntu-latest
+        steps:
+          - uses: webfactory/ssh-agent@v0.9.0
+            with:
+              ssh-private-key: ${{ secrets.PREVIEW_SSH_KEY }}
+          - name: Remove PR stack
+            run: |
+              ssh -o StrictHostKeyChecking=accept-new deploy@$PREVIEW_HOST \
+                "cd /srv/previews/$STACK && docker compose -p $STACK down -v && cd .. && rm -rf $STACK"
+    ```
+
+    **Green Notes**
+    - **Minimize environments** (reduces E and M): the stack is removed when the PR is merged or closed, so it no longer runs for days after the review ends. This is the part that saves real energy.
+    - **Fewer services per preview** (reduces E and M): the `--scale` flags are gone, so each stack runs one of each service. The saving per minute is small (see the 3% figure above), but it also frees memory on the shared host. Put the replica counts back only if a test needs them.
+    - **Behavior change:** previews now start per pull request, not per pushed branch, and `concurrency` cancels an older deploy of the same PR. Branches without a PR get no stack.
+
+    **To measure your own saving:**
+    - Count environment-hours before and after. List running stacks with `docker compose ls` or `docker ps` on the host and note how many belong to merged or deleted branches.
+    - For energy, run one stack idle for a fixed time in a Green Metrics Tool usage scenario. Repeat it with the smaller stack and compare machine energy. Multiply by your own count of removed environment-hours, not by a benchmark figure.
+verify:
+  static_only: GitHub Actions workflow needing remote hosts and secrets

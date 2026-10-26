@@ -140,7 +140,7 @@ def run(jobs, model, effort, workers):
 
 def repair(model, effort, workers):
     report_path = OUT_DIR / "verify-report.json"
-    if not report_path.exists():
+    if not report_path.exists() or not report_path.stat().st_size:
         sys.exit("Run scripts/verify.py examples/generated first.")
     report = json.loads(report_path.read_text())
     targets = [(k, v) for k, v in report.items()
@@ -169,6 +169,10 @@ def main():
     p_plan = sub.add_parser("plan", help="Sample a job matrix into out/jobs.jsonl (same as generate.py plan)")
     p_plan.add_argument("--n", type=int, default=300)
     p_plan.add_argument("--seed", type=int, default=1)
+    p_plan.add_argument("--fill", action="store_true",
+                        help="Plan only what is missing for the target mix (thin patterns first), ignores --n")
+    p_plan.add_argument("--oversample", type=float, default=1.3,
+                        help="With --fill: plan this many times the gap, because some generated examples fail verify")
     p_run = sub.add_parser("run", help="Generate examples for pending jobs")
     p_run.add_argument("--limit", type=int)
     p_rep = sub.add_parser("repair", help="One repair attempt for failing generated examples")
@@ -184,7 +188,7 @@ def main():
 
     OUT_DIR.mkdir(exist_ok=True)
     if args.cmd == "plan":
-        jobs = plan_jobs(args.n, args.seed)
+        jobs = plan_jobs(args.n, args.seed, args.fill, args.oversample)
         with open(JOBS_FILE, "w") as f:
             for j in jobs:
                 f.write(json.dumps(j) + "\n")

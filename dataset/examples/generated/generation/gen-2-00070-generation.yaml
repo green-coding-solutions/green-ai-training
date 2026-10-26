@@ -1,0 +1,110 @@
+id: gen-2-00070-generation
+category: generation
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    We run a fall-detection model on our IoT gateways. Each wearable streams 3-axis accelerometer data at 100 Hz. The gateway gets a batch every 10 s and runs the model per sensor, roughly 300 sensors per gateway. I need the feature extraction step.
+
+    Requirements:
+    - input: a list of `(ax, ay, az)` tuples in g, oldest first
+    - magnitude per sample = sqrt(ax² + ay² + az²)
+    - sliding windows of 200 samples with a hop of 100 (50% overlap), drop the trailing partial window
+    - one row per window: `[mean, std, min, max, peak_to_peak, freefall_fraction]`
+    - std must match `numpy.std` with default settings, because that's what the training pipeline used
+    - freefall_fraction = share of samples in the window with magnitude < 0.4 g
+    - stdlib only, Python 3.11. The gateway image is locked down and we can't install numpy
+    - raise ValueError for a window or hop that isn't positive
+
+    This is where it plugs in:
+
+    ```python
+    def handle_batch(batch, model):
+        for sensor_id, samples in batch.items():
+            rows = window_features(samples)
+            if rows:
+                probs = model.predict(rows)
+                publish(sensor_id, probs)
+    ```
+- role: assistant
+  content: |
+    ```python
+    import math
+    from collections.abc import Sequence
+
+    WINDOW = 200
+    HOP = 100
+    FREEFALL_G = 0.4
+
+
+    def window_features(
+        samples: Sequence[tuple[float, float, float]],
+        window: int = WINDOW,
+        hop: int = HOP,
+        freefall_g: float = FREEFALL_G,
+    ) -> list[list[float]]:
+        """Turn raw (ax, ay, az) samples in g into one feature row per window.
+
+        Row layout: [mean, std, min, max, peak_to_peak, freefall_fraction].
+        std is the population std (ddof=0), same as numpy.std's default.
+        A trailing partial window is dropped.
+        """
+        if window <= 0 or hop <= 0:
+            raise ValueError("window and hop must be positive")
+
+        sqrt = math.sqrt  # bound once, not looked up again for every sample
+
+        # one magnitude per sample, shared by the two overlapping windows
+        mags = [sqrt(x * x + y * y + z * z) for x, y, z in samples]
+
+        rows = []
+        for start in range(0, len(mags) - window + 1, hop):
+            w = mags[start:start + window]
+            mean = sum(w) / window
+            var = sum((m - mean) * (m - mean) for m in w) / window
+            lo = min(w)
+            hi = max(w)
+            freefall = sum(1 for m in w if m < freefall_g) / window
+            rows.append([mean, sqrt(var), lo, hi, hi - lo, freefall])
+        return rows
+    ```
+
+    **Green Notes**
+    - **Hoist loop-invariant lookups** (reduces E): the magnitude loop runs once for every sample from every sensor in every batch, so `math.sqrt` is bound to a local name once. That skips a global lookup and an attribute lookup on each call. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local variable before a 10,000,000-iteration loop saved about 4-5%. That is a small gain. It is only worth doing because this is the hottest loop on the gateway.
+    - Nothing else is hoisted, for example `rows.append`. The per-window loop runs only a few times per batch, and the code reads better as it is.
+verify:
+  test: |
+    import math as _m
+
+    flat = [(0.0, 0.0, 1.0)] * 450
+    rows = window_features(flat)
+    assert len(rows) == 3, len(rows)
+    assert rows[0] == [1.0, 0.0, 1.0, 1.0, 0.0, 0.0], rows[0]
+
+    mixed = [(0.0, 0.0, 0.0)] * 100 + [(3.0, 4.0, 0.0)] * 100
+    r = window_features(mixed)
+    assert len(r) == 1
+    mean, std, lo, hi, ptp, ff = r[0]
+    assert _m.isclose(mean, 2.5)
+    assert _m.isclose(std, 2.5)
+    assert lo == 0.0 and hi == 5.0 and ptp == 5.0
+    assert ff == 0.5
+
+    assert window_features([(0.0, 0.0, 1.0)] * 199) == []
+    assert window_features([]) == []
+
+    small = window_features([(1.0, 0.0, 0.0), (0.0, 2.0, 0.0), (0.0, 0.0, 3.0)], window=2, hop=1)
+    assert len(small) == 2
+    assert _m.isclose(small[1][0], 2.5) and _m.isclose(small[1][1], 0.5)
+
+    for bad in ({"window": 0}, {"hop": 0}, {"window": -5}):
+        try:
+            window_features(flat, **bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(bad)

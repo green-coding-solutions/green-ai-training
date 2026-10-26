@@ -1,0 +1,106 @@
+id: gen-2-00309-generation
+category: generation
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    I need a price formatting helper for the pricing section of our landing page (Flask + Jinja). Prices are stored in cents in `plans.yaml`: 3 plans, each with a monthly and a yearly price, in USD, EUR and GBP. The template calls it as a Jinja filter for every plan card, so it runs on every hit to `/`.
+
+    Requirements:
+    - `format_price(amount_cents, currency, locale)` returns a string
+    - locales: en-US, en-GB, de-DE, fr-FR. The locale comes from the Accept-Language header, so it can look like `de-AT,de;q=0.9` or be missing. Same language with another region uses our version of that language (de-AT -> de-DE). Unknown -> en-US
+    - de-DE: `1.299,50 €`, fr-FR: `1 299,50 €` (narrow no-break space for thousands), en: `$1,299.50`
+    - whole amounts without decimals: `€29`, not `€29.00`
+    - always a no-break space between number and symbol when the symbol is after the number
+    - unknown currency or negative amount -> ValueError
+    - stdlib only, we don't want Babel just for this
+- role: assistant
+  content: |
+    ```python
+    from functools import lru_cache
+
+    _SYMBOLS = {"USD": "$", "EUR": "€", "GBP": "£"}
+
+    # locale -> (thousands separator, decimal separator, symbol after number)
+    _LOCALES = {
+        "en-US": (",", ".", False),
+        "en-GB": (",", ".", False),
+        "de-DE": (".", ",", True),
+        "fr-FR": ("\u202f", ",", True),
+    }
+    DEFAULT_LOCALE = "en-US"
+
+
+    def normalize_locale(raw: str | None) -> str:
+        """Map an Accept-Language value like 'de-AT,de;q=0.9' to a supported locale."""
+        if not raw:
+            return DEFAULT_LOCALE
+        tag = raw.split(",")[0].split(";")[0].strip().replace("_", "-")
+        lang, _, region = tag.partition("-")
+        lang = lang.lower()
+        if region and f"{lang}-{region.upper()}" in _LOCALES:
+            return f"{lang}-{region.upper()}"
+        for loc in _LOCALES:
+            if lang and loc.startswith(lang + "-"):
+                return loc
+        return DEFAULT_LOCALE
+
+
+    def format_price(amount_cents: int, currency: str, locale: str | None = None) -> str:
+        if locale not in _LOCALES:
+            locale = normalize_locale(locale)
+        return _format_price(amount_cents, currency.upper(), locale)
+
+
+    @lru_cache(maxsize=256)
+    def _format_price(amount_cents: int, currency: str, locale: str) -> str:
+        if amount_cents < 0:
+            raise ValueError(f"negative price: {amount_cents}")
+        symbol = _SYMBOLS.get(currency)
+        if symbol is None:
+            raise ValueError(f"unsupported currency: {currency}")
+        thousands, decimal, symbol_after = _LOCALES[locale]
+        units, cents = divmod(amount_cents, 100)
+        number = f"{units:,}".replace(",", thousands)
+        if cents:
+            number += f"{decimal}{cents:02d}"
+        return f"{number}\u00a0{symbol}" if symbol_after else f"{symbol}{number}"
+    ```
+
+    Register it with `app.add_template_filter(format_price, "price")`. It is best to normalize the locale once per request (for example in `before_request` into `g.locale`) and pass that to the filter. Then every call takes the fast path.
+
+    **Green Notes**
+    - **Memoize the formatting** (reduces E): the inputs repeat on every page view. There are 6 prices, 3 currencies and 4 locales, so the cache holds at most a few dozen keys. After warm-up each plan card is a dictionary lookup. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations drawn from 200 distinct inputs used about 9× less CPU energy with `lru_cache` than without it.
+    - **Bounded cache key** (reduces M): the cache key uses the normalized locale, not the raw Accept-Language header. Raw headers differ between browsers and would fill the cache with entries that are rarely hit again. `maxsize=256` caps memory in any case.
+    - Changing a price in `plans.yaml` needs no cache invalidation, because the amount is part of the key. Errors are not cached, so a bad currency raises every time.
+verify:
+  green_block: 0
+  test: |-
+    assert format_price(2990, "EUR", "de-DE") == "29,90\u00a0€"
+    assert format_price(129950, "EUR", "de-DE") == "1.299,50\u00a0€"
+    assert format_price(2900, "usd", "en-US") == "$29"
+    assert format_price(129900, "EUR", "fr-FR") == "1\u202f299\u00a0€"
+    assert format_price(129950, "GBP", "en-GB") == "£1,299.50"
+    assert format_price(2990, "EUR", "de-AT,de;q=0.9") == "29,90\u00a0€"
+    assert format_price(2990, "USD", None) == "$29.90"
+    assert format_price(2990, "USD", "xx") == "$29.90"
+    assert format_price(2990, "EUR", "fr_CH") == "29,90\u00a0€"
+    assert format_price(5, "USD", "en-US") == "$0.05"
+    assert normalize_locale("en") == "en-US"
+    assert normalize_locale(",") == "en-US"
+    for bad in [(2990, "JPY", "en-US"), (-1, "USD", "en-US")]:
+        try:
+            format_price(*bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(bad)
+    _format_price.cache_clear()
+    format_price(4900, "EUR", "fr-FR")
+    format_price(4900, "EUR", "fr-FR")
+    info = _format_price.cache_info()
+    assert info.misses == 1 and info.hits == 1

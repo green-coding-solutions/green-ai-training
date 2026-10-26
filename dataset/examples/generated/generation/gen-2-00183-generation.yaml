@@ -1,0 +1,78 @@
+id: gen-2-00183-generation
+category: generation
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    hi, we run postfix for our newsletter and the transactional mails of our shop. every day the mail.log have around 400k lines. i need a bash script what show per recipient domain how many mails was sent, deferred and bounced, the domains with most problems should be on top. it must work also with the old rotated files (mail.log.1, mail.log.2.gz, ...). tab separated output is ok, we run it from cron every morning and get the result by mail.
+
+    lines look like this:
+
+    ```text
+    Oct 23 06:12:44 mx1 postfix/smtp[28811]: 4B7C21A0F3: to=<jan.kowalski@wp.pl>, relay=mx.wp.pl[212.77.101.1]:25, delay=0.92, delays=0.05/0/0.31/0.56, dsn=2.0.0, status=sent (250 2.0.0 OK)
+    Oct 23 06:12:51 mx1 postfix/smtp[28814]: 9D02E1A0F7: to=<m.berger@gmx.de>, relay=mx00.emig.gmx.net[212.227.15.9]:25, delay=3.1, delays=0.04/0/3/0, dsn=4.7.0, status=deferred (host mx00.emig.gmx.net said: 421 try again later)
+    ```
+
+    thanks!
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # mail-domains.sh - Postfix delivery results per recipient domain
+    # Usage: mail-domains.sh [logfile ...]      (default: /var/log/mail.log)
+    #        plain and .gz files both work, e.g. mail-domains.sh /var/log/mail.log*
+    set -euo pipefail
+
+    (( $# > 0 )) || set -- /var/log/mail.log
+
+    printf 'domain\tsent\tdeferred\tbounced\n'
+
+    zcat -f -- "$@" | awk -v nodomain='(local)' '
+    match($0, / to=<[^>]*>/) {
+        addr = substr($0, RSTART + 5, RLENGTH - 6)
+        if (!match($0, / status=[a-z]+/)) next
+        st = substr($0, RSTART + 8, RLENGTH - 8)
+
+        # column per status: 1 = sent, 2 = deferred, 3 = bounced
+        if (st ~ /^sent$/)          k = 1
+        else if (st ~ /^deferred$/) k = 2
+        else if (st ~ /^bounced$/)  k = 3
+        else next
+
+        n = split(addr, part, /@/)
+        dom = (n > 1) ? tolower(part[n]) : nodomain
+
+        seen[dom] = 1
+        count[dom, k]++
+    }
+    END {
+        for (d in seen) {
+            s = count[d, 1] + 0
+            f = count[d, 2] + 0
+            b = count[d, 3] + 0
+            printf "%d\t%s\t%d\t%d\t%d\n", f + b, d, s, f, b
+        }
+    }' | sort -t $'\t' -k1,1nr -k2,2 | cut -f 2-
+    ```
+
+    Run it from cron on yesterday's file after the daily rotation. Cron mails the output to `MAILTO`:
+
+    ```text
+    MAILTO=ops@example.com
+    15 6 * * * /usr/local/bin/mail-domains.sh /var/log/mail.log.1
+    ```
+
+    Some notes on the numbers:
+    - `deferred` counts delivery attempts, not messages. A mail that is retried 5 times shows up 5 times, and once more as `sent` or `bounced` at the end.
+    - The ` to=<` match needs a space before `to`, so the `orig_to=<...>` field is not counted by mistake.
+    - Addresses without a domain (local recipients) are grouped as `(local)`.
+    - Sorting is by deferred + bounced, highest first. Ties are sorted by domain name.
+
+    **Green Notes**
+    - **One `awk` pass instead of a per-line shell loop** (reduces E): all parsing and counting runs in a single process. `zcat`, `sort` and `cut` each start only once. A `while read` loop with `$(echo | cut)` or `grep` per line would start several processes for every log line. In Green Metrics Tool micro-benchmarks that summarized a 20,000-line access log, one `awk` pass used over 1000× less CPU energy than a loop that started about 10 processes per line.
+verify:
+  static_only: bash script reading Postfix log files from /var/log, no python/javascript test runner

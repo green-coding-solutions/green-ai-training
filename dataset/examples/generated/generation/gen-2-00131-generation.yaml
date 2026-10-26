@@ -1,0 +1,100 @@
+id: gen-2-00131-generation
+category: generation
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    I need a bash script that anonymizes our nginx access logs before they get uploaded to the log archive. Legal says the client IP and the session tokens must not leave the server.
+
+    Requirements:
+    - Usage: `anonymize-logs.sh OUT_DIR FILE...`
+    - Set the last octet of the client IP (first field) to 0. Everything is IPv4 behind our load balancer.
+    - Replace every `token=...` value in the line (request URL and referer) with `token=REDACTED`.
+    - Leave everything else in the line byte for byte unchanged. Our log parser downstream relies on the exact format.
+    - Write the result to `OUT_DIR/<same file name>`. The uploader picks up `*.log` from OUT_DIR every few minutes, so it must never see a half-written file.
+    - Print one line per file to stderr: file name, number of lines, number of IPs masked.
+    - If an input file is missing, report it, keep going with the others, and exit non-zero at the end.
+
+    Runs nightly from cron over 6 vhost logs with roughly 400k lines each. Example line:
+
+    ```text
+    203.0.113.57 - - [21/Oct/2026:03:12:44 +0000] "GET /checkout?step=2&token=a8f3c2d1 HTTP/1.1" 200 5123 "https://shop.example.com/cart?token=a8f3c2d1" "Mozilla/5.0 (X11; Linux x86_64)"
+    ```
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # Anonymize nginx access logs before upload:
+    #   - last octet of the client IPv4 address -> 0
+    #   - every token= value -> REDACTED
+    # Usage: anonymize-logs.sh OUT_DIR FILE...
+    set -euo pipefail
+
+    if (( $# < 2 )); then
+      echo 'usage: anonymize-logs.sh OUT_DIR FILE...' >&2
+      exit 2
+    fi
+
+    out_dir=$1
+    shift
+    mkdir -p -- "$out_dir"
+
+    status=0
+    for src in "$@"; do
+      if [[ ! -f $src ]]; then
+        echo "missing: $src" >&2
+        status=1
+        continue
+      fi
+
+      name=${src##*/}
+      dest=$out_dir/$name
+      tmp=$dest.tmp          # not *.log, so the uploader ignores it
+
+      # Strings are passed with -v; awk turns \042 into a double quote and \n into a newline.
+      awk -v name="$name" \
+          -v zero='.0' \
+          -v tok_re='token=[^& \042]*' \
+          -v redacted='token=REDACTED' \
+          -v fmt='%s: %d lines, %d IPs masked\n' \
+          -v err='/dev/stderr' '
+        match($0, /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ /) {
+          ip = substr($0, 1, RLENGTH - 1)
+          sub(/\.[0-9]+$/, zero, ip)
+          $0 = ip substr($0, RLENGTH)
+          masked++
+        }
+        {
+          gsub(tok_re, redacted)
+          print
+        }
+        END {
+          printf fmt, name, NR, masked > err
+        }
+      ' "$src" > "$tmp"
+
+      mv -- "$tmp" "$dest"
+    done
+
+    exit "$status"
+    ```
+
+    Your example line becomes:
+
+    ```text
+    203.0.113.0 - - [21/Oct/2026:03:12:44 +0000] "GET /checkout?step=2&token=REDACTED HTTP/1.1" 200 5123 "https://shop.example.com/cart?token=REDACTED" "Mozilla/5.0 (X11; Linux x86_64)"
+    ```
+
+    - The script only edits text with `substr` and `gsub`. It never assigns to `$1`, so awk does not rebuild the line and the spacing stays exactly as it was.
+    - A token value ends at `&`, a space or a double quote, so the query string and the quoted referer stay intact.
+    - `mv` within one directory is atomic, so the uploader only ever sees complete `.log` files.
+    - The regex also catches `access_token=` and similar names. If a line does not start with an IPv4 address, it passes through unmasked. The masked count is lower than the line count then, so you can spot it in the stderr output.
+
+    **Green Notes**
+    - **One awk pass instead of per-line subprocesses** (reduces E): the common approach is a `while read` loop that calls `$(echo "$line" | cut ...)` or `sed` for every line. That starts several processes per line, and process starts dominate the cost. Here each file uses one `awk` process. In Green Metrics Tool micro-benchmarks that summarized a 20,000-line access log, a `while read` loop with about 10 processes per line used ~1302 J. One `awk` pass used ~1.0 J, over 1000× less. It was also about 4× less than a loop that used only bash builtins.
+verify:
+  static_only: bash script that reads nginx log files from disk; no Python/JS harness

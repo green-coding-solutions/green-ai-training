@@ -1,0 +1,79 @@
+id: gen-2-00200-refactor
+category: refactor
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    fix this, cron runs it every 10 min and the export box cpu is basically never idle
+
+    ```bash
+    #!/bin/bash
+    # cron: */10 * * * *  push stock + prices to the marketplace bridge
+    set -u
+
+    BRIDGE=mpbridge@10.20.0.15
+    INCOMING=/srv/bridge/incoming
+    LOG=/var/log/shop/mp-push.log
+    TMP=/tmp/mp-push
+
+    mkdir -p $TMP
+    cd $TMP
+
+    for shop in de at ch nl; do
+      psql -h db-replica -U export -d shop -Atc \
+        "COPY (SELECT sku, warehouse, qty, price_cents, currency, updated_at FROM marketplace_stock WHERE shop = '$shop') TO STDOUT WITH CSV HEADER" \
+        > stock_$shop.csv
+
+      xz -f stock_$shop.csv
+      cat stock_$shop.csv.xz | ssh $BRIDGE "xz -dc > $INCOMING/stock_$shop.csv.tmp && mv $INCOMING/stock_$shop.csv.tmp $INCOMING/stock_$shop.csv"
+      echo "$(date -Is) pushed $shop" >> $LOG
+    done
+
+    rm -f $TMP/*.xz
+    ```
+- role: assistant
+  content: |
+    ```bash
+    #!/bin/bash
+    # cron: */10 * * * *  push stock + prices to the marketplace bridge
+    set -uo pipefail
+
+    BRIDGE='mpbridge@10.20.0.15'
+    INCOMING='/srv/bridge/incoming'
+    LOG='/var/log/shop/mp-push.log'
+    TMP='/tmp/mp-push'
+
+    mkdir -p "$TMP"
+
+    for shop in de at ch nl; do
+      csv="$TMP/stock_$shop.csv"
+
+      if ! psql -h db-replica -U export -d shop -v ON_ERROR_STOP=1 -Atc \
+          "COPY (SELECT sku, warehouse, qty, price_cents, currency, updated_at FROM marketplace_stock WHERE shop = '$shop') TO STDOUT WITH CSV HEADER" \
+          > "$csv"; then
+        echo "$(date -Is) export FAILED for $shop, bridge keeps previous file" >> "$LOG"
+        continue
+      fi
+
+      if zstd -q -c "$csv" | ssh "$BRIDGE" \
+          "zstd -dqc > $INCOMING/stock_$shop.csv.tmp && mv $INCOMING/stock_$shop.csv.tmp $INCOMING/stock_$shop.csv"; then
+        echo "$(date -Is) pushed $shop" >> "$LOG"
+      else
+        echo "$(date -Is) push FAILED for $shop" >> "$LOG"
+      fi
+    done
+
+    rm -f "$TMP"/stock_*.csv
+    ```
+
+    **Green Notes**
+    - **Fast codec for data sent every 10 minutes** (reduces E): xz at its default level is one of the most expensive codecs. Here it runs for every shop on every cron run, and the bridge unpacks the files right away, so the strong compression buys you very little. In Green Metrics Tool benchmarks on 100 MB of text, xz used ~458 J and zstd ~16 J to compress, so xz cost about 29× more. To decompress, xz used ~11.7 J and zstd ~5.3 J. Those runs compare energy only. xz usually makes somewhat smaller files, which matters little for a short transfer like this. If the bridge is on a fast LAN, lz4 (~6 J in the same runs) or no compression at all is fine too.
+    - **Install zstd on the bridge first.** The remote side now runs `zstd -dqc`. Without zstd there, every push fails. The good news is that the old file stays in place in that case.
+    - **Bug fixed:** before, if `psql` failed, the redirect still left an empty CSV behind. That empty file got compressed, pushed and moved over the live `stock_<shop>.csv`, so the marketplace saw no stock. Now a failed export skips that shop and the bridge keeps its last good file. "pushed" is only logged when the transfer and the `mv` both succeeded.
+    - The `.xz` temp files and the `cat` are gone, because zstd streams straight into `ssh`. Variables are quoted now.
+verify:
+  static_only: needs psql against a Postgres replica, ssh to a remote bridge host and zstd on both ends

@@ -1,0 +1,84 @@
+id: gen-12764612-00112-review
+category: review
+language: bash
+patterns:
+- compress-transmitted
+- bash-quoting
+facts:
+- F-COMPRESS-CODECS
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    review?
+
+    ```bash
+    #!/bin/bash
+    # push new order invoices to ERP
+    SPOOL="/var/spool/shop/invoices"
+    ERP_URL="https://erp.shop.internal/api/v2/invoices"
+    TOKEN_FILE="/etc/shop/erp.token"
+
+    for f in "$SPOOL"/*.json; do
+      [ -e "$f" ] || continue
+      xz -9e -k -c "$f" > "/tmp/$(basename "$f").xz"
+      curl -s -X POST "$ERP_URL" \
+        -H "Content-Type: application/json" \
+        -H "Content-Encoding: xz" \
+        -H "Authorization: Bearer $(cat $TOKEN_FILE)" \
+        --data-binary @"/tmp/$(basename "$f").xz"
+      rm "/tmp/$(basename "$f").xz"
+      mv "$f" "$SPOOL/done/"
+    done
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (cron-style batch, one upload per order invoice)
+
+    #### [Bug] Failed uploads are marked as done
+    - **Where:** `curl -s ...` followed by `mv "$f" "$SPOOL/done/"`
+    - **Issue:** `curl -s` exits 0 on HTTP 4xx/5xx, and the `mv` runs no matter what. If the ERP is down or rejects a file, the invoice moves to `done/` and is never retried.
+    - **Fix:** use `--fail`, and move the file only when the upload succeeded (see the full script below).
+
+    #### [Security] Predictable temp files and unquoted token path
+    - **Where:** `/tmp/$(basename "$f").xz`, `$(cat $TOKEN_FILE)`
+    - **Issue:** invoice data is written to a predictable path in a shared `/tmp`. Another local user can read or swap it. `$TOKEN_FILE` is unquoted, so a path with spaces breaks. The token is also read again for every file.
+    - **Fix:** stream the compressed data straight into `curl` (no temp file), and read the token once before the loop.
+
+    #### [High] Maximum-effort `xz` on small data that is compressed on every run
+    - **Where:** `xz -9e -k -c "$f"`
+    - **Issue:** every invoice is compressed again, each time at the most expensive preset. In Green Metrics Tool micro-benchmarks compressing 100 MB of text, `xz` at its default level used ~458 J and `zstd` at its default level ~16 J, so `xz` used about 29× more. Your preset is higher than that default. The data is sent once and then archived, so a stronger ratio buys little. These figures compare energy only, not compressed size. `zstd` usually gives a somewhat larger file than `xz`.
+    - **Fix:** `zstd` at its default level, piped into `curl`. The ERP must accept `Content-Encoding: zstd`, so check that first. If it only accepts `gzip`, use `gzip -6`, which is still far cheaper than `xz`.
+    - **Impact:** E (CPU) on every run, more so as invoice volume grows.
+
+    #### [Low] Double quotes on literals that need no expansion
+    - **Where:** `"Content-Type: application/json"`, `"Content-Encoding: xz"`, the `SPOOL`, `ERP_URL` and `TOKEN_FILE` values
+    - **Issue:** bash scans double-quoted text for `$`, backticks and backslashes. Single quotes are taken as is. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal 1,000,000 times used about 24% less CPU energy with single quotes. Your literals are short and run once per file, so the saving here is tiny.
+    - **Fix:** single quotes for fixed strings. Keep double quotes where a variable must expand, such as the `Authorization` header.
+
+    **Fixed script:**
+    ```bash
+    #!/bin/bash
+    set -o pipefail
+
+    spool='/var/spool/shop/invoices'
+    erp_url='https://erp.shop.internal/api/v2/invoices'
+    token=$(<'/etc/shop/erp.token')
+
+    for f in "$spool"/*.json; do
+      [ -e "$f" ] || continue
+      if zstd -q -c "$f" | curl -sS --fail -X POST "$erp_url" \
+          -H 'Content-Type: application/json' \
+          -H 'Content-Encoding: zstd' \
+          -H "Authorization: Bearer $token" \
+          --data-binary @-; then
+        mv "$f" "$spool/done/"
+      else
+        echo "upload failed: $f" >&2
+      fi
+    done
+    ```
+
+    **Already good:** the `[ -e "$f" ] || continue` guard for an empty spool, and quoted `"$f"` everywhere.
+verify:
+  static_only: bash script needs network (curl to an ERP), zstd and a spool directory

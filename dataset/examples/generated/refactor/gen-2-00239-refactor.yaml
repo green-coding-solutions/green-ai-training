@@ -1,0 +1,88 @@
+id: gen-2-00239-refactor
+category: refactor
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    gateway image, CI rebuilds it on every commit and every gateway pulls it. fix this
+
+    ```dockerfile
+    FROM python:3.12
+
+    RUN apt-get update
+    RUN apt-get install -y build-essential git curl vim nano iputils-ping net-tools
+
+    WORKDIR /opt/gateway
+    COPY . .
+
+    RUN pip install --upgrade pip
+    RUN pip install -r requirements.txt
+    RUN pip install -r requirements-dev.txt
+
+    ENV GATEWAY_CONFIG=/opt/gateway/config/gateway.yaml
+    ENV MQTT_BROKER=mqtt.internal
+    ENV MODBUS_POLL_INTERVAL=5
+
+    EXPOSE 8080
+
+    HEALTHCHECK --interval=30s --timeout=5s CMD curl -f http://localhost:8080/health || exit 1
+
+    CMD ["python", "-m", "gateway.main"]
+    ```
+- role: assistant
+  content: |
+    ```dockerfile
+    FROM python:3.12-slim
+
+    WORKDIR /opt/gateway
+
+    # Dependency layer first: only rebuilt when requirements.txt changes
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    # Source last: a code change only rebuilds this layer
+    COPY . .
+
+    RUN useradd --system --no-create-home gateway
+    USER gateway
+
+    ENV GATEWAY_CONFIG=/opt/gateway/config/gateway.yaml \
+        MQTT_BROKER=mqtt.internal \
+        MODBUS_POLL_INTERVAL=5
+
+    EXPOSE 8080
+
+    HEALTHCHECK --interval=30s --timeout=5s \
+      CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=3)"]
+
+    CMD ["python", "-m", "gateway.main"]
+    ```
+
+    Add a `.dockerignore` so `COPY . .` doesn't pull in the repo history and caches:
+
+    ```text
+    .git
+    .venv
+    __pycache__/
+    *.pyc
+    tests/
+    .pytest_cache/
+    .mypy_cache/
+    ```
+
+    **Green Notes**
+    - **Slim base, runtime dependencies only** (reduces E and network): no compiler, editors or network tools, and no `requirements-dev.txt`. Run tests in their own CI step instead. Every gateway now pulls a much smaller image. In Green Metrics Tool measurements of a small Flask app image built without cache, the full `python:3.12` base with build and dev tools used ~885 J and 157 s. The slim runtime-only image used ~124 J and 25 s, about 7× less. Serving 2,000 requests afterwards cost the same with both (~17 J), so all of the saving is in builds, pulls and stored copies.
+    - **Dependency layer before the source** (reduces E): before, `COPY . .` came first, so every commit made pip reinstall everything. Now a commit that only changes code reuses the cached pip layer.
+    - **`--no-cache-dir`** (reduces network and storage): pip's download cache no longer ends up in the image.
+
+    Other changes:
+    - **Bug:** `apt-get update` in its own `RUN` gets cached. Later builds then install from a stale package index, and that can fail. The apt step is gone now. If you add it back, put `update` and `install` in the same `RUN`.
+    - **Healthcheck:** slim has no `curl`. The check now uses Python's `urllib`, which exits non-zero on a connection error or an HTTP error status, the same as `curl -f`.
+    - **Security:** the service no longer runs as root. If the gateway writes into `/opt/gateway` (for example a local buffer), `chown` that path or mount a volume for it.
+    - slim has no compiler. If pip ever falls back to building a dependency from source, add a builder stage rather than putting `build-essential` back in the runtime image. If you need `vim` or `ping` for field debugging, use a separate debug image instead of shipping them to every gateway.
+verify:
+  static_only: Dockerfile, needs a Docker build to test

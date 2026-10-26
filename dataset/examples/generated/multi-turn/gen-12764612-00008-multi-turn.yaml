@@ -1,0 +1,102 @@
+id: gen-12764612-00008-multi-turn
+category: multi-turn
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    ```python
+    import numpy as np
+
+    def format_predictions(ids, probs, labels, threshold=0.5):
+        """Build the TSV report for a batch of classifier outputs."""
+        report = "id\tlabel\tscore\n"
+        for i, row in zip(ids, probs):
+            best = int(np.argmax(row))
+            score = float(row[best])
+            if score < threshold:
+                name = "unknown"
+            else:
+                name = labels[best]
+            report += str(i) + "\t" + name + "\t" + "%.4f" % score + "\n"
+        return report
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```python
+    import numpy as np
+
+    def format_predictions(ids, probs, labels, threshold=0.5):
+        """Build the TSV report for a batch of classifier outputs."""
+        lines = ["id\tlabel\tscore"]
+        for i, row in zip(ids, probs):
+            best = int(np.argmax(row))
+            score = float(row[best])
+            name = labels[best] if score >= threshold else "unknown"
+            lines.append(f"{i}\t{name}\t{score:.4f}")
+        return "\n".join(lines) + "\n"
+    ```
+
+    The output is identical, including the trailing newline.
+
+    **Green Notes**
+    - **Join instead of `+=`** (reduces E): the loop now collects lines in a list and builds the string once at the end. With `+=`, the work to extend the string grows with the report size, once per row.
+- role: user
+  content: |
+    i find the list + join ugly. can i just keep `report += f"{i}\t{name}\t{score:.4f}\n"` in the loop? f-strings are fast
+
+    ```python
+    ```
+- role: assistant
+  content: |
+    Use the f-string, it is a good way to format one line. The `+=` is the part that costs. An f-string appended in a loop behaves like any other `+=`.
+
+    In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces took ~469 J with `+=`, ~455 J with f-string concatenation in a loop, and ~1.8 J with `"".join()`. That is roughly 260× less CPU energy for `join`.
+
+    You can keep the f-string and drop the list bookkeeping by joining a generator:
+
+    ```python
+    import numpy as np
+
+    def format_predictions(ids, probs, labels, threshold=0.5):
+        """Build the TSV report for a batch of classifier outputs."""
+        def line(i, row):
+            best = int(np.argmax(row))
+            score = float(row[best])
+            name = labels[best] if score >= threshold else "unknown"
+            return f"{i}\t{name}\t{score:.4f}"
+
+        rows = (line(i, row) for i, row in zip(ids, probs))
+        return "\n".join(["id\tlabel\tscore", *rows]) + "\n"
+    ```
+
+    **Green Notes**
+    - **Join instead of `+=`** (reduces E): each line is still an f-string, and the report is built once at the end.
+
+    If your batches are always a few dozen rows, the difference is small and your `+=` version is fine. It matters for large batches.
+verify:
+  equivalence:
+    driver: |
+      import numpy as np
+      ids = [101, 102, 103, "x7", 105]
+      probs = np.array([
+          [0.1, 0.8, 0.1],
+          [0.4, 0.3, 0.3],
+          [0.05, 0.05, 0.9],
+          [0.5, 0.5, 0.0],
+          [0.333333, 0.333333, 0.333334],
+      ])
+      labels = ["cat", "dog", "bird"]
+      print(repr(format_predictions(ids, probs, labels)))
+      print(repr(format_predictions(ids, probs, labels, threshold=0.85)))
+      print(repr(format_predictions([], np.zeros((0, 3)), labels)))
+  test: |-
+    import numpy as np
+    out = format_predictions([1, 2], np.array([[0.2, 0.7], [0.6, 0.4]]), ["a", "b"], threshold=0.65)
+    assert out == "id\tlabel\tscore\n1\tb\t0.7000\n2\tunknown\t0.6000\n", out
+    assert format_predictions([], np.zeros((0, 2)), ["a", "b"]) == "id\tlabel\tscore\n"

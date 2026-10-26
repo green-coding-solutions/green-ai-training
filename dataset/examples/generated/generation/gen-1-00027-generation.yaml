@@ -1,0 +1,66 @@
+id: gen-1-00027-generation
+category: generation
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    I need a function for our nightly price export in the shop backend. Input is a list of `(sku, cost_cents)` tuples, around 3 million items. Settings come in a dataclass `PricingConfig` with `margin` (float, 0.35 means 35%), `vat_rate` (float), `charm_cents` (int, for example 99) and `min_price_cents` (int).
+
+    For every item: take the cost, add margin, add VAT, round up to the next full euro, then set the cents part to `charm_cents` (so 14.20 becomes 14.99, never above the rounded-up euro). The final price must not be below `min_price_cents`. Return a list of `(sku, price_cents)` in the same order. If a cost is zero or negative, raise `ValueError` with the SKU in the message. Plain Python, no numpy please, we don't want the dependency on that box.
+- role: assistant
+  content: |
+    ```python
+    import math
+    from dataclasses import dataclass
+
+
+    @dataclass(frozen=True)
+    class PricingConfig:
+        margin: float
+        vat_rate: float
+        charm_cents: int = 99
+        min_price_cents: int = 99
+
+
+    def retail_prices(items, cfg: PricingConfig):
+        factor = (1 + cfg.margin) * (1 + cfg.vat_rate)
+        charm = cfg.charm_cents
+        min_price = cfg.min_price_cents
+        ceil = math.ceil
+
+        out = []
+        for sku, cost in items:
+            if cost <= 0:
+                raise ValueError(f"invalid cost for {sku}: {cost}")
+            euros = ceil(cost * factor / 100)
+            price = (euros - 1) * 100 + charm
+            out.append((sku, price if price > min_price else min_price))
+        return out
+    ```
+
+    The price stays at or below the rounded-up euro as long as `charm_cents` is between 0 and 99. For example, cost 1000 with margin 0.5 and no VAT gives 1500, rounded up to 15 euros, so the price is 1499.
+
+    **Green Notes**
+    - **Hoist loop-invariants** (reduces E): the combined margin and VAT factor is computed once, the config fields are read once, and `math.ceil` is bound to a local name. Nothing in the loop body looks up `cfg.margin`, `cfg.vat_rate` or `math.ceil` again. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local variable before a 10,000,000-iteration loop saved about 4-5%. Expect a gain of that size, a few percent, not a large one. It is worth it here because the loop runs millions of times and the code stays just as readable.
+verify:
+  test: |-
+    cfg = PricingConfig(margin=0.5, vat_rate=0.0, charm_cents=99, min_price_cents=99)
+    res = retail_prices([("A", 1000), ("B", 1001), ("C", 10)], cfg)
+    assert res == [("A", 1499), ("B", 1599), ("C", 99)]
+    cfg2 = PricingConfig(margin=0.5, vat_rate=0.0, charm_cents=99, min_price_cents=199)
+    assert retail_prices([("D", 1)], cfg2) == [("D", 199)]
+    assert retail_prices([], cfg) == []
+    try:
+        retail_prices([("X", 0)], cfg)
+        assert False
+    except ValueError as e:
+        assert "X" in str(e)
+    try:
+        retail_prices([("Y", -5)], cfg)
+        assert False
+    except ValueError as e:
+        assert "Y" in str(e)

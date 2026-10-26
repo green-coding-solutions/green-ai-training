@@ -1,0 +1,188 @@
+id: gen-2-00269-multi-turn
+category: multi-turn
+language: bash
+patterns:
+- bash-quoting
+facts:
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # auth-digest.sh - nightly digest of auth.log for #sec-alerts
+    # cron: 15 6 * * * /opt/ops/auth-digest.sh /var/log/auth.log.1 > /var/tmp/auth-digest.txt
+    set -u
+
+    LOG="${1:-/var/log/auth.log}"
+
+    failed=0
+    accepted=0
+    sudo_cmds=0
+
+    echo "== Auth digest for $LOG =="
+    echo "Lines marked [!] need a look, everything else is informational."
+
+    while read line; do
+        case $line in
+            *"Failed password"*)
+                failed=$((failed + 1))
+                tag="[!] FAILED LOGIN  - repeated failures from one IP usually mean a brute force attempt, check fail2ban"
+                ;;
+            *"Accepted publickey"*|*"Accepted password"*)
+                accepted=$((accepted + 1))
+                tag="[ ] LOGIN OK      - successful login, compare the user and source IP with the on-call list"
+                ;;
+            *"sudo:"*"COMMAND="*)
+                sudo_cmds=$((sudo_cmds + 1))
+                tag="[ ] SUDO          - privileged command, see the full line for the user and the command"
+                ;;
+            *)
+                continue
+                ;;
+        esac
+        echo "$tag"
+        echo "    "$line
+    done < "$LOG"
+
+    echo ""
+    echo "Summary: $failed failed, $accepted accepted, $sudo_cmds sudo"
+    ```
+
+    ?
+- role: assistant
+  content: |
+    I cleaned it up and fixed two bugs in how lines are read and printed.
+
+    ```bash
+    #!/usr/bin/env bash
+    # auth-digest.sh - nightly digest of auth.log for #sec-alerts
+    # cron: 15 6 * * * /opt/ops/auth-digest.sh /var/log/auth.log.1 > /var/tmp/auth-digest.txt
+    set -u
+
+    LOG="${1:-/var/log/auth.log}"
+
+    failed=0
+    accepted=0
+    sudo_cmds=0
+
+    echo "== Auth digest for $LOG =="
+    echo 'Lines marked [!] need a look, everything else is informational.'
+
+    while IFS= read -r line; do
+        case $line in
+            *'Failed password'*)
+                failed=$((failed + 1))
+                tag='[!] FAILED LOGIN  - repeated failures from one IP usually mean a brute force attempt, check fail2ban'
+                ;;
+            *'Accepted publickey'*|*'Accepted password'*)
+                accepted=$((accepted + 1))
+                tag='[ ] LOGIN OK      - successful login, compare the user and source IP with the on-call list'
+                ;;
+            *'sudo:'*'COMMAND='*)
+                sudo_cmds=$((sudo_cmds + 1))
+                tag='[ ] SUDO          - privileged command, see the full line for the user and the command'
+                ;;
+            *)
+                continue
+                ;;
+        esac
+        echo "$tag"
+        echo "    $line"
+    done < "$LOG"
+
+    echo
+    echo "Summary: $failed failed, $accepted accepted, $sudo_cmds sudo"
+    ```
+
+    **Green Notes**
+    - **Bug: `echo "    "$line` left `$line` unquoted.** Bash split the line into words and glob-expanded it. Double spaces were collapsed (`Oct  4` became `Oct 4`, `sudo:     arne` became `sudo: arne`). A `*` in a logged command, like `COMMAND=/bin/rm /tmp/*`, was replaced with file names from cron's working directory. The output now shows the log lines exactly as they are.
+    - **Bug: `read line` without `-r`** dropped backslashes from logged commands. `IFS= read -r` keeps the line unchanged.
+    - **Single quotes for fixed text** (reduces E): the tag strings are assigned again for every matching line. In single quotes, bash doesn't scan them for `$`, backticks and backslashes. In Green Metrics Tool micro-benchmarks, assigning a long literal in a loop used about 24% less CPU energy with single quotes. These tags are short, so the saving here is small, but it grows with the size of the log. Strings that contain `$LOG` or the counters keep their double quotes.
+- role: user
+  content: |
+    we use double quotes for all strings, its in our style guide. put them back pls but keep the read/echo fixes
+- role: assistant
+  content: |
+    Sure. Only the quote characters change back:
+
+    - the second `echo` line (`Lines marked [!] ...`)
+    - the three `case` patterns (`Failed password`, `Accepted publickey` / `Accepted password`, `sudo:` / `COMMAND=`)
+    - the three `tag=` assignments
+
+    `IFS= read -r line` and `echo "    $line"` stay as they are. None of the tag texts contain `$`, backticks or `\`, so the output is the same with either kind of quote.
+- role: user
+  content: |
+    can it skip sudo lines from the deploy user? ansible runs hundreds of them every night, its just noise
+- role: assistant
+  content: |
+    Yes. Add a variable at the top and one check at the start of the loop, before the `case`:
+
+    ```bash
+    SKIP_SUDO_USER="${SKIP_SUDO_USER:-deploy}"
+
+    # first line inside the while loop, before `case $line in`:
+        [[ $line == *sudo:*" $SKIP_SUDO_USER : "*COMMAND=* ]] && continue
+    ```
+
+    - sudo logs the user as `sudo:   deploy : TTY=...`. The spaces around the name keep it from matching similar names like `deploy2`.
+    - The quoted part with `$SKIP_SUDO_USER` is matched as plain text, so a name with special characters can't act as a wildcard. `sudo:` and `COMMAND=` contain no wildcard characters, so they need no quotes in the pattern.
+    - Skipped lines are not counted in the `sudo` total. You can change the user without editing the script: `SKIP_SUDO_USER=ansible /opt/ops/auth-digest.sh ...`.
+verify:
+  lang: bash
+  green_code: |
+    auth_digest() (
+        set -u
+
+        LOG="${1:-/var/log/auth.log}"
+        SKIP_SUDO_USER="${SKIP_SUDO_USER:-deploy}"
+
+        failed=0
+        accepted=0
+        sudo_cmds=0
+
+        echo "== Auth digest for $LOG =="
+        echo 'Lines marked [!] need a look, everything else is informational.'
+
+        while IFS= read -r line; do
+            [[ $line == *sudo:*" $SKIP_SUDO_USER : "*COMMAND=* ]] && continue
+            case $line in
+                *'Failed password'*)
+                    failed=$((failed + 1))
+                    tag='[!] FAILED LOGIN  - repeated failures from one IP usually mean a brute force attempt, check fail2ban'
+                    ;;
+                *'Accepted publickey'*|*'Accepted password'*)
+                    accepted=$((accepted + 1))
+                    tag='[ ] LOGIN OK      - successful login, compare the user and source IP with the on-call list'
+                    ;;
+                *'sudo:'*'COMMAND='*)
+                    sudo_cmds=$((sudo_cmds + 1))
+                    tag='[ ] SUDO          - privileged command, see the full line for the user and the command'
+                    ;;
+                *)
+                    continue
+                    ;;
+            esac
+            echo "$tag"
+            echo "    $line"
+        done < "$LOG"
+
+        echo
+        echo "Summary: $failed failed, $accepted accepted, $sudo_cmds sudo"
+    )
+  test: |-
+    tmp="$(mktemp)"
+    printf '%s\n' \
+      'Oct  4 03:12:01 gw-01 sshd[811]: Failed password for root from 203.0.113.9 port 52214 ssh2' \
+      'Oct  4 03:12:09 gw-01 sshd[811]: Connection closed by 203.0.113.9 port 52214' \
+      'Oct  4 07:30:44 gw-01 sshd[902]: Accepted publickey for arne from 198.51.100.7 port 40022 ssh2' \
+      'Oct  4 07:31:02 gw-01 sudo:     arne : TTY=pts/0 ; PWD=/home/arne ; USER=root ; COMMAND=/bin/rm /tmp/*' \
+      'Oct  4 07:45:10 gw-01 sudo:   deploy : TTY=pts/1 ; PWD=/srv ; USER=root ; COMMAND=/usr/bin/apt-get update' \
+      > "$tmp"
+    out="$(auth_digest "$tmp")"
+    printf '%s\n' "$out" | grep -qxF '    Oct  4 03:12:01 gw-01 sshd[811]: Failed password for root from 203.0.113.9 port 52214 ssh2' || { echo 'failed line not preserved'; exit 1; }
+    printf '%s\n' "$out" | grep -qxF '    Oct  4 07:31:02 gw-01 sudo:     arne : TTY=pts/0 ; PWD=/home/arne ; USER=root ; COMMAND=/bin/rm /tmp/*' || { echo 'sudo line not preserved'; exit 1; }
+    printf '%s\n' "$out" | grep -qF 'apt-get update' && { echo 'deploy sudo line not skipped'; exit 1; }
+    printf '%s\n' "$out" | grep -qF 'Connection closed' && { echo 'informational line not skipped'; exit 1; }
+    [ "$(printf '%s\n' "$out" | tail -n 1)" = 'Summary: 1 failed, 1 accepted, 1 sudo' ] || { echo 'summary wrong'; exit 1; }
+    rm -f "$tmp"

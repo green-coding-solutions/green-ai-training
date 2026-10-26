@@ -1,0 +1,176 @@
+id: gen-2-00159-review
+category: review
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    fix this. preview node pool keeps growing
+
+    ```yaml
+    apiVersion: argoproj.io/v1alpha1
+    kind: ApplicationSet
+    metadata:
+      name: logpipe-previews
+      namespace: argocd
+    spec:
+      goTemplate: true
+      goTemplateOptions: ["missingkey=error"]
+      generators:
+        - pullRequest:
+            github:
+              owner: acme
+              repo: logpipe
+              tokenRef:
+                secretName: github-token
+                key: token
+            requeueAfterSeconds: 300
+      syncPolicy:
+        applicationsSync: create-only
+        preserveResourcesOnDeletion: true
+      template:
+        metadata:
+          name: 'logpipe-pr-{{.number}}'
+        spec:
+          project: previews
+          source:
+            repoURL: https://github.com/acme/logpipe.git
+            targetRevision: '{{.head_sha}}'
+            path: deploy/chart
+            helm:
+              valuesObject:
+                vector:
+                  aggregator:
+                    replicas: 3
+                kafka:
+                  brokers: 3
+                clickhouse:
+                  shards: 1
+                  replicas: 2
+                grafana:
+                  enabled: true
+                  ingress:
+                    host: 'pr-{{.number}}.logs.preview.acme.dev'
+                  anonymous: true
+                replay:
+                  enabled: true
+                  schedule: "*/5 * * * *"
+                  source: s3://acme-prod-logs/raw/
+          destination:
+            server: https://kubernetes.default.svc
+            namespace: 'logpipe-{{.branch}}'
+          syncPolicy:
+            automated:
+              prune: true
+              selfHeal: true
+            syncOptions:
+              - CreateNamespace=true
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (per-PR preview environments for a log pipeline)
+
+    #### [Bug] Namespace built from the branch name
+    - **Where:** `destination.namespace: 'logpipe-{{.branch}}'`
+    - **Issue:** branch names like `feature/clickhouse-ttl` or `Fix_Parser` are not valid namespace names. Those PRs fail to sync. Long branch names also exceed the 63-character limit.
+    - **Fix:** use `logpipe-pr-{{.number}}`, the same key as the Application name.
+
+    #### [Security] Production logs in a public, anonymous Grafana
+    - **Where:** `replay.source: s3://acme-prod-logs/raw/` together with `grafana.anonymous: true` and a public ingress host
+    - **Issue:** every preview copies raw production logs, which usually hold IPs, user IDs and sometimes tokens. Anyone who guesses `pr-<n>.logs.preview.acme.dev` can read them.
+    - **Fix:** replay a sanitized fixture set, turn off anonymous access, and put Grafana behind your SSO or OAuth proxy.
+
+    #### [High] Environments are never removed after the PR closes
+    - **Where:** `spec.syncPolicy.applicationsSync: create-only` and `preserveResourcesOnDeletion: true`
+    - **Issue:** `create-only` stops the controller from deleting Applications. `preserveResourcesOnDeletion` would keep the Kafka, ClickHouse and Vector pods even if the Application were deleted. Every closed or merged PR leaves a full stack running. This is why the node pool only grows.
+    - **Fix:** remove both settings. With the default policy, the controller deletes the Application and its resources when the PR closes. After you apply this, check that the old `logpipe-<branch>` namespaces are gone. Delete leftover empty namespaces by hand.
+    - **Impact:** E and M. It removes all the hours of environments nobody uses anymore. That is the largest term here.
+
+    #### [Medium] Every PR gets a full stack
+    - **Where:** `pullRequest.github` has no `labels` filter
+    - **Issue:** Dependabot bumps, docs fixes and drafts each start brokers, ClickHouse and Grafana.
+    - **Fix:** add `labels: [preview]`. Removing the label also tears the environment down, so reviewers can switch it off themselves.
+    - **Impact:** E and M, in proportion to the PRs that don't need a running pipeline.
+
+    #### [Medium] Running nights and weekends
+    - **Where:** the whole template. Nothing scales down outside working hours.
+    - **Issue:** an open PR can sit for days, and most of those hours nobody looks at it.
+    - **Fix:** if you run kube-downscaler or similar, annotate the namespaces through `managedNamespaceMetadata` (see below). It scales Deployments and StatefulSets to zero outside the uptime window and suspends the replay CronJob.
+    - **Impact:** E and M for every night and weekend hour of every open preview.
+
+    #### [Medium] Production-sized topology
+    - **Where:** `vector.aggregator.replicas: 3`, `kafka.brokers: 3`, `clickhouse.replicas: 2`
+    - **Issue:** a preview needs one of each. Be realistic about the gain, though. In Green Metrics Tool measurements of a preview environment idling for 60 seconds, trimming 3 app replicas, Postgres, Redis and a polling worker down to 1 replica and Postgres saved only about 3% CPU energy. Machine energy differed by less than 1%. The real gain is in memory and CPU requests: fewer pods reserve fewer nodes.
+    - **Fix:** one replica each. If the chart sets the topic replication factor to 3, lower it to 1 too, or Kafka can't create topics with a single broker.
+    - **Impact:** M (reserved memory, node count). The CPU energy per idle minute changes little.
+
+    Fixed manifest:
+
+    ```yaml
+    apiVersion: argoproj.io/v1alpha1
+    kind: ApplicationSet
+    metadata:
+      name: logpipe-previews
+      namespace: argocd
+    spec:
+      goTemplate: true
+      goTemplateOptions: ["missingkey=error"]
+      generators:
+        - pullRequest:
+            github:
+              owner: acme
+              repo: logpipe
+              labels:
+                - preview
+              tokenRef:
+                secretName: github-token
+                key: token
+            requeueAfterSeconds: 300
+      template:
+        metadata:
+          name: 'logpipe-pr-{{.number}}'
+        spec:
+          project: previews
+          source:
+            repoURL: https://github.com/acme/logpipe.git
+            targetRevision: '{{.head_sha}}'
+            path: deploy/chart
+            helm:
+              valuesObject:
+                vector:
+                  aggregator:
+                    replicas: 1
+                kafka:
+                  brokers: 1
+                clickhouse:
+                  shards: 1
+                  replicas: 1
+                grafana:
+                  enabled: true
+                  ingress:
+                    host: 'pr-{{.number}}.logs.preview.acme.dev'
+                  anonymous: false
+                replay:
+                  enabled: true
+                  schedule: "*/5 * * * *"
+                  source: s3://acme-preview-fixtures/logs/
+          destination:
+            server: https://kubernetes.default.svc
+            namespace: 'logpipe-pr-{{.number}}'
+          syncPolicy:
+            automated:
+              prune: true
+              selfHeal: true
+            syncOptions:
+              - CreateNamespace=true
+            managedNamespaceMetadata:
+              annotations:
+                downscaler/uptime: Mon-Fri 07:00-20:00 Europe/Berlin
+    ```
+
+    **Already good:** pinned to `head_sha`, `missingkey=error` catches template typos, automated sync with `prune`.
+verify:
+  static_only: Argo CD ApplicationSet manifest, needs a Kubernetes cluster

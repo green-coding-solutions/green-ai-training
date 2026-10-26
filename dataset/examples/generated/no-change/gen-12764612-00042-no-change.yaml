@@ -1,0 +1,64 @@
+id: gen-12764612-00042-no-change
+category: no-change
+language: nginx
+patterns:
+- text-compression
+- context-tradeoff
+facts:
+- F-TEXT-COMPRESS
+- F-COMPRESS
+messages:
+- role: user
+  content: |
+    We're launching a static marketing site for a new product (plain HTML, one CSS file, one small JS file, an SVG logo, and about 20 photos as JPG/WebP). It is served by a single nginx on a small VM.
+
+    Requirements:
+    - the CI job runs `gzip -9 -k -f` on every `.html`, `.css`, `.js` and `.svg` file in `public/` after the build, then rsyncs to the VM
+    - hashed assets must be cached for a long time
+    - the contact form posts to a small separate service on 127.0.0.1:9000, which only returns a short JSON like `{"ok":true}`
+    - no surprises for old browsers or crawlers that don't send `Accept-Encoding: gzip`
+
+    This is my config. A colleague says I should also add `gzip on; gzip_comp_level 6;` "to be safe", and someone else wants brotli. Can you check it and tell me what to change?
+
+    ```nginx
+    server {
+        listen 443 ssl;
+        http2 on;
+        server_name launch.example.com;
+
+        ssl_certificate     /etc/ssl/launch/fullchain.pem;
+        ssl_certificate_key /etc/ssl/launch/privkey.pem;
+
+        root /srv/landing/public;
+        index index.html;
+
+        gzip_static on;
+        gzip_vary on;
+
+        location /assets/ {
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+        }
+
+        location = /contact {
+            limit_except POST { deny all; }
+            proxy_pass http://127.0.0.1:9000;
+        }
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    Change nothing for compression. This config is already the efficient setup for a static site.
+
+    - **`gzip_static on`** serves the `.gz` files your CI already made. In Green Metrics Tool nginx benchmarks (2,000 requests for text assets), precompressed files sent about 10× fewer bytes than uncompressed ones. Compressing on every request cost about 4× the CPU energy of serving precompressed files.
+    - **`gzip_vary on`** adds `Vary: Accept-Encoding`. Clients without gzip support get the plain files, which are still on disk. That covers your old-browser and crawler requirement.
+    - **No `gzip on`.** Every text file is already precompressed, so it would only act on the tiny `/contact` response. A few bytes of JSON are not worth CPU time, and it would be a trap if someone later adds a file the CI step misses. Leave it out.
+    - **Photos are untouched.** JPG and WebP are already compressed, so gzip would waste CPU and gain nothing.
+
+    On brotli: it would only help if you precompress at build time, because compressing with brotli at maximum quality is very expensive per run. That is fine for files compressed once and served many times, but not per request. It also needs the third-party `ngx_brotli` module, which stock nginx packages don't include. For a small launch page, gzip is enough. Only add brotli if you already build nginx with that module.
+verify:
+  static_only: nginx config, no runnable code

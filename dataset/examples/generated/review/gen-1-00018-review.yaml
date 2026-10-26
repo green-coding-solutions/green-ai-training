@@ -1,0 +1,163 @@
+id: gen-1-00018-review
+category: review
+language: python
+patterns:
+- keep-star-imports
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    Hello, can you review my script? It read the nginx access log from our server and print the status groups and the top 5 IPs by bytes. I run it by hand when the site is slow, with the log file name as argument. My colegue say that the `from ... import *` lines make the script slow and use more energy, is it true? Please tell me what is wrong.
+
+    ```python
+    import sys
+    import subprocess
+    from collections import *
+    from os.path import *
+
+    LOG_DIR = "/var/log/nginx"
+
+    def parse_line(line):
+        parts = line.split(" ")
+        return parts[0], int(parts[8]), int(parts[9])
+
+    def summarize(path):
+        counts = Counter()
+        ips = defaultdict(int)
+        f = open(path)
+        for line in f:
+            ip, status, size = parse_line(line)
+            counts[status // 100] += 1
+            ips[ip] += size
+        return counts, ips
+
+    def main():
+        name = sys.argv[1]
+        path = join(LOG_DIR, name)
+        if not exists(path):
+            print("no file")
+            return
+        if name.endswith(".gz"):
+            subprocess.call("zcat " + path + " > /tmp/tmp.log", shell=True)
+            path = "/tmp/tmp.log"
+        counts, ips = summarize(path)
+        for klass in sorted(counts):
+            print(f"{klass}xx: {counts[klass]}")
+        for ip, total in sorted(ips.items(), key=lambda kv: -kv[1])[:5]:
+            print(ip, total)
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (run by hand)
+
+    #### [Security] Shell command built from the argument
+    - **Where:** `subprocess.call("zcat " + path + ..., shell=True)`
+    - **Issue:** the file name goes straight into a shell command. A name like `x.gz; rm -rf ~` runs the second command. The fixed `/tmp/tmp.log` is also shared, so two runs can overwrite each other.
+    - **Fix:** don't use a shell. Read `.gz` files directly with `gzip.open`.
+
+    #### [Security] Path can leave the log folder
+    - **Where:** `join(LOG_DIR, name)`
+    - **Issue:** `join` drops `LOG_DIR` when `name` is an absolute path, and `../..` also escapes it. The script can then read any file.
+    - **Fix:** resolve the path with `realpath` and check that it is inside `LOG_DIR`.
+
+    #### [Bug] Crash on normal log lines
+    - **Where:** `parse_line`
+    - **Issue:** nginx writes `-` as the size when there is no body, so `int("-")` raises `ValueError`. Short or broken lines raise `IndexError`. One bad line stops the whole report.
+    - **Fix:** treat `-` as 0 and skip lines that cannot be parsed.
+
+    #### [Bug] File is never closed
+    - **Where:** `f = open(path)`
+    - **Fix:** use `with`.
+
+    #### Star imports
+    Your colegue is not right. In Green Metrics Tool micro-benchmarks, 1,000 Python process starts that import a module used ~3103 J with `from sympy import *` and ~3093 J with `import sympy`. That is no measurable difference. What costs energy is loading a heavy module at all, and `collections` and `os.path` are light. I left both lines as they are. There are no name clashes between them.
+
+    No efficiency issues worth changing. This is a by-hand script that reads the file once.
+
+    ```python
+    import gzip
+    import sys
+    from collections import *
+    from os.path import *
+
+    LOG_DIR = "/var/log/nginx"
+
+    def parse_line(line):
+        parts = line.split(" ")
+        try:
+            size = 0 if parts[9] == "-" else int(parts[9])
+            return parts[0], int(parts[8]), size
+        except (IndexError, ValueError):
+            return None
+
+    def summarize(path):
+        counts = Counter()
+        ips = defaultdict(int)
+        opener = gzip.open if path.endswith(".gz") else open
+        with opener(path, "rt", errors="replace") as f:
+            for line in f:
+                parsed = parse_line(line)
+                if parsed is None:
+                    continue
+                ip, status, size = parsed
+                counts[status // 100] += 1
+                ips[ip] += size
+        return counts, ips
+
+    def main():
+        path = realpath(join(LOG_DIR, sys.argv[1]))
+        if commonpath([path, LOG_DIR]) != LOG_DIR or not exists(path):
+            print("no file")
+            return
+        counts, ips = summarize(path)
+        for klass in sorted(counts):
+            print(f"{klass}xx: {counts[klass]}")
+        for ip, total in sorted(ips.items(), key=lambda kv: -kv[1])[:5]:
+            print(ip, total)
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    Output for good lines is the same as before. Bad lines are now skipped instead of stopping the script.
+verify:
+  module: true
+  green_block: 0
+  test: |-
+    import tempfile, gzip, io, contextlib
+    d = realpath(tempfile.mkdtemp())
+    lines = [
+        '1.1.1.1 - - [10/Oct/2026:13:55:36 +0000] "GET /a HTTP/1.1" 200 500',
+        '2.2.2.2 - - [10/Oct/2026:13:55:37 +0000] "GET /b HTTP/1.1" 404 -',
+        'garbage line',
+        '1.1.1.1 - - [10/Oct/2026:13:55:38 +0000] "GET /c HTTP/1.1" 200 300',
+    ]
+    text = "\n".join(lines) + "\n"
+    with open(d + "/access.log", "w") as f:
+        f.write(text)
+    with gzip.open(d + "/access.log.gz", "wt") as f:
+        f.write(text)
+    assert parse_line(lines[1]) == ("2.2.2.2", 404, 0)
+    assert parse_line("garbage line") is None
+    counts, ips = summarize(d + "/access.log")
+    assert counts == {2: 2, 4: 1}
+    assert ips["1.1.1.1"] == 800
+    counts_gz, ips_gz = summarize(d + "/access.log.gz")
+    assert counts_gz == counts and ips_gz == ips
+    LOG_DIR = d
+    def run(arg):
+        sys.argv = ["prog", arg]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            main()
+        return buf.getvalue()
+    out = run("access.log")
+    assert out.splitlines()[0] == "2xx: 2"
+    assert "1.1.1.1 800" in out
+    assert run("access.log.gz") == out
+    assert run("../../etc/passwd").strip() == "no file"
+    assert run("/etc/passwd").strip() == "no file"

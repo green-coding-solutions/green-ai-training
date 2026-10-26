@@ -1,0 +1,143 @@
+id: refactor-bash-hourly-logs-xz-001
+category: refactor
+language: bash
+patterns: [compress-transmitted]
+facts: [F-COMPRESS-CODECS]
+messages:
+  - role: user
+    content: |
+      this runs every hour on ~40 app servers and ships the rotated logs to our log store. can you improve it?
+
+      ```bash
+      #!/bin/bash
+      cd /var/log/shop
+      for f in $(ls *.log.1); do
+        xz -9 $f
+        curl -s -T $f.xz "https://logstore.internal.example/upload/$(hostname)/"
+        rm $f.xz
+      done
+      ```
+  - role: assistant
+    content: |
+      ```bash
+      #!/usr/bin/env bash
+      set -euo pipefail
+      shopt -s nullglob
+
+      log_dir=/var/log/shop
+      target="https://logstore.internal.example/upload/$(hostname)/"
+
+      for f in "$log_dir"/*.log.1; do
+          zstd -q --rm "$f"
+          curl -fsS -T "$f.zst" "$target"
+          rm -- "$f.zst"
+      done
+      ```
+
+      **Green Notes**
+      - **Compress transmitted data with a fast codec** (reduces E): these files are compressed once, sent once and then handled by the log store, so a strong codec only adds CPU work on 40 servers every hour. In Green Metrics Tool measurements with default settings on 100 MB of text, xz used ~458 J and zstd ~16 J to compress, about 29× more for xz. Your script used `xz -9`, which is slower still than the measured default level.
+
+      Other changes:
+      - `for f in $(ls ...)` broke on file names with spaces and ran `ls` in a subprocess. The glob with `nullglob` does the same safely and skips the loop when there are no files.
+      - `set -euo pipefail` and `curl -f` stop the script when an upload fails. Before, `rm` deleted the compressed file even if the upload had failed, so those logs were lost. Now a failed upload keeps the `.zst` file for the next run to retry by hand.
+
+      Check that the log store accepts `.zst` files. If it only takes gzip, use `gzip -1` to `gzip -6` there rather than xz. zstd files are usually somewhat larger than xz files, which the energy figures above don't account for.
+verify:
+  static_only: "needs zstd, a log directory and the upload endpoint"
+---
+id: gen-bash-nightly-pg-backup-zstd-001
+category: generation
+language: bash
+patterns: [compress-stored]
+facts: [F-COMPRESS-CODECS]
+messages:
+  - role: user
+    content: |
+      write a bash script for cron that dumps our postgres database "inventory" every night into /backups and deletes dumps older than 14 days
+  - role: assistant
+    content: |
+      ```bash
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      db=inventory
+      backup_dir=/backups
+      keep_days=14
+
+      stamp=$(date +%F)
+      tmp="$backup_dir/.$db-$stamp.sql.zst.partial"
+      out="$backup_dir/$db-$stamp.sql.zst"
+
+      pg_dump --no-owner "$db" | zstd -q -T0 -o "$tmp"
+      mv -- "$tmp" "$out"
+
+      find "$backup_dir" -maxdepth 1 -name "$db-*.sql.zst" -mtime +"$keep_days" -delete
+      ```
+
+      Crontab entry for 02:30 every night:
+
+      ```bash
+      30 2 * * * /usr/local/bin/backup-inventory.sh >> /var/log/backup-inventory.log 2>&1
+      ```
+
+      Restore with `zstd -dc inventory-2026-10-22.sql.zst | psql inventory`.
+
+      **Green Notes**
+      - **Compress stored data with zstd** (reduces E and storage): dumps compress well and are kept for two weeks, so compression pays off, and a fast codec keeps the nightly cost low. In Green Metrics Tool measurements with default settings on 100 MB of text, zstd used ~16 J and gzip ~67 J to compress, about 4× less for zstd, and both decompress cheaply (~5.3 J and ~9.1 J).
+
+      The dump is written to a `.partial` file first and renamed when it is complete, so a failed run never leaves a broken file that looks like a good backup.
+verify:
+  static_only: "needs PostgreSQL and zstd"
+---
+id: multiturn-bash-quotes-consistency-pushback-001
+category: multi-turn
+language: bash
+patterns: [bash-quoting]
+facts: [F-BASH-QUOTES]
+messages:
+  - role: user
+    content: |
+      tidy this up pls, it generates our nginx vhost files from a list of domains (a few thousand)
+
+      ```bash
+      #!/bin/bash
+      while read domain; do
+        conf="server {\n    listen 80;\n    server_name $domain;\n    root /srv/sites/$domain;\n}"
+        echo -e $conf > /etc/nginx/sites-enabled/$domain.conf
+        echo "done"
+      done < domains.txt
+      echo "All vhosts written"
+      ```
+  - role: assistant
+    content: |
+      ```bash
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      out_dir=/etc/nginx/sites-enabled
+
+      while IFS= read -r domain; do
+          [[ -z $domain ]] && continue
+          printf 'server {\n    listen 80;\n    server_name %s;\n    root /srv/sites/%s;\n}\n' \
+              "$domain" "$domain" > "$out_dir/$domain.conf"
+      done < domains.txt
+
+      echo 'All vhosts written'
+      ```
+
+      **Green Notes**
+      - **Single quotes for literals** (reduces E): the template and the final message need no expansion, so they are single-quoted, and `printf` fills in the domain. Bash scans double-quoted text for `$`, backticks and backslashes on every use. In Green Metrics Tool micro-benchmarks with a long literal in a loop, single quotes used about 24% less CPU energy.
+
+      Other changes: `read -r` keeps backslashes in the input, empty lines are skipped, the unquoted `$conf` and `$domain` could split on spaces, and the per-line `echo "done"` is gone, because thousands of "done" lines tell nobody anything.
+  - role: user
+    content: |
+      I'd rather keep double quotes everywhere, it's more consistent for the team. Does it really matter that much?
+  - role: assistant
+    content: |
+      Not much for this script. It is a fair choice to keep double quotes.
+
+      The measured difference was about 24% for a 6,200-character literal assigned in a loop of 1,000,000 iterations, and about 14% with 10,000 iterations. Your template is short, and a few thousand domains is a small loop, so the absolute saving here is tiny. The changes that actually matter in this script are the quoting around variables and `read -r`, because they fix real bugs.
+
+      If you want one rule for the team, a common compromise is: double quotes around anything with a variable, single quotes for fixed strings in loops and long templates. Where you keep double quotes, the script still works the same.
+verify:
+  static_only: "writes into /etc/nginx"

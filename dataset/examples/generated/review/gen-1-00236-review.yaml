@@ -1,0 +1,80 @@
+id: gen-1-00236-review
+category: review
+language: bash
+patterns:
+- bash-quoting
+facts:
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    hi, I am a physics student and I wrote this bash script to merge the scans from our spectrometer into one csv. It works on my test folder but I have about 300 scan files with 5000 lines each now and it feels slow. I dont know bash well, can you tell me whats wrong with it?
+
+    ```bash
+    #!/bin/bash
+    # merge raw spectrometer scans into one cleaned file
+    RAW_DIR=$1
+    OUT=$2
+
+    echo "file,wavelength,counts,note" > $OUT
+
+    for f in $RAW_DIR/*.csv; do
+      name=$(basename $f)
+      while IFS=, read -r wl counts; do
+        NOTE="Saturated pixel: value replaced by -1. Dark current already subtracted by the instrument. No wavelength calibration applied; calibration constants come from the last service visit and are not updated by this script. Do not use these rows for absolute intensity comparisons."
+        if [ "$counts" -ge 65535 ]; then
+          echo "$name,$wl,-1,$NOTE" >> "$OUT"
+        else
+          echo "$name,$wl,$counts," >> "$OUT"
+        fi
+      done < $f
+    done
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (data processing)
+
+    #### [Bug] Unquoted variables
+    - **Where:** `> $OUT`, `$RAW_DIR/*.csv`, `basename $f`, `done < $f`
+    - **Issue:** if a path contains a space, bash splits it into several words. The script then writes to the wrong file or fails. An empty `$1` is also silently accepted.
+    - **Fix:** quote every expansion: `"$OUT"`, `"$RAW_DIR"/*.csv`, `basename "$f"`, `< "$f"`. Add `[ $# -eq 2 ] || { echo 'usage: merge.sh RAW_DIR OUT' >&2; exit 1; }` at the top.
+    - **Impact:** correctness only.
+
+    #### [Medium] Long plain text in double quotes, assigned for every line
+    - **Where:** the `NOTE="..."` line inside the inner loop
+    - **Issue:** the text has no `$`, backtick or backslash, so it needs no expansion. Bash still scans double-quoted text for those characters. With about 1.5 million lines, this scan runs 1.5 million times.
+    - **Fix:** use single quotes. Bash then takes the text as is.
+    - **Impact:** reduces E per line. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal in a loop used about 24% less CPU energy with single quotes at 100,000 and 1,000,000 iterations, and about 14% less at 10,000 iterations. Your text is much shorter, so expect a smaller saving. It grows with the length of the text and the loop count. Keep the double quotes on `"$name,$wl,-1,$NOTE"`, because those variables must expand.
+
+    #### [Low] Header literal in double quotes
+    - **Where:** `echo "file,wavelength,counts,note"`
+    - **Issue:** nothing expands in it. It runs once, so the saving is negligible.
+    - **Fix:** `echo 'file,wavelength,counts,note'`. This is mainly for consistency.
+
+    ```bash
+    #!/bin/bash
+    # merge raw spectrometer scans into one cleaned file
+    [ $# -eq 2 ] || { echo 'usage: merge.sh RAW_DIR OUT' >&2; exit 1; }
+    RAW_DIR=$1
+    OUT=$2
+
+    echo 'file,wavelength,counts,note' > "$OUT"
+
+    for f in "$RAW_DIR"/*.csv; do
+      name=$(basename "$f")
+      while IFS=, read -r wl counts; do
+        NOTE='Saturated pixel: value replaced by -1. Dark current already subtracted by the instrument. No wavelength calibration applied; calibration constants come from the last service visit and are not updated by this script. Do not use these rows for absolute intensity comparisons.'
+        if [ "$counts" -ge 65535 ]; then
+          echo "$name,$wl,-1,$NOTE" >> "$OUT"
+        else
+          echo "$name,$wl,$counts," >> "$OUT"
+        fi
+      done < "$f"
+    done
+    ```
+
+    The output file is the same as before.
+
+    **Already good:** `IFS=, read -r` splits each line with a shell builtin, so there is no extra process per line. `"$counts"` and `"$OUT"` in the loop are already quoted.
+verify:
+  static_only: bash review, no python or javascript code to execute

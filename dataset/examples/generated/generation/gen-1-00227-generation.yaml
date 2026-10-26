@@ -1,0 +1,41 @@
+id: gen-1-00227-generation
+category: generation
+language: sql
+sql_dialect: postgres
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    psql script to seed 300k fake orders for load testing. orders(id identity, customer_id, status, total_cents, created_at)
+- role: assistant
+  content: |
+    One set-based `INSERT ... SELECT` builds all rows inside the server, in one transaction:
+
+    ```sql
+    \set ON_ERROR_STOP on
+
+    BEGIN;
+
+    SELECT setseed(0.42);  -- same data on every run
+
+    INSERT INTO orders (customer_id, status, total_cents, created_at)
+    SELECT
+        1 + floor(random() * 10000)::int,
+        (ARRAY['new', 'paid', 'shipped', 'cancelled'])[1 + floor(random() * 4)::int],
+        500 + floor(random() * 49500)::int,
+        now() - random() * interval '90 days'
+    FROM generate_series(1, 300000);
+
+    COMMIT;
+    ```
+
+    Run it with `psql -f seed_orders.sql yourdb`. It assumes `id` is an identity column and that customer ids 1-10000 are valid if you have a foreign key.
+
+    **Green Notes**
+    - **Batch database writes** (reduces E): this is 1 statement and 1 commit instead of 300,000 single-row INSERTs, so there is no per-row round trip or parse. In Green Metrics Tool micro-benchmarks that inserted 500,000 rows in batches of 5,000 rows, one `execute()` per row used ~384 J and `COPY` used ~17 J, about 22× less. That test was driven from a client, and generating the rows server-side avoids the per-row client work as well.
+    - *Not applied:* `COPY`. It helps when the rows come from a file or a client. Here the server makes the data itself, so there is nothing to stream in.
+verify:
+  static_only: postgres-only psql script (generate_series, setseed, \set)

@@ -1,0 +1,165 @@
+id: gen-2-00263-refactor
+category: refactor
+language: javascript
+patterns:
+- dom-size
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    Hi, we have a reconcilation report for our nightly ETL. After the load it compare staging and warehouse and the page show every value that not match. Normally its few hundreds, but after a schema change upstream we get 20-30k mismatches and the page is loading very long, also changing the column filter freeze the tab for some seconds. Can you optimize it and clean up a bit? Thanks
+
+    ```javascript
+    // recon-report.js - shows rows that differ between staging and warehouse after nightly load
+    const container = document.getElementById('mismatches');
+    const summary = document.getElementById('summary');
+    const columnFilter = document.getElementById('column-filter');
+
+    let allMismatches = [];
+
+    async function loadReport(runId) {
+      const res = await fetch(`/api/recon/${runId}/mismatches`);
+      allMismatches = await res.json();
+      summary.textContent = `${allMismatches.length} mismatched values in run ${runId}`;
+      renderMismatches(allMismatches);
+    }
+
+    function renderMismatches(rows) {
+      container.innerHTML = '';
+      rows.forEach((m) => {
+        const row = document.createElement('div');
+        row.className = 'mm-row';
+        for (const [label, value] of [
+          ['Table', m.table],
+          ['Key', m.primaryKey],
+          ['Column', m.column],
+          ['Staging', m.stagingValue],
+          ['Warehouse', m.warehouseValue],
+        ]) {
+          const cell = document.createElement('div');
+          cell.className = 'mm-cell';
+          const inner = document.createElement('div');
+          inner.className = 'mm-cell-inner';
+          const lab = document.createElement('span');
+          lab.className = 'mm-label';
+          lab.textContent = label;
+          const val = document.createElement('span');
+          val.className = 'mm-value';
+          val.innerHTML = value;
+          inner.appendChild(lab);
+          inner.appendChild(val);
+          cell.appendChild(inner);
+          row.appendChild(cell);
+        }
+        container.appendChild(row);
+      });
+    }
+
+    columnFilter.addEventListener('change', () => {
+      const col = columnFilter.value;
+      const filtered = col === 'all' ? allMismatches : allMismatches.filter((m) => m.column === col);
+      renderMismatches(filtered);
+    });
+
+    loadReport(new URLSearchParams(location.search).get('run'));
+    ```
+- role: assistant
+  content: |
+    ```javascript
+    // recon-report.js - shows rows that differ between staging and warehouse after nightly load
+    const PAGE_SIZE = 100;
+    const COLUMNS = [
+      ['Table', 'table'],
+      ['Key', 'primaryKey'],
+      ['Column', 'column'],
+      ['Staging', 'stagingValue'],
+      ['Warehouse', 'warehouseValue'],
+    ];
+
+    const container = document.getElementById('mismatches');
+    const summary = document.getElementById('summary');
+    const columnFilter = document.getElementById('column-filter');
+
+    let allMismatches = [];
+    let currentRows = [];
+    let page = 0;
+
+    // Table and pager are built once and reused for every page.
+    const table = document.createElement('table');
+    table.className = 'mm-table';
+    const headRow = table.createTHead().insertRow();
+    for (const [label] of COLUMNS) {
+      const th = document.createElement('th');
+      th.textContent = label;
+      headRow.appendChild(th);
+    }
+    const tbody = table.createTBody();
+
+    const pager = document.createElement('div');
+    pager.className = 'mm-pager';
+    const prevBtn = document.createElement('button');
+    prevBtn.textContent = 'Previous';
+    const nextBtn = document.createElement('button');
+    nextBtn.textContent = 'Next';
+    const pageInfo = document.createElement('span');
+    pager.append(prevBtn, pageInfo, nextBtn);
+
+    container.replaceChildren(table, pager);
+
+    function renderPage() {
+      const pageCount = Math.max(1, Math.ceil(currentRows.length / PAGE_SIZE));
+      page = Math.min(Math.max(page, 0), pageCount - 1);
+      const start = page * PAGE_SIZE;
+
+      const frag = document.createDocumentFragment();
+      for (const m of currentRows.slice(start, start + PAGE_SIZE)) {
+        const tr = document.createElement('tr');
+        for (const [, key] of COLUMNS) {
+          const td = document.createElement('td');
+          td.textContent = m[key] ?? '';
+          tr.appendChild(td);
+        }
+        frag.appendChild(tr);
+      }
+      tbody.replaceChildren(frag);
+
+      pageInfo.textContent = `Page ${page + 1} of ${pageCount}`;
+      prevBtn.disabled = page === 0;
+      nextBtn.disabled = page >= pageCount - 1;
+    }
+
+    function showRows(rows) {
+      currentRows = rows;
+      page = 0;
+      renderPage();
+    }
+
+    async function loadReport(runId) {
+      const res = await fetch(`/api/recon/${runId}/mismatches`);
+      allMismatches = await res.json();
+      summary.textContent = `${allMismatches.length} mismatched values in run ${runId}`;
+      showRows(allMismatches);
+    }
+
+    prevBtn.addEventListener('click', () => { page -= 1; renderPage(); });
+    nextBtn.addEventListener('click', () => { page += 1; renderPage(); });
+
+    columnFilter.addEventListener('change', () => {
+      const col = columnFilter.value;
+      showRows(col === 'all' ? allMismatches : allMismatches.filter((m) => m.column === col));
+    });
+
+    loadReport(new URLSearchParams(location.search).get('run'));
+    ```
+
+    **Green Notes**
+    - **Paginate the list** (reduces E, M): the page used to put all 20-30k mismatches in the DOM. Now it shows 100 per page. A filter change or a page change rebuilds 100 rows, not the whole list. The filter still runs over all data in memory, so the summary count and the filter results stay the same. In Green Metrics Tool benchmarks, 30 page loads of a 10,000-row table with 14 elements per row, appended one by one to the live DOM, used about 56% less CPU energy (about 2.3× less) when it was paginated to 100 rows per page as a plain `<table>` built in a `DocumentFragment`.
+    - **Plain table, no wrapper elements** (reduces E, M): each mismatch was 21 elements (row, plus cell, inner div, label and value for every field). Now it is 6 (`tr` and 5 `td`). The labels appear once in the `<thead>` instead of being repeated in every row.
+    - **One insert per page** (reduces E): rows are built in a `DocumentFragment` and inserted with one `replaceChildren`. Before, every row was appended to the live DOM on its own.
+    - **Security fix:** `val.innerHTML = value` put raw source data into the page as HTML. A value like `<img src=x onerror=...>` from an upstream system would run as script. `textContent` shows the value as plain text. Values that contain HTML tags or entities now appear exactly as they are stored, which is what a reconciliation report should show anyway.
+
+    Changing the filter now goes back to page 1. The `.mm-row` / `.mm-cell` CSS no longer applies, so move that styling to `.mm-table td` and add some for `.mm-pager`.
+verify:
+  static_only: 'Browser code: needs a DOM (document, DocumentFragment, table APIs) and fetch, not available in plain Node
+    without extra packages.'

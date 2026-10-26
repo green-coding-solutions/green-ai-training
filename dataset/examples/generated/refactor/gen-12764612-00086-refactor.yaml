@@ -1,0 +1,106 @@
+id: gen-12764612-00086-refactor
+category: refactor
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    hi, I'm new in the platform team and I made this GitHub workflow for preview deploys of our log pipeline (parses app logs, stores them, shows them in a small UI). It works but the cluster people said we use too many resources and I don't really know what is wrong. can you clean it up?
+
+    ```yaml
+    name: preview
+
+    on:
+      pull_request:
+        branches: [main]
+
+    jobs:
+      deploy-preview:
+        runs-on: ubuntu-latest
+        env:
+          NS: logpipe-pr-${{ github.event.number }}
+        steps:
+          - uses: actions/checkout@v4
+          - uses: azure/setup-helm@v4
+          - name: Write kubeconfig
+            run: echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > $HOME/kubeconfig
+          - name: Deploy
+            run: |
+              helm upgrade --install logpipe ./chart \
+                --namespace $NS --create-namespace \
+                --kubeconfig $HOME/kubeconfig \
+                --set parser.replicas=3 \
+                --set api.replicas=3 \
+                --set redis.enabled=true \
+                --set postgres.enabled=true \
+                --set alerter.enabled=true \
+                --set image.tag=${{ github.sha }} \
+                --wait --timeout 5m
+          - name: Comment URL
+            run: echo "Preview at https://pr-${{ github.event.number }}.preview.example.com"
+    ```
+- role: assistant
+  content: |
+    ```yaml
+    name: preview
+
+    on:
+      pull_request:
+        branches: [main]
+        types: [opened, synchronize, reopened, closed]
+
+    env:
+      NS: logpipe-pr-${{ github.event.number }}
+
+    jobs:
+      deploy-preview:
+        if: github.event.action != 'closed'
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+          - uses: azure/setup-helm@v4
+          - name: Write kubeconfig
+            run: |
+              umask 077
+              echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > "$HOME/kubeconfig"
+          - name: Deploy
+            run: |
+              helm upgrade --install logpipe ./chart \
+                --namespace "$NS" --create-namespace \
+                --kubeconfig "$HOME/kubeconfig" \
+                --set parser.replicas=1 \
+                --set api.replicas=1 \
+                --set redis.enabled=true \
+                --set postgres.enabled=true \
+                --set alerter.enabled=false \
+                --set image.tag=${{ github.sha }} \
+                --wait --timeout 5m
+          - name: Comment URL
+            run: echo "Preview at https://pr-${{ github.event.number }}.preview.example.com"
+
+      teardown-preview:
+        if: github.event.action == 'closed'
+        runs-on: ubuntu-latest
+        steps:
+          - uses: azure/setup-helm@v4
+          - name: Write kubeconfig
+            run: |
+              umask 077
+              echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > "$HOME/kubeconfig"
+          - name: Remove preview
+            run: |
+              helm uninstall logpipe --namespace "$NS" --kubeconfig "$HOME/kubeconfig" || true
+              kubectl --kubeconfig "$HOME/kubeconfig" delete namespace "$NS" --ignore-not-found
+    ```
+
+    **Green Notes**
+    - **Minimize deployed environments** (reduces E and M): the biggest problem was that the workflow never removed anything. Every PR left a full stack running until someone cleaned it up by hand. The new `closed` trigger and the `teardown-preview` job delete the release and the namespace when the PR is merged or closed. This saves the most, because an environment that no longer exists costs nothing for all the hours after the merge.
+    - **Fewer replicas and services** (reduces E and M): a preview serves one reviewer, so 1 parser and 1 API replica are enough, and the alerter is off. In Green Metrics Tool micro-benchmarks, a preview environment idling for 60 seconds with 3 app replicas, Postgres, Redis and a polling worker used ~269 J of CPU energy. With 1 app replica and Postgres it used ~262 J, about 3% less. Idle extra services cost little per minute, but fewer replicas still reserve less memory and leave room on the cluster.
+    - **Behavior change:** previews no longer run the alerter. Turn it back on only for PRs that change alerting. Previews also no longer test several replicas. If a PR changes parallel parsing, scale `parser.replicas` up for that PR only.
+
+    *Not applied:* night-time scale-to-zero for open PRs. It helps when PRs stay open for days, but it needs a scheduled job and a wake-up path. Add it if teardown on close is not enough.
+verify:
+  static_only: GitHub Actions workflow that needs a Kubernetes cluster, Helm and secrets

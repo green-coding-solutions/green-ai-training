@@ -1,0 +1,72 @@
+id: gen-2-00444-generation
+category: generation
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    hello, we use ArgoCD for our etl pipelines and I need to make preview enviroment for the pull requests. Our repo is github acme-data/etl-pipelines, the helm chart is in helm/etl (it have ingest api, one worker and postgres). Token for github is in secret github-token in argocd namespace, key is token. I think I need a ApplicationSet but I never wrote one. Can you write it please? Thank you!
+- role: assistant
+  content: |
+    Yes, an `ApplicationSet` with the pull request generator fits well. It creates one Argo CD application per open PR and deletes it again when the PR is closed or merged.
+
+    ```yaml
+    apiVersion: argoproj.io/v1alpha1
+    kind: ApplicationSet
+    metadata:
+      name: etl-previews
+      namespace: argocd
+    spec:
+      generators:
+        - pullRequest:
+            github:
+              owner: acme-data
+              repo: etl-pipelines
+              tokenRef:
+                secretName: github-token
+                key: token
+              # only PRs with this label get an environment
+              labels:
+                - preview
+            requeueAfterSeconds: 300
+      template:
+        metadata:
+          name: 'etl-pr-{{number}}'
+          finalizers:
+            - resources-finalizer.argocd.argoproj.io
+        spec:
+          project: default
+          source:
+            repoURL: https://github.com/acme-data/etl-pipelines.git
+            targetRevision: '{{head_sha}}'
+            path: helm/etl
+            helm:
+              parameters:
+                - name: api.replicaCount
+                  value: '1'
+                - name: worker.replicaCount
+                  value: '1'
+          destination:
+            server: https://kubernetes.default.svc
+            namespace: 'etl-pr-{{number}}'
+          syncPolicy:
+            automated:
+              prune: true
+              selfHeal: true
+            syncOptions:
+              - CreateNamespace=true
+    ```
+
+    I assumed the chart has `api.replicaCount` and `worker.replicaCount` values. Please check the names in your `values.yaml`.
+
+    **Green Notes**
+    - **Minimize deployed environments** (reduces E and M): the preview is removed when the PR closes, and the finalizer makes Argo CD delete its resources too. Nothing stays up for weeks after a merge. This is where the saving is. In Green Metrics Tool micro-benchmarks, an idle preview with extra replicas and services used only about 3% more CPU energy per minute than a minimal one. The hours an environment exists matter more than its size.
+    - **Opt-in label** (reduces E and M): only PRs with the `preview` label get an environment. Docs-only or small PRs don't start Postgres and a worker for nobody.
+    - **One replica per component** (reduces M): a preview has a few users, so it reserves less memory and more previews fit on a node.
+
+    Argo CD may leave the empty namespace behind after the app is deleted. Check this once on a closed PR.
+verify:
+  static_only: Argo CD ApplicationSet manifest, needs a cluster

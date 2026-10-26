@@ -1,0 +1,44 @@
+id: gen-2-00083-generation
+category: generation
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    Need `to_dot(graph)` for our depgraph CLI. Input is `dict[str, list[str]]` (package -> its deps), output is a Graphviz DOT string that the CLI writes to stdout. Package names are things like `@scope/ui-kit`, so they always need quoting, and a few fixture names contain double quotes. Packages with no deps must still show up as nodes. Keep insertion order. Full monorepo graph is ~80k edges. Code only, skip the explanation.
+- role: assistant
+  content: |
+    ```python
+    def _quote(name: str) -> str:
+        return '"' + name.replace('"', '\\"') + '"'
+
+
+    def to_dot(graph: dict[str, list[str]], name: str = "deps") -> str:
+        lines = [f"digraph {_quote(name)} {{"]
+        for src, deps in graph.items():
+            s = _quote(src)
+            if not deps:
+                lines.append(f"  {s};")
+                continue
+            for dst in deps:
+                lines.append(f"  {s} -> {_quote(dst)};")
+        lines.append("}")
+        return "\n".join(lines) + "\n"
+    ```
+
+    **Green Notes**
+    - **Join strings instead of `+=`** (reduces E): each line goes into a list and is joined once at the end. With `out += ...` on tens of thousands of edges, CPython can end up copying the growing string again and again, and appending f-strings with `+=` behaves the same. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces used roughly 260× less CPU energy with `"".join()` than with `+=`.
+verify:
+  test: |-
+    g = {"@app/web": ["@app/ui", "lodash"], "@app/ui": [], 'odd"name': ["lodash"]}
+    out = to_dot(g)
+    assert out == 'digraph "deps" {\n  "@app/web" -> "@app/ui";\n  "@app/web" -> "lodash";\n  "@app/ui";\n  "odd\\"name" -> "lodash";\n}\n', out
+    assert to_dot({}) == 'digraph "deps" {\n}\n'
+    big = {f"pkg{i}": [f"pkg{i + 1}"] for i in range(80000)}
+    big_out = to_dot(big)
+    assert big_out.count(" -> ") == 80000
+    assert big_out.startswith('digraph "deps" {\n  "pkg0" -> "pkg1";\n')
+    assert big_out.endswith('  "pkg79999" -> "pkg80000";\n}\n')

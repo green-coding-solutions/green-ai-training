@@ -1,0 +1,153 @@
+id: gen-2-00008-review
+category: review
+language: python
+patterns:
+- batch-db-writes
+- simple-conditions
+facts:
+- F-PG-INSERT
+- F-COND
+messages:
+- role: user
+  content: |
+    Can you review our syslog ingester? Some context and requirements:
+
+    - Cron runs it every 10 minutes. It processes the rotated syslog files from about 200 switches and firewalls. Each file has roughly 300k-600k lines.
+    - Postgres 16 with psycopg 3. Please keep it plain psycopg, no ORM.
+    - We must not lose lines. Row order in the table doesn't matter.
+    - Sometimes the next cron run starts before the previous one is done, so speed matters.
+
+    ```python
+    import sys
+    from datetime import datetime
+
+    import psycopg
+
+    DSN = "postgresql://ingest@db.internal/logs"
+    BATCH = 5000
+
+
+    def level_for(priority):
+        if priority % 8 >= 0 and priority % 8 <= 2:
+            return "critical"
+        elif priority % 8 > 2 and priority % 8 < 4:
+            return "error"
+        elif priority % 8 >= 4 and priority % 8 < 5:
+            return "warning"
+        elif priority % 8 >= 5 and priority % 8 < 7:
+            return "info"
+        else:
+            return "debug"
+
+
+    def parse(line, year):
+        end = line.index(">")
+        priority = int(line[1:end])
+        rest = line[end + 1:]
+        stamp = datetime.strptime(f"{year} {rest[:15]}", "%Y %b %d %H:%M:%S")
+        host, _, message = rest[16:].partition(" ")
+        return stamp, host, priority // 8, level_for(priority), message.rstrip("\n")
+
+
+    def load(path):
+        year = datetime.now().year
+        conn = psycopg.connect(DSN)
+        cur = conn.cursor()
+        n = 0
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not line.startswith("<"):
+                    continue
+                row = parse(line, year)
+                cur.execute(
+                    "INSERT INTO syslog_events (logged_at, host, facility, level, message) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    row,
+                )
+                n += 1
+                if n % BATCH == 0:
+                    conn.commit()
+        conn.close()
+        print(f"{path}: {n} rows")
+
+
+    if __name__ == "__main__":
+        for p in sys.argv[1:]:
+            load(p)
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (log ingestion, every 10 minutes)
+
+    #### [Bug] The last partial batch is never committed
+    - **Where:** `load()`, `conn.close()` at the end
+    - **Issue:** you only commit when `n` is a multiple of 5,000. When the connection closes, psycopg 3 rolls back the open transaction. So the last 1 to 4,999 lines of every file are lost, and the printed count still includes them.
+    - **Fix:** commit after every batch, including the last one. Use `with psycopg.connect(...) as conn`, which commits on a clean exit. The version in the next finding does both.
+
+    #### [High] One INSERT round trip per log line
+    - **Where:** `cur.execute(...)` inside the line loop
+    - **Issue:** each file makes 300k-600k separate statements, and each one is a round trip to the server. Most of the run time goes into this, not into parsing. In Green Metrics Tool micro-benchmarks with PostgreSQL 16 and psycopg 3, inserting 500,000 rows in batches of 5,000 took ~384 J with one `execute()` per row, ~139 J with `executemany()`, and ~17 J with `COPY ... FROM STDIN`. COPY used about 22× less than the loop. Your batch size matches that setup.
+    - **Fix:** stream each batch through `COPY`:
+
+    ```python
+    from itertools import islice
+
+    COPY_SQL = "COPY syslog_events (logged_at, host, facility, level, message) FROM STDIN"
+
+
+    def load(path):
+        year = datetime.now().year
+        n = 0
+        with psycopg.connect(DSN) as conn, open(path, encoding="utf-8", errors="replace") as f:
+            cur = conn.cursor()
+            rows = (parse(line, year) for line in f if line.startswith("<"))
+            while batch := list(islice(rows, BATCH)):
+                with cur.copy(COPY_SQL) as copy:
+                    for row in batch:
+                        copy.write_row(row)
+                conn.commit()
+                n += len(batch)
+        print(f"{path}: {n} rows")
+    ```
+
+    - **Impact:** E on both the client and the database for every line ingested. This should also stop the cron runs from overlapping. COPY has no `ON CONFLICT`. If you ever add a unique constraint and need to skip duplicates, switch to `executemany()` with `ON CONFLICT DO NOTHING`, which is still far cheaper than the loop.
+
+    #### [Low] Range checks with `% 8` repeated in every branch
+    - **Where:** `level_for()`
+    - **Issue:** each call computes `priority % 8` up to ten times, inside chained range comparisons. The ranges are really just single values. In Green Metrics Tool micro-benchmarks over 10,000,000 classifications, simple equality branches used ~46 J and complex range/modulo conditions ~54 J, so the simple version used about 16% less.
+    - **Fix:** compute the severity once and compare with `==`. The most common levels go first:
+
+    ```python
+    def level_for(priority):
+        sev = priority % 8
+        if sev == 6 or sev == 5:
+            return "info"
+        if sev == 4:
+            return "warning"
+        if sev == 3:
+            return "error"
+        if sev == 7:
+            return "debug"
+        return "critical"
+    ```
+
+    - **Impact:** E, small. It runs once per line, but the insert fix matters far more. The output is the same for every priority, because the branches don't overlap. Changing the order changes nothing.
+
+    **Already good:** the file is streamed line by line instead of being read into memory, and `errors="replace"` keeps one bad byte from stopping the whole run.
+verify:
+  green_block: 1
+  test: |-
+    def _orig(priority):
+        if priority % 8 >= 0 and priority % 8 <= 2:
+            return "critical"
+        elif priority % 8 > 2 and priority % 8 < 4:
+            return "error"
+        elif priority % 8 >= 4 and priority % 8 < 5:
+            return "warning"
+        elif priority % 8 >= 5 and priority % 8 < 7:
+            return "info"
+        else:
+            return "debug"
+
+    for p in range(-16, 192):
+        assert level_for(p) == _orig(p), p

@@ -1,0 +1,87 @@
+id: gen-1-00073-multi-turn
+category: multi-turn
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    fix this, takes forever on our prediction dumps
+
+    ```bash
+    #!/bin/bash
+    # usage: ./summarize.sh preds.txt
+    # lines look like: img_00123 cat 87
+    declare -A count
+    declare -A low
+    total=0
+
+    while read -r line; do
+      label=$(echo "$line" | cut -d' ' -f2)
+      conf=$(echo "$line" | cut -d' ' -f3)
+      count[$label]=$(expr ${count[$label]:-0} + 1)
+      if [ "$conf" -lt 50 ]; then
+        low[$label]=$(expr ${low[$label]:-0} + 1)
+      fi
+      total=$(expr $total + 1)
+    done < "$1"
+
+    echo "total: $total"
+    for l in "${!count[@]}"; do
+      echo "$l ${count[$l]} low=${low[$l]:-0}"
+    done
+    ```
+- role: assistant
+  content: |
+    ```bash
+    #!/bin/bash
+    # usage: ./summarize.sh preds.txt
+    # lines look like: img_00123 cat 87
+    declare -A count
+    declare -A low
+    total=0
+
+    while read -r _ label conf _; do
+      count[$label]=$(( ${count[$label]:-0} + 1 ))
+      if (( conf < 50 )); then
+        low[$label]=$(( ${low[$label]:-0} + 1 ))
+      fi
+      total=$(( total + 1 ))
+    done < "$1"
+
+    echo "total: $total"
+    for l in "${!count[@]}"; do
+      echo "$l ${count[$l]} low=${low[$l]:-0}"
+    done
+    ```
+
+    **Green Notes**
+    - **Builtins instead of subprocesses in the loop** (reduces E): the old loop started about five processes per line (`echo`, `cut` twice, `expr` up to three times). `read -r` now splits the fields and `$(( ))` does the arithmetic, so no process is started per line. In Green Metrics Tool micro-benchmarks on a 20,000-line log, a loop with `echo | cut` and `expr` per field used ~1302 J and 238 s. The same loop with builtins only used ~4.3 J and 0.72 s, about 300× less.
+    - The new loop splits on any run of whitespace, the old one on single spaces. For your format the result is the same. The label order in the output was already unspecified.
+- role: user
+  content: |
+    too long for what it does, i dont like the arrays. can it be shorter?
+- role: assistant
+  content: |
+    Yes, `awk` does this in one short pass:
+
+    ```bash
+    #!/bin/bash
+    # usage: ./summarize.sh preds.txt
+    awk '
+      { count[$2]++; if ($3 < 50) low[$2]++ }
+      END {
+        print "total: " NR
+        for (l in count) print l, count[l], "low=" (low[l] + 0)
+      }
+    ' "$1"
+    ```
+
+    **Green Notes**
+    - **Single-pass tool** (reduces E): one `awk` process reads the whole file, so there is no per-line work in bash at all. In the same Green Metrics Tool benchmark, one `awk` pass used ~1.0 J, about 4× less than the builtin loop and over 1000× less than the subprocess loop.
+
+    Output format is the same as before. Label order is still unspecified, so add `| sort` if you need it stable.
+verify:
+  static_only: bash script that needs an input file and awk; output order of associative arrays is unspecified

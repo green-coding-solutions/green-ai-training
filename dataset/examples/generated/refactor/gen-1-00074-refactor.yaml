@@ -1,0 +1,117 @@
+id: gen-1-00074-refactor
+category: refactor
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    Our nightly ETL has a step that cleans the ledger extract from the billing system. It takes about 600k lines now and the step runs for hours. Can you refactor it so it is faster?
+
+    Requirements:
+    - the cleaned file must stay byte-for-byte the same format (`account,YYYY-MM-DD,cents,CUR`), the next job reads it
+    - bad lines still go to `<out>.rejects`
+    - the summary on stdout (totals per currency, sorted, then `rows=N`) must stay the same, our monitoring parses it
+    - bash is fine, no Python on that box
+
+    ```bash
+    #!/bin/bash
+    # clean ledger extract and sum amounts per currency
+    # usage: clean_ledger.sh ledger.psv cleaned.csv
+    IN="$1"
+    OUT="$2"
+    REJECT="$OUT.rejects"
+    : > "$OUT"
+    : > "$REJECT"
+
+    declare -A totals
+    count=0
+
+    while IFS= read -r line; do
+      case "$line" in
+        ''|'#'*|account_id*) continue ;;
+      esac
+
+      if [ "$(echo "$line" | tr -cd '|' | wc -c)" -ne 3 ]; then
+        echo "$line" >> "$REJECT"
+        continue
+      fi
+
+      account=$(echo "$line" | cut -d'|' -f1)
+      day=$(echo "$line" | cut -d'|' -f2)
+      cents=$(echo "$line" | cut -d'|' -f3)
+      cur=$(echo "$line" | cut -d'|' -f4)
+
+      if [ -z "$account" ] || ! [[ "$cents" =~ ^-?[0-9]+$ ]]; then
+        echo "$line" >> "$REJECT"
+        continue
+      fi
+
+      d=$(echo "$day" | cut -d. -f1)
+      m=$(echo "$day" | cut -d. -f2)
+      y=$(echo "$day" | cut -d. -f3)
+      iso="$y-$m-$d"
+      cur=$(echo "$cur" | tr 'a-z' 'A-Z')
+
+      echo "$account,$iso,$cents,$cur" >> "$OUT"
+      prev=${totals[$cur]:-0}
+      totals[$cur]=$(expr $prev + $cents)
+      count=$(expr $count + 1)
+    done < "$IN"
+
+    for c in "${!totals[@]}"; do
+      echo "$c total_cents=${totals[$c]}"
+    done | sort
+    echo "rows=$count"
+    ```
+- role: assistant
+  content: |
+    The whole job is one pass over the file, so one `awk` call can do it.
+
+    ```bash
+    #!/bin/bash
+    # clean ledger extract and sum amounts per currency
+    # usage: clean_ledger.sh ledger.psv cleaned.csv
+    in=$1
+    out=$2
+
+    awk -v out="$out" -v reject="$out.rejects" '
+    BEGIN {
+      FS = "|"
+      printf "" > out
+      printf "" > reject
+    }
+    /^$/ || /^#/ || /^account_id/ { next }
+    {
+      if (NF != 4 || $1 == "" || $3 !~ /^-?[0-9]+$/ || $4 == "") {
+        print > reject
+        next
+      }
+      split($2, p, ".")
+      cur = toupper($4)
+      print $1 "," p[3] "-" p[2] "-" p[1] "," $3 "," cur > out
+      totals[cur] += $3
+      count++
+    }
+    END {
+      for (c in totals) printf "%s total_cents=%.0f\n", c, totals[c] | "sort"
+      close("sort")
+      print "rows=" count + 0
+    }
+    ' "$in"
+    ```
+
+    **Green Notes**
+    - **One `awk` pass instead of subprocesses per line** (reduces E): the old loop started about a dozen processes for every line (`echo | cut` four times for the fields, three more `cut` calls for the date, `tr`, `wc`, `expr` twice), plus a subshell for each. On 600k lines that is millions of process starts, and they dominate the cost, not the actual work. In Green Metrics Tool micro-benchmarks on a 20,000-line log summary, a `while read` loop with `$(echo | cut)` and `$(expr)` used ~1302 J and 238 s, and one `awk` pass with identical output used ~1.0 J and 0.21 s, over 1000× less. That is a different workload from yours, so measure your run with `time` or `perf stat`.
+    - **Output files opened once** (reduces E): `>> "$OUT"` re-opened the file for every line. `awk` keeps both files open for the whole run.
+    - *Not applied:* a pure-builtin bash loop (`read -r` with `IFS='|'`, `$(( ))`). It would also avoid the forks, but for a whole-file job a single `awk` call is simpler and still faster.
+
+    Differences to the old script:
+    - A last line without a trailing newline is now processed. `read` used to drop it.
+    - A line with an empty currency now goes to the rejects file. Before, it made bash fail with a "bad array subscript" error.
+    - The date is still not validated, as before.
+    - Sums are printed with `%.0f`, so they stay exact integers up to 2^53 cents.
+verify:
+  static_only: bash script needs input files and awk; no Python or JS harness applies
