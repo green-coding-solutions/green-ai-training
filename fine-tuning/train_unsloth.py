@@ -86,6 +86,7 @@ def train_model(model_name, target_modules, dataset_path, output_dir, split_and_
             },
         ]
 
+        template_kwargs = {}
         if "enable_thinking" in tokenizer.get_chat_template():
             template_kwargs["enable_thinking"] = False
 
