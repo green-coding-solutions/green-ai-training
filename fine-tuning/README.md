@@ -29,6 +29,18 @@ Loss is computed on the assistant turns only. Defaults: all attention and MLP pr
 3 epochs, learning rate 2e-4 with cosine decay. Watch the eval loss per epoch: if it rises while the train loss keeps
 falling, the model is memorizing, so use fewer epochs (`--epochs 2`).
 
+### Choosing --max-seq-length
+
+`token_lengths.py` counts the tokens per example with the model's chat template and suggests a `--max-seq-length`
+that truncates nothing. `--threshold` lists the longer examples with their source YAML, `--delete` removes them from
+the JSONL and deletes their source YAML in `../dataset/examples` after a y/N prompt, so a rebuild does not bring them back.
+
+```bash
+python3 token_lengths.py --model 'unsloth/Qwen2.5-Coder-7B-Instruct' \
+  --dataset ../dataset/out/train.jsonl ../dataset/out/eval.jsonl \
+  --threshold 2048 --delete
+```
+
 
 ## Fusing
 
