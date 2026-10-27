@@ -531,6 +531,9 @@ def check_sql(ex, cfg, errors, verified):
         return
     verified.append("run")
     if cfg.get("compare"):
+        if original is None:
+            errors.append("exec: SQL compare needs original code (user sql block or verify.original_code)")
+            return
         try:
             orig_rows = execute(original)
         except sqlite3.Error as e:
