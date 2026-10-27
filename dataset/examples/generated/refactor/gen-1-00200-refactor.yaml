@@ -65,28 +65,28 @@ messages:
     file=${1:?'usage: settlement_summary.sh SETTLEMENT_FILE'}
     out='/tmp/settlement_summary.txt'
 
-    awk -F'|' '
-      $5 == "captured" { cap[$3] += $4; ncap++; seen[$3] = 1 }
-      $5 == "refunded" { ref[$3] += $4; nref++; seen[$3] = 1 }
+    awk -F'|' -v cap_status='captured' -v ref_status='refunded' -v sorter='sort' '
+      $5 == cap_status { cap[$3] += $4; ncap++; seen[$3] = 1 }
+      $5 == ref_status { ref[$3] += $4; nref++; seen[$3] = 1 }
       END {
         for (c in seen)
-          printf "%s captured=%.0f refunded=%.0f\n", c, cap[c], ref[c] | "sort"
-        close("sort")
+          printf "%s captured=%.0f refunded=%.0f\n", c, cap[c], ref[c] | sorter
+        close(sorter)
         printf "captured_orders=%d refunds=%d\n", ncap, nref
       }
     ' "$file" > "$out"
     ```
 
-    The output format is the same: one line per currency in sorted order, then the totals line. The header line and any other line with a different status are skipped, as before.
+    The output format is the same: one line per currency in sorted order, then the totals line. The header line and lines with any other status are skipped, as before.
 
     **Green Notes**
-    - **Single-pass tools instead of subprocesses in loops** (reduces E): your loop started several processes for every line (`echo`, `cut` three times, `expr`). With 150k lines that is hundreds of thousands of process starts, and this is what makes the job slow. Now one `awk` process reads the file once. In Green Metrics Tool micro-benchmarks, summarizing a 20,000-line access log with per-field `$(echo | cut)` and `$(expr)` used over 1000× more CPU energy than one `awk` pass, and about 300× more than a loop with only bash builtins.
-    - **Single quotes for literals** (reduces E, small here): the path, the usage text and the awk program need no expansion, so they use single quotes. The saving is tiny for short strings in a script that runs once a night. It grows with literal length and loop count. The variable `"$file"` keeps its double quotes.
+    - **Single-pass tools instead of subprocesses in loops** (reduces E): your loop started several processes for every line (`echo`, `cut` three times, `expr`). With 150k lines that is hundreds of thousands of process starts, and that is what makes the job slow. Now one `awk` process reads the file once. In Green Metrics Tool micro-benchmarks, summarizing a 20,000-line access log with per-field `$(echo | cut)` and `$(expr)` used over 1000× more CPU energy than one `awk` pass, and about 300× more than a loop with only bash builtins.
+    - **Single quotes for literals** (reduces E, small here): the path, the usage text, the status names and the awk program need no expansion, so they are in single quotes. The status names and the `sort` command go into awk with `-v`. The saving is tiny for short strings in a script that runs once a night, and it grows with literal length and loop count. The variable `"$file"` keeps its double quotes.
 
     Differences to know about:
-    - `read` skipped a last line that has no trailing newline. `awk` reads it. If the provider's file ever ends that way, the new totals are the correct ones.
-    - The sums use `%.0f`, so large cent totals do not overflow on awk versions with 32-bit integers.
-    - `set -euo pipefail` makes the job fail loudly if the file is missing or `awk` fails, so cron can mail you instead of leaving a half-written summary unnoticed.
+    - `read` skipped a last line with no trailing newline. `awk` reads it. If the provider's file ever ends that way, the new totals are the correct ones.
+    - The sums use `%.0f`, so large cent totals don't overflow on awk versions with 32-bit integers.
+    - `set -euo pipefail` makes the job fail loudly if the file is missing or `awk` fails. Cron can then mail you, so a half-written summary doesn't go unnoticed.
     - The `declare -A` arrays are gone, so the script no longer needs bash 4.
 verify:
   static_only: needs a sample settlement file and a temp output path, bash output compared by hand

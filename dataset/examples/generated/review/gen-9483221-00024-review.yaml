@@ -1,0 +1,109 @@
+id: gen-9483221-00024-review
+category: review
+language: python
+patterns:
+- regex-precompile
+- keep-star-imports
+facts:
+- F-REGEX
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import re
+    import sys
+    from collections import *
+
+    def summarize(path):
+        hits = Counter()
+        errors = defaultdict(list)
+        with open(path) as f:
+            for line in f:
+                m = re.match(r'(\S+) \S+ \S+ \[([^\]]+)\] "(\S+) (\S+) [^"]*" (\d{3}) (\d+|-)', line)
+                if not m:
+                    continue
+                ip, ts, method, url, status, size = m.groups()
+                if re.match(r'5\d\d$', status):
+                    errors[url].append(ip)
+                hits[re.sub(r'\?.*$', '', url)] += 1
+        return hits, errors
+
+    if __name__ == "__main__":
+        hits, errors = summarize(sys.argv[1])
+        for url, n in hits.most_common(10):
+            print(n, url)
+        print("5xx urls:", len(errors))
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (access log processing)
+
+    #### [Low] Three regexes passed as strings on every line
+    - **Where:** the `re.match(...)`, `re.match(...)` and `re.sub(...)` calls in the loop
+    - **Issue:** each call looks the pattern up in Python's internal regex cache. The patterns are fixed, so this is repeated work for every log line. The win is small, because `re` caches compiled patterns. In Green Metrics Tool micro-benchmarks with 1,000,000 matches, an inline `re.match(pattern, s)` used ~21 J of CPU energy and a precompiled pattern ~18 J, about 18% less.
+    - **Fix:** compile once at module level:
+      ```python
+      LINE_RE = re.compile(r'(\S+) \S+ \S+ \[([^\]]+)\] "(\S+) (\S+) [^"]*" (\d{3}) (\d+|-)')
+      SERVER_ERROR_RE = re.compile(r'5\d\d$')
+      QUERY_RE = re.compile(r'\?.*$')
+      ```
+    - **Impact:** reduces E per line. It is a small, steady saving on big logs. It matters little for a log of a few thousand lines.
+
+    ```python
+    import re
+    import sys
+    from collections import *
+
+    LINE_RE = re.compile(r'(\S+) \S+ \S+ \[([^\]]+)\] "(\S+) (\S+) [^"]*" (\d{3}) (\d+|-)')
+    SERVER_ERROR_RE = re.compile(r'5\d\d$')
+    QUERY_RE = re.compile(r'\?.*$')
+
+    def summarize(path):
+        hits = Counter()
+        errors = defaultdict(list)
+        with open(path) as f:
+            for line in f:
+                m = LINE_RE.match(line)
+                if not m:
+                    continue
+                ip, ts, method, url, status, size = m.groups()
+                if SERVER_ERROR_RE.match(status):
+                    errors[url].append(ip)
+                hits[QUERY_RE.sub('', url)] += 1
+        return hits, errors
+
+    if __name__ == "__main__":
+        hits, errors = summarize(sys.argv[1])
+        for url, n in hits.most_common(10):
+            print(n, url)
+        print("5xx urls:", len(errors))
+    ```
+
+    **Star import:** `from collections import *` is fine to keep. In Green Metrics Tool micro-benchmarks, star imports and `import x` showed no measurable energy difference, so I left it as is.
+
+    **Already good:** the file is read line by line, so memory stays flat on large logs. The `with` block closes the file.
+verify:
+  module: true
+  equivalence:
+    driver: |-
+      import os
+      import tempfile
+      lines = [
+          '10.0.0.1 - - [01/May/2024:10:00:00 +0000] "GET /index.html?a=1 HTTP/1.1" 200 512',
+          '10.0.0.2 - - [01/May/2024:10:00:01 +0000] "POST /api/orders HTTP/1.1" 500 -',
+          '10.0.0.3 - - [01/May/2024:10:00:02 +0000] "GET /index.html HTTP/1.1" 200 100',
+          'garbage line',
+          '10.0.0.4 - - [01/May/2024:10:00:03 +0000] "GET /api/orders?id=7 HTTP/1.1" 503 12',
+          '10.0.0.5 - - [01/May/2024:10:00:04 +0000] "GET /api/orders HTTP/1.1" 502 0',
+      ]
+      with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as tmp:
+          tmp.write("\n".join(lines) + "\n")
+      try:
+          hits, errors = summarize(tmp.name)
+          print(sorted(hits.items()))
+          print(sorted(errors.items()))
+      finally:
+          os.unlink(tmp.name)

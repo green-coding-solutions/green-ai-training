@@ -64,21 +64,32 @@ messages:
 
     #### [High] Inference runs with autograd enabled
     - **Where:** `classify_batch`, the `model(**enc)` call
-    - **Issue:** outside `torch.no_grad()` PyTorch records the graph for a backward pass that never happens. That costs CPU time and memory on every batch. In Green Metrics Tool micro-benchmarks, 100,000 CPU inferences used ~157 J without `torch.no_grad()` and ~135 J with it, about 14% less. The saving is moderate per call, but it repeats for every ticket and every night.
-    - **Fix:** decorate the function. Output values do not change.
-      ```python
-      @torch.no_grad()
-      def classify_batch(texts):
-          ...
-      ```
-    - **Impact:** E and M, a steady cut on every batch, with lower peak memory on a CPU-only worker.
+    - **Issue:** outside `torch.no_grad()`, PyTorch records the graph for a backward pass that never happens. That costs CPU time and memory on every batch. In Green Metrics Tool micro-benchmarks, 100,000 CPU inferences used ~157 J without `torch.no_grad()` and ~135 J with it, about 14% less. The saving per call is moderate, but it repeats for every ticket and every night.
+    - **Fix:** put the `@torch.no_grad()` decorator on `classify_batch`. The output values do not change.
+    - **Impact:** E and M. A steady cut on every batch, and lower peak memory on a CPU-only worker.
 
     #### [Medium] Report built with `+=` in the row loop
     - **Where:** `report += f"..."` in `run`
-    - **Issue:** one string is grown once per ticket. Each `+=` can copy the string built so far, so the cost can grow faster than the row count. An f-string with `+=` behaves the same way. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces used ~469 J with `+=` and ~1.8 J with `"".join()`, roughly 260× less. That is a much larger piece count than your dump, and I would not scale the figure to it. Model inference will still dominate your run time, so this is Medium. It is a trivial fix and it removes a cost that grows with input size.
-    - **Fix:** collect the rows in a list and join once. The file content stays byte for byte the same, including the trailing newline on each row.
+    - **Issue:** one string grows by one row per ticket. Each `+=` can copy the whole string built so far, so the cost can grow faster than the row count. An f-string with `+=` behaves the same way. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces used ~469 J with `+=` and ~1.8 J with `"".join()`, roughly 260× less. That benchmark used far more pieces than your dump has, so I would not scale the figure to your case. Model inference will still dominate your run time, which is why this is Medium. The fix is trivial, though, and it removes a cost that grows with input size.
+    - **Fix:** collect the rows in a list and join them once. The file content stays byte for byte the same, including the trailing newline on each row.
+    - **Impact:** E. The string cost stays linear in the number of tickets.
+
+    Both changes together:
 
     ```python
+    import sys
+    import torch
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+    MODEL_DIR = "models/ticket-triage-v3"
+    LABELS = ["billing", "bug", "feature", "other"]
+    BATCH_SIZE = 32
+    MAX_LEN = 256
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+    model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR)
+
+
     @torch.no_grad()
     def classify_batch(texts):
         enc = tokenizer(
@@ -107,10 +118,12 @@ messages:
         with open(path_out, "w", encoding="utf-8") as f:
             f.write("".join(rows))
         print(f"classified {len(lines)} tickets")
+
+
+    if __name__ == "__main__":
+        run(sys.argv[1], sys.argv[2])
     ```
 
-    - **Impact:** E, the string cost stays linear in the number of tickets.
-
-    **Already good:** batching the tokenizer and model calls, `truncation` with a fixed `max_length`, the model loaded once at import, and explicit `encoding="utf-8"`.
+    **Already good:** the tokenizer and model calls are batched, `truncation` uses a fixed `max_length`, the model loads once at import, and the files use explicit `encoding="utf-8"`.
 verify:
   static_only: needs torch, transformers and a local model directory

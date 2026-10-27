@@ -1,0 +1,99 @@
+id: gen-6593849-00176-review
+category: review
+language: bash
+patterns:
+- compress-transmitted
+- bash-quoting
+facts:
+- F-COMPRESS
+- F-TEXT-COMPRESS
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    hello, can you look at this script pls? its a cgi for our landing page, show the number of signups in a little counter. the page call it every time someone open the site. we have not so many visitors but the server is small and sometimes it is slow. i use brotli becouse i read it is the best compression. please tell me what is wrong or can be better
+
+    ```bash
+    #!/bin/bash
+    # stats.cgi - signup numbers for the counter on landing page
+
+    DATA="/var/lib/landing/signups.csv"   # day,campaign,count
+    CAMPAIGN=$QUERY_STRING
+
+    echo "Content-Type: application/json"
+    echo "Content-Encoding: br"
+    echo "Cache-Control: no-cache"
+    echo ""
+
+    json="["
+    first=1
+    while IFS=, read -r day campaign count; do
+        if [ "$CAMPAIGN" != "" ] && [ "$campaign" != "$CAMPAIGN" ]; then
+            continue
+        fi
+        if [ $first -eq 0 ]; then
+            json="$json,"
+        fi
+        json="$json{\"day\":\"$day\",\"campaign\":\"$campaign\",\"count\":$count}"
+        first=0
+    done < "$DATA"
+    json="$json]"
+
+    echo "$json" | brotli -q 11 -c
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (runs on every page view)
+
+    #### [Bug] Brotli is sent to every client
+    - **Where:** `echo "Content-Encoding: br"`
+    - **Issue:** the script never checks `Accept-Encoding`. A client without brotli support gets bytes it can't read. There is also no `Vary: Accept-Encoding`, so a cache can mix up the variants.
+    - **Fix:** read `$HTTP_ACCEPT_ENCODING`, compress only when the client accepts it, and send `Vary: Accept-Encoding`.
+
+    #### [High] Maximum-quality brotli on every request
+    - **Where:** `brotli -q 11 -c`
+    - **Issue:** quality 11 is the slowest and most expensive setting. It is made for files compressed once and served many times. Here it runs on every page view, for a small JSON body.
+    - **Fix:** use a cheap codec for dynamic responses, for example `gzip -5`. All clients support it.
+    - **Impact:** reduces E per request on your small server. In Green Metrics Tool micro-benchmarks compressing 100 MB of text, brotli at its default quality 11 used about 45× the CPU energy of gzip. Those facts compare energy only. Brotli does give smaller files, but for a short JSON that gain is tiny. If the CSV changes only now and then, compress once when the file changes and serve that file. In nginx micro-benchmarks, compressing on every request cost about 4× the CPU energy of serving precompressed files.
+
+    #### [Low] Double quotes on literals that need no expansion
+    - **Where:** the `echo "Content-Type: ..."` lines, `DATA="..."`, `json="["`, `echo ""`
+    - **Issue:** Bash scans double-quoted text for `$`, backticks and backslashes. Single quotes are taken as is. In Green Metrics Tool micro-benchmarks, single quotes used about 24% less CPU energy for assigning a 6,200-character literal in a loop. Your literals are short and run once per request, so the real saving is very small.
+    - **Fix:** single quotes for fixed text. Keep double quotes around variables. `printf -v` with a single-quoted template also removes the escaped `\"` in the JSON line.
+
+    ```bash
+    #!/bin/bash
+    # stats.cgi - signup numbers for the counter on landing page
+
+    DATA='/var/lib/landing/signups.csv'   # day,campaign,count
+    CAMPAIGN=$QUERY_STRING
+
+    echo 'Content-Type: application/json'
+    echo 'Cache-Control: no-cache'
+    echo 'Vary: Accept-Encoding'
+    if [[ $HTTP_ACCEPT_ENCODING == *gzip* ]]; then
+        echo 'Content-Encoding: gzip'
+        compress() { gzip -5 -c; }
+    else
+        compress() { cat; }
+    fi
+    echo
+
+    json='['
+    sep=''
+    while IFS=, read -r day campaign count; do
+        if [[ -n $CAMPAIGN && $campaign != "$CAMPAIGN" ]]; then
+            continue
+        fi
+        printf -v row '{"day":"%s","campaign":"%s","count":%s}' "$day" "$campaign" "$count"
+        json+=$sep$row
+        sep=','
+    done < "$DATA"
+    json+=']'
+
+    printf '%s\n' "$json" | compress
+    ```
+
+    **Already good:** the loop uses `read -r` and no subprocesses per line, and `Cache-Control: no-cache` is set on purpose for changing data.
+verify:
+  static_only: CGI script needs a web server environment, CSV data and the brotli binary

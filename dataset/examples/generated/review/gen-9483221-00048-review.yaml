@@ -1,0 +1,107 @@
+id: gen-9483221-00048-review
+category: review
+language: python
+patterns:
+- keep-star-imports
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    review?
+
+    ```python
+    # gw_buffer.py - buffers sensor frames on the gateway, spools them to disk
+    from struct import *
+    from time import *
+    from json import *
+
+    FRAME = '<HHhI'   # sensor id, flags, temp in 0.01 C, uptime in s
+    SPOOL = '/var/spool/gw/readings.jsonl'
+
+
+    def parse_frames(buf):
+        out = []
+        size = calcsize(FRAME)
+        for i in range(0, len(buf) - size + 1, size):
+            sid, flags, t, up = unpack(FRAME, buf[i:i + size])
+            out.append({'id': sid, 'flags': flags, 'temp': t / 100, 'up': up, 'ts': time()})
+        return out
+
+
+    def flush(readings):
+        with open(SPOOL, 'a') as f:
+            for r in readings:
+                f.write(dumps(r) + '\n')
+
+
+    def run(port):
+        pending = []
+        while True:
+            data = port.read(64)
+            pending += parse_frames(data)
+            if len(pending) >= 20:
+                flush(pending)
+                pending = []
+            sleep(0.5)
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (small gateway daemon)
+
+    #### [Bug] Partial frames are dropped and the stream drifts
+    - **Where:** `parse_frames(data)` in `run`
+    - **Issue:** a frame is 10 bytes, but `port.read(64)` returns 64 bytes. That is 6 full frames and 4 bytes of a 7th. Those 4 bytes are thrown away, and the next read starts in the middle of a frame. From then on every frame is decoded from the wrong offset, so ids and temperatures are garbage. The same happens whenever a read returns fewer bytes than asked.
+    - **Fix:** keep the unused tail and put it in front of the next read:
+
+    ```python
+    # gw_buffer.py - buffers sensor frames on the gateway, spools them to disk
+    from struct import *
+    from time import *
+    from json import *
+
+    FRAME = '<HHhI'   # sensor id, flags, temp in 0.01 C, uptime in s
+    SPOOL = '/var/spool/gw/readings.jsonl'
+
+
+    def parse_frames(buf):
+        out = []
+        size = calcsize(FRAME)
+        usable = len(buf) - len(buf) % size
+        for i in range(0, usable, size):
+            sid, flags, t, up = unpack(FRAME, buf[i:i + size])
+            out.append({'id': sid, 'flags': flags, 'temp': t / 100, 'up': up, 'ts': time()})
+        return out, buf[usable:]
+
+
+    def flush(readings):
+        with open(SPOOL, 'a') as f:
+            for r in readings:
+                f.write(dumps(r) + '\n')
+
+
+    def run(port):
+        pending = []
+        rest = b''
+        while True:
+            readings, rest = parse_frames(rest + port.read(64))
+            pending += readings
+            if len(pending) >= 20:
+                flush(pending)
+                pending = []
+            sleep(0.5)
+    ```
+
+    #### Star imports
+    I left `from struct import *`, `from time import *` and `from json import *` as they are. In Green Metrics Tool micro-benchmarks, 1,000 process starts with `from sympy import *` used ~3103 J and with `import sympy` ~3093 J, so there is no measurable energy difference. Change them only if you want to for style.
+
+    **Already good:** frames are written in batches of 20 and the spool file is opened once per flush. No efficiency issues worth changing.
+verify:
+  test: |-
+    a = pack(FRAME, 1, 0, 2150, 100)
+    b = pack(FRAME, 2, 0, -300, 101)
+    r, rest = parse_frames(a + b[:4])
+    assert [x['id'] for x in r] == [1] and rest == b[:4]
+    assert r[0]['temp'] == 21.5
+    r, rest = parse_frames(rest + b[4:])
+    assert len(r) == 1 and r[0]['id'] == 2 and r[0]['temp'] == -3.0 and rest == b''

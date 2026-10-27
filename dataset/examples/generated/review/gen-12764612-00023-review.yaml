@@ -53,46 +53,49 @@ messages:
     #### [Low] Repeated attribute and global lookups in the per-line loop
     - **Where:** `feed`: `math.log2`, `self.max_bucket`, `self.counts`, `self.total`
     - **Issue:** each line does a module attribute lookup, three instance attribute lookups and one attribute write. They never change during the loop. In Green Metrics Tool micro-benchmarks, binding `math.sqrt` to a local before a 10,000,000-iteration loop saved about 4-5%. That is a small win, and only worth it because this loop runs once per log line on large files.
-    - **Fix:** bind them once before the loop, count in a local, and add to `self.total` at the end. The `finally` keeps `total` correct if a bad line raises:
-      ```python
-      import math
-
-      class LatencyHistogram:
-          """Power-of-two latency buckets from an access log.
-          Line format: ip method path ms
-          """
-
-          def __init__(self, max_bucket=20):
-              self.max_bucket = max_bucket
-              self.counts = [0] * (max_bucket + 1)
-              self.total = 0
-
-          def feed(self, path):
-              counts = self.counts
-              max_bucket = self.max_bucket
-              log2 = math.log2
-              n = 0
-              try:
-                  with open(path) as f:
-                      for line in f:
-                          parts = line.split()
-                          if len(parts) < 4:
-                              continue
-                          ms = float(parts[3])
-                          b = int(log2(ms)) if ms >= 1 else 0
-                          if b > max_bucket:
-                              b = max_bucket
-                          counts[b] += 1
-                          n += 1
-              finally:
-                  self.total += n
-
-          def report(self):
-              for i, c in enumerate(self.counts):
-                  if c:
-                      print(f"<{2 ** (i + 1)}ms: {c}")
-      ```
+    - **Fix:** bind them once before the loop, count in a local, and add to `self.total` at the end. The `finally` keeps `total` correct if a bad line raises.
     - **Impact:** E, a few percent of the loop's CPU time at most. Reading and parsing the lines dominates, so don't expect more.
+
+    The class with both fixes:
+
+    ```python
+    import math
+
+    class LatencyHistogram:
+        """Power-of-two latency buckets from an access log.
+        Line format: ip method path ms
+        """
+
+        def __init__(self, max_bucket=20):
+            self.max_bucket = max_bucket
+            self.counts = [0] * (max_bucket + 1)
+            self.total = 0
+
+        def feed(self, path):
+            counts = self.counts
+            max_bucket = self.max_bucket
+            log2 = math.log2
+            n = 0
+            try:
+                with open(path) as f:
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) < 4:
+                            continue
+                        ms = float(parts[3])
+                        b = int(log2(ms)) if ms >= 1 else 0
+                        if b > max_bucket:
+                            b = max_bucket
+                        counts[b] += 1
+                        n += 1
+            finally:
+                self.total += n
+
+        def report(self):
+            for i, c in enumerate(self.counts):
+                if c:
+                    print(f"<{2 ** (i + 1)}ms: {c}")
+    ```
 
     **Already good:** the file is streamed line by line, so memory stays flat, and the bucket list is fixed-size.
 verify:

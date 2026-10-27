@@ -1,0 +1,38 @@
+id: gen-12764612-00473-estimate
+category: estimate
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    Heat pump gateway, CPU only, ARM. Scores each sensor window with a small torch model. Diff only please, and what does it save?
+
+    ```python
+    def score_window(self, window):
+        x = torch.tensor(window, dtype=torch.float32).unsqueeze(0)
+        self.model.eval()
+        out = self.model(x)
+        return float(out.squeeze())
+    ```
+- role: assistant
+  content: |
+    ```diff
+    -        self.model.eval()
+    -        out = self.model(x)
+    +        with torch.no_grad():
+    +            out = self.model(x)
+    ```
+
+    Also move `self.model.eval()` to `__init__`. It only needs to run once, not per window.
+
+    **Green Notes**
+    - **torch.no_grad()** (reduces E): without it, every forward pass records an autograd graph that you never use. In Green Metrics Tool micro-benchmarks, 100,000 PyTorch CPU inferences used ~157 J without `torch.no_grad()` and ~135 J with it, about 14% less.
+
+    That figure comes from one x86 benchmark with its own model. I can't give you a number for your gateway. The saving depends on model size, because the graph work grows with the number of ops, and on your CPU. Behavior is unchanged: the output value is the same, you just can't call `backward()` on it.
+
+    To measure it on the gateway, run a fixed set of windows (say 100,000) through both versions and compare CPU time with `perf stat` or `time`. Use RAPL if the SoC exposes it. A Green Metrics Tool usage scenario can also run both variants.
+verify:
+  static_only: needs torch, which is not in stdlib

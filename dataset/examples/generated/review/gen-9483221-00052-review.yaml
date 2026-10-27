@@ -1,0 +1,74 @@
+id: gen-9483221-00052-review
+category: review
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    ```dockerfile
+    FROM python:3.12
+
+    RUN apt-get update && apt-get install -y build-essential git curl vim
+    RUN pip install pytest black mypy ipython
+
+    WORKDIR /app
+    COPY . .
+    RUN pip install -r requirements.txt
+
+    ENV FLASK_APP=app.py
+    EXPOSE 5000
+    CMD ["flask", "run", "--host=0.0.0.0", "--debug"]
+    ```
+
+    ?
+- role: assistant
+  content: |
+    **Workload:** web (Flask landing page service)
+
+    #### [Security] Debug mode in the container
+    - **Where:** `CMD ["flask", "run", "--host=0.0.0.0", "--debug"]`
+    - **Issue:** `--debug` turns on the Werkzeug debugger. Anyone who can reach port 5000 and trigger an error can run code on the server. The Flask dev server is also not meant for real traffic.
+    - **Fix:** run a production server such as gunicorn (add it to `requirements.txt`). See the Dockerfile below.
+
+    #### [Security] Runs as root, copies everything
+    - **Where:** no `USER`, and `COPY . .`
+    - **Issue:** the app runs as root inside the container. `COPY . .` also puts everything from the build context into the image, including `.env` or `.git` if you have no `.dockerignore`.
+    - **Fix:** add a non-root `USER`, and list `.env`, `.git`, `__pycache__` and similar in `.dockerignore`.
+
+    #### [High] Fat base image with build and dev tools
+    - **Where:** `FROM python:3.12`, the `apt-get install` line, `pip install pytest black mypy ipython`
+    - **Issue:** the full base image plus compilers, `git`, `vim` and test tools are not needed to serve a landing page. They make every build, pull and stored copy of the image bigger.
+    - **Fix:** use `python:3.12-slim` and install only runtime dependencies. Keep `pytest`, `black` and `mypy` in a separate dev requirements file for CI.
+    - **Impact:** E for every build. In Green Metrics Tool measurements of a small Flask app, building with the full image and dev tools took about 7× more energy than building on `python:3.12-slim` with runtime dependencies only. Serving requests afterwards cost the same with both. Since you build on every push, the saving repeats each time.
+
+    #### [Medium] Dependency layer comes after the source
+    - **Where:** `COPY . .` before `pip install`
+    - **Issue:** any edit to a template or CSS file invalidates the layer cache, so all dependencies are installed again. `pip` also keeps its download cache in the image.
+    - **Fix:** copy `requirements.txt` first, install, then copy the source. Use `--no-cache-dir`.
+    - **Impact:** E per build when only content changes, which is the usual case for a landing page.
+
+    Suggested Dockerfile (assumes your Flask object is called `app` in `app.py`):
+
+    ```dockerfile
+    FROM python:3.12-slim
+
+    WORKDIR /app
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY . .
+
+    RUN useradd --no-create-home appuser
+    USER appuser
+
+    EXPOSE 5000
+    CMD ["gunicorn", "--bind", "0.0.0.0:5000", "app:app"]
+    ```
+
+    If a dependency has no wheel and needs a compiler, build it in a separate stage and copy only the installed packages into the slim image.
+verify:
+  static_only: Dockerfile, needs a container build

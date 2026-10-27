@@ -1,0 +1,51 @@
+id: gen-12764612-00452-generation
+category: generation
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    hello, I need bash script for our gitlab runner server. Every pipeline leave a folder in /var/lib/ci/artifacts (test reports, junit xml, coverage html, build logs) and the disk is allways full. We want keep the old pipelines 90 days in /srv/artifact-archive, only one file per pipeline, and delete the original folder. Pipelines newer than 2 days should stay as they are, because people still open them. It will run from cron every night. Thank you!
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    SRC_DIR=${1:-/var/lib/ci/artifacts}
+    ARCHIVE_DIR=${2:-/srv/artifact-archive}
+    MIN_AGE_DAYS=2
+    KEEP_DAYS=90
+
+    mkdir -p "$ARCHIVE_DIR"
+
+    # one archive per pipeline folder that is older than MIN_AGE_DAYS
+    find "$SRC_DIR" -mindepth 1 -maxdepth 1 -type d -mtime +"$MIN_AGE_DAYS" -print0 |
+    while IFS= read -r -d '' dir; do
+        name=${dir##*/}
+        out="$ARCHIVE_DIR/$name.tar.zst"
+        tmp="$out.part"
+
+        tar -C "$SRC_DIR" -cf - -- "$name" | zstd -q -f -o "$tmp"
+        zstd -q -t "$tmp"          # check the archive before we delete anything
+        mv -- "$tmp" "$out"
+        rm -rf -- "$dir"
+    done
+
+    # remove archives older than KEEP_DAYS
+    find "$ARCHIVE_DIR" -maxdepth 1 -type f -name '*.tar.zst' -mtime +"$KEEP_DAYS" -delete
+    ```
+
+    To open an old pipeline: `tar --zstd -xf /srv/artifact-archive/<pipeline>.tar.zst`. If the script stops in the middle, only a `.part` file stays behind and the original folder is not deleted.
+
+    **Green Notes**
+    - **Fast codec for stored data** (reduces E): the script uses `zstd` at its default level, not `xz` or `gzip -9`. In Green Metrics Tool micro-benchmarks compressing 100 MB of text, zstd used ~16 J, gzip ~67 J and xz ~458 J, so zstd used about 4× less energy than gzip and xz about 29× more than zstd. Reports, XML and logs compress well, and zstd also decompresses fast when someone opens an old pipeline.
+    - **Compress only what is kept** (reduces E, storage): the archives stay 90 days, which is far above the estimated break-even of about 0.15 days for zstd, so compressing pays off. The recent pipelines (2 days) stay uncompressed, because they are opened often and may be deleted soon anyway.
+
+    *Not applied:* stronger codec like `xz -9` — these numbers compare energy only, not file size. Use xz only if the archive must stay for a long time and disk space matters more than the nightly CPU cost. If your artifacts also contain `.zip`, `.jar` or images, those gain almost nothing from compression.
+verify:
+  static_only: needs zstd, tar and a real artifact directory layout

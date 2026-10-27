@@ -1,0 +1,80 @@
+id: gen-12764612-00471-estimate
+category: estimate
+language: javascript
+patterns:
+- css-animations
+facts:
+- F-ANIM
+messages:
+- role: user
+  content: |
+    hi i made a small node cli tool "diskscan" that scans a folder and opens a local page in the browser to show progress. the page has a spinner so you see its working. my laptop fan gets loud when the scan runs for long and i dont know whats wrong. maybe the spinner? this is the code of the spinner in public/app.js
+
+    ```js
+    const spinner = document.getElementById('spinner');
+    const label = document.getElementById('label');
+    let angle = 0;
+
+    const timer = setInterval(() => {
+      angle = (angle + 6) % 360;
+      spinner.style.transform = 'rotate(' + angle + 'deg)';
+    }, 16);
+
+    const events = new EventSource('/progress');
+    events.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+      label.textContent = data.files + ' files, ' + data.mb + ' MB';
+      if (data.done) {
+        clearInterval(timer);
+        events.close();
+        label.textContent += ' - finished';
+      }
+    };
+    ```
+
+    how much energy would i save if i do the spinner in another way?
+- role: assistant
+  content: |
+    Some, but the spinner is probably not the main reason for the fan. The scan itself, running in your Node process, is the more likely cause.
+
+    Your timer runs about 60 times per second. Each tick runs JavaScript that writes a new `transform` style. A CSS animation lets the browser do the same rotation without your script running every frame.
+
+    In Green Metrics Tool browser benchmarks, a 20-second animation used ~161 J of CPU energy when JavaScript updated styles every frame with `requestAnimationFrame`. The same animation with CSS `@keyframes` used ~145 J, about 10% less. Your timer uses `setInterval`, not `requestAnimationFrame`, but it does the same kind of work: script wakes up and writes a style every frame.
+
+    ```css
+    #spinner {
+      animation: spin 1s linear infinite;
+    }
+
+    #spinner.done {
+      animation: none;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    ```
+
+    ```js
+    const spinner = document.getElementById('spinner');
+    const label = document.getElementById('label');
+
+    const events = new EventSource('/progress');
+    events.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+      label.textContent = data.files + ' files, ' + data.mb + ' MB';
+      if (data.done) {
+        spinner.classList.add('done');
+        events.close();
+        label.textContent += ' - finished';
+      }
+    };
+    ```
+
+    - The animation only changes `transform`, so the browser can run it without recalculating the page layout.
+    - The spinner stops when the scan finishes, as before.
+    - The 10% is for the animation alone, measured in one benchmark. It will not apply to your whole laptop or to your whole scan.
+
+    To find out what causes the fan, compare the browser task manager with `top` for the Node process while a scan runs. To measure the spinner change, run both versions for the same time in a Green Metrics Tool usage scenario, or at least compare CPU time with `perf stat`.
+verify:
+  static_only: browser DOM code

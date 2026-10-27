@@ -1,0 +1,108 @@
+id: gen-12764612-00394-review
+category: review
+language: bash
+patterns:
+- bash-quoting
+facts:
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    hi, i am not sure whats wrong with this but my supervisor said it looks "sloppy". i write a header on top of every output file from our lattice boltzmann parameter sweep (about 30000 .dat files). it works for me. can you check it?
+
+    ```bash
+    #!/usr/bin/env bash
+    OUTDIR="results/sweep_042"
+    count=0
+
+    for f in $OUTDIR/*.dat; do
+        echo "# Lattice Boltzmann sweep output" > $f.tmp
+        echo "# Columns: step, time_s, density, velocity_x, velocity_y, pressure" >> $f.tmp
+        echo "# Units: SI. Time step dt = 1e-5 s. Grid 256x256, periodic boundaries." >> $f.tmp
+        echo "# Do not edit by hand. Regenerate with run_sweep.sh" >> $f.tmp
+        cat $f >> $f.tmp
+        mv $f.tmp $f
+        count=$((count+1))
+    done
+
+    echo "Stamped $count files"
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (batch over ~30000 files)
+
+    #### [Bug] Unquoted variables
+    - **Where:** `$OUTDIR/*.dat`, `$f.tmp`, `cat $f`, `mv $f.tmp $f`
+    - **Issue:** if a path ever contains a space (for example `run 7.dat`), bash splits it into two words. Then `cat` and `mv` act on the wrong files, and you can lose data. Your supervisor is right about quotes here: variables need double quotes.
+    - **Fix:** `"$OUTDIR"/*.dat`, `"$f.tmp"`, `"$f"`.
+
+    #### [Bug] Empty glob runs the loop once
+    - **Where:** `for f in $OUTDIR/*.dat`
+    - **Issue:** if no `.dat` file exists, bash keeps the literal text `*.dat` as `$f`. The loop then creates a stray `*.dat.tmp` and prints "Stamped 1 files".
+    - **Fix:** add `shopt -s nullglob` before the loop, so an empty match runs zero times.
+
+    #### [Low] Double quotes around fixed text
+    - **Where:** the four `echo "# ..."` lines inside the loop
+    - **Issue:** these lines contain nothing to expand, but bash scans double-quoted text for `$`, backticks and backslashes on every pass. In Green Metrics Tool micro-benchmarks, single quotes used about 24% less CPU energy for that work, measured on a 6,200-character literal in a loop. Your lines are short, so the absolute saving is small. It is not worth more than a Low, but single quotes are the better default, and they stop accidental expansion if someone later adds a `$` to the text.
+    - **Fix:** single quotes for the literal text. Keep double quotes where a variable must expand (`"$f"`, `"Stamped $count files"`). Do not remove quotes around variables.
+
+    ```bash
+    #!/usr/bin/env bash
+    OUTDIR='results/sweep_042'
+    count=0
+    shopt -s nullglob
+
+    for f in "$OUTDIR"/*.dat; do
+        echo '# Lattice Boltzmann sweep output' > "$f.tmp"
+        echo '# Columns: step, time_s, density, velocity_x, velocity_y, pressure' >> "$f.tmp"
+        echo '# Units: SI. Time step dt = 1e-5 s. Grid 256x256, periodic boundaries.' >> "$f.tmp"
+        echo '# Do not edit by hand. Regenerate with run_sweep.sh' >> "$f.tmp"
+        cat -- "$f" >> "$f.tmp"
+        mv -- "$f.tmp" "$f"
+        count=$((count+1))
+    done
+
+    echo "Stamped $count files"
+    ```
+
+    **Already good:** writing to a `.tmp` file and then `mv` means a crash never leaves a half-written data file. The counter uses `$(( ))`, so it starts no extra process.
+verify:
+  lang: bash
+  setup: |
+    d="$(mktemp -d)"
+    mkdir -p "$d/results/sweep_042"
+    for i in 1 2 3; do printf '%s\n' "$i 0.1 1.0 0.0 0.0 101325" > "$d/results/sweep_042/run$i.dat"; done
+    cd "$d"
+  original_code: |
+    OUTDIR="results/sweep_042"
+    count=0
+
+    for f in $OUTDIR/*.dat; do
+        echo "# Lattice Boltzmann sweep output" > $f.tmp
+        echo "# Columns: step, time_s, density, velocity_x, velocity_y, pressure" >> $f.tmp
+        echo "# Units: SI. Time step dt = 1e-5 s. Grid 256x256, periodic boundaries." >> $f.tmp
+        echo "# Do not edit by hand. Regenerate with run_sweep.sh" >> $f.tmp
+        cat $f >> $f.tmp
+        mv $f.tmp $f
+        count=$((count+1))
+    done
+
+    echo "Stamped $count files"
+  green_code: |
+    OUTDIR='results/sweep_042'
+    count=0
+    shopt -s nullglob
+
+    for f in "$OUTDIR"/*.dat; do
+        echo '# Lattice Boltzmann sweep output' > "$f.tmp"
+        echo '# Columns: step, time_s, density, velocity_x, velocity_y, pressure' >> "$f.tmp"
+        echo '# Units: SI. Time step dt = 1e-5 s. Grid 256x256, periodic boundaries.' >> "$f.tmp"
+        echo '# Do not edit by hand. Regenerate with run_sweep.sh' >> "$f.tmp"
+        cat -- "$f" >> "$f.tmp"
+        mv -- "$f.tmp" "$f"
+        count=$((count+1))
+    done
+
+    echo "Stamped $count files"
+  equivalence:
+    driver: for f in results/sweep_042/*; do echo "== $f"; cat "$f"; done

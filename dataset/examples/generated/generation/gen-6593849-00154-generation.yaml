@@ -1,0 +1,48 @@
+id: gen-6593849-00154-generation
+category: generation
+language: bash
+patterns:
+- bash-quoting
+facts:
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    hello, i need small bash script for our gateway box (raspberry pi, in the factory hall). Sensors write lines in a text file like this:
+
+    ```text
+    # sensor ts temp hum
+    s-014 1761465600 21.4 48.2
+    s-015 1761465600 22.9 51.7
+    ```
+
+    Every few thousand lines per run. I must convert each line to influx line protocol and send all to our influx server one time with curl. Tags are always same: site plant7, region eu-west, gateway gw-12, firmware 2.4.1. Skip comment lines and empty lines pls. Sorry for my english
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    in_file=${1:?usage: gateway-push.sh readings.txt}
+    out_file=$(mktemp)
+    trap 'rm -f "$out_file"' EXIT
+
+    url='http://10.0.0.5:8086/write?db=sensors&precision=s'
+    tags='site=plant7,region=eu-west,gateway=gw-12,firmware=2.4.1'
+
+    while read -r sensor ts temp hum || [[ -n ${sensor:-} ]]; do
+      [[ -z $sensor || $sensor == '#'* ]] && continue
+      printf 'climate,%s,sensor=%s temp=%s,hum=%s %s\n' \
+        "$tags" "$sensor" "$temp" "$hum" "$ts"
+    done < "$in_file" > "$out_file"
+
+    curl -fsS --data-binary "@$out_file" "$url"
+    ```
+
+    Run it with `./gateway-push.sh /var/spool/sensors/readings.txt`. All lines go to one temporary file and are sent in a single request. The file is removed when the script exits, also on errors.
+
+    **Green Notes**
+    - **Single quotes for literals** (reduces E): `url`, `tags`, the `printf` format and the `'#'` pattern need no expansion, so they use single quotes. Bash does not have to scan them for `$`, backticks or backslashes on every loop pass. Double quotes are kept only around variables, where they are required. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal in a loop used about 24% less CPU energy with single quotes. Your literals are short, so the real saving here is small. It grows with literal length and loop count.
+    - *Not applied:* nothing heavier. The loop uses only shell builtins, and a few thousand lines per run does not need another tool.
+verify:
+  static_only: needs a running influx server and curl

@@ -1,0 +1,86 @@
+id: gen-12764612-00431-generation
+category: generation
+language: bash
+patterns:
+- bash-builtins
+- bash-quoting
+facts:
+- F-BASH-SUBPROC
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # build-redirects.sh
+    # landing page: old url -> new url
+    # input redirects.txt, one per line: "/old-pricing /pricing 301"
+    # (status is optional, default 301, # = comment, ~6000 lines after the relaunch)
+    # output: nginx include file, one location block per redirect
+    # runs in the deploy job, fail on bad lines
+    # TODO
+    ```
+
+    ?
+- role: assistant
+  content: |
+    Here is the script. It reads the file once with `read` and `case`, so it starts no extra process per line:
+
+    ```bash
+    #!/usr/bin/env bash
+    # build-redirects.sh <redirects.txt> <out.conf>
+    set -euo pipefail
+
+    in=${1:?'usage: build-redirects.sh redirects.txt out.conf'}
+    out=${2:?'usage: build-redirects.sh redirects.txt out.conf'}
+    tmp=$out.tmp
+    trap 'rm -f "$tmp"' EXIT
+
+    n=0
+    while read -r from to code rest || [[ -n $from ]]; do
+      n=$((n + 1))
+
+      # skip blank lines and comments
+      case $from in
+        ''|'#'*) continue ;;
+      esac
+
+      code=${code:-301}
+
+      case $code in
+        301|302|307|308) ;;
+        *) echo "line $n: bad status '$code'" >&2; exit 1 ;;
+      esac
+
+      case $from in
+        /*) ;;
+        *) echo "line $n: source must start with /" >&2; exit 1 ;;
+      esac
+
+      case $to in
+        /*|http://*|https://*) ;;
+        *) echo "line $n: bad target '$to'" >&2; exit 1 ;;
+      esac
+
+      # characters that would break the nginx config
+      case $from$to in
+        *[\;\{\}\"\'\$\\]*) echo "line $n: illegal character" >&2; exit 1 ;;
+      esac
+
+      printf 'location = %s { return %s %s; }\n' "$from" "$code" "$to"
+    done < "$in" > "$tmp"
+
+    mv "$tmp" "$out"
+    echo "wrote $n lines to $out" >&2
+    ```
+
+    Use it in nginx with `include /etc/nginx/redirects.conf;` inside the `server` block. Run `nginx -t` after the build step.
+
+    The output goes to a temp file and is moved into place at the end. A bad line fails the job and leaves the old file untouched.
+
+    **Green Notes**
+    - **Builtins instead of subprocesses in the loop** (reduces E): `read -r` splits the fields, `case` checks them and `$(( ))` counts, so nothing is forked per line. With about 6000 lines, `$(echo | cut)` or `expr` would start several processes per line. In Green Metrics Tool micro-benchmarks, a log-summary loop with builtins used about 300× less CPU energy than the same loop with `$(echo | cut)` and `$(expr)`, at 20,000 lines. A single `awk` pass is cheaper still, but this loop is small and the checks stay readable.
+    - **Single quotes for literals without expansion** (reduces E): the usage text and the `printf` format are single-quoted. For short strings in a job that runs once per deploy, the saving is tiny. Variables stay in double quotes.
+    - **One output redirect for the whole loop:** the file is opened once, not once per line.
+verify:
+  static_only: bash script that reads and writes files, nginx config output

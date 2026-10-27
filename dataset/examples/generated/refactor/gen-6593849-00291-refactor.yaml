@@ -1,0 +1,104 @@
+id: gen-6593849-00291-refactor
+category: refactor
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    hello, we are small group for ocean modelling and we have a web viewer for the model runs (python app, postgres, redis for the tile cache and a worker who make the plots). Our gitlab ci make a review app for every branch, but I think we have a problem, the cluster is always full and nobody remember to delete old ones. can you clean up this .gitlab-ci.yml? sorry for my english
+
+    ```yaml
+    stages: [build, review]
+
+    variables:
+      IMAGE: $CI_REGISTRY_IMAGE/viewer:$CI_COMMIT_REF_SLUG
+
+    build:
+      stage: build
+      image: docker:26
+      services: [docker:26-dind]
+      script:
+        - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+        - docker build -t $IMAGE .
+        - docker push $IMAGE
+
+    deploy_review:
+      stage: review
+      image: alpine/k8s:1.29.2
+      script:
+        - helm upgrade --install viewer-$CI_COMMIT_REF_SLUG ./chart
+            --namespace review-$CI_COMMIT_REF_SLUG --create-namespace
+            --set image=$IMAGE
+            --set replicaCount=3
+            --set postgres.enabled=true
+            --set redis.enabled=true
+            --set worker.enabled=true
+      environment:
+        name: review/$CI_COMMIT_REF_SLUG
+        url: https://$CI_COMMIT_REF_SLUG.review.ocean-lab.example
+      rules:
+        - if: $CI_COMMIT_BRANCH
+    ```
+- role: assistant
+  content: |
+    ```yaml
+    stages: [build, review]
+
+    variables:
+      IMAGE: $CI_REGISTRY_IMAGE/viewer:$CI_COMMIT_REF_SLUG
+
+    build:
+      stage: build
+      image: docker:26
+      services: [docker:26-dind]
+      script:
+        - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+        - docker build -t $IMAGE .
+        - docker push $IMAGE
+
+    deploy_review:
+      stage: review
+      image: alpine/k8s:1.29.2
+      script:
+        - helm upgrade --install viewer-$CI_COMMIT_REF_SLUG ./chart
+            --namespace review-$CI_COMMIT_REF_SLUG --create-namespace
+            --set image=$IMAGE
+            --set replicaCount=1
+            --set postgres.enabled=true
+            --set redis.enabled=false
+            --set worker.enabled=false
+      environment:
+        name: review/$CI_COMMIT_REF_SLUG
+        url: https://$CI_COMMIT_REF_SLUG.review.ocean-lab.example
+        on_stop: stop_review
+        auto_stop_in: 3 days
+      rules:
+        - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+
+    stop_review:
+      stage: review
+      image: alpine/k8s:1.29.2
+      variables:
+        GIT_STRATEGY: none
+      script:
+        - helm uninstall viewer-$CI_COMMIT_REF_SLUG --namespace review-$CI_COMMIT_REF_SLUG
+        - kubectl delete namespace review-$CI_COMMIT_REF_SLUG --ignore-not-found
+      environment:
+        name: review/$CI_COMMIT_REF_SLUG
+        action: stop
+      rules:
+        - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+          when: manual
+    ```
+
+    **Green Notes**
+    - **Tear down environments** (reduces E, M): this is the main fix for your full cluster. The new `stop_review` job removes the Helm release and the namespace. GitLab runs it when the branch is deleted, for example when you merge with "delete source branch". `auto_stop_in: 3 days` is a fallback for branches that are forgotten. Three days is my guess, change it to fit your team. In Green Metrics Tool micro-benchmarks, an idle preview environment cost only a little per minute. Trimming one from 3 app replicas, Postgres, Redis and a worker down to 1 replica and Postgres saved only about 3% CPU energy over 60 seconds. The real saving is environments that no longer exist, because every hour they stay up is gone.
+    - **Fewer services per preview** (reduces M): 1 replica instead of 3, and no Redis or worker. A review app does not need to be highly available. This reserves less memory on the cluster.
+    - **No review app for the default branch:** the old rule also deployed `main` as a review app. That is now excluded.
+
+    Check that the viewer works without Redis and the worker. If the tile cache is optional, the app should simply be slower. If the worker makes the plots, the plot pages will be empty. In that case set `worker.enabled=true` again and keep the other changes.
+verify:
+  static_only: GitLab CI YAML with Helm and kubectl, needs a cluster

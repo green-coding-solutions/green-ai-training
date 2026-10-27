@@ -1,0 +1,120 @@
+id: gen-6593849-00290-review
+category: review
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    hi, I'm new in the platform team of our smart-meter gateway product and I got this ArgoCD file from my predecessor. It makes a test environment for our firmware team for each branch. People say the cluster is always full but I don't understand what is wrong here. can you look?
+
+    ```yaml
+    apiVersion: argoproj.io/v1alpha1
+    kind: ApplicationSet
+    metadata:
+      name: gateway-branch-envs
+      namespace: argocd
+    spec:
+      generators:
+        - scmProvider:
+            github:
+              organization: acme-iot
+              allBranches: true
+              tokenRef:
+                secretName: github-token
+                key: token
+            filters:
+              - repositoryMatch: '^gateway-stack$'
+      syncPolicy:
+        preserveResourcesOnDeletion: true
+      template:
+        metadata:
+          name: 'gw-{{repository}}-{{branchNormalized}}'
+        spec:
+          project: default
+          source:
+            repoURL: '{{url}}'
+            targetRevision: '{{branch}}'
+            path: charts/gateway-stack
+            helm:
+              parameters:
+                - name: gateway.replicaCount
+                  value: '3'
+                - name: simulator.devices
+                  value: '20'
+                - name: postgres.enabled
+                  value: 'true'
+                - name: redis.enabled
+                  value: 'true'
+                - name: telemetryWorker.enabled
+                  value: 'true'
+                - name: mqtt.password
+                  value: 'gw-test-2024'
+          destination:
+            server: https://kubernetes.default.svc
+            namespace: 'gw-{{branchNormalized}}'
+          syncPolicy:
+            automated:
+              prune: true
+              selfHeal: true
+            syncOptions:
+              - CreateNamespace=true
+    ```
+- role: assistant
+  content: |
+    **Workload:** mixed (CI/CD and infrastructure)
+
+    #### [Security] MQTT password in the file
+    - **Where:** `mqtt.password` in `helm.parameters`
+    - **Issue:** the password is stored in plain text in Git and visible in the ArgoCD UI. Anyone with repo access has it, and test brokers are often reachable from other networks.
+    - **Fix:** create a Kubernetes Secret per environment (or use an external secrets tool) and let the chart read it with `existingSecret`. Rotate the current password.
+
+    #### [High] Every branch gets a full environment, and nothing removes it
+    - **Where:** `allBranches: true` and `preserveResourcesOnDeletion: true`
+    - **Issue:** `allBranches: true` creates a full stack for every branch, including old and abandoned ones, not only branches with a pull request. `preserveResourcesOnDeletion: true` then keeps the namespace running after the branch is deleted. So environments pile up and never go away. This is most likely why the cluster is always full.
+    - **Fix:** create environments only for pull requests that carry a label, and let ArgoCD delete them when the PR closes:
+      ```yaml
+      spec:
+        generators:
+          - pullRequest:
+              github:
+                owner: acme-iot
+                repo: gateway-stack
+                labels: [preview]
+                tokenRef:
+                  secretName: github-token
+                  key: token
+              requeueAfterSeconds: 300
+        syncPolicy:
+          preserveResourcesOnDeletion: false
+        template:
+          metadata:
+            name: 'gw-pr-{{number}}'
+            finalizers:
+              - resources-finalizer.argocd.argoproj.io
+          spec:
+            source:
+              repoURL: 'https://github.com/acme-iot/gateway-stack.git'
+              targetRevision: '{{head_sha}}'
+            destination:
+              namespace: 'gw-pr-{{number}}'
+      ```
+      Keep the rest of the template as it is. The finalizer makes ArgoCD delete the resources when the application is removed. Check the ArgoCD docs for your version.
+    - **Impact:** E and M (memory reserved on the cluster) for every hour an old environment stays up. In Green Metrics Tool micro-benchmarks, an idle preview environment with 3 app replicas, Postgres, Redis and a polling worker used ~269 J of CPU energy in 60 seconds. Trimmed to 1 app replica and Postgres, it used ~262 J, about 3% less. Idle services cost little per minute, so the saving comes from environments that no longer exist, not from trimming each one.
+
+    #### [Medium] Environments are bigger than most tests need
+    - **Where:** `gateway.replicaCount`, `simulator.devices`, `redis.enabled`, `telemetryWorker.enabled`
+    - **Issue:** a test environment for one branch rarely needs 3 gateway replicas, 20 simulated devices, Redis and the telemetry worker. They reserve memory and CPU on the cluster even when idle.
+    - **Fix:** use `gateway.replicaCount: 1`, a handful of simulated devices, and enable Redis and the worker only if the firmware tests use them. Keep a bigger setup for one shared long-running staging environment, if you need load tests.
+    - **Impact:** M (reserved memory and node count). The CPU difference per minute is small, as the measurement above shows.
+
+    #### [Low] Environments run all night and weekends
+    - **Where:** the whole template
+    - **Issue:** nobody is testing firmware at 3 am, but the environments keep running.
+    - **Fix:** scale the preview namespaces to zero in the evening and back up in the morning with a small CronJob, or keep a shared test environment instead of one per PR where that is enough.
+
+    **Already good:** `prune: true` keeps the cluster in line with Git, and `CreateNamespace=true` keeps setup simple.
+verify:
+  static_only: ArgoCD ApplicationSet YAML, needs a cluster

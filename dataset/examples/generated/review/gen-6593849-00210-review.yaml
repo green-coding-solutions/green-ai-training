@@ -1,0 +1,82 @@
+id: gen-6593849-00210-review
+category: review
+language: python
+patterns:
+- torch-no-grad
+- hoist-invariants
+facts:
+- F-NOGRAD
+- F-ATTR
+messages:
+- role: user
+  content: |
+    ```python
+    import math
+    import time
+
+    import torch
+
+
+    class VibrationScorer:
+        def __init__(self, model_path, publish, threshold=0.8):
+            self.model = torch.jit.load(model_path)
+            self.publish = publish
+            self.threshold = threshold
+            self.window = 256
+            self.scale = 1.0 / 2048.0
+            self.alerts = 0
+
+        def normalize(self, raw):
+            out = []
+            for v in raw:
+                out.append(math.sqrt(abs(v) * self.scale) * (1 if v >= 0 else -1))
+            return out
+
+        def score(self, raw):
+            x = torch.tensor(self.normalize(raw), dtype=torch.float32).view(1, 1, -1)
+            out = self.model(x)
+            return float(out.squeeze())
+
+        def run(self, windows):
+            for dev_id, raw in windows:
+                if len(raw) != self.window:
+                    continue
+                s = self.score(raw)
+                if s > self.threshold:
+                    self.alerts += 1
+                    self.publish(f"vib/{dev_id}/alert", {"score": s, "ts": time.time()})
+    ```
+
+    ?
+- role: assistant
+  content: |
+    **Workload:** IoT gateway, ML inference
+
+    #### [High] Inference runs with gradient tracking on
+    - **Where:** `score()`, the call `self.model(x)`
+    - **Issue:** this runs once per window per device, forever. Outside `torch.no_grad()`, PyTorch records an autograd graph that you never use.
+    - **Fix:** wrap the call, and put the model in eval mode once in `__init__`, so layers like dropout and batch norm behave as at inference:
+      ```python
+      self.model = torch.jit.load(model_path)
+      self.model.eval()
+      ...
+      with torch.no_grad():
+          out = self.model(x)
+      ```
+    - **Impact:** reduces E per window, and M for the graph buffers. In Green Metrics Tool micro-benchmarks with 100,000 PyTorch CPU inferences, `torch.no_grad()` used about 14% less CPU energy (~135 J vs ~157 J). Scores do not change.
+
+    #### [Low] Attribute lookups inside the per-sample loop
+    - **Where:** `normalize()`, `math.sqrt`, `self.scale` and `out.append` for every sample
+    - **Issue:** these are looked up again for each of the 256 samples in every window.
+    - **Fix:** bind them to locals once and use a comprehension:
+      ```python
+      def normalize(self, raw):
+          sqrt = math.sqrt
+          scale = self.scale
+          return [sqrt(abs(v) * scale) if v >= 0 else -sqrt(abs(v) * scale) for v in raw]
+      ```
+    - **Impact:** small. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local before a 10,000,000-iteration loop saved about 4-5%. It only matters here because the loop runs on every window. The output is identical.
+
+    **Already good:** windows with the wrong length are skipped before any model work. The tensor is created in one call from a list.
+verify:
+  static_only: needs torch and a TorchScript model file

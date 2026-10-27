@@ -1,0 +1,104 @@
+id: gen-12764612-00466-refactor
+category: refactor
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import os
+
+    import requests
+    from fastapi import FastAPI, HTTPException
+
+    app = FastAPI()
+
+    BILLING_URL = os.environ["BILLING_URL"]
+    USAGE_URL = os.environ["USAGE_URL"]
+    TICKETS_URL = os.environ["TICKETS_URL"]
+
+
+    @app.get("/accounts/{account_id}/overview")
+    async def account_overview(account_id: int):
+        headers = {"Authorization": f"Bearer {os.environ['INTERNAL_TOKEN']}"}
+
+        billing = requests.get(
+            f"{BILLING_URL}/accounts/{account_id}", headers=headers, timeout=5
+        )
+        if billing.status_code == 404:
+            raise HTTPException(status_code=404, detail="account not found")
+
+        usage = requests.get(
+            f"{USAGE_URL}/accounts/{account_id}/current", headers=headers, timeout=5
+        )
+        tickets = requests.get(
+            f"{TICKETS_URL}/accounts/{account_id}/open", headers=headers, timeout=5
+        )
+
+        billing_data = billing.json()
+        return {
+            "plan": billing_data["plan"],
+            "balance": billing_data["balance"],
+            "usage": usage.json(),
+            "open_tickets": len(tickets.json()["items"]),
+        }
+    ```
+- role: assistant
+  content: |
+    ```python
+    import asyncio
+    import os
+    from contextlib import asynccontextmanager
+
+    import httpx
+    from fastapi import FastAPI, HTTPException
+
+    BILLING_URL = os.environ["BILLING_URL"]
+    USAGE_URL = os.environ["USAGE_URL"]
+    TICKETS_URL = os.environ["TICKETS_URL"]
+
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        app.state.http = httpx.AsyncClient(timeout=5)
+        yield
+        await app.state.http.aclose()
+
+
+    app = FastAPI(lifespan=lifespan)
+
+
+    @app.get("/accounts/{account_id}/overview")
+    async def account_overview(account_id: int):
+        headers = {"Authorization": f"Bearer {os.environ['INTERNAL_TOKEN']}"}
+        client = app.state.http
+
+        billing, usage, tickets = await asyncio.gather(
+            client.get(f"{BILLING_URL}/accounts/{account_id}", headers=headers),
+            client.get(f"{USAGE_URL}/accounts/{account_id}/current", headers=headers),
+            client.get(f"{TICKETS_URL}/accounts/{account_id}/open", headers=headers),
+        )
+        if billing.status_code == 404:
+            raise HTTPException(status_code=404, detail="account not found")
+
+        billing_data = billing.json()
+        return {
+            "plan": billing_data["plan"],
+            "balance": billing_data["balance"],
+            "usage": usage.json(),
+            "open_tickets": len(tickets.json()["items"]),
+        }
+    ```
+
+    **Green Notes**
+    - **Concurrent async I/O** (reduces E, mostly wall time): the handler was `async def` but called blocking `requests.get`, so every call froze the event loop for all other requests, and the three calls ran one after another. Now they run together and the request waits for the slowest service, not the sum. Expect a modest energy gain. In Green Metrics Tool micro-benchmarks, 10 HTTP requests with async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. With only 3 calls per request, the saving is mostly latency and a free event loop.
+    - **One shared client:** a single `AsyncClient` is created at startup and closed on shutdown, instead of a new client per call.
+
+    **Behavior change:** the usage and tickets calls are now sent even when the account does not exist. The 404 response is the same, but those two calls are wasted for unknown accounts. If that is common, tell me and I will keep billing first. This needs `httpx` instead of `requests`.
+verify:
+  static_only: needs fastapi and httpx and internal HTTP services, which are not available in the stdlib sandbox

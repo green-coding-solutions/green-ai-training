@@ -1,0 +1,89 @@
+id: gen-6593849-00243-review
+category: review
+language: html
+patterns:
+- dom-size
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    fix this, category page is slow, ~6000 products
+
+    ```html
+    <section class="catalog">
+      <h1>All products</h1>
+      <div id="grid" class="grid"></div>
+    </section>
+
+    <script>
+      fetch('/api/products')
+        .then((r) => r.json())
+        .then((products) => {
+          const grid = document.getElementById('grid');
+          products.forEach((p) => {
+            grid.innerHTML += `
+              <div class="card">
+                <div class="card-inner">
+                  <div class="img-wrap"><img src="${p.image}" alt="${p.name}"></div>
+                  <div class="info">
+                    <div class="name"><span>${p.name}</span></div>
+                    <div class="price"><span>${p.price}</span></div>
+                  </div>
+                </div>
+              </div>`;
+          });
+        });
+    </script>
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (storefront page)
+
+    #### [Security] Product data goes into `innerHTML`
+    - **Where:** the template string in `forEach`
+    - **Issue:** `p.name`, `p.image` and `p.price` are inserted as HTML. If a name contains markup, for example from a supplier feed, it runs in your shop page.
+    - **Fix:** set values with `textContent` and `src`/`alt` properties, as in the snippet below.
+
+    #### [High] All 6,000 products rendered at once
+    - **Where:** the whole `forEach` loop
+    - **Issue:** each card has 9 elements, so the page holds about 54,000 elements. Every `grid.innerHTML +=` also re-parses all cards built so far, so the work grows with each product. Style and layout cost grow with element count on every page view. In Green Metrics Tool browser benchmarks, a 10,000-row table with wrapper elements, appended to the live DOM one by one, used ~1036 J for 30 page loads. Paginated to 100 rows as a plain `<table>` built in a `DocumentFragment`, it used ~457 J, about 56% less. Your page is a card grid, not a table, but the cause is the same.
+    - **Fix:** ask the API for one page and build it off-DOM:
+      ```html
+      <section class="catalog">
+        <h1>All products</h1>
+        <div id="grid" class="grid"></div>
+        <nav id="pager"></nav>
+      </section>
+
+      <script>
+        async function loadPage(page = 1, pageSize = 48) {
+          const res = await fetch(`/api/products?page=${page}&page_size=${pageSize}`);
+          const { items } = await res.json();
+          const frag = document.createDocumentFragment();
+          for (const p of items) {
+            const card = document.createElement('article');
+            card.className = 'card';
+            const img = document.createElement('img');
+            img.src = p.image;
+            img.alt = p.name;
+            const name = document.createElement('h3');
+            name.textContent = p.name;
+            const price = document.createElement('p');
+            price.textContent = p.price;
+            card.append(img, name, price);
+            frag.appendChild(card);
+          }
+          document.getElementById('grid').replaceChildren(frag);
+        }
+        loadPage();
+      </script>
+      ```
+    - **Impact:** E on the client for every page view, and network, because the API sends 48 products instead of 6,000. The endpoint needs `page` and `page_size` (or a cursor), and you need prev/next links in `#pager`. Search, sort and filters must then run on the server, because the browser no longer holds all products.
+
+    #### [Medium] Wrapper elements
+    - **Where:** `card-inner`, `img-wrap`, `info`, and the `div > span` pairs for name and price
+    - **Issue:** these add 6 of the 9 elements per card and carry no content. The snippet above uses 4 per card. If you need a wrapper for CSS, put that style on `.card` or on `img` instead.
+    - **Impact:** E on the client, roughly in proportion to elements per card.
+verify:
+  static_only: browser DOM code needing fetch and a real document

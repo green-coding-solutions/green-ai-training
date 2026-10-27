@@ -1,0 +1,53 @@
+id: gen-9483221-00019-estimate
+category: estimate
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    Beam search backtrace in our decoder service. Profiler flags `out.insert(0, ...)`. Diff only please. And what does it save in energy? Need a line for the sustainability report.
+
+    ```python
+    def reconstruct(step_tokens, step_parents, beam, end_step):
+        """Walk back-pointers from (end_step, beam) to step 0."""
+        out = []
+        b = beam
+        for t in range(end_step, -1, -1):
+            out.insert(0, step_tokens[t][b])
+            b = step_parents[t][b]
+        return out
+    ```
+
+    Up to 512 steps, 8 beams, a few thousand requests a minute.
+- role: assistant
+  content: |
+    ```python
+    out = []
+    b = beam
+    for t in range(end_step, -1, -1):
+        out.append(step_tokens[t][b])
+        b = step_parents[t][b]
+    out.reverse()
+    return out
+    ```
+
+    Same output. Append the tokens while walking back, then reverse once at the end.
+
+    **Energy estimate:** I can't give you a number for your service. What I can say:
+    - In Green Metrics Tool micro-benchmarks, 1,000,000 × `list.insert(0, x)` used ~1515 J and 1,000,000 × `list.append(x)` used ~1.2 J, over 1000× less. Every front insert shifts the whole list.
+    - That list grew to a million items. Yours is at most 512 long, so the gap is much smaller. Front inserts are still quadratic per backtrace, append plus one reverse is linear.
+    - The model forward passes will dominate your total energy, so this change is likely a small share of it. Don't scale the benchmark figure to your traffic.
+
+    To get a number for the report, run the old and new `reconstruct` on a recorded batch of real beams and compare CPU time (`perf stat` or `time`). For energy, use a Green Metrics Tool usage scenario or RAPL on the same run.
+verify:
+  equivalence:
+    driver: |
+      step_tokens = [[(t * 7 + b * 3) % 50 for b in range(4)] for t in range(40)]
+      step_parents = [[(b + t) % 4 for b in range(4)] for t in range(40)]
+      for beam in range(4):
+          print(reconstruct(step_tokens, step_parents, beam, 39))
+      print(reconstruct(step_tokens, step_parents, 2, 0))
+  static_only: answer block is a function body fragment; equivalence checks the full function rewritten from it

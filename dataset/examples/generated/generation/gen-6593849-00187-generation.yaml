@@ -1,0 +1,60 @@
+id: gen-6593849-00187-generation
+category: generation
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    need a python fn that makes the plain text receipt for an order (id, customer, currency, items with sku/name/qty/unit price in cents). b2b orders can have 5k+ lines
+- role: assistant
+  content: |
+    ```python
+    def _money(cents: int) -> str:
+        return f"{cents // 100}.{cents % 100:02d}"
+
+
+    def render_receipt(order: dict) -> str:
+        lines = [f"Order {order['id']}", f"Customer: {order['customer']}", ""]
+        total = 0
+        for item in order["items"]:
+            line_total = item["qty"] * item["unit_price_cents"]
+            total += line_total
+            lines.append(
+                f"{item['sku']:<12} {item['name'][:30]:<30} "
+                f"{item['qty']:>4} x {_money(item['unit_price_cents']):>9} "
+                f"= {_money(line_total):>10}"
+            )
+        lines.append("")
+        lines.append(f"Total: {_money(total)} {order['currency']}")
+        return "\n".join(lines) + "\n"
+    ```
+
+    Prices stay in integer cents, so the total has no float rounding errors. Names longer than 30 characters are cut so the columns line up.
+
+    **Green Notes**
+    - **Join instead of `+=`** (reduces E): each line goes into a list and `"\n".join()` builds the receipt once. With 5k+ lines, `receipt += f"..."` in the loop would copy the growing string again and again. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces with `+=` used ~469 J of CPU energy and `"".join()` ~1.8 J, about 260× less. An f-string added in a loop behaved like `+=`, so the f-strings here only format single lines and are never appended to the result.
+verify:
+  test: |-
+    order = {
+        "id": 1001,
+        "customer": "ACME GmbH",
+        "currency": "EUR",
+        "items": [
+            {"sku": "A1", "name": "Mug", "qty": 2, "unit_price_cents": 450},
+            {"sku": "B22", "name": "X" * 50, "qty": 1, "unit_price_cents": 5},
+        ],
+    }
+    text = render_receipt(order)
+    rows = text.splitlines()
+    assert rows[0] == "Order 1001"
+    assert rows[1] == "Customer: ACME GmbH"
+    assert rows[3].startswith("A1 ") and rows[3].endswith("= " + "9.00".rjust(10))
+    assert "X" * 30 in rows[4] and "X" * 31 not in rows[4]
+    assert text.endswith("Total: 9.05 EUR\n")
+    assert _money(7) == "0.07"
+    big = {"id": 1, "customer": "c", "currency": "EUR",
+           "items": [{"sku": "S", "name": "n", "qty": 1, "unit_price_cents": 100}] * 5000}
+    assert render_receipt(big).endswith("Total: 5000.00 EUR\n")

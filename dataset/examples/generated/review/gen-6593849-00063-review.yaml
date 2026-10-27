@@ -1,0 +1,75 @@
+id: gen-6593849-00063-review
+category: review
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    hello, we are small webshop and this script make backup of our database every hour, we keep 3 days. can you check if is ok? sometimes the server is slow when it run, i dont know why
+
+    ```bash
+    #!/bin/bash
+    # backup shop db every hour
+    DB=shopdb
+    DIR=/var/backups/shop
+    DATE=$(date +%Y%m%d_%H%M)
+
+    mysqldump -u root -pSh0pR00t_2024 $DB > $DIR/$DB-$DATE.sql
+    xz -9e $DIR/$DB-$DATE.sql
+    find $DIR -name "*.sql.xz" -mtime +3 -exec rm {} \;
+    echo "backup done $DATE" >> /var/log/shopbackup.log
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (hourly cron, database backup)
+
+    #### [Security] Database root password on the command line
+    - **Where:** `mysqldump -u root -pSh0pR00t_2024`
+    - **Issue:** every user on the server can see the password in `ps` while the dump runs. It is also stored in the script and in your shell history. The script also uses the root account for a backup.
+    - **Fix:** put the credentials in a file that only the backup user can read, and use a dedicated backup user with read-only rights. Please also change this password, because it is now exposed.
+      ```ini
+      # /root/.shop-backup.cnf (chmod 600)
+      [mysqldump]
+      user=shop_backup
+      password=...
+      ```
+
+    #### [Bug] Failed dump is not detected, old backups are still deleted
+    - **Where:** the line after `mysqldump`, and the `find ... rm` line
+    - **Issue:** if `mysqldump` fails halfway, the script still compresses the broken file and still deletes old backups. After a few failed hours you can have no good backup left. Unquoted `$DIR` and `$DB` also break if a path has a space.
+    - **Fix:** `set -euo pipefail`, write to a temporary name, and rename only when the dump is complete (see the script below).
+
+    #### [High] Slowest xz level for data you compress every hour
+    - **Where:** `xz -9e`
+    - **Issue:** `xz -9e` is one of the most expensive ways to compress. It is the likely reason the server is slow during the backup. You compress 24 times a day and delete after 3 days. In Green Metrics Tool micro-benchmarks compressing 100 MB of text, xz used ~458 J of CPU energy and zstd at its default level ~16 J, so xz used about 29× more. The single extra `-e` makes it even slower than that default xz run.
+    - **Fix:** use `zstd` at its default level, and stream the dump into it so the big `.sql` file is never written to disk.
+    - **Impact:** E on the server, every hour. Also less disk I/O and a shorter slow period. These measurements compare energy only, not file size. xz usually gives smaller files, so expect the zstd files to be somewhat bigger. For 3 days of backups this is normally fine. If disk space is tight, try a higher zstd level and check that it is still cheap.
+
+    #### Fixed script
+    ```bash
+    #!/usr/bin/env bash
+    # backup shop db every hour
+    set -euo pipefail
+
+    DB=shopdb
+    DIR=/var/backups/shop
+    DATE=$(date +%Y%m%d_%H%M)
+    OUT="$DIR/$DB-$DATE.sql.zst"
+
+    trap 'rm -f "$OUT.tmp"' EXIT
+
+    mysqldump --defaults-extra-file=/root/.shop-backup.cnf "$DB" | zstd -q -o "$OUT.tmp"
+    mv "$OUT.tmp" "$OUT"
+
+    find "$DIR" -name '*.sql.zst' -mtime +3 -delete
+    echo "backup done $DATE" >> /var/log/shopbackup.log
+    ```
+
+    To restore: `zstd -dc /var/backups/shop/shopdb-<date>.sql.zst | mysql shopdb`. The old `.sql.xz` files are not deleted by the new `find`, so remove them by hand once you have enough new backups.
+
+    **Already good:** the dumps are compressed and old ones are cleaned up. Since you keep them for 3 days, compression is worth it.
+verify:
+  static_only: needs mysqldump, a database and zstd; shell script only

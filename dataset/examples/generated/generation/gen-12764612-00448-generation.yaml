@@ -1,0 +1,95 @@
+id: gen-12764612-00448-generation
+category: generation
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    gh actions workflow: PR preview on our one vm over ssh, docker compose, project per PR
+- role: assistant
+  content: |
+    This assumes `compose.yaml` reads the host port from `APP_PORT`, and that the secrets `PREVIEW_HOST`, `PREVIEW_USER`, `PREVIEW_SSH_KEY` and `PREVIEW_KNOWN_HOSTS` exist.
+
+    ```yaml
+    name: PR preview
+
+    on:
+      pull_request:
+        types: [labeled, unlabeled, synchronize, reopened, closed]
+
+    concurrency:
+      group: preview-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+
+    permissions:
+      contents: read
+
+    env:
+      PR: ${{ github.event.pull_request.number }}
+      HOST: ${{ secrets.PREVIEW_HOST }}
+      REMOTE_USER: ${{ secrets.PREVIEW_USER }}
+
+    jobs:
+      deploy:
+        # Only PRs labeled "preview", only from this repo (no secrets for forks).
+        if: >
+          github.event.action != 'closed' &&
+          github.event.action != 'unlabeled' &&
+          (github.event.action != 'labeled' || github.event.label.name == 'preview') &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          contains(github.event.pull_request.labels.*.name, 'preview')
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+
+          - name: Set up SSH
+            env:
+              SSH_KEY: ${{ secrets.PREVIEW_SSH_KEY }}
+              KNOWN_HOSTS: ${{ secrets.PREVIEW_KNOWN_HOSTS }}
+            run: |
+              install -m 700 -d ~/.ssh
+              printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+              chmod 600 ~/.ssh/id_ed25519
+              printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+          - name: Copy sources
+            run: |
+              rsync -az --delete --exclude '.git' ./ "$REMOTE_USER@$HOST:/srv/previews/pr-$PR/"
+
+          - name: Start the stack
+            run: |
+              ssh "$REMOTE_USER@$HOST" "cd /srv/previews/pr-$PR && APP_PORT=$((20000 + PR)) docker compose -p pr-$PR up -d --build --remove-orphans"
+
+      teardown:
+        # Remove the stack when the PR closes or the label is removed.
+        if: >
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          (github.event.action == 'closed' ||
+           (github.event.action == 'unlabeled' && github.event.label.name == 'preview'))
+        runs-on: ubuntu-latest
+        steps:
+          - name: Set up SSH
+            env:
+              SSH_KEY: ${{ secrets.PREVIEW_SSH_KEY }}
+              KNOWN_HOSTS: ${{ secrets.PREVIEW_KNOWN_HOSTS }}
+            run: |
+              install -m 700 -d ~/.ssh
+              printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+              chmod 600 ~/.ssh/id_ed25519
+              printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+          - name: Remove the stack
+            run: |
+              ssh "$REMOTE_USER@$HOST" "if [ -d /srv/previews/pr-$PR ]; then cd /srv/previews/pr-$PR && docker compose -p pr-$PR down -v --rmi local; fi; rm -rf /srv/previews/pr-$PR"
+    ```
+
+    **Green Notes**
+    - **Minimize deployed environments** (reduces E, M): a preview exists only for PRs with the `preview` label, and it is removed when the PR closes or the label is removed. No stack is left running on the VM after a merge. In Green Metrics Tool micro-benchmarks, a preview environment idling for 60 seconds with 3 app replicas, Postgres, Redis and a worker used only about 3% more CPU energy than 1 replica plus Postgres. Idle services cost little per minute. The saving comes from environments that don't exist, so teardown matters more than trimming services.
+    - *Not applied:* a nightly stop job. On a single shared VM the idle cost per minute is small, so add one only if memory on the VM becomes the limit.
+
+    Previews from forks are skipped on purpose, so a fork PR can't run code with your SSH key.
+verify:
+  static_only: GitHub Actions workflow YAML, needs SSH host and Docker

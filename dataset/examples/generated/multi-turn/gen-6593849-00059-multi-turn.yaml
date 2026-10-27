@@ -1,0 +1,125 @@
+id: gen-6593849-00059-multi-turn
+category: multi-turn
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    depweight is crawling on our monorepo lockfile (~4k packages, lots of shared deps). diff only please
+
+    ```python
+    #!/usr/bin/env python3
+    """depweight: print transitive dependency counts from a lockfile graph."""
+    import argparse
+    import json
+    import sys
+
+    GRAPH = {}
+
+
+    def load_graph(path):
+        with open(path) as f:
+            data = json.load(f)
+        return {name: entry.get("deps", []) for name, entry in data["packages"].items()}
+
+
+    def transitive(pkg):
+        seen = set()
+        for dep in GRAPH.get(pkg, []):
+            seen.add(dep)
+            seen |= transitive(dep)
+        return seen
+
+
+    def main():
+        ap = argparse.ArgumentParser()
+        ap.add_argument("lockfile")
+        ap.add_argument("--min", type=int, default=0)
+        args = ap.parse_args()
+        GRAPH.update(load_graph(args.lockfile))
+        rows = [(len(transitive(p)), p) for p in GRAPH]
+        for count, name in sorted(rows, reverse=True):
+            if count >= args.min:
+                print(f"{count:5d}  {name}")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+- role: assistant
+  content: |
+    ```diff
+     import argparse
+    +import functools
+     import json
+     import sys
+    @@
+    +@functools.lru_cache(maxsize=None)
+     def transitive(pkg):
+         seen = set()
+         for dep in GRAPH.get(pkg, []):
+             seen.add(dep)
+             seen |= transitive(dep)
+    -    return seen
+    +    return frozenset(seen)
+    ```
+
+    **Green Notes**
+    - **Memoize repeated pure computations** (reduces E): a shared dependency is walked again for every path that reaches it, and each top-level package starts a new walk. With the cache, every package is expanded once. In Green Metrics Tool micro-benchmarks, 1,000,000 computations over 200 distinct inputs used about 9× less CPU energy with `lru_cache`. The gain depends on repeated inputs, and a lockfile graph has many.
+    - **`frozenset` return**: a cached value is shared between callers, so it must not be mutable. `len()` and `|=` work the same on it.
+    - `maxsize=None` is safe here: the cache can't grow beyond the number of packages. `GRAPH` is filled once in `main()`, before the first call. If it ever changes later, call `transitive.cache_clear()`.
+- role: user
+  content: |
+    transitive() is imported by two other tools and they call .discard()/.add() on the result. can't change the return type. keep it a set
+- role: assistant
+  content: |
+    Keep the cache private and return a fresh set from the public function:
+
+    ```python
+    import functools
+
+
+    @functools.lru_cache(maxsize=None)
+    def _transitive(pkg):
+        seen = set()
+        for dep in GRAPH.get(pkg, []):
+            seen.add(dep)
+            seen |= _transitive(dep)
+        return frozenset(seen)
+
+
+    def transitive(pkg):
+        return set(_transitive(pkg))
+    ```
+
+    In `main()`, count with `len(_transitive(p))` so the loop over all packages makes no copies.
+
+    **Green Notes**
+    - **Memoize repeated pure computations** (reduces E): the recursion still expands each package once. Callers get a new `set` on every call, so their `.discard()` and `.add()` can't change cached data.
+    - The copy is linear in the result size. That is far cheaper than the repeated graph walks it replaces.
+verify:
+  green_block: 0
+  test: |-
+    N = 30
+    g = {}
+    for i in range(N):
+        g[f"a{i}"] = [f"b{i}", f"c{i}"]
+        g[f"b{i}"] = [f"a{i+1}"]
+        g[f"c{i}"] = [f"a{i+1}"]
+    g[f"a{N}"] = []
+    GRAPH = g
+
+    r = transitive("a0")
+    assert isinstance(r, set) and not isinstance(r, frozenset)
+    assert len(r) == 3 * N
+    r.discard("b0")
+    r.add("zzz")
+    r2 = transitive("a0")
+    assert "b0" in r2 and "zzz" not in r2 and len(r2) == 3 * N
+    assert transitive("a29") == {"b29", "c29", "a30"}
+    assert transitive("a30") == set()
+    assert len(_transitive("a0")) == 3 * N

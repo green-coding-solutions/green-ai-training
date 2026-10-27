@@ -1,0 +1,70 @@
+id: gen-6593849-00142-generation
+category: generation
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    Field gateway (ARM, 2 cores), nginx 1.22. Here is the current vhost. Add compression for the UI and the telemetry JSON. Only the diff please.
+
+    ```nginx
+    server {
+        listen 8080;
+        server_name _;
+
+        root /opt/gw/ui;
+        index index.html;
+
+        location / {
+            try_files $uri $uri/ /index.html;
+        }
+
+        location /api/ {
+            proxy_pass http://127.0.0.1:9100;
+            proxy_set_header Host $host;
+            proxy_read_timeout 30s;
+        }
+    }
+    ```
+
+    UI bundle (html/js/css/svg) is baked into the firmware image at build time. /api/telemetry returns 20-200 KB JSON, different on every call.
+- role: assistant
+  content: |
+    ```text
+     server {
+         listen 8080;
+         server_name _;
+
+         root /opt/gw/ui;
+         index index.html;
+
+    +    gzip_static on;
+    +    gzip on;
+    +    gzip_comp_level 1;
+    +    gzip_min_length 1024;
+    +    gzip_vary on;
+    +    gzip_types application/json text/css application/javascript image/svg+xml;
+    +
+         location / {
+             try_files $uri $uri/ /index.html;
+         }
+    ```
+
+    Create the `.gz` files in the firmware image build, next to the originals:
+
+    ```bash
+    find /opt/gw/ui -type f \( -name '*.html' -o -name '*.js' -o -name '*.css' -o -name '*.svg' \) \
+        -exec gzip -k -9 {} +
+    ```
+
+    `text/html` is always compressed by `gzip on`, so it is not in `gzip_types`. The `/api/` block needs no change. Its JSON is compressed by the server-level `gzip on`.
+
+    **Green Notes**
+    - **Precompressed UI files** (reduces E, network): the bundle is fixed at image build time, so it is compressed once with `gzip_static` and not on every request. In Green Metrics Tool measurements of nginx serving text assets, compression sent about 10× fewer bytes. Compressing on every request cost about 4× the CPU energy of serving precompressed files. Level 9 is fine because it runs once per build.
+    - **Low level for the telemetry JSON** (reduces network): the response changes on every call, so it cannot be precompressed. Level 1 keeps the per-request CPU work small on a 2-core device. The cost is a slightly larger payload than higher levels.
+    - **`gzip_min_length 1024`**: tiny responses skip compression, because the CPU work is not worth the few bytes saved.
+verify:
+  static_only: nginx config

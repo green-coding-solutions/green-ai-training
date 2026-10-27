@@ -1,0 +1,106 @@
+id: gen-6593849-00104-refactor
+category: refactor
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    hi, we have cleanup step on our CI runners that delete old build cache files. the manifest have around 3 million entries and this function is the slowest part of the step. can you make it more clean and fast? sorry for my english
+
+    ```python
+    import os
+    import time
+
+
+    class CachePruner:
+        def __init__(self, policy):
+            self.policy = policy
+            self.removed = []
+
+        def select_stale(self, entries):
+            """entries: iterable of (path, mtime, size_bytes)"""
+            stale = []
+            for path, mtime, size in entries:
+                ext = os.path.splitext(path)[1]
+                age = time.time() - mtime
+                if ext in self.policy.keep_ext:
+                    continue
+                if age > self.policy.max_age_s:
+                    stale.append(path)
+            return stale
+    ```
+- role: assistant
+  content: |
+    ```python
+    import os
+    import time
+
+
+    class CachePruner:
+        def __init__(self, policy):
+            self.policy = policy
+            self.removed = []
+
+        def select_stale(self, entries):
+            """entries: iterable of (path, mtime, size_bytes)"""
+            splitext = os.path.splitext
+            keep_ext = self.policy.keep_ext
+            max_age_s = self.policy.max_age_s
+            now = time.time()
+            stale = []
+            append = stale.append
+            for path, mtime, _size in entries:
+                if splitext(path)[1] in keep_ext:
+                    continue
+                if now - mtime > max_age_s:
+                    append(path)
+            return stale
+    ```
+
+    **Green Notes**
+    - **Hoist loop-invariant lookups** (reduces E): `self.policy.keep_ext`, `self.policy.max_age_s`, `os.path.splitext` and `stale.append` were looked up again on every one of the 3 million iterations. They are now read once before the loop. Expect a small gain only: in Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local before a 10,000,000-iteration loop saved about 4-5%. It is worth it here because the loop is the hot path of the step. Do not do this in cold code.
+    - **One `time.time()` call per run** (reduces E): the clock was read for every entry. Now all entries are compared against the same `now`. This also makes the result consistent, because no file moves across the age limit while the loop runs.
+
+    The result is the same list in the same order. The only difference is that the policy values are read once, so changing `policy` from another thread during the run has no effect on this call. If the cleanup step is not CPU-bound, the real time is probably in the file deletes and the manifest read, not in this loop.
+verify:
+  test: |
+    import time
+    from types import SimpleNamespace
+    _real_time = time.time
+    time.time = lambda: 1000.0
+    try:
+        policy = SimpleNamespace(keep_ext={".lock"}, max_age_s=100)
+        pruner = CachePruner(policy)
+        entries = [
+            ("a/x.o", 500.0, 1),
+            ("a/y.o", 950.0, 2),
+            ("a/z.lock", 100.0, 3),
+            ("b/w.a", 899.0, 4),
+        ]
+        assert pruner.select_stale(entries) == ["a/x.o", "b/w.a"]
+        assert pruner.select_stale(iter(entries)) == ["a/x.o", "b/w.a"]
+        assert pruner.select_stale([]) == []
+    finally:
+        time.time = _real_time
+  equivalence:
+    driver: |-
+      import time
+      from types import SimpleNamespace
+      time.time = lambda: 1_000_000.0
+      policy = SimpleNamespace(keep_ext={".lock", ".json"}, max_age_s=3600)
+      entries = [
+          ("cache/a.o", 990000.0, 10),
+          ("cache/b.o", 999000.0, 20),
+          ("cache/c.lock", 1000.0, 30),
+          ("cache/d.json", 5.0, 40),
+          ("cache/e", 100.0, 50),
+          ("cache/sub/f.tar.gz", 900000.0, 60),
+          ("cache/g.a", 996399.0, 70),
+          ("cache/h.a", 996400.0, 80),
+      ]
+      print(CachePruner(policy).select_stale(entries))
+      print(CachePruner(policy).select_stale(iter(entries[:3])))
+      print(CachePruner(policy).select_stale([]))

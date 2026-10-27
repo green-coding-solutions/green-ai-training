@@ -1,0 +1,76 @@
+id: gen-6593849-00285-refactor
+category: refactor
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    Can you slim down the Dockerfile for our Modbus poller? It runs on small ARM gateways in plant rooms. It reads registers over RS-485 and pushes the values to InfluxDB. Requirements:
+
+    - keep running as a non-root user that can open /dev/ttyUSB0
+    - same entrypoint, `python -m modbus_poller`
+    - GitLab CI builds and pushes the image on every commit, and the gateways pull it on each release
+    - no behavior change at runtime
+
+    ```dockerfile
+    FROM python:3.12
+
+    RUN apt-get update && apt-get install -y \
+        build-essential git curl vim minicom \
+        && rm -rf /var/lib/apt/lists/*
+
+    WORKDIR /app
+    COPY . .
+
+    RUN pip install -r requirements.txt
+    RUN pip install pytest black mypy ipython
+
+    RUN useradd -m poller && usermod -aG dialout poller
+    USER poller
+
+    ENV PYTHONUNBUFFERED=1
+    CMD ["python", "-m", "modbus_poller"]
+    ```
+
+    requirements.txt has pymodbus, pyserial, influxdb-client and pydantic. The tests run in a separate CI job.
+- role: assistant
+  content: |
+    ```dockerfile
+    FROM python:3.12-slim
+
+    ENV PYTHONUNBUFFERED=1 \
+        PYTHONDONTWRITEBYTECODE=1
+
+    WORKDIR /app
+
+    # dependency layer first: it is rebuilt only when requirements.txt changes
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY modbus_poller/ modbus_poller/
+
+    RUN useradd --system --no-create-home --groups dialout poller
+    USER poller
+
+    CMD ["python", "-m", "modbus_poller"]
+    ```
+
+    Changes you need to make around it:
+    - Add a `.dockerignore` with `.git`, `tests/`, `__pycache__/` and `*.md`, so they don't reach the build context.
+    - Move `pytest`, `black`, `mypy` and `ipython` into a `requirements-dev.txt`. Install it only in your CI test job.
+    - If you need a shell with `minicom` on a gateway, run it on the host or in a separate debug image.
+
+    The non-root user and the `dialout` access to `/dev/ttyUSB0` are unchanged. The entrypoint is the same.
+
+    **Green Notes**
+    - **Slim base image** (reduces E and network): `python:3.12-slim` replaces the full image and its compiler toolchain, `git`, `curl` and `vim`. In Green Metrics Tool micro-benchmarks, building a small Flask image this way (slim base, runtime dependencies only, dependency layer first) used about 7× less energy, ~124 J instead of ~885 J. The same benchmark showed the same serving cost at runtime. The saving is in every build, push and pull, so it matters most with a CI build on every commit and a pull on every gateway.
+    - **Runtime dependencies only** (reduces network and storage): the dev tools are gone from the shipped image. Smaller images also mean shorter pulls over slow gateway links and less flash storage used.
+    - **Dependency layer before the source** (reduces E): with `COPY requirements.txt` first, a code-only commit reuses the cached `pip install` layer instead of reinstalling everything.
+    - **`--no-cache-dir`** (reduces storage): pip's download cache is not kept in the image layer.
+
+    *Not applied:* a multi-stage build. Your four dependencies normally install from prebuilt wheels, including on arm64, so no compiler is needed. If a later dependency has to be compiled, add a builder stage and copy only the installed packages into the final image.
+verify:
+  static_only: Dockerfile

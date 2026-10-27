@@ -1,0 +1,108 @@
+id: gen-6593849-00057-refactor
+category: refactor
+language: bash
+patterns:
+- compress-transmitted
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    We have a build cache for our Rust monorepo on self-hosted CI runners. At the end of every pipeline (about 150 pushes a day), `save-cache.sh` packs the build output and uploads it to our cache host. `restore-cache.sh` runs at the start of the next pipeline. The cache host keeps the last 5 caches per branch.
+
+    Requirements:
+    - Same cache key and same retention as now.
+    - Old `.tar.xz` caches must still restore during the switch, so no big-bang migration.
+    - Keep `set -euo pipefail`. A failed upload must fail the job.
+
+    Please clean up both scripts. Pipelines feel slow at the end, and the runners are busy a lot.
+
+    ```bash
+    #!/usr/bin/env bash
+    # save-cache.sh
+    set -euo pipefail
+
+    CACHE_HOST="cache.ci.internal"
+    CACHE_DIR="/srv/ci-cache/${CI_PROJECT_NAME}"
+    KEY="${CI_COMMIT_REF_SLUG}-$(sha256sum Cargo.lock | cut -c1-16)"
+    ARCHIVE="/tmp/cache-${KEY}.tar.xz"
+
+    tar -cf - target/release/deps .cargo/registry | xz -9e -T0 > "$ARCHIVE"
+    rsync -a "$ARCHIVE" "${CACHE_HOST}:${CACHE_DIR}/"
+    ssh "$CACHE_HOST" "cd ${CACHE_DIR} && ls -1t cache-${CI_COMMIT_REF_SLUG}-*.tar.xz | tail -n +6 | xargs -r rm -f"
+    rm -f "$ARCHIVE"
+    ```
+
+    ```bash
+    #!/usr/bin/env bash
+    # restore-cache.sh
+    set -euo pipefail
+
+    CACHE_HOST="cache.ci.internal"
+    CACHE_DIR="/srv/ci-cache/${CI_PROJECT_NAME}"
+    KEY="${CI_COMMIT_REF_SLUG}-$(sha256sum Cargo.lock | cut -c1-16)"
+    ARCHIVE="/tmp/cache-${KEY}.tar.xz"
+
+    if rsync -a "${CACHE_HOST}:${CACHE_DIR}/cache-${KEY}.tar.xz" "$ARCHIVE" 2>/dev/null; then
+      xz -dc "$ARCHIVE" | tar -xf -
+      rm -f "$ARCHIVE"
+    else
+      echo "no cache for ${KEY}"
+    fi
+    ```
+- role: assistant
+  content: |
+    The slow part is `xz -9e` on every push. Here are both scripts with zstd. The restore script tries the new `.tar.zst` first and falls back to an old `.tar.xz`.
+
+    ```bash
+    #!/usr/bin/env bash
+    # save-cache.sh
+    set -euo pipefail
+
+    CACHE_HOST='cache.ci.internal'
+    CACHE_DIR="/srv/ci-cache/${CI_PROJECT_NAME}"
+    KEY="${CI_COMMIT_REF_SLUG}-$(sha256sum Cargo.lock | cut -c1-16)"
+    ARCHIVE="/tmp/cache-${KEY}.tar.zst"
+    trap 'rm -f "$ARCHIVE"' EXIT
+
+    tar -cf - target/release/deps .cargo/registry | zstd -T0 -q -f -o "$ARCHIVE"
+    rsync -a "$ARCHIVE" "${CACHE_HOST}:${CACHE_DIR}/"
+    # the glob matches old .tar.xz and new .tar.zst, so retention stays "last 5"
+    ssh "$CACHE_HOST" "cd ${CACHE_DIR} && ls -1t cache-${CI_COMMIT_REF_SLUG}-*.tar.* | tail -n +6 | xargs -r rm -f"
+    ```
+
+    ```bash
+    #!/usr/bin/env bash
+    # restore-cache.sh
+    set -euo pipefail
+
+    CACHE_HOST='cache.ci.internal'
+    CACHE_DIR="/srv/ci-cache/${CI_PROJECT_NAME}"
+    KEY="${CI_COMMIT_REF_SLUG}-$(sha256sum Cargo.lock | cut -c1-16)"
+
+    for ext in tar.zst tar.xz; do
+      ARCHIVE="/tmp/cache-${KEY}.${ext}"
+      if rsync -a "${CACHE_HOST}:${CACHE_DIR}/cache-${KEY}.${ext}" "$ARCHIVE" 2>/dev/null; then
+        case "$ext" in
+          tar.zst) zstd -dc "$ARCHIVE" | tar -xf - ;;
+          tar.xz)  xz -dc "$ARCHIVE" | tar -xf - ;;
+        esac
+        rm -f "$ARCHIVE"
+        exit 0
+      fi
+    done
+    echo "no cache for ${KEY}"
+    ```
+
+    Install `zstd` on every runner before you roll this out. Otherwise the save step fails, because of `pipefail`.
+
+    **Green Notes**
+    - **Fast codec for data compressed often** (reduces E): this cache is rebuilt on every push and replaced a few pushes later. In Green Metrics Tool micro-benchmarks, compressing 100 MB of English text with default settings took ~16 J with zstd and ~458 J with xz. `-9e` is heavier than the xz default, so the gap on your runners is likely larger. Your cache is build output, not text, so measure it with `perf stat` or `time` on one runner. The direction should hold.
+    - **Cheaper restore too** (reduces E): every pipeline start decompresses the cache. In the same benchmarks, decompressing 100 MB took ~5.3 J with zstd and ~11.7 J with xz.
+    - **No heavy codec for short-lived data** (reduces E, storage): a smaller xz file only pays back the extra CPU if the data is stored for a long time. A cache that is overwritten within hours or days never gets there.
+    - *Not applied:* a higher zstd level. Those measurements compare energy at default settings, not file size. The `.tar.zst` will likely be larger than the `.tar.xz`. If the link to the cache host is slow, compare upload time and size before changing the level.
+
+    The cache key, the retention and the failure behavior are unchanged. The `trap` just makes sure the temp archive is removed even if the upload fails.
+verify:
+  static_only: needs CI environment variables, ssh/rsync to a cache host and zstd on the runner

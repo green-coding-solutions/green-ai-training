@@ -1,0 +1,62 @@
+id: gen-6593849-00051-generation
+category: generation
+language: sql
+sql_dialect: postgres
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    I need a psql script for a small cron job on our DB host (PostgreSQL 16). It archives old telemetry events.
+
+    Tables:
+    - `events(id bigint primary key, device_id int not null, created_at timestamptz not null, payload jsonb not null)`
+    - `events_archive` has the same columns
+
+    Requirements:
+    - Move every row in `events` older than 90 days into `events_archive` and remove it from `events`.
+    - No row may be lost or duplicated, even if the script fails halfway.
+    - It runs once per night with `psql -f archive_events.sql`. It must stop on the first error.
+    - It should print how many rows were moved.
+
+    Right now there are about 1.5 million rows to move on the first run. My first idea was a `DO` block that loops over the old rows and does one INSERT and one DELETE per row. Can you write it?
+- role: assistant
+  content: |
+    A loop is not needed. One statement can delete the old rows and insert them into the archive in a single pass. It is also atomic, so a failure moves nothing:
+
+    ```sql
+    \set ON_ERROR_STOP on
+
+    BEGIN;
+
+    WITH moved AS (
+        DELETE FROM events
+        WHERE created_at < now() - interval '90 days'
+        RETURNING id, device_id, created_at, payload
+    ),
+    inserted AS (
+        INSERT INTO events_archive (id, device_id, created_at, payload)
+        SELECT id, device_id, created_at, payload
+        FROM moved
+        RETURNING 1
+    )
+    SELECT count(*) AS rows_moved FROM inserted;
+
+    COMMIT;
+    ```
+
+    Run it with `psql -f archive_events.sql`.
+
+    - `ON_ERROR_STOP` makes psql exit on the first error. The open transaction is then rolled back, so no row is deleted without being archived.
+    - `now()` is fixed for the whole transaction, so the delete and the insert use the same cutoff.
+    - If `events_archive` already contains an `id` (for example from a half-finished manual run), the insert fails and everything rolls back. That is safer than silently skipping rows.
+    - For the first run with 1.5 million rows, this holds locks and writes WAL in one large transaction. If that is a problem on your host, run the same statement with an added `AND id BETWEEN ...` range several times.
+
+    **Green Notes**
+    - **Set-based batch write instead of a row-by-row loop** (reduces E): 1.5 million INSERT and DELETE pairs become one statement. In Green Metrics Tool micro-benchmarks with a Python client, one INSERT per row used about 22× more CPU energy than `COPY` in batches of 5,000 rows. The data here never leaves the server, so a single `INSERT ... SELECT` is the same idea taken to the end.
+    - **One transaction** (reduces E): one commit instead of one per row, so the WAL flush work is paid once.
+    - *Not applied:* `COPY`. It helps when data comes from a client or file. Here both tables are on the server, so it would add an export and import step for nothing.
+verify:
+  static_only: PostgreSQL dialect with psql meta-command and data-modifying CTE

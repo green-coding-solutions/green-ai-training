@@ -1,0 +1,101 @@
+id: gen-6593849-00015-review
+category: review
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    Can you review this Julia set renderer? It is part of our nightly job on the physics cluster that explores a map family for a nonlinear oscillator study. The job renders about 60 values of c per night, each on a 4096x3072 grid with max_iter 500, and stores the iteration counts with np.save. Later steps read the counts and fit boundary statistics.
+
+    Requirements: the stored counts must stay the same as today, numpy is available and numba can be installed on the nodes, and I don't want to change the function signature because other scripts call it. I mostly care about correctness and run time, but if there is a cheap way to cut the compute cost, I would like to know.
+
+    ```python
+    import numpy as np
+
+
+    def julia_counts(c, width, height, max_iter=500, bound=2.0):
+        """Escape-time iteration counts for z -> z*z + c on a fixed window."""
+        xs = np.linspace(-1.6, 1.6, width)
+        ys = np.linspace(-1.2, 1.2, height)
+        out = np.zeros((height, width), dtype=np.uint8)
+
+        for i in range(height):
+            for j in range(width):
+                z = complex(xs[j], ys[i])
+                n = 0
+                while abs(z) <= bound and n < max_iter:
+                    z = z * z + c
+                    n += 1
+                out[i, j] = n
+        return out
+
+
+    def render_family(cs, path_fmt, width=4096, height=3072):
+        for k, c in enumerate(cs):
+            counts = julia_counts(c, width, height)
+            np.save(path_fmt.format(k), counts)
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (scientific computing, nightly batch)
+
+    #### [Bug] Iteration counts overflow `uint8`
+    - **Where:** `out = np.zeros((height, width), dtype=np.uint8)`
+    - **Issue:** `uint8` holds 0-255, but `max_iter` is 500. Any pixel that runs longer than 255 iterations wraps around. Points inside the set (count 500) are stored as 244, so they look like points that escaped. Your boundary statistics read these wrong values.
+    - **Fix:** use `uint16`, which is enough up to `max_iter` 65535. The stored counts will differ from today's file for those pixels, but today's values are wrong.
+
+    #### [High] Pure Python loop over 12.6 million pixels
+    - **Where:** the nested `for i` / `for j` / `while` loops in `julia_counts`
+    - **Issue:** every pixel runs up to 500 iterations of Python-level complex arithmetic. That is billions of interpreter steps per grid, times 60 grids per night. The loop is CPU-bound, purely numeric, and each step depends on the last, so numpy vectorization is awkward here. This is the case where a JIT fits.
+    - **Fix:** move the loops into an `@njit(cache=True)` kernel that works on plain floats. Keep `julia_counts` as a thin wrapper, so the signature does not change.
+    - **Impact:** reduces E on every nightly run. In Green Metrics Tool micro-benchmarks, a pure Python quantization loop over 10,000,000 samples used about 40 J, and the same loop with Numba `@njit` used about 9.5 J (about 4× less). Your loop does more work per element, so measure your own job before you quote a number.
+
+    #### [Low] Compile time and cache
+    - **Where:** first call of the kernel
+    - **Issue:** Numba compiles on the first call. With `cache=True` it is compiled once per node and reused by later processes. For a few small test grids the compile time would not pay off, but 60 large grids a night clearly do.
+
+    ```python
+    import numpy as np
+    from numba import njit
+
+
+    @njit(cache=True)
+    def _julia_kernel(cre, cim, xs, ys, max_iter, bound2):
+        h = ys.shape[0]
+        w = xs.shape[0]
+        out = np.empty((h, w), dtype=np.uint16)
+        for i in range(h):
+            y0 = ys[i]
+            for j in range(w):
+                x = xs[j]
+                y = y0
+                n = 0
+                while n < max_iter and x * x + y * y <= bound2:
+                    x, y = x * x - y * y + cre, 2.0 * x * y + cim
+                    n += 1
+                out[i, j] = n
+        return out
+
+
+    def julia_counts(c, width, height, max_iter=500, bound=2.0):
+        """Escape-time iteration counts for z -> z*z + c on a fixed window."""
+        xs = np.linspace(-1.6, 1.6, width)
+        ys = np.linspace(-1.2, 1.2, height)
+        c = complex(c)
+        return _julia_kernel(c.real, c.imag, xs, ys, max_iter, bound * bound)
+
+
+    def render_family(cs, path_fmt, width=4096, height=3072):
+        for k, c in enumerate(cs):
+            counts = julia_counts(c, width, height)
+            np.save(path_fmt.format(k), counts)
+    ```
+
+    The kernel compares `x*x + y*y` with `bound**2` instead of calling `abs()`. A pixel exactly on the bound could differ by one iteration because of rounding. Diff one stored grid against the old output before you switch the whole job. Expect differences only where the old `uint8` wrapped.
+
+    **Already good:** the axes are built once outside the loops, and `render_family` writes each grid right away, so memory use stays at one grid.
+  verify:
+    static_only: needs numba, which is beyond stdlib + numpy

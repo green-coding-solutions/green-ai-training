@@ -1,0 +1,135 @@
+id: gen-6593849-00222-review
+category: review
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    hi, i am new to python and CI. i wrote this script that runs at the end of our release pipeline. it checks that all the download files are online after we publish. it works but i feel something is not good, can you look at it? i dont know what
+
+    ```python
+    import sys
+    import requests
+
+    BASE = "https://downloads.example.com/releases/latest/"
+    ARTIFACTS = [
+        "app-linux-x64.tar.gz",
+        "app-linux-arm64.tar.gz",
+        "app-macos-x64.dmg",
+        "app-macos-arm64.dmg",
+        "app-windows-x64.msi",
+        "app-windows-arm64.msi",
+        "app-linux-x64.tar.gz.sha256",
+        "app-linux-arm64.tar.gz.sha256",
+        "app-macos-x64.dmg.sha256",
+        "app-macos-arm64.dmg.sha256",
+        "app-windows-x64.msi.sha256",
+        "app-windows-arm64.msi.sha256",
+    ]
+
+
+    def check(url):
+        try:
+            r = requests.head(url, verify=False)
+            return r.status_code
+        except:
+            return None
+
+
+    def main():
+        failed = []
+        for name in ARTIFACTS:
+            status = check(BASE + name)
+            print(name, status)
+            if status != 200:
+                failed.append(name)
+        if failed:
+            print("MISSING:", ", ".join(failed))
+            sys.exit(1)
+        print("all ok")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (CI/CD release check)
+
+    #### [Security] TLS check is switched off
+    - **Where:** `requests.head(url, verify=False)`
+    - **Issue:** the script no longer checks the certificate, so it can "verify" a download from the wrong server. It also prints an InsecureRequestWarning in your CI log.
+    - **Fix:** remove `verify=False`. If the check fails because of a certificate problem, fix the certificate.
+
+    #### [Bug] No timeout, bare `except`
+    - **Where:** `requests.head(...)` and `except:`
+    - **Issue:** `requests` waits forever by default. One stuck server can hang the pipeline until the CI limit. The bare `except:` also hides every error, even Ctrl+C, and you only see `None`.
+    - **Fix:** set a timeout and catch only request errors, for example `except httpx.HTTPError` in the code below.
+
+    #### [Bug] Redirects count as "missing"
+    - **Where:** `status != 200`
+    - **Issue:** `requests.head` does not follow redirects. Download hosts often answer `302` and send you to a CDN. The file is fine, but your script reports it as missing.
+    - **Fix:** follow redirects (`follow_redirects=True` below).
+
+    #### [Medium] 12 requests one after another
+    - **Where:** the `for name in ARTIFACTS` loop
+    - **Issue:** each request waits for the answer before the next one starts. The script mostly sits idle, and the CI runner is held for the sum of all waits. The requests do not depend on each other, so they can run together.
+    - **Fix:**
+      ```python
+      import asyncio
+      import sys
+
+      import httpx
+
+      BASE = "https://downloads.example.com/releases/latest/"
+      ARTIFACTS = [
+          "app-linux-x64.tar.gz",
+          "app-linux-arm64.tar.gz",
+          "app-macos-x64.dmg",
+          "app-macos-arm64.dmg",
+          "app-windows-x64.msi",
+          "app-windows-arm64.msi",
+          "app-linux-x64.tar.gz.sha256",
+          "app-linux-arm64.tar.gz.sha256",
+          "app-macos-x64.dmg.sha256",
+          "app-macos-arm64.dmg.sha256",
+          "app-windows-x64.msi.sha256",
+          "app-windows-arm64.msi.sha256",
+      ]
+
+
+      async def check(client, name):
+          try:
+              r = await client.head(BASE + name)
+              return name, r.status_code
+          except httpx.HTTPError as exc:
+              print(name, "error:", type(exc).__name__)
+              return name, None
+
+
+      async def main():
+          async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+              results = await asyncio.gather(*(check(client, n) for n in ARTIFACTS))
+          failed = []
+          for name, status in results:
+              print(name, status)
+              if status != 200:
+                  failed.append(name)
+          if failed:
+              print("MISSING:", ", ".join(failed))
+              sys.exit(1)
+          print("all ok")
+
+
+      if __name__ == "__main__":
+          asyncio.run(main())
+      ```
+      `gather` keeps the input order, so the output looks the same as before.
+    - **Impact:** mostly wall time and runner time. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. With only 12 requests, expect a small gain in energy and a clear gain in time. Install `httpx` in the CI job (`pip install httpx`).
+
+    **Already good:** the script exits with a non-zero code on failure, so the pipeline stops. It also lists all missing files instead of stopping at the first one.
+verify:
+  static_only: needs network access and the third-party package httpx

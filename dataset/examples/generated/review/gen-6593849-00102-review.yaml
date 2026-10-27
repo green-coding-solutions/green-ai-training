@@ -1,0 +1,100 @@
+id: gen-6593849-00102-review
+category: review
+language: python
+patterns:
+- memoize
+- vectorize-or-jit
+facts:
+- F-LRU
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    Review, diff only please. This is the preprocessing step in front of our sensor classifier. It runs on every inference request. Request batches are 1-2M float samples in [0, 1]. `gain_code` is an int and only takes about 200 distinct values across all devices.
+
+    ```python
+    import math
+    import numpy as np
+
+    def gain_table(gain_code):
+        table = []
+        for i in range(256):
+            x = i / 255.0
+            v = 0.0
+            for k in range(1, 400):
+                v += math.sin(k * x * gain_code * 0.01) / k
+            table.append(v)
+        return table
+
+    def apply_correction(samples, gain_code):
+        table = gain_table(gain_code)
+        out = np.empty(len(samples), dtype=np.float32)
+        for i in range(len(samples)):
+            s = float(samples[i])
+            idx = int(min(max(s, 0.0), 1.0) * 255)
+            out[i] = s * (1.0 + 0.05 * table[idx])
+        return out
+
+    def preprocess(request):
+        x = apply_correction(request["samples"], request["gain_code"])
+        return x.reshape(-1, 64)
+    ```
+- role: assistant
+  content: |
+    **Workload:** AI/ML inference (per request)
+
+    #### [High] Pure-Python loop over every sample
+    - **Where:** `apply_correction`, the `for i in range(len(samples))` loop
+    - **Issue:** this is a CPU-bound numeric loop over millions of floats per request, run in the interpreter. It is the kind of loop JIT compilation is made for.
+    - **Fix:** move the loop into an `@njit` function that takes arrays.
+    - **Impact:** reduces E on the server for every request. In Green Metrics Tool micro-benchmarks, a Numba-compiled sample loop used about 4× less CPU energy than the same pure Python loop. Use `cache=True` so the compile cost is paid once per deploy, not per process start.
+
+    #### [High] Correction table is recomputed on every request
+    - **Where:** `gain_table(gain_code)`
+    - **Issue:** it is a pure function with a nested loop, and it only sees about 200 distinct inputs. Almost every call repeats work that was already done.
+    - **Fix:** memoize it with a bounded `lru_cache`, and return a read-only array so callers cannot change the shared cached value.
+    - **Impact:** reduces E. In Green Metrics Tool micro-benchmarks, `lru_cache` on a computation with 200 distinct inputs used about 9× less CPU energy. This only holds because your inputs repeat. With mostly unique inputs the cache would only add overhead.
+
+    ```python
+    from functools import lru_cache
+    import math
+    import numpy as np
+    from numba import njit
+
+    @lru_cache(maxsize=512)
+    def gain_table(gain_code):
+        table = np.empty(256)
+        for i in range(256):
+            x = i / 255.0
+            v = 0.0
+            for k in range(1, 400):
+                v += math.sin(k * x * gain_code * 0.01) / k
+            table[i] = v
+        table.setflags(write=False)
+        return table
+
+    @njit(cache=True)
+    def _correct(samples, table):
+        out = np.empty(samples.shape[0], dtype=np.float32)
+        for i in range(samples.shape[0]):
+            s = samples[i]
+            idx = int(min(max(s, 0.0), 1.0) * 255)
+            out[i] = s * (1.0 + 0.05 * table[idx])
+        return out
+
+    def apply_correction(samples, gain_code):
+        arr = np.ascontiguousarray(samples, dtype=np.float64)
+        if np.isnan(arr).any():
+            raise ValueError("NaN in samples")
+        return _correct(arr, gain_table(gain_code))
+    ```
+
+    `preprocess` stays unchanged.
+
+    #### [Bug] NaN handling changes under JIT
+    - **Where:** `int(min(max(s, 0.0), 1.0) * 255)`
+    - **Issue:** in plain Python a NaN sample raises `ValueError` at `int(...)`. Inside `@njit` the same expression gives an undefined index, which can read outside `table`. The explicit `isnan` check in the diff keeps the original behavior. If you would rather clamp or drop NaNs, decide that on purpose and do it before the JIT call.
+
+    **Already good:** `preprocess` and the output dtype. Clamping in the loop matches the table range.
+verify:
+  static_only: numba is not in stdlib + numpy

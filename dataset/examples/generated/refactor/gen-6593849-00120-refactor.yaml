@@ -1,0 +1,98 @@
+id: gen-6593849-00120-refactor
+category: refactor
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    hi, i am student and learning python for my physics lab. i wrote this to calculate how far a random walker goes (diffusion). it works but when i put max_steps 30 it never finish, my laptop gets hot. i dont know what is wrong, maybe python is just slow? can you improve it?
+
+    ```python
+    import sys
+
+
+    def prob(n, x):
+        """probability that the walker is at position x after n steps
+        (each step is +1 or -1 with chance 0.5)"""
+        if abs(x) > n:
+            return 0.0
+        if n == 0:
+            return 1.0 if x == 0 else 0.0
+        return 0.5 * prob(n - 1, x - 1) + 0.5 * prob(n - 1, x + 1)
+
+
+    def msd(n):
+        """mean squared displacement after n steps"""
+        total = 0.0
+        for x in range(-n, n + 1):
+            total += x * x * prob(n, x)
+        return total
+
+
+    def report(max_steps):
+        print("steps  msd")
+        for n in range(1, max_steps + 1):
+            print(n, round(msd(n), 6))
+
+
+    if __name__ == "__main__":
+        report(int(sys.argv[1]) if len(sys.argv) > 1 else 20)
+    ```
+- role: assistant
+  content: |
+    Python is not the problem. `prob` solves the same small questions again and again. For example, `prob(10, 2)` is needed by many different calls, and each one recomputes its whole tree. The work doubles with every extra step. Caching the results fixes this.
+
+    ```python
+    import sys
+    from functools import lru_cache
+
+
+    @lru_cache(maxsize=None)
+    def prob(n, x):
+        """probability that the walker is at position x after n steps
+        (each step is +1 or -1 with chance 0.5)"""
+        if abs(x) > n:
+            return 0.0
+        if n == 0:
+            return 1.0 if x == 0 else 0.0
+        return 0.5 * prob(n - 1, x - 1) + 0.5 * prob(n - 1, x + 1)
+
+
+    def msd(n):
+        """mean squared displacement after n steps"""
+        total = 0.0
+        for x in range(-n, n + 1):
+            total += x * x * prob(n, x)
+        return total
+
+
+    def report(max_steps):
+        print("steps  msd")
+        for n in range(1, max_steps + 1):
+            print(n, round(msd(n), 6))
+
+
+    if __name__ == "__main__":
+        report(int(sys.argv[1]) if len(sys.argv) > 1 else 20)
+    ```
+
+    The output is the same as before. Only `prob` changed.
+
+    **Green Notes**
+    - **Memoize repeated pure computations** (reduces E): `prob` is pure, and the same `(n, x)` pairs come up many times. Each pair is now computed once. The work drops from about 2^n calls to about n² distinct pairs. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over only 200 distinct inputs used about 9× less CPU energy with `lru_cache`. Your case has far more repeats per input, so expect a bigger gap, but measure it with `time` or `perf stat` on your own runs.
+    - **Cache size:** `maxsize=None` is fine here, because there are only about `max_steps²` distinct pairs. Do not use an unbounded cache when inputs are mostly unique. Then it only adds overhead and uses memory.
+    - **Recursion depth:** the recursion goes `max_steps` levels deep. Python's default limit is about 1000, so very large values of `max_steps` would need a loop instead.
+verify:
+  module: true
+  test: |
+    assert prob(0, 0) == 1.0
+    assert prob(2, 0) == 0.5
+    assert prob(3, 1) == 0.375
+    assert prob(3, 4) == 0.0
+    assert abs(msd(40) - 40) < 1e-9
+    assert abs(msd(150) - 150) < 1e-6
+  equivalence:
+    driver: report(14)

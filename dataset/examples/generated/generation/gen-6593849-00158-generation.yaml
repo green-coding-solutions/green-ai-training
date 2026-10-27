@@ -1,0 +1,47 @@
+id: gen-6593849-00158-generation
+category: generation
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    python fn: score orders for return risk with our torch model models/return_risk.pt. order dict has n_items, total, days_since_last_order, is_new_customer, discount_pct, shipping_days. list in, list of floats out
+- role: assistant
+  content: |-
+    ```python
+    import torch
+
+    FEATURES = (
+        "n_items",
+        "total",
+        "days_since_last_order",
+        "is_new_customer",
+        "discount_pct",
+        "shipping_days",
+    )
+
+    _model = torch.jit.load("models/return_risk.pt", map_location="cpu")
+    _model.eval()
+
+
+    def return_risk(orders, batch_size=1024):
+        """Return one return-probability (0..1) per order, in input order."""
+        scores = []
+        with torch.no_grad():
+            for i in range(0, len(orders), batch_size):
+                chunk = orders[i:i + batch_size]
+                x = torch.tensor(
+                    [[float(o[f]) for f in FEATURES] for o in chunk],
+                    dtype=torch.float32,
+                )
+                scores.extend(torch.sigmoid(_model(x)).squeeze(1).tolist())
+        return scores
+    ```
+
+    I assumed the model is a TorchScript file that outputs one logit per order, shape `(n, 1)`. If it already ends in a sigmoid, remove the `torch.sigmoid` call. The model loads once at import and is put in `eval()` mode, so dropout and batch norm behave correctly.
+
+    **Green Notes**
+    - **No gradient tracking for inference** (reduces E): `torch.no_grad()` stops PyTorch from building an autograd graph that scoring never uses. In Green Metrics Tool micro-benchmarks with 100,000 PyTorch CPU inferences, runs without it used ~157 J and runs with it ~135 J, about 14% less.

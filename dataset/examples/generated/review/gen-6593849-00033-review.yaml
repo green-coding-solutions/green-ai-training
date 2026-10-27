@@ -1,0 +1,97 @@
+id: gen-6593849-00033-review
+category: review
+language: bash
+patterns:
+- compress-transmitted
+- bash-quoting
+facts:
+- F-COMPRESS-CODECS
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    hi, i am not so good with bash. i wrote this script for our image classifier box. it runs from cron every 2 minutes, takes the prediction files the model writes (jsonl, around 50 MB each) and sends them to our monitoring server. it works but my colleague said something looks wrong and i dont know what. can you look?
+
+    ```bash
+    #!/bin/bash
+    # send prediction results to monitoring server
+
+    OUT_DIR=/var/lib/infer/results
+    SERVER="https://metrics.internal.example/ingest"
+    TOKEN="tk_live_8f3a91c27d4e"
+
+    cd $OUT_DIR
+
+    for f in $(ls *.jsonl); do
+      echo "Compressing $f"
+      xz -9e -k $f
+      echo "Uploading $f.xz"
+      curl -s -X POST \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/x-xz" \
+        --data-binary @$f.xz $SERVER
+      rm $f $f.xz
+    done
+    echo "Done"
+    ```
+- role: assistant
+  content: |
+    **Workload:** AI/ML (inference output shipping, runs from cron)
+
+    #### [Bug] Files are deleted even when the upload fails
+    - **Where:** `curl -s ...` followed by `rm $f $f.xz`
+    - **Issue:** `curl -s` returns success even if the server answers with an HTTP error, and the script never checks the result anyway. If the server is down or rejects the file, the predictions are deleted and lost. Also, `cd $OUT_DIR` has no check, so a failed `cd` would run the loop in the wrong folder.
+    - **Fix:** use `curl -f`, delete only when it succeeds, and stop if `cd` fails.
+
+    #### [Security] Token is hardcoded in the script
+    - **Where:** `TOKEN="tk_live_8f3a91c27d4e"`
+    - **Issue:** anyone with read access to the script or its git history has the token.
+    - **Fix:** read it from the environment (for example from a root-only env file loaded by cron or systemd) and rotate this token.
+
+    #### [High] Very expensive compression codec on a frequent job
+    - **Where:** `xz -9e -k $f`
+    - **Issue:** `xz -9e` is one of the most CPU-hungry codecs. This job compresses about 50 MB on every run, and the compressed file is deleted right after the upload. In Green Metrics Tool micro-benchmarks compressing 100 MB of English text, zstd at its default level used about 16 J and xz about 458 J (about 29× more). Those figures compare energy only, not file size. xz makes smaller files, which matters on a slow link or for long-term storage, but not much for a file that lives for seconds on a local network.
+    - **Fix:** use `zstd` at its default level. The monitoring server must accept zstd. If it can only decode gzip, use `gzip -6` instead, which is still much cheaper than `xz -9e`.
+    - **Impact:** reduces E on the inference box on every run, and the box has less CPU time taken from the model.
+
+    #### [Low] Double quotes on a literal that needs no expansion
+    - **Where:** `-H "Content-Type: application/x-xz"` inside the loop
+    - **Issue:** bash scans double-quoted text for `$`, backticks and backslashes. Single quotes are taken as is. In Green Metrics Tool micro-benchmarks, single quotes saved about 24% of the quoting work for a 6,200-character literal in a loop. Your literal is short, so the real saving here is tiny. It is a good habit, not a fix that matters.
+    - **Fix:** use single quotes for the plain literals. Keep double quotes where a variable must expand, like `"Authorization: Bearer $INGEST_TOKEN"`. Never remove the quotes around variables.
+
+    Here is the script with all of this applied:
+
+    ```bash
+    #!/bin/bash
+    set -u
+
+    OUT_DIR=/var/lib/infer/results
+    SERVER='https://metrics.internal.example/ingest'
+
+    : "${INGEST_TOKEN:?INGEST_TOKEN is not set}"
+
+    cd "$OUT_DIR" || exit 1
+
+    for f in *.jsonl; do
+      [ -e "$f" ] || continue
+      echo "Compressing $f"
+      zstd -q -f "$f" -o "$f.zst" || continue
+      echo "Uploading $f.zst"
+      if curl -fsS -X POST \
+           -H "Authorization: Bearer $INGEST_TOKEN" \
+           -H 'Content-Type: application/zstd' \
+           --data-binary @"$f.zst" "$SERVER"; then
+        rm -f -- "$f" "$f.zst"
+      else
+        echo "Upload failed for $f, keeping it" >&2
+        rm -f -- "$f.zst"
+      fi
+    done
+    echo 'Done'
+    ```
+
+    The `Content-Type` header changed too, so the server side must handle `application/zstd` before you switch. `for f in *.jsonl` replaces `$(ls ...)`, which breaks on file names with spaces.
+
+    **Already good:** the files are sent in one request each, and the loop itself starts no extra processes per file besides compression and upload.
+verify:
+  static_only: needs curl, zstd, a monitoring server and an inference output folder

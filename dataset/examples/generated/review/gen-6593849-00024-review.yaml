@@ -1,0 +1,81 @@
+id: gen-6593849-00024-review
+category: review
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    ?
+
+    ```nginx
+    server {
+        listen 80;
+        server_name dl.mytool.example.org;
+        root /srv/mytool/site;
+
+        gzip on;
+        gzip_comp_level 9;
+        gzip_min_length 0;
+        gzip_proxied any;
+        gzip_types *;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        # install.sh, mytool-1.x.tar.gz, mytool-1.x.zip, checksums
+        location /dl {
+            alias /srv/mytool/releases/;
+            autoindex on;
+        }
+
+        location = /latest.json {
+            add_header Cache-Control "no-cache";
+        }
+
+        location /api/ {
+            proxy_pass http://127.0.0.1:8081;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (download and docs site for a CLI tool)
+
+    #### [Security] Path traversal through `alias`
+    - **Where:** `location /dl { alias /srv/mytool/releases/; }`
+    - **Issue:** the location has no trailing slash, but the alias has one. A request like `/dl../secret` is mapped to `/srv/mytool/releases/../secret`, so files next to the releases folder can be read.
+    - **Fix:** make both sides match: `location /dl/ { alias /srv/mytool/releases/; }`.
+
+    #### [High] Every static file is compressed again on every request
+    - **Where:** `gzip on; gzip_comp_level 9; gzip_min_length 0; gzip_types *;`
+    - **Issue:** your docs, JS, CSS and `install.sh` never change between releases, but nginx compresses them for each request, at the most expensive level. `gzip_types *` also sends the `.tar.gz` and `.zip` releases through gzip. They are already compressed, so this burns CPU and gains nothing. `gzip_min_length 0` also compresses tiny responses where the headers cost more than the body. In Green Metrics Tool micro-benchmarks (nginx, 2,000 requests for text assets), gzip level 5 on every request used about 4× the CPU energy of serving precompressed files. Both sent about 10× fewer bytes than no compression. That test ran on a local network, so it shows only the CPU side.
+    - **Fix:** compress once at release time and let nginx serve the `.gz` files. Level 9 is fine there, because it runs once per file:
+      ```bash
+      find /srv/mytool/site -type f \( -name '*.html' -o -name '*.css' -o -name '*.js' -o -name '*.json' -o -name '*.sh' \) -exec gzip -9 -kf {} +
+      ```
+      ```nginx
+      gzip_static on;
+      gzip_vary on;
+      ```
+      Add the `find` line to your release script, so the `.gz` files are never older than the originals.
+    - **Impact:** E, on every request to a static file. Clients get the same bytes on the wire.
+
+    #### [Medium] Level 9 and `gzip_types *` on the API proxy
+    - **Where:** `location /api/` inherits the server-level gzip settings
+    - **Issue:** JSON from the API is dynamic, so it must be compressed per request. Level 9 costs much more CPU than a middle level for a small extra saving.
+    - **Fix:** for dynamic responses use a moderate level and an explicit type list:
+      ```nginx
+      gzip on;
+      gzip_comp_level 4;
+      gzip_min_length 256;
+      gzip_types text/plain text/css application/json application/javascript image/svg+xml;
+      ```
+    - **Impact:** E per API request, bounded by your API traffic.
+
+    **Already good:** `/latest.json` has `no-cache`, so clients see new releases right away.
+verify:
+  static_only: nginx config, no runnable code

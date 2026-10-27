@@ -1,0 +1,105 @@
+id: gen-6593849-00098-refactor
+category: refactor
+language: python
+patterns:
+- deque-or-append
+- keep-star-imports
+facts:
+- F-LISTINS
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    hi, i am new to python and i made a small activity log for our REST API (every webhook call we get is stored, and the dashboard shows the latest ones first). it works but my colleague said the server gets slower the more traffic we have and i dont know why. can you look at it and make it better?
+
+    ```python
+    from datetime import *
+    from json import *
+
+    MAX_EVENTS = 50000
+    events = []
+
+
+    def record_event(kind, payload, at=None):
+        at = at or datetime.now(timezone.utc)
+        events.insert(0, {
+            "kind": kind,
+            "payload": payload,
+            "at": at.isoformat(),
+        })
+        if len(events) > MAX_EVENTS:
+            events.pop()
+
+
+    def recent_events(limit=50, kind=None):
+        result = []
+        for e in events:
+            if kind is None or e["kind"] == kind:
+                result.append(e)
+            if len(result) == limit:
+                break
+        return result
+
+
+    def events_json(limit=50, kind=None):
+        return dumps(recent_events(limit, kind))
+    ```
+- role: assistant
+  content: |
+    ```python
+    from collections import deque
+    from datetime import *
+    from json import *
+
+    MAX_EVENTS = 50000
+    events = deque(maxlen=MAX_EVENTS)
+
+
+    def record_event(kind, payload, at=None):
+        at = at or datetime.now(timezone.utc)
+        events.appendleft({
+            "kind": kind,
+            "payload": payload,
+            "at": at.isoformat(),
+        })
+
+
+    def recent_events(limit=50, kind=None):
+        result = []
+        for e in events:
+            if kind is None or e["kind"] == kind:
+                result.append(e)
+            if len(result) == limit:
+                break
+        return result
+
+
+    def events_json(limit=50, kind=None):
+        return dumps(recent_events(limit, kind))
+    ```
+
+    **Green Notes**
+    - **No front insertion into a list** (reduces E on every webhook call): `events.insert(0, ...)` moves every stored item one place to the right, so each call does more work as the log fills up. That is why it gets slower with traffic. A `deque` adds at the left end in constant time, with no shifting. In Green Metrics Tool micro-benchmarks, 1,000,000 × `list.insert(0, x)` used ~1515 J and 1,000,000 × `list.append(x)` used ~1.2 J, over 1000× less. `appendleft` on a deque is constant time like `append`, but that exact call was not measured.
+    - **`maxlen` replaces the manual trim:** the deque drops the oldest event by itself when it is full, so the `if len(events) > MAX_EVENTS: events.pop()` check is gone.
+    - **Star imports left unchanged:** `from datetime import *` and `from json import *` stay as they are. Changing them makes no measurable energy difference in Green Metrics Tool micro-benchmarks, so there is nothing to gain.
+
+    Behavior is the same: newest event first, at most 50,000 kept, and `recent_events` reads from the left, so it stops early. Do not index into the middle of a deque (`events[25000]`), it is slow there. For "latest N" reads, the loop you have is the right way.
+verify:
+  module: true
+  equivalence:
+    driver: |
+      from datetime import datetime as _dt, timezone as _tz
+      for i in range(51000):
+          record_event("a" if i % 3 else "b", {"n": i}, _dt(2024, 1, 1, tzinfo=_tz.utc))
+      print(len(events))
+      print(events_json(5))
+      print(events_json(3, "b"))
+      print(len(recent_events(100000)))
+  test: |-
+    from datetime import datetime as _dt, timezone as _tz
+    events.clear()
+    for i in range(MAX_EVENTS + 10):
+        record_event("x", {"n": i}, _dt(2024, 1, 1, tzinfo=_tz.utc))
+    assert len(events) == MAX_EVENTS
+    assert recent_events(1)[0]["payload"]["n"] == MAX_EVENTS + 9
+    assert events[-1]["payload"]["n"] == 10

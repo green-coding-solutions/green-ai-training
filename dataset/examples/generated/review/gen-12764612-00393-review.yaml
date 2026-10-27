@@ -1,0 +1,93 @@
+id: gen-12764612-00393-review
+category: review
+language: bash
+patterns:
+- bash-quoting
+- compress-transmitted
+facts:
+- F-BASH-QUOTES
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    hi, i wrote this script to send our app logs to the log server. cron runs it every 10 minutes. it works but my colleague said something is not good with it. i dont know what. can you review?
+
+    ```bash
+    #!/bin/bash
+    # ship app logs to the log server
+
+    LOG_DIR="/var/log/myapp"
+    OUT_DIR="/tmp/shipping"
+    HOST="logs.internal.example.com"
+
+    mkdir -p "$OUT_DIR"
+
+    for f in $(ls $LOG_DIR/*.log); do
+        name=$(basename $f)
+        echo "Processing $name"
+        grep -v "DEBUG" $f > "$OUT_DIR/$name.filtered"
+        xz -9 "$OUT_DIR/$name.filtered"
+        if scp "$OUT_DIR/$name.filtered.xz" "shipper@$HOST:/incoming/"; then
+            echo "Sent"
+        else
+            echo "FAILED"
+        fi
+        rm -f "$OUT_DIR/$name.filtered.xz"
+    done
+
+    echo "Done"
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (recurring cron job, log shipping)
+
+    #### [Bug] Unquoted variables and `ls` in the `for` loop
+    - **Where:** `for f in $(ls $LOG_DIR/*.log)`, `basename $f`, `grep ... $f`
+    - **Issue:** the shell splits the file list on spaces. A log file named `my app.log` becomes two broken names. If no `.log` file exists, `ls` prints an error and the loop gets nothing useful.
+    - **Fix:** loop over the glob directly and quote `$f`. Quotes around variables are needed, keep them.
+
+    #### [Security] Fixed, predictable directory in `/tmp`
+    - **Where:** `OUT_DIR="/tmp/shipping"`
+    - **Issue:** on a shared machine, another user can create this directory first and read or swap your log copies. Logs often hold tokens or user data.
+    - **Fix:** use `mktemp -d` and clean up with a `trap`.
+
+    #### [High] Slow, expensive codec for data you compress every 10 minutes
+    - **Where:** `xz -9`
+    - **Issue:** you compress fresh data again and again, and each file is deleted right after sending. In Green Metrics Tool measurements on 100 MB of text, xz at its default level used ~458 J of CPU energy and zstd ~16 J, about 29× less. `-9` is above the measured default, so it costs even more. These figures compare energy only, not file size. xz makes smaller files, but for a short hop to an internal server the extra CPU is not worth it.
+    - **Fix:** use `zstd`, and pipe the filtered lines straight into it. This also removes the temporary `.filtered` file.
+    - **Impact:** reduces E on every run, for every file. Your server still gets far fewer bytes than uncompressed. The receiving side must read `.zst` instead of `.xz`.
+
+    #### [Low] Double quotes on literals that need no expansion
+    - **Where:** `"/var/log/myapp"`, `"DEBUG"`, `"Sent"`, `"FAILED"`, `"Done"`
+    - **Issue:** bash scans double-quoted text for `$`, backticks and backslashes. In Green Metrics Tool micro-benchmarks, a 6,200-character literal assigned 1,000,000 times cost about 24% less CPU energy with single quotes. Your literals are short and run a few times, so the real saving here is tiny. Single quotes are still a good default for plain text.
+    - **Fix:** single quotes for plain text, double quotes only where a variable must expand.
+
+    ```bash
+    #!/bin/bash
+    # ship app logs to the log server
+
+    LOG_DIR='/var/log/myapp'
+    HOST='logs.internal.example.com'
+
+    OUT_DIR=$(mktemp -d) || exit 1
+    trap 'rm -rf "$OUT_DIR"' EXIT
+
+    for f in "$LOG_DIR"/*.log; do
+        [ -e "$f" ] || continue
+        name=$(basename "$f")
+        echo "Processing $name"
+        grep -v 'DEBUG' "$f" | zstd -q -o "$OUT_DIR/$name.zst"
+        if scp "$OUT_DIR/$name.zst" "shipper@$HOST:/incoming/"; then
+            echo 'Sent'
+        else
+            echo 'FAILED'
+        fi
+        rm -f "$OUT_DIR/$name.zst"
+    done
+
+    echo 'Done'
+    ```
+
+    **Already good:** you filter out `DEBUG` lines before compressing, so less data is compressed and sent. Variables are quoted in most places. The script cleans up its output files.
+verify:
+  static_only: needs real log files, zstd and scp to a remote host

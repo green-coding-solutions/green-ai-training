@@ -1,0 +1,111 @@
+id: gen-12764612-00477-review
+category: review
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    ```python
+    import re
+
+    TOKEN_RE = re.compile(r"[a-z0-9']+")
+    PAD_ID, UNK_ID = 0, 1
+
+
+    def build_vocab(path):
+        with open(path, encoding="utf-8") as f:
+            return [line.strip() for line in f]
+
+
+    def encode(text, vocab, max_len=128, unk_log=[]):
+        ids = []
+        for tok in TOKEN_RE.findall(text.lower()):
+            if tok in vocab:
+                ids.append(vocab.index(tok))
+            else:
+                unk_log.append(tok)
+                ids.append(UNK_ID)
+            if len(ids) == max_len:
+                break
+        ids += [PAD_ID] * (max_len - len(ids))
+        return ids
+
+
+    # called once per request by the sentiment endpoint
+    # vocab = build_vocab("vocab.txt")   # ~30k lines, loaded at startup
+    ```
+
+    ?
+- role: assistant
+  content: |
+    **Workload:** AI/ML (inference, runs on every request)
+
+    #### [Bug] Mutable default argument collects tokens forever
+    - **Where:** `unk_log=[]` in `encode`
+    - **Issue:** the default list is created once and shared by all calls. Every unknown token from every request is appended to it, so memory grows without bound. It also mixes data from different users in one list.
+    - **Fix:** remove it. If you need unknown-token stats, pass your own bounded counter in explicitly.
+
+    #### [High] Linear scans of a 30k-entry list for every token
+    - **Where:** `tok in vocab` and `vocab.index(tok)`
+    - **Issue:** `vocab` is a list. For each known token the code scans it twice: once for `in`, once for `index`. Each scan is O(V) with V around 30k. Tokens repeat across requests, so this adds up on the hot path.
+    - **Fix:** build a dict from token to id once at startup and use `vocab.get(tok, UNK_ID)`. That is one O(1) lookup per token. `setdefault` keeps the first position of a duplicated line, the same as `list.index`.
+    - **Impact:** reduces E per request, and the saving scales with vocab size and token count. The dict costs O(V) to build, which is only worth it because lookups repeat. In Green Metrics Tool micro-benchmarks, a single membership test on a list was cheaper than converting it to a set first. Here you do thousands of lookups per process, so the dict wins.
+
+    ```python
+    import re
+
+    TOKEN_RE = re.compile(r"[a-z0-9']+")
+    PAD_ID, UNK_ID = 0, 1
+
+
+    def build_vocab(path):
+        vocab = {}
+        with open(path, encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                vocab.setdefault(line.strip(), i)
+        return vocab
+
+
+    def encode(text, vocab, max_len=128):
+        ids = []
+        for tok in TOKEN_RE.findall(text.lower()):
+            ids.append(vocab.get(tok, UNK_ID))
+            if len(ids) == max_len:
+                break
+        ids += [PAD_ID] * (max_len - len(ids))
+        return ids
+    ```
+
+    Build the dict once at startup, not per request. The output ids are the same as before.
+
+    **Already good:** the regex is compiled once at module level, and the text is truncated and padded to a fixed length.
+verify:
+  test: |
+    import os, tempfile
+    p = os.path.join(tempfile.mkdtemp(), "v.txt")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("[PAD]\n[UNK]\nthe\ncat\nsat\nthe\n")
+    v = build_vocab(p)
+    assert encode("The cat sat on the mat", v, max_len=8) == [2, 3, 4, 1, 2, 1, 0, 0]
+    assert encode("cat cat cat cat", v, max_len=3) == [3, 3, 3]
+    assert encode("", v, max_len=2) == [0, 0]
+  equivalence:
+    driver: |-
+      import os, tempfile
+      p = os.path.join(tempfile.mkdtemp(), "v.txt")
+      with open(p, "w", encoding="utf-8") as f:
+          f.write("[PAD]\n[UNK]\nthe\ncat\nsat\nthe\nmat\ndog's\n\nrun\n")
+      v = build_vocab(p)
+      texts = [
+          "The cat sat on the mat",
+          "dog's run, the DOG runs",
+          "unknown words only here",
+          "",
+          "the " * 20,
+      ]
+      for t in texts:
+          print(encode(t, v, max_len=8))
+          print(encode(t, v, max_len=3))

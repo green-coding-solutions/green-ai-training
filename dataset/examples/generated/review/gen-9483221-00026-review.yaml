@@ -1,0 +1,75 @@
+id: gen-9483221-00026-review
+category: review
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    hello, can you look my script please? It run every night from cron after the ETL finish. It put the staging folder of the day in one archive and we keep 90 days. Sometimes I am not sure it is all ok, but it never send error mail.
+
+    ```bash
+    #!/bin/bash
+    # nightly archive of ETL staging output
+    STAGE=/data/etl/staging
+    OUT=/data/etl/archive
+    DAY=$(date +%F)
+    KEEP=90
+
+    mkdir -p $OUT
+    cd $STAGE
+    tar -cf - $DAY | xz -9e -T0 > $OUT/staging-$DAY.tar.xz
+    if [ $? -eq 0 ]; then
+        rm -rf $STAGE/$DAY
+    fi
+    find $OUT -name 'staging-*.tar.xz' -mtime +$KEEP -delete
+    echo "archived $DAY" >> /var/log/etl-archive.log
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly archive job)
+
+    #### [Bug] A failed `tar` still deletes the source data
+    - **Where:** `tar ... | xz ... > file`, then `if [ $? -eq 0 ]`
+    - **Issue:** `$?` is only the exit code of the last command in the pipe, which is `xz`. If `tar` fails (disk full, unreadable file, missing folder), `xz` still succeeds on a short or empty stream. Then `rm -rf` deletes the staging folder and you keep a broken archive. This also explains why you never get an error mail.
+    - **Fix:** `set -euo pipefail`, and test the archive before you delete anything (see the script below).
+
+    #### [Security] Unquoted variables around `rm -rf` and `cd`
+    - **Where:** `cd $STAGE`, `rm -rf $STAGE/$DAY`, `$OUT/...`
+    - **Issue:** if a variable is empty or has a space, `rm -rf` can hit the wrong path. `cd $STAGE` is also not checked, so a failed `cd` leaves the script in the wrong folder.
+    - **Fix:** quote all variables, use `tar -C`, and use `${STAGE:?}` so the script stops when the variable is empty.
+
+    #### [Medium] `xz -9e` for an archive you write every night
+    - **Where:** `xz -9e -T0`
+    - **Issue:** xz is one of the most expensive codecs, and `-9e` is even slower than the default level. In Green Metrics Tool micro-benchmarks on 100 MB of text, xz at its default level used about 458 J to compress and zstd at its default level about 16 J, so xz used about 29× more. Decompression is cheap for both. You compress every night and probably almost never read the files, so the compression side is what you pay for.
+    - **Fix:** `zstd -T0` (default level). Those figures compare energy only, not file size. xz and higher zstd levels usually give smaller files, so if disk space is your problem, check the size on your own data. For 90 days of retention, compressing is the right choice. Only the codec is expensive.
+    - **Impact:** E on every nightly run, growing with the daily data size.
+
+    ```bash
+    #!/bin/bash
+    # nightly archive of ETL staging output
+    set -euo pipefail
+
+    STAGE=/data/etl/staging
+    OUT=/data/etl/archive
+    DAY=$(date +%F)
+    KEEP=90
+
+    mkdir -p "$OUT"
+    tar -C "$STAGE" -cf - "$DAY" | zstd -T0 -q -f -o "$OUT/staging-$DAY.tar.zst.tmp"
+    zstd -tq "$OUT/staging-$DAY.tar.zst.tmp"
+    mv "$OUT/staging-$DAY.tar.zst.tmp" "$OUT/staging-$DAY.tar.zst"
+    rm -rf -- "${STAGE:?}/$DAY"
+
+    find "$OUT" -name 'staging-*.tar.*' -mtime +"$KEEP" -delete
+    echo "archived $DAY" >> /var/log/etl-archive.log
+    ```
+
+    The `find` pattern now matches `.tar.xz` and `.tar.zst`, so your old xz archives are still cleaned up after 90 days. Old files can stay as they are. Re-compressing them would cost more energy than it saves.
+
+    **Already good:** you stream `tar` into the compressor, so no big temporary tar file is written. `-T0` uses all cores, and `-mtime` cleanup keeps the archive folder bounded.
+verify:
+  static_only: bash script that works on /data paths and needs tar, xz and zstd installed

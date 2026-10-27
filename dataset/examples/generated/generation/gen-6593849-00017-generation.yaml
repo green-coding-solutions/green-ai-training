@@ -1,0 +1,56 @@
+id: gen-6593849-00017-generation
+category: generation
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    hi, i am new with nginx. our jenkins copy the test reports and build logs to /srv/ci-artifacts/<job>/<build number>/ after every build (coverage html report, junit xml, results json, and console.log). Developers open them in browser. I make nginx config but I think something is wrong, the .log files download instead of show and the server cpu is high when many people open coverage reports. Can you write me the server block? nginx 1.24, server name ci-artifacts.internal, only internal network, no https needed.
+- role: assistant
+  content: |
+    The `.log` files download because nginx does not know the `.log` type by default. The config below fixes that. It also serves compressed copies that the pipeline creates once, so nginx does not compress on every request.
+
+    ```nginx
+    server {
+        listen 80;
+        server_name ci-artifacts.internal;
+
+        root /srv/ci-artifacts;
+        autoindex on;
+
+        include mime.types;
+        types {
+            text/plain log;
+        }
+
+        # Serve file.html.gz, file.log.gz, ... if they exist
+        gzip_static on;
+
+        # Fallback for files that were not precompressed
+        gzip on;
+        gzip_vary on;
+        gzip_comp_level 2;
+        gzip_min_length 1024;
+        gzip_types text/plain text/css application/javascript application/json application/xml;
+    }
+    ```
+
+    Add this step at the end of the Jenkins job, after the files are copied. It compresses each text file once:
+
+    ```bash
+    find "$ARTIFACT_DIR" -type f \
+        \( -name '*.html' -o -name '*.css' -o -name '*.js' -o -name '*.json' -o -name '*.xml' -o -name '*.log' \) \
+        -exec gzip -9 -k -f {} +
+    ```
+
+    `$ARTIFACT_DIR` is the folder of the current build, for example `/srv/ci-artifacts/<job>/<build number>`. Keep the originals (`-k`) so clients without gzip support still work. If a file is changed later, run the step again so the `.gz` copy is not stale.
+
+    **Green Notes**
+    - **Precompressed text files** (reduces E, network): a build's reports never change after the copy, so compress them once in the pipeline and let `gzip_static` serve the result. In Green Metrics Tool micro-benchmarks with nginx, compressing on every request cost about 4× the CPU energy of serving precompressed files. Compression sent about 10× fewer bytes for text assets. That test ran on a local network, so it shows the CPU side only. Your high CPU is most likely per-request compression of big coverage pages, which this removes.
+    - **Cheap fallback** (reduces E): `gzip_comp_level 2` keeps per-request work small for any file that was not precompressed.
+    - *Not applied:* compression for images or already-compressed files such as `.zip`. They gain nothing and only cost CPU.
+verify:
+  static_only: nginx config and shell snippet, no runnable Python or JavaScript

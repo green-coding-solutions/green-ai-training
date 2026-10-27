@@ -1,0 +1,71 @@
+id: gen-6593849-00208-review
+category: review
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    review pls. landing page, small express server (server.js) serving public/. GitHub Actions builds it on every push
+
+    ```dockerfile
+    FROM node:20
+
+    RUN apt-get update && apt-get install -y build-essential git curl vim
+    RUN npm install -g nodemon
+
+    WORKDIR /app
+    COPY . .
+    RUN npm install
+
+    ENV NODE_ENV=production
+    EXPOSE 3000
+    CMD ["node", "server.js"]
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (image built in CI on every push)
+
+    #### [Security] Container runs as root
+    - **Where:** no `USER` line
+    - **Issue:** the server process runs as root. A bug in the app then gives an attacker root inside the container.
+    - **Fix:** add `USER node` (the official Node images already ship this user).
+
+    #### [High] Full base image plus tools the app never uses
+    - **Where:** `FROM node:20`, the `apt-get install` line, `npm install -g nodemon`
+    - **Issue:** the full image already carries a compiler toolchain. You then add `build-essential`, `git`, `curl`, `vim` and `nodemon`, but `CMD` only runs `node server.js`. Every build, pull and stored copy of the image carries this weight.
+    - **Fix:** use `node:20-slim` and drop the extra packages and `nodemon`.
+    - **Impact:** reduces E in CI and registry traffic, not runtime cost. In Green Metrics Tool micro-benchmarks, building a small Flask app image on `python:3.12-slim` with runtime dependencies only used about 7× less energy than the same app on the full image with dev tools. Serving requests afterwards cost the same. That was a Python image, but the cause is the same here: less to install, pull and store on every push.
+
+    #### [Medium] `COPY . .` before the install
+    - **Where:** `COPY . .` followed by `RUN npm install`
+    - **Issue:** any change to any file, even one line of CSS, invalidates the layer cache, so dependencies are reinstalled on every push. `npm install` can also change the lockfile and installs dev dependencies.
+    - **Fix:** copy only the package files first, then run `npm ci --omit=dev`, then copy the source. Add a `.dockerignore` so `node_modules` and `.git` don't enter the build context.
+
+    ```dockerfile
+    FROM node:20-slim
+
+    WORKDIR /app
+    COPY package.json package-lock.json ./
+    RUN npm ci --omit=dev
+
+    COPY server.js ./
+    COPY public ./public
+
+    ENV NODE_ENV=production
+    USER node
+    EXPOSE 3000
+    CMD ["node", "server.js"]
+    ```
+
+    ```text
+    node_modules
+    .git
+    npm-debug.log
+    ```
+
+    The slim image has no compiler. Your server runs fine without one if all dependencies are pure JavaScript. If a dependency needs to compile native code, install the build tools for that step only.
+verify:
+  static_only: Dockerfile review, needs docker build and a registry

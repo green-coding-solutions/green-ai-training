@@ -1,0 +1,80 @@
+id: gen-6593849-00079-review
+category: review
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    Review this vhost for our pipeline run dashboard (static SPA build plus a small JSON API for run status, plus the artifacts each run writes). Diff only, please, no essay.
+
+    ```nginx
+    server {
+        listen 80;
+        server_name pipeline.internal.example;
+        root /srv/pipeline-ui/dist;
+
+        gzip on;
+        gzip_comp_level 9;
+        gzip_min_length 0;
+        gzip_types *;
+        gzip_proxied any;
+
+        location / {
+            try_files $uri /index.html;
+        }
+
+        location /api/ {
+            proxy_pass http://127.0.0.1:8081;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+        }
+
+        location /artifacts/ {
+            alias /data/run-artifacts/;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (internal dashboard, static assets plus JSON API plus file downloads)
+
+    #### [Medium] Static build is compressed on every request
+    - **Where:** `gzip on; gzip_comp_level 9;` serving `/srv/pipeline-ui/dist`
+    - **Issue:** the JS, CSS and HTML only change on deploy, but nginx recompresses them for every request, at the top gzip level. In Green Metrics Tool micro-benchmarks (nginx, 2,000 text-asset requests), gzip level 5 per request used ~54 J of CPU energy. Precompressed files served with `gzip_static` used ~14 J, about 4× less. Both sent about 10× fewer bytes than uncompressed.
+    - **Fix:** precompress once in the build step and serve the `.gz` files: `find dist -type f \( -name '*.js' -o -name '*.css' -o -name '*.html' -o -name '*.json' -o -name '*.svg' \) -exec gzip -9 -k -f {} +`. Keep the originals (`-k`) for clients without gzip support.
+    - **Impact:** E on the server per asset request. The top level is fine at build time, because it runs once.
+
+    #### [Medium] `gzip_types *` also compresses already-compressed artifacts
+    - **Where:** `gzip_types *;`, `gzip_min_length 0;`, `/artifacts/`
+    - **Issue:** Parquet, ZIP and PNG files gain almost nothing from gzip, but they burn CPU on every download. A zero minimum length also compresses tiny responses where the header overhead cancels the gain.
+    - **Fix:** list text types only, and use a moderate level for what is compressed per request (the API JSON and CSV artifacts). See the diff.
+    - **Impact:** E per artifact download and per API response.
+
+    #### [Low] Missing `Vary: Accept-Encoding`
+    - **Where:** gzip block
+    - **Issue:** with both plain and gzip variants served for the same URL, a proxy or browser cache in between can hand a gzip body to a client that did not ask for it.
+    - **Fix:** `gzip_vary on;`
+
+    ```diff
+    -    gzip on;
+    -    gzip_comp_level 9;
+    -    gzip_min_length 0;
+    -    gzip_types *;
+    -    gzip_proxied any;
+    +    gzip_static on;
+    +    gzip on;
+    +    gzip_vary on;
+    +    gzip_comp_level 5;
+    +    gzip_min_length 256;
+    +    gzip_types text/plain text/css text/csv application/javascript application/json image/svg+xml;
+    +    gzip_proxied any;
+    ```
+
+    `gzip_static` needs the `ngx_http_gzip_static_module`, which the official nginx packages and images include.
+
+    **Already good:** compression stays on for the API, which is right because those responses are dynamic and can't be precompressed.
+verify:
+  static_only: nginx config, no runnable Python or JavaScript

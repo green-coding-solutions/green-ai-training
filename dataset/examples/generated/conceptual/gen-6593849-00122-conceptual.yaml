@@ -1,0 +1,48 @@
+id: gen-6593849-00122-conceptual
+category: conceptual
+language: text
+patterns:
+- memoize
+- context-tradeoff
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    We are writing internal guidelines for our shop backend (Python, FastAPI, Postgres). People keep asking if they should add `functools.lru_cache` to price and discount helpers. Our requirements: no stale prices, no memory leaks in long-running workers, no surprising behavior. The functions in question:
+
+    - `tax_rate(country, product_category)`: pure lookup from a static table
+    - `apply_promotions(cart_items, promo_code)`: cart_items is a list of dicts, nearly every cart is different
+    - `current_price(sku)`: reads the price from the DB
+
+    Which of these should get a cache and which not? And what rule should we put in the guideline so it is not guesswork?
+- role: assistant
+  content: |
+    Only `tax_rate` is a good fit. A cache pays off when the same inputs come back often and the function is pure.
+
+    **Your three functions**
+
+    - **`tax_rate(country, product_category)`: yes.** Pure, few distinct inputs, called again and again. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over only 200 distinct values used ~43 J uncached and ~4.7 J with `@functools.lru_cache`, about 9× less. Your case has the same shape.
+    - **`apply_promotions(cart_items, promo_code)`: no.** Nearly every cart is different, so the hit rate is close to zero. You would pay for hashing and storing every call and get nothing back. Also, a list of dicts is not hashable, so `lru_cache` raises `TypeError` unless you convert the cart first. If a part of it is repeated work, such as a rule lookup per promo code, cache that part.
+    - **`current_price(sku)`: no.** It is not pure. It reads the DB, so a cache returns stale prices and breaks your first requirement. If you need caching here, that is a separate decision with its own expiry rule, not `lru_cache`.
+
+    ```python
+    from functools import lru_cache
+
+    @lru_cache(maxsize=1024)
+    def tax_rate(country: str, product_category: str) -> float:
+        return _TAX_TABLE[(country, product_category)]
+    ```
+
+    **Rule for the guideline**
+
+    Add `lru_cache` only if all of these are true:
+
+    1. The function is pure: same arguments always give the same result, no DB, clock or global state.
+    2. The arguments are hashable and few distinct values repeat often.
+    3. `maxsize` is set. An unbounded cache grows without limit in a long-running worker. Mutable results should not be returned from a cache, because callers can change the shared object.
+    4. The hit rate was checked. Use `tax_rate.cache_info()` under realistic traffic. A low hit count means remove the cache.
+
+    The 9× figure comes from a benchmark with many repeats of few inputs. It does not carry over to workloads with mostly unique inputs, where a cache only adds overhead. To measure your own case, compare CPU time with and without the cache on a replay of real traffic, or use `perf stat`.
+verify:
+  static_only: conceptual answer

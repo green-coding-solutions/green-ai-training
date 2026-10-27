@@ -1,0 +1,74 @@
+id: gen-6593849-00233-estimate
+category: estimate
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    hi, im new to python and i dont know if this is good. we have a small text classifier for customer messages (support tickets) and this function turns a message into numbers for the model. i read that try/except is slow but im not sure if it matters here. many words in the tickets are not in our vocab, maybe half. how much energy would we save if i change it? we run about 2 million messages a day
+
+    ```python
+    PAD_ID = 0
+    UNK_ID = 1
+    MAX_LEN = 16
+    VOCAB = {"the": 2, "order": 3, "arrived": 4, "late": 5, "refund": 6}
+
+    def encode(text):
+        ids = []
+        for word in text.lower().split():
+            try:
+                ids.append(VOCAB[word])
+            except KeyError:
+                ids.append(UNK_ID)
+        ids = ids[:MAX_LEN]
+        ids += [PAD_ID] * (MAX_LEN - len(ids))
+        return ids
+    ```
+- role: assistant
+  content: |
+    Some saving, but I can't give you a number for 2 million messages a day, and I'd be careful about promising one.
+
+    Your guess is right. Half of your words are missing from `VOCAB`, so half of the lookups raise a `KeyError`. Raising and catching an exception is the expensive part. `dict.get` with a default does the same job with no exception:
+
+    ```python
+    PAD_ID = 0
+    UNK_ID = 1
+    MAX_LEN = 16
+    VOCAB = {"the": 2, "order": 3, "arrived": 4, "late": 5, "refund": 6}
+
+    def encode(text):
+        ids = [VOCAB.get(word, UNK_ID) for word in text.lower().split()]
+        ids = ids[:MAX_LEN]
+        ids += [PAD_ID] * (MAX_LEN - len(ids))
+        return ids
+    ```
+
+    The output is the same for every input.
+
+    **What was measured:** in Green Metrics Tool micro-benchmarks with 10,000,000 dict lookups where about half of the keys were missing, `dict.get(key, default)` used ~67 J of CPU energy and `try/except KeyError` used ~76 J. That is about 12% less for `get`. If misses are rare, `try/except` is cheap, because the cost is in raising.
+
+    **Why I won't scale it to your traffic:**
+    - That 12% is for the lookup alone. In your service the model call most likely costs much more than the encoding, so the saving for the whole service will be smaller than 12%.
+    - It depends on your messages, your vocab size and your machine.
+
+    **How to measure your own saving:**
+    - Take a fixed batch of real messages, for example 100,000.
+    - Run it through the old and the new `encode` and compare CPU time with `time` or `perf stat`. That is a good proxy.
+    - For energy, use RAPL or a Green Metrics Tool usage scenario.
+    - Then measure the whole request path once, to see how large the encoding part is.
+
+    The change is small and safe, so I would make it. It is not worth more work than that.
+verify:
+  green_block: 0
+  test: |
+    assert encode("The order arrived late") == [2, 3, 4, 5] + [0] * 12
+    assert encode("the xyz refund abc") == [2, 1, 6, 1] + [0] * 12
+    assert encode("") == [0] * 16
+    assert len(encode("late " * 40)) == 16
+  equivalence:
+    driver: |-
+      for t in ["The order arrived late", "the xyz refund abc", "", "late " * 40, "Where is my REFUND please", "zzz yyy"]:
+          print(encode(t))

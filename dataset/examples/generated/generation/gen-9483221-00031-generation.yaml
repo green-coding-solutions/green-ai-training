@@ -1,0 +1,90 @@
+id: gen-9483221-00031-generation
+category: generation
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    I'm writing the firmware-side Python for our building gateway (ARM board, 512 MB RAM, Python 3.11). Every 100 ms a sensor hub sends one binary frame with 24 temperature readings. Each reading is a raw 12-bit ADC value (0-4095), little-endian uint16, so the frame is 48 bytes.
+
+    Sensors are 10k NTC thermistors (B = 3950, 25 °C nominal) on the low side of a divider with a 10k series resistor. The ADC reference is the same as the divider supply.
+
+    Requirements:
+    - `adc_to_celsius(code)` returns the temperature rounded to 0.1 °C
+    - codes 0 and 4095 mean short or open circuit, return `None` for those
+    - `decode_frame(frame: bytes)` returns a list of 24 values (float or None)
+    - wrong frame length should fail loudly
+    - memory use must stay bounded, this box runs other services too
+    - stdlib only
+- role: assistant
+  content: |
+    ```python
+    import math
+    import struct
+    from functools import lru_cache
+    from typing import Optional
+
+    ADC_MAX = 4095
+    R_SERIES = 10_000.0
+    R_NOMINAL = 10_000.0
+    T_NOMINAL_K = 298.15
+    BETA = 3950.0
+    KELVIN = 273.15
+
+    SENSORS = 24
+    FRAME = struct.Struct(f"<{SENSORS}H")
+
+
+    @lru_cache(maxsize=ADC_MAX + 1)
+    def adc_to_celsius(code: int) -> Optional[float]:
+        """Convert a raw 12-bit ADC code to degrees Celsius (0.1 resolution)."""
+        if not 0 < code < ADC_MAX:
+            return None  # short or open circuit
+        r_ntc = R_SERIES * code / (ADC_MAX - code)
+        inv_t = 1.0 / T_NOMINAL_K + math.log(r_ntc / R_NOMINAL) / BETA
+        return round(1.0 / inv_t - KELVIN, 1)
+
+
+    def decode_frame(frame: bytes) -> list[Optional[float]]:
+        if len(frame) != FRAME.size:
+            raise ValueError(f"expected {FRAME.size} bytes, got {len(frame)}")
+        return [adc_to_celsius(code) for code in FRAME.unpack(frame)]
+
+
+    if __name__ == "__main__":
+        sample = FRAME.pack(*([2048] * 23 + [0]))
+        print(decode_frame(sample))
+        print(adc_to_celsius.cache_info())
+    ```
+
+    The cache holds at most 4096 entries, one per possible ADC code, so memory is fixed and small. `None` results for the fault codes are cached too.
+
+    **Green Notes**
+    - **Memoize a pure computation** (reduces E): `adc_to_celsius` does a division, a `log` and a few float operations, and it runs 240 times per second on inputs from a tiny set of values. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over 200 distinct inputs used ~4.7 J with `functools.lru_cache` against ~43 J uncached (about 9× less). The saving depends on inputs repeating. A 12-bit code space guarantees that.
+    - **Bounded cache** (reduces M): `maxsize` equals the number of possible codes, so the cache can never grow past that.
+    - *Not applied:* caching `decode_frame`. Whole 48-byte frames rarely repeat, so a cache would only add lookups and memory. If you ever pass raw float voltages instead of integer codes, drop the cache for the same reason.
+verify:
+  module: true
+  green_block: 0
+  test: |-
+    import struct as _st
+    assert adc_to_celsius(0) is None
+    assert adc_to_celsius(4095) is None
+    assert abs(adc_to_celsius(2048) - 25.0) < 0.1
+    assert adc_to_celsius(1000) > adc_to_celsius(3000)
+    assert adc_to_celsius.cache_info().maxsize == 4096
+    adc_to_celsius.cache_clear()
+    out = decode_frame(_st.pack("<24H", *([2048] * 24)))
+    assert len(out) == 24 and all(abs(v - 25.0) < 0.1 for v in out)
+    info = adc_to_celsius.cache_info()
+    assert info.misses == 1 and info.hits == 23
+    mixed = decode_frame(_st.pack("<24H", *([0] + [4095] + [2048] * 22)))
+    assert mixed[0] is None and mixed[1] is None
+    try:
+        decode_frame(b"\x00" * 10)
+        raise SystemExit("expected ValueError")
+    except ValueError:
+        pass

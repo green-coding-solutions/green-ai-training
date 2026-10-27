@@ -1,0 +1,94 @@
+id: gen-12764612-00430-review
+category: review
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    Review this. Log rollup for our API gateway, one pass over the daily file. Only tell me what to change, I'll apply it myself.
+
+    ```python
+    from collections import Counter
+
+
+    class LevelStats:
+        def __init__(self, cfg):
+            self.cfg = cfg
+            self.counts = Counter()
+            self.slow = []
+
+        def feed(self, lines):
+            for line in lines:
+                parts = line.split(self.cfg.sep)
+                level = parts[self.cfg.level_idx]
+                ms = int(parts[self.cfg.ms_idx])
+                self.counts[level] += 1
+                if ms > self.cfg.slow_ms:
+                    self.slow.append((level, ms))
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (per-line loop)
+
+    #### [Bug] One bad line aborts the whole run
+    - **Where:** `LevelStats.feed`, the `parts[...]` and `int(...)` lines
+    - **Issue:** a blank, truncated or non-numeric line raises `IndexError` or `ValueError`. The rollup dies midway and the counts so far are lost with the caller's state half-updated.
+    - **Fix:** catch both errors, skip the line and count it in `self.malformed`, so the caller can see how many lines were dropped.
+
+    #### [Low] Repeated attribute lookups in the loop
+    - **Where:** `self.cfg.sep`, `self.cfg.level_idx`, `self.cfg.ms_idx`, `self.cfg.slow_ms`, `self.counts`, `self.slow.append`
+    - **Issue:** each is a chain of attribute lookups, repeated for every line. The values don't change during the loop.
+    - **Fix:** bind them to locals before the loop.
+    - **Impact:** reduces E slightly. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local before a 10,000,000-iteration loop saved about 4-5%. Expect a gain of that order at most, because `split` and `int` dominate the per-line cost. Worth it here only because the file is large. It assumes `cfg` is not changed while `feed` runs and `self.slow` is not rebound.
+
+    ```python
+    from collections import Counter
+
+
+    class LevelStats:
+        def __init__(self, cfg):
+            self.cfg = cfg
+            self.counts = Counter()
+            self.slow = []
+            self.malformed = 0
+
+        def feed(self, lines):
+            sep = self.cfg.sep
+            level_idx = self.cfg.level_idx
+            ms_idx = self.cfg.ms_idx
+            slow_ms = self.cfg.slow_ms
+            counts = self.counts
+            slow_append = self.slow.append
+            for line in lines:
+                parts = line.split(sep)
+                try:
+                    level = parts[level_idx]
+                    ms = int(parts[ms_idx])
+                except (IndexError, ValueError):
+                    self.malformed += 1
+                    continue
+                counts[level] += 1
+                if ms > slow_ms:
+                    slow_append((level, ms))
+    ```
+
+    **Already good:** the loop streams over `lines` and never loads the whole file, so memory stays flat.
+verify:
+  green_block: 0
+  equivalence:
+    driver: |-
+      from types import SimpleNamespace
+
+      cfg = SimpleNamespace(sep="|", level_idx=1, ms_idx=2, slow_ms=500)
+      levels = ["INFO", "WARN", "ERROR", "DEBUG"]
+      lines = [f"{i}|{levels[i % 4]}|{(i * 37) % 900}" for i in range(20000)]
+      stats = LevelStats(cfg)
+      stats.feed(lines[:10000])
+      stats.feed(iter(lines[10000:]))
+      print(sorted(stats.counts.items()))
+      print(len(stats.slow))
+      print(stats.slow[:5])
+      print(stats.slow[-1])

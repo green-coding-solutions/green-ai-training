@@ -1,0 +1,68 @@
+id: gen-6593849-00274-generation
+category: generation
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # post-build step, called by jenkins as: archive-build.sh <job> <build number>
+    set -euo pipefail
+
+    JOB_NAME="$1"
+    BUILD_NUM="$2"
+    BUILD_DIR="/var/lib/jenkins/jobs/$JOB_NAME/builds/$BUILD_NUM"
+    ARCHIVE_DIR="/srv/ci-archive/$JOB_NAME"
+    KEEP_DAYS=60
+
+    mkdir -p "$ARCHIVE_DIR"
+
+    # TODO pack build dir (log, junitResult.xml, test reports) into ARCHIVE_DIR
+    # TODO delete archives older than KEEP_DAYS
+    # TODO remove the build dir after it was archived
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # post-build step, called by jenkins as: archive-build.sh <job> <build number>
+    set -euo pipefail
+
+    JOB_NAME="$1"
+    BUILD_NUM="$2"
+    BUILD_DIR="/var/lib/jenkins/jobs/$JOB_NAME/builds/$BUILD_NUM"
+    ARCHIVE_DIR="/srv/ci-archive/$JOB_NAME"
+    KEEP_DAYS=60
+
+    mkdir -p "$ARCHIVE_DIR"
+
+    target="$ARCHIVE_DIR/build-$BUILD_NUM.tar.zst"
+    tmp="$target.part"
+
+    # pack, compress with zstd (default level), then rename so a half-written file never looks finished
+    tar -C "$BUILD_DIR" -cf - . | zstd -q -T1 -o "$tmp"
+    zstd -q -t "$tmp"
+    mv "$tmp" "$target"
+
+    # remove the build dir only after the archive was written and tested
+    rm -rf -- "$BUILD_DIR"
+
+    # delete archives older than the retention time
+    find "$ARCHIVE_DIR" -name 'build-*.tar.zst' -type f -mtime +"$KEEP_DAYS" -delete
+    ```
+
+    **Green Notes**
+    - **Compress stored data with a fast codec** (reduces E and storage): build logs and JUnit XML are text, so they shrink a lot, and they sit on disk for 60 days. This script runs after every build, so the codec cost repeats. In Green Metrics Tool measurements compressing 100 MB of text, zstd used ~16 J, gzip ~67 J and xz ~458 J, so zstd used about 4× less than gzip and about 29× less than xz. `xz` or `brotli` would only make sense for data that is compressed once and kept for a long time.
+    - **Worth it at 60 days:** a Green Coding Solutions estimate (not a direct measurement) puts the break-even for zstd at about 0.15 days of storage. Data that lives only minutes should not be compressed.
+    - `-T1` keeps the compression on one core, so it does not compete with the next build on the same server.
+
+    The measurements compare energy only, not compressed size. If you need the smallest possible archives for long-term storage, test a higher zstd level on your own logs first.
+verify:
+  static_only: needs Jenkins build directories, tar and zstd

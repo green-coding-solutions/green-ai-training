@@ -1,0 +1,128 @@
+id: gen-6593849-00109-refactor
+category: refactor
+language: python
+patterns:
+- deque-or-append
+- batch-db-writes
+facts:
+- F-LISTINS
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    I have a small CLI that loads the nightly scan export from our warehouse scanners into Postgres. The CSV has around 300k rows, oldest first. It got slow and my colleague says it also "eats RAM". Can you optimize it?
+
+    Requirements:
+    - Same command line (`python import_scans.py export.csv`), same output.
+    - The summary must still list the 20 newest scans, newest first.
+    - psycopg 3 is already installed, no new dependencies.
+    - Rows with an empty SKU are skipped, like now.
+
+    ```python
+    #!/usr/bin/env python3
+    """Import warehouse scan events from a CSV export."""
+    import csv
+    import sys
+
+    import psycopg
+
+    DSN = "postgresql://wms@localhost/wms"
+    INSERT_SQL = (
+        "INSERT INTO scan_events (scanned_at, sku, location, qty) "
+        "VALUES (%s, %s, %s, %s)"
+    )
+
+
+    def import_scans(path):
+        recent = []
+        total = 0
+        with psycopg.connect(DSN) as conn, open(path, newline="") as f:
+            cur = conn.cursor()
+            for row in csv.DictReader(f):
+                if not row["sku"]:
+                    continue
+                event = (
+                    row["scanned_at"],
+                    row["sku"],
+                    row["location"],
+                    int(row["qty"]),
+                )
+                cur.execute(INSERT_SQL, event)
+                conn.commit()
+                recent.insert(0, event)
+                total += 1
+        print(f"imported {total} rows")
+        for scanned_at, sku, location, qty in recent[:20]:
+            print(scanned_at, sku, location, qty)
+
+
+    if __name__ == "__main__":
+        import_scans(sys.argv[1])
+    ```
+- role: assistant
+  content: |
+    ```python
+    #!/usr/bin/env python3
+    """Import warehouse scan events from a CSV export."""
+    import csv
+    import sys
+    from collections import deque
+
+    import psycopg
+
+    DSN = "postgresql://wms@localhost/wms"
+    COPY_SQL = "COPY scan_events (scanned_at, sku, location, qty) FROM STDIN"
+    BATCH_SIZE = 5000
+    SUMMARY_SIZE = 20
+
+
+    def flush(conn, batch):
+        with conn.cursor() as cur:
+            with cur.copy(COPY_SQL) as copy:
+                for event in batch:
+                    copy.write_row(event)
+        conn.commit()
+
+
+    def import_scans(path):
+        recent = deque(maxlen=SUMMARY_SIZE)  # appendleft keeps newest first
+        batch = []
+        total = 0
+        with psycopg.connect(DSN) as conn, open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                if not row["sku"]:
+                    continue
+                event = (
+                    row["scanned_at"],
+                    row["sku"],
+                    row["location"],
+                    int(row["qty"]),
+                )
+                batch.append(event)
+                recent.appendleft(event)
+                total += 1
+                if len(batch) >= BATCH_SIZE:
+                    flush(conn, batch)
+                    batch.clear()
+            if batch:
+                flush(conn, batch)
+        print(f"imported {total} rows")
+        for scanned_at, sku, location, qty in recent:
+            print(scanned_at, sku, location, qty)
+
+
+    if __name__ == "__main__":
+        import_scans(sys.argv[1])
+    ```
+
+    The output is the same: a row count, then the 20 newest scans, newest first.
+
+    **Green Notes**
+    - **Batched `COPY` instead of one `INSERT` and commit per row** (reduces E): the old loop ran one statement and one commit per row, so about 300k round trips and commits. Now it runs one `COPY` and one commit per 5,000 rows. In Green Metrics Tool micro-benchmarks on PostgreSQL, `COPY` with 5,000-row batches used about 22× less CPU energy than one `execute()` per row. With batches of only 100 rows the differences were small, so keep `BATCH_SIZE` in the thousands.
+    - **`deque(maxlen=20)` with `appendleft` instead of `list.insert(0, ...)`** (reduces E, M): every front insert shifts the whole list, so the cost grows with each row. In the same micro-benchmarks, 1,000,000 front inserts cost over 1000× the energy of 1,000,000 appends. The deque inserts in O(1). It also keeps only the 20 rows you print, so memory stays flat. That explains the RAM use your colleague saw: the old code kept all 300k rows just to show 20.
+
+    **Behavior differences**
+    - **Failure handling:** the old code committed every row as it went. Now a bad row stops the import, for example a non-numeric `qty` or a database error. Everything up to the last full batch is committed, and the current partial batch is lost. If you need all-or-nothing, remove the commit from `flush()` and commit once at the end. If you need to resume after a failure, log the row number of the last committed batch.
+    - **`COPY` has no per-row error handling:** one bad row fails its whole batch of 5,000. If you add conflict handling later, load into a staging table first and merge from it.
+verify:
+  static_only: needs a running PostgreSQL server and psycopg 3

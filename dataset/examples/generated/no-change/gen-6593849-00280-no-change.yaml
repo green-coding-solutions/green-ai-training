@@ -1,0 +1,57 @@
+id: gen-6593849-00280-no-change
+category: no-change
+language: nginx
+patterns:
+- text-compression
+- context-tradeoff
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    Internal vhost for our log archive viewer. Anything worth changing for compression / CPU? Diff only, I don't want a rewrite.
+
+    ```nginx
+    server {
+        listen 443 ssl http2;
+        server_name logs.internal.example.com;
+
+        ssl_certificate     /etc/ssl/internal/logs.crt;
+        ssl_certificate_key /etc/ssl/internal/logs.key;
+
+        auth_basic           "Log archive";
+        auth_basic_user_file /etc/nginx/htpasswd.logs;
+
+        # viewer UI, .gz/.br files are created in the deploy job
+        location /ui/ {
+            root /srv/logviewer;
+            gzip off;
+            gzip_static on;
+            gzip_vary on;
+            expires 7d;
+        }
+
+        # logrotate output: app-2026-10-25.log.gz, ...
+        location /archive/ {
+            root /srv/logs;
+            autoindex on;
+            autoindex_exact_size off;
+            types { application/gzip gz; }
+            default_type text/plain;
+            add_header Content-Disposition attachment;
+        }
+
+        location = / {
+            return 302 /ui/;
+        }
+    }
+    ```
+- role: assistant
+  content: |-
+    No diff. This config is already right for compression.
+
+    - **`/ui/`** serves files that the deploy job compressed once. `gzip_static on` sends them as they are, and `gzip off` stops nginx from compressing on each request. In Green Metrics Tool micro-benchmarks with nginx and 2,000 text requests, per-request gzip level 5 cost about 4× the CPU energy of precompressed files. Both sent about 10× fewer bytes than no compression.
+    - **`/archive/`** serves `.log.gz` files that logrotate already compressed. Compressing them again would burn CPU and save almost nothing. Your config leaves `application/gzip` out of any compression, which is correct.
+    - **Index page.** The `autoindex` listing is small, behind auth and rarely requested. Compressing it would not be worth a directive.
+
+    One thing to watch later: if you ever serve uncompressed `.log` files from `/archive/`, compress them at rotation time and use `gzip_static`. Do not turn on `gzip on` for them.

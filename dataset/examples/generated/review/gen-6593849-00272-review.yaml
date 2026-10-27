@@ -1,0 +1,102 @@
+id: gen-6593849-00272-review
+category: review
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+- F-COMPRESS
+messages:
+- role: user
+  content: |
+    hi, i am not sure what is wrong but our landing page feel slow on the small server and CPU go up when we have campaign traffic. the agency make this nginx config. can you look?
+
+    ```nginx
+    server {
+        listen 80;
+        server_name launch.example.com;
+
+        root /var/www/launch;
+        index index.html;
+
+        gzip on;
+        gzip_comp_level 9;
+        gzip_vary on;
+        gzip_types text/css application/javascript application/json image/svg+xml image/jpeg image/png video/mp4;
+
+        brotli on;
+        brotli_comp_level 11;
+        brotli_types text/html text/css application/javascript image/svg+xml image/jpeg image/png;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location /assets/ {
+            expires 30d;
+            add_header Cache-Control "public, immutable";
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (static landing page, bursty campaign traffic)
+
+    #### [High] Maximum-effort compression on every request
+    - **Where:** `brotli_comp_level 11;` and `gzip_comp_level 9;`
+    - **Issue:** nginx compresses the same unchanged files again for every visitor, and it uses the slowest settings to do it. Brotli at quality 11 is built for files you compress once. In Green Metrics Tool micro-benchmarks, brotli at quality 11 used about 45× the CPU energy of gzip at its default level when compressing 100 MB of text. That is likely your CPU spike during campaigns.
+    - **Fix:** compress the files once at build time, and let nginx send the ready files. Your files are static, so nothing is lost.
+    - **Impact:** reduces E on the server for every request. In Green Metrics Tool micro-benchmarks, nginx serving text assets with per-request gzip (level 5) used about 4× the CPU energy of serving precompressed files. Compression sent about 10× fewer bytes in both cases, so keep it on for real networks.
+
+    #### [Medium] Images and video are in the compress lists
+    - **Where:** `image/jpeg`, `image/png`, `video/mp4` in `gzip_types` and `brotli_types`
+    - **Issue:** JPEG, PNG and MP4 are already compressed. Compressing them again burns CPU and saves almost no bytes.
+    - **Fix:** list only text types: HTML, CSS, JS, JSON and SVG.
+
+    #### [Low] Both gzip and brotli run on the fly
+    - **Where:** the `gzip` and `brotli` blocks
+    - **Issue:** with prebuilt files, nginx does not need to compress anything itself. If you keep a fallback for files that were not precompressed, a moderate gzip level is enough.
+
+    **Fix: config**
+
+    ```nginx
+    server {
+        listen 80;
+        server_name launch.example.com;
+
+        root /var/www/launch;
+        index index.html;
+
+        gzip_static on;
+        brotli_static on;
+        gzip_vary on;
+
+        # fallback for files without a precompressed copy
+        gzip on;
+        gzip_comp_level 5;
+        gzip_types text/css application/javascript application/json image/svg+xml;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location /assets/ {
+            expires 30d;
+            add_header Cache-Control "public, immutable";
+        }
+    }
+    ```
+
+    **Fix: run once after each build**
+
+    ```bash
+    find /var/www/launch -type f \( -name '*.html' -o -name '*.css' -o -name '*.js' -o -name '*.json' -o -name '*.svg' \) \
+        -exec gzip -k -9 -f {} + \
+        -exec brotli -k -q 11 -f {} +
+    ```
+
+    Max levels are fine here, because each file is compressed only once. `brotli_static` needs the ngx_brotli module, and `gzip_static` needs the gzip static module, so check both are in your nginx build. Rerun the command on every deploy, or visitors will get stale `.gz` and `.br` files.
+
+    **Already good:** long cache lifetime with `immutable` on `/assets/`, and `gzip_vary on`.
+verify:
+  static_only: nginx configuration review, no runnable code

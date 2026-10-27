@@ -1,0 +1,50 @@
+id: gen-6593849-00074-generation
+category: generation
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    ```bash
+    #!/bin/bash
+    # run_sim.sh - run the diffusion model and send results to the analysis box
+    RUN_ID=$1
+    OUT=/scratch/sim/$RUN_ID
+
+    ./diffuse --config params.toml --out "$OUT"
+
+    # TODO send $OUT to analysis box (analysis01.lab.example, user sim, ~/incoming)
+    ```
+
+    ?
+- role: assistant
+  content: |
+    Here is the script with the missing step filled in. It streams the results to the analysis box.
+
+    ```bash
+    #!/bin/bash
+    # run_sim.sh - run the diffusion model and send results to the analysis box
+    set -euo pipefail
+
+    RUN_ID=$1
+    OUT=/scratch/sim/$RUN_ID
+
+    ./diffuse --config params.toml --out "$OUT"
+
+    # stream results to the analysis box: tar -> zstd -> ssh, no temp archive
+    tar -C /scratch/sim -cf - -- "$RUN_ID" \
+        | zstd -T0 -q \
+        | ssh sim@analysis01.lab.example 'mkdir -p ~/incoming && zstd -d -q | tar -C ~/incoming -xf -'
+    ```
+
+    **Green Notes**
+    - **Fast codec for transmitted data** (reduces network, E): the CSV and text output compresses well, so fewer bytes cross the link. `zstd` at its default level is the cheap choice. In Green Metrics Tool micro-benchmarks on 100 MB of text, zstd compressing used ~16 J, gzip ~67 J (about 4× more) and xz ~458 J. Those figures compare energy only, not compression ratio.
+    - **Streaming** (reduces M, E): the data is compressed on the fly and unpacked on the other side. No temporary archive is written to `/scratch`.
+    - **Safe failure:** `pipefail` makes the script exit with an error if the simulation, the compression or the transfer fails.
+
+    *Not applied:* `xz` or `brotli -q 11`. They give smaller files, but the energy cost is one to two orders of magnitude higher, and this runs after every run. If your output is already compressed (`.nc` with internal compression, `.h5` with gzip filters, PNG), this step gains little for those files.
+verify:
+  static_only: needs a simulation binary, zstd and an ssh host

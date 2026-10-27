@@ -1,0 +1,59 @@
+id: gen-6593849-00068-estimate
+category: estimate
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    ```dockerfile
+    # ingest worker: kafka -> parquet -> postgres
+    # CI builds this on every push. how much energy would slim save??
+    FROM python:3.12
+
+    RUN apt-get update && apt-get install -y \
+        build-essential git curl vim
+
+    WORKDIR /app
+    COPY . .
+
+    RUN pip install -r requirements.txt
+    RUN pip install pytest black mypy ipython
+
+    ENV PYTHONUNBUFFERED=1
+    CMD ["python", "-m", "ingest.main"]
+    ```
+
+    ?
+- role: assistant
+  content: |
+    A lot less per build, and the saving repeats on every push. In Green Metrics Tool micro-benchmarks, building a small Flask app image without a build cache used ~885 J and 157 s with the full `python:3.12` base plus compilers and dev tools. The slim version (`python:3.12-slim`, runtime dependencies only, dependency layer before the source) used ~124 J and 25 s. That is about 7× less.
+
+    Serving 2,000 requests afterwards cost the same with both images (~17 J). So the saving is in each build, pull and stored copy of the image, not in how the worker runs.
+
+    ```dockerfile
+    FROM python:3.12-slim
+
+    WORKDIR /app
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY . .
+
+    ENV PYTHONUNBUFFERED=1
+    CMD ["python", "-m", "ingest.main"]
+    ```
+
+    What changed:
+
+    - **Slim base:** no `build-essential`, `git`, `curl` or `vim`. If a dependency has no prebuilt wheel and must compile, add the compiler only for that build step and keep it out of the final image.
+    - **Dependency layer first:** `requirements.txt` is copied before the source, so a code change doesn't reinstall packages when the layer cache is available.
+    - **Dev tools removed:** `pytest`, `black`, `mypy` and `ipython` don't belong in a runtime image. Run them in a separate CI step or a dev image.
+    - **`--no-cache-dir`:** pip's download cache is not stored in the image.
+
+    Don't scale the benchmark numbers to your pipeline. Your dependencies, runner and cache settings differ. To get your own number, run `docker build --no-cache` for both Dockerfiles in a Green Metrics Tool usage scenario and compare. Or use `time` on the build as a rough CPU-time proxy.
+verify:
+  static_only: Dockerfile, needs docker build

@@ -1,0 +1,93 @@
+id: gen-6593849-00083-refactor
+category: refactor
+language: python
+patterns:
+- batch-db-writes
+- set-membership
+facts:
+- F-PG-INSERT
+- F-MEMB
+messages:
+- role: user
+  content: |
+    fix this, import of ~40k rows takes forever
+
+    ```python
+    import csv
+    import sys
+
+    import psycopg
+
+
+    def load_subscribers(path, dsn):
+        conn = psycopg.connect(dsn)
+        cur = conn.cursor()
+        cur.execute("SELECT email FROM subscribers")
+        existing = [r[0] for r in cur.fetchall()]
+
+        added = 0
+        skipped = 0
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                email = row["email"].strip().lower()
+                if email in existing:
+                    skipped += 1
+                    continue
+                cur.execute(
+                    "INSERT INTO subscribers (email, name, source) VALUES (%s, %s, %s)",
+                    (email, row["name"].strip(), row.get("source") or "import"),
+                )
+                conn.commit()
+                existing.append(email)
+                added += 1
+        conn.close()
+        print(f"added {added}, skipped {skipped}")
+
+
+    if __name__ == "__main__":
+        load_subscribers(sys.argv[1], sys.argv[2])
+    ```
+- role: assistant
+  content: |
+    ```python
+    import csv
+    import sys
+
+    import psycopg
+
+
+    def load_subscribers(path, dsn):
+        added = 0
+        skipped = 0
+        with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+            cur.execute("SELECT email FROM subscribers")
+            existing = {r[0] for r in cur.fetchall()}
+
+            with cur.copy("COPY subscribers (email, name, source) FROM STDIN") as copy:
+                with open(path, newline="") as f:
+                    for row in csv.DictReader(f):
+                        email = row["email"].strip().lower()
+                        if email in existing:
+                            skipped += 1
+                            continue
+                        existing.add(email)
+                        copy.write_row(
+                            (email, row["name"].strip(), row.get("source") or "import")
+                        )
+                        added += 1
+        print(f"added {added}, skipped {skipped}")
+
+
+    if __name__ == "__main__":
+        load_subscribers(sys.argv[1], sys.argv[2])
+    ```
+
+    **Green Notes**
+    - **Batch the writes** (reduces E): the old code sent one `INSERT` and one commit per row. Now all new rows go through a single `COPY` and one commit. In Green Metrics Tool micro-benchmarks with 5,000-row batches, `COPY` used about 22× less CPU energy than one `execute()` per row. With only a few hundred rows the gap would be small, but your file is large enough for it to matter.
+    - **Set for membership** (reduces E): `email in existing` on a list scans the list for every CSV row, so the cost grows with rows × existing emails. A set makes each check O(1). It pays off here because you check once per row. In the same benchmarks, a single lookup was cheaper on the plain list than building a set first.
+
+    Behavior changes to know about:
+    - The import is now all-or-nothing. If a row fails, nothing is saved. Before, rows committed one by one, so a crash left a partial import.
+    - `COPY` has no `ON CONFLICT`. Duplicates already in the table or earlier in the file are still skipped by the set. A row inserted by someone else during the import would fail the whole load.
+verify:
+  static_only: needs psycopg and a running PostgreSQL server

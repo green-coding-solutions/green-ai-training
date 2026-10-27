@@ -1,0 +1,77 @@
+id: gen-6593849-00169-review
+category: review
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    Review this Dockerfile for our marketing landing page (Flask, Jinja templates, a signup form, static assets). CI builds it on every push to every branch. Just give me the diff.
+
+    ```dockerfile
+    FROM python:3.12
+
+    RUN apt-get update && apt-get install -y build-essential git curl vim
+
+    WORKDIR /app
+    COPY . .
+
+    RUN pip install -r requirements.txt && pip install pytest black mypy ipython
+
+    ENV FLASK_ENV=production
+    EXPOSE 8000
+
+    CMD ["gunicorn", "-b", "0.0.0.0:8000", "app:app"]
+    ```
+
+    requirements.txt: flask, gunicorn, wtforms, email-validator.
+- role: assistant
+  content: |
+    **Workload:** web (CI image build)
+
+    #### [Security] Container runs as root
+    - **Where:** no `USER` instruction
+    - **Issue:** gunicorn runs as root, so a bug in the app gives root inside the container.
+    - **Fix:** create and switch to an unprivileged user (in the diff).
+
+    #### [High] Fat base image with build and dev tools
+    - **Where:** `FROM python:3.12`, the `apt-get install` line, `pip install pytest black mypy ipython`
+    - **Issue:** a landing page needs only the runtime packages. Your four dependencies are pure Python, so `build-essential`, `git`, `curl` and `vim` are never used at runtime. The dev tools do not belong in a production image.
+    - **Fix:** use `python:3.12-slim`, drop the apt line and the dev tools. Run tests in a separate CI step.
+    - **Impact:** reduces E on every build, pull and stored copy. In Green Metrics Tool micro-benchmarks of a small Flask app built without cache, the slim image with runtime dependencies only used about 7× less energy to build. Serving requests cost the same with both images, so the saving is in the builds. It repeats on every push.
+
+    #### [Medium] Dependency layer is invalidated by every code change
+    - **Where:** `COPY . .` before `pip install`
+    - **Issue:** any template or CSS edit reruns the full dependency install.
+    - **Fix:** copy `requirements.txt` first, install, then copy the source. Add `--no-cache-dir` so pip's download cache stays out of the layer.
+    - **Impact:** reduces E per build when only the source changed.
+
+    ```diff
+    -FROM python:3.12
+    -
+    -RUN apt-get update && apt-get install -y build-essential git curl vim
+    -
+    +FROM python:3.12-slim
+    +
+     WORKDIR /app
+    -COPY . .
+    -
+    -RUN pip install -r requirements.txt && pip install pytest black mypy ipython
+    +COPY requirements.txt .
+    +RUN pip install --no-cache-dir -r requirements.txt
+    +COPY . .
+    +
+    +RUN useradd --create-home appuser
+    +USER appuser
+
+     ENV FLASK_ENV=production
+     EXPOSE 8000
+    ```
+
+    Also add a `.dockerignore` with `.git`, `.env`, `__pycache__` and `tests/`. Otherwise `COPY . .` puts your git history and any local secrets into the image.
+
+    **Already good:** gunicorn as the server, an exec-form `CMD`, and a single `EXPOSE`.
+verify:
+  static_only: Dockerfile review, needs Docker and a build environment

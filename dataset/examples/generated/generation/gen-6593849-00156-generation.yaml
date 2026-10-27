@@ -1,0 +1,57 @@
+id: gen-6593849-00156-generation
+category: generation
+language: bash
+patterns:
+- bash-quoting
+- bash-builtins
+facts:
+- F-BASH-QUOTES
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    bash script to smoke test our REST API endpoints from a file, print status per endpoint
+- role: assistant
+  content: |
+    Each line of the endpoint file is `METHOD /path [expected_status]`. Lines starting with `#` are ignored. The expected status defaults to 200.
+
+    ```bash
+    #!/usr/bin/env bash
+    # usage: smoke.sh BASE_URL [endpoints.txt]
+    # API_TOKEN (optional) is sent as a bearer token
+    set -u
+
+    base=${1:?'usage: smoke.sh BASE_URL [endpoints.txt]'}
+    list=${2:-endpoints.txt}
+    failed=0
+
+    while read -r method path expected; do
+      [[ -z $method || $method == '#'* ]] && continue
+      expected=${expected:-200}
+
+      code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+        -X "$method" \
+        -H 'Accept: application/json' \
+        -H "Authorization: Bearer ${API_TOKEN:-}" \
+        "$base$path")
+
+      if [[ $code == "$expected" ]]; then
+        printf '%-6s %-40s %s\n' "$method" "$path" "$code"
+      else
+        printf 'FAIL %s %s: got %s, want %s\n' "$method" "$path" "$code" "$expected"
+        failed=$((failed + 1))
+      fi
+    done < "$list"
+
+    if (( failed > 0 )); then
+      printf '%d endpoint(s) failed\n' "$failed" >&2
+      exit 1
+    fi
+    ```
+
+    **Green Notes**
+    - **Single quotes for literals** (reduces E): headers, `printf` formats and messages without variables use single quotes. Only strings that need `$token` or `$base` expansion use double quotes. Variables stay quoted. In Green Metrics Tool micro-benchmarks, a 6,200-character literal assigned in a loop used about 24% less CPU energy with single quotes. Your literals are short and `curl` dominates each iteration, so the saving here is small. It is free, though.
+    - **Builtins for parsing** (reduces E): `read -r` splits the fields and `$(( ))` does the counting, so the only process started per endpoint is `curl`. In a log-summary benchmark, builtin field splitting used about 300× less CPU energy than `$(echo | cut)` per line.
+    - *Not applied:* parallel requests. A smoke test with a few endpoints is dominated by wait time, and the order of the output is easier to read.
+verify:
+  static_only: needs a network and curl against a live API

@@ -1,0 +1,72 @@
+id: gen-12764612-00411-generation
+category: generation
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    py: group log lines by request id, events per request newest first, for our triage view. log is oldest first, format is `2026-10-26T12:00:01.123Z ERROR req=ab12 msg text...`. only WARN and ERROR matter. streams from a file, can be big. just the code
+- role: assistant
+  content: |
+    ```python
+    import re
+    import sys
+    from collections import defaultdict
+
+    REQ_ID = re.compile(r"\breq=(\S+)")
+
+
+    def group_by_request(lines, levels=("WARN", "ERROR")):
+        """Map request id -> its WARN/ERROR lines, newest first.
+
+        Input must be oldest first, as in the log file.
+        """
+        groups = defaultdict(list)
+        for line in lines:
+            parts = line.split(" ", 2)
+            if len(parts) < 3 or parts[1] not in levels:
+                continue
+            m = REQ_ID.search(parts[2])
+            if m:
+                groups[m.group(1)].append(line.rstrip("\n"))
+        return {req: events[::-1] for req, events in groups.items()}
+
+
+    def main(path):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for req, events in group_by_request(f).items():
+                print(req)
+                for event in events:
+                    print("  " + event)
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1])
+    ```
+
+    **Green Notes**
+    - **Append, then reverse once** (reduces E): `insert(0, line)` shifts the whole list on every call, so a request with many events gets quadratic work. `append` is O(1), and one reverse per group at the end gives the newest-first order. In Green Metrics Tool micro-benchmarks, 1,000,000 `list.insert(0, x)` calls used ~1515 J and 1,000,000 `list.append(x)` calls used ~1.2 J, over 1000× less.
+    - The file is read line by line, so only the kept WARN/ERROR lines are held in memory.
+    - *Not applied:* `deque.appendleft` — the groups are written once and read once, so a plain list plus one reverse is simpler.
+verify:
+  module: true
+  test: |-
+    sample = [
+        "2026-10-26T12:00:01.100Z INFO req=a1 start",
+        "2026-10-26T12:00:01.200Z WARN req=a1 slow query",
+        "2026-10-26T12:00:01.300Z ERROR req=b2 boom",
+        "2026-10-26T12:00:01.400Z ERROR req=a1 timeout",
+        "2026-10-26T12:00:01.500Z WARN req=a1 retry",
+        "garbage",
+    ]
+    res = group_by_request(sample)
+    assert res["a1"] == [
+        "2026-10-26T12:00:01.500Z WARN req=a1 retry",
+        "2026-10-26T12:00:01.400Z ERROR req=a1 timeout",
+        "2026-10-26T12:00:01.200Z WARN req=a1 slow query",
+    ]
+    assert res["b2"] == ["2026-10-26T12:00:01.300Z ERROR req=b2 boom"]
+    assert set(res) == {"a1", "b2"}

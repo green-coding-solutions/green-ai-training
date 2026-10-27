@@ -1,0 +1,84 @@
+id: gen-6593849-00153-review
+category: review
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS
+messages:
+- role: user
+  content: |
+    hi, i am new to this. i wrote a script for our gateway box (small ARM, LTE). cron starts it every 10 minutes. it works but the box gets hot and slow when it runs and i dont know why. can you look?
+
+    ```bash
+    #!/bin/bash
+    # send sensor data to cloud
+    DEV=$(hostname)
+    OUT=/tmp/batch_$DEV.tar.xz
+    TOKEN="gw-7f3a91c2e8d44b10"
+
+    cd /var/lib/sensord/outbox
+    tar -cf - *.csv *.jpg | xz -9e > $OUT
+
+    curl -s -X POST -H "Authorization: Bearer $TOKEN" -F "file=@$OUT" https://ingest.example.com/v1/batch
+
+    rm -f /var/lib/sensord/outbox/*.csv /var/lib/sensord/outbox/*.jpg
+    rm $OUT
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (cron every 10 minutes on a small ARM box)
+
+    #### [Security] Token written in the script
+    - **Where:** `TOKEN="gw-7f3a91c2e8d44b10"`
+    - **Issue:** anyone who can read the script, a backup or your repo can upload as this gateway. The token is also visible in the process list while `curl` runs.
+    - **Fix:** put the header line in a file only root can read (`chmod 600`) and let `curl` read it with `-H @file`. The fixed script below does this. Rotate the token you have now, because it is already in this message.
+
+    #### [Bug] Data is deleted even when the upload fails
+    - **Where:** the `rm -f` after `curl`
+    - **Issue:** `curl -s` hides errors and the script never checks the result. If LTE is down, the readings are lost. If one of `*.csv` or `*.jpg` has no match, `tar` also fails on the literal pattern, and the script still goes on to the `rm`.
+    - **Fix:** use `curl -f`, and delete the files only when `curl` succeeds. Use arrays for the file lists, so empty patterns are handled. Also quote `"$OUT"` and use `mktemp` instead of a fixed name in `/tmp`.
+
+    #### [High] Heavy compressor, and it also packs JPEG files
+    - **Where:** `xz -9e` on the whole `tar` stream
+    - **Issue:** `xz -9e` is one of the most expensive codecs. In Green Metrics Tool micro-benchmarks on 100 MB of text, `xz` used ~458 J and `zstd` ~16 J, so `xz` cost about 29× more. This runs every 10 minutes on a small CPU, which is why the box gets hot. JPEG files are already compressed, so `xz` burns CPU on them and saves almost no bytes. The benchmark compares energy only, not file size. `xz` usually makes smaller files, so check the size on your own CSVs.
+    - **Fix:** compress only the CSV files, with `zstd` at its default level, and send the JPEGs as they are. The server must accept `.tar.zst`. If it can only read gzip, use `gzip -6`, which is still much cheaper than `xz -9e`.
+    - **Impact:** E on the gateway for every run. LTE bytes stay about the same for the JPEGs and should stay close for the CSVs.
+
+    ```bash
+    #!/bin/bash
+    set -u
+    OUTBOX='/var/lib/sensord/outbox'
+    HDR_FILE='/etc/sensord/auth_header'   # one line: Authorization: Bearer <token>, chmod 600
+
+    shopt -s nullglob
+    cd "$OUTBOX" || exit 1
+    csvs=(*.csv)
+    jpgs=(*.jpg)
+    (( ${#csvs[@]} + ${#jpgs[@]} )) || exit 0
+
+    tmp=$(mktemp -d) || exit 1
+    trap 'rm -rf "$tmp"' EXIT
+
+    form=()
+    if (( ${#csvs[@]} )); then
+        tar -cf - -- "${csvs[@]}" | zstd -q -T1 -o "$tmp/readings.tar.zst" || exit 1
+        form+=(-F "readings=@$tmp/readings.tar.zst")
+    fi
+    for f in "${jpgs[@]}"; do
+        form+=(-F "images=@$f")
+    done
+
+    if curl -sf -H "@$HDR_FILE" "${form[@]}" 'https://ingest.example.com/v1/batch'; then
+        rm -f -- "${csvs[@]}" "${jpgs[@]}"
+    fi
+    ```
+
+    #### [Low] Double quotes around fixed text
+    - **Where:** `"gw-..."`, `"Authorization: Bearer $TOKEN"` and similar
+    - **Issue:** text with nothing to expand is better in single quotes. The saving is tiny in a script like this. The fixed script already does it.
+
+    **Already good:** you batch many readings into one upload instead of one request per reading, and you compress before sending over a paid link.
+verify:
+  static_only: needs a sensor outbox, zstd, network access to an ingest server and an ARM gateway

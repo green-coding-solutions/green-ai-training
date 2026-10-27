@@ -37,7 +37,7 @@ messages:
     # make sure the review file exists and is empty, even if nothing is below the threshold
     : > "$review"
 
-    awk -F'\t' -v thr="$threshold" -v review="$review" '
+    awk -F'\t' -v thr="$threshold" -v review="$review" -v errout=/dev/stderr '
       NF < 3 || $3 !~ /^([0-9]+\.?[0-9]*|\.[0-9]+)([eE][-+]?[0-9]+)?$/ {
         bad++
         next
@@ -55,7 +55,7 @@ messages:
         for (label in count) {
           printf "%s\t%d\t%.4f\n", label, count[label], sum[label] / count[label]
         }
-        printf "total: %d, below threshold: %d, skipped: %d\n", total, low, bad > "/dev/stderr"
+        printf "total: %d, below threshold: %d, skipped: %d\n", total, low, bad > errout
       }
     ' "$preds" | LC_ALL=C sort -t $'\t' -k2,2nr -k1,1
     ```
@@ -66,11 +66,11 @@ messages:
     ./summarize_preds.sh predictions.tsv 0.7 review_0.7.txt > label_table.tsv
     ```
 
-    Lines with fewer than three fields or a confidence that is not a number are skipped and counted, not treated as 0. The ties in the table are broken by label name, so the output is stable between runs.
+    Lines with fewer than three fields or a confidence that is not a number are skipped and counted, not treated as 0. Ties in the table are broken by label name, so the output is stable between runs. The summary goes to stderr through the `errout` variable, so it never ends up in the piped table.
 
     **Green Notes**
-    - **One `awk` pass instead of a shell loop** (reduces E): a `while read` loop with a command substitution per line (`$(echo | cut)`, `$(expr)`, or `bc` for the float compare) starts several processes for every one of your 300k-600k lines. In Green Metrics Tool micro-benchmarks, summarizing a 20,000-line access log with identical output used over 1000× less energy with one `awk` pass than with a per-field subprocess loop. Bash builtins alone can't compare decimals like `3e-05`, so `awk` is the right tool here.
-    - **One `sort` at the end** (reduces E): the table has only as many rows as there are labels, so sorting the aggregated result is cheap. Sorting the raw lines would not be.
+    - **One `awk` pass instead of a shell loop** (reduces E): a `while read` loop with a command substitution per line (`$(echo | cut)`, `$(expr)`, or `bc` for the float compare) starts several processes for each of your 300k-600k lines. In Green Metrics Tool micro-benchmarks, one `awk` pass used over 1000× less energy than a loop with a subprocess per field. That benchmark summarized a 20,000-line access log, and both versions printed the same output. Bash builtins alone can't compare decimals like `3e-05`, so `awk` is the right tool here.
+    - **One `sort` at the end** (reduces E): the table has only one row per label, so sorting the aggregated result is cheap. Sorting the raw lines would not be.
     - **Single quotes for literals** (reduces E): the usage message and the `awk` program need no shell expansion, so they are single-quoted. The saving is tiny for a script that runs once a night. Variables like `"$preds"` keep their double quotes.
 verify:
   static_only: bash script that needs awk and a predictions TSV input file

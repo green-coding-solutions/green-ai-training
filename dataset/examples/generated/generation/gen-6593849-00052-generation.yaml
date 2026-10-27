@@ -1,0 +1,75 @@
+id: gen-6593849-00052-generation
+category: generation
+language: python
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    hi, im new to this and not sure how to do the database part. our gitlab pipeline makes a junit xml file (report.xml) with about 8000 tests in it. i want to save the results in postgres so we can see slow tests over time. the table is already there:
+
+    test_results(run_id text, suite text, name text, status text, duration_ms integer)
+
+    can you write a python script for this? the run id should come from the command line
+- role: assistant
+  content: |
+    Here is a script that reads the JUnit file and writes all results to Postgres in one `COPY`. It uses `psycopg` (version 3).
+
+    ```python
+    import os
+    import sys
+    import xml.etree.ElementTree as ET
+
+    import psycopg
+
+
+    def read_results(path):
+        root = ET.parse(path).getroot()
+        for case in root.iter("testcase"):
+            if case.find("failure") is not None or case.find("error") is not None:
+                status = "failed"
+            elif case.find("skipped") is not None:
+                status = "skipped"
+            else:
+                status = "passed"
+            duration_ms = int(float(case.get("time", "0")) * 1000)
+            yield case.get("classname", ""), case.get("name", ""), status, duration_ms
+
+
+    def save_results(conninfo, run_id, path):
+        count = 0
+        with psycopg.connect(conninfo) as conn:
+            with conn.cursor() as cur:
+                with cur.copy(
+                    "COPY test_results (run_id, suite, name, status, duration_ms) FROM STDIN"
+                ) as copy:
+                    for suite, name, status, duration_ms in read_results(path):
+                        copy.write_row((run_id, suite, name, status, duration_ms))
+                        count += 1
+        return count
+
+
+    if __name__ == "__main__":
+        if len(sys.argv) != 3:
+            sys.exit("usage: save_results.py RUN_ID report.xml")
+        saved = save_results(os.environ["DATABASE_URL"], sys.argv[1], sys.argv[2])
+        print(f"saved {saved} results for run {sys.argv[1]}")
+    ```
+
+    Run it in your pipeline job like this:
+
+    ```bash
+    DATABASE_URL="$RESULTS_DB_URL" python save_results.py "$CI_PIPELINE_ID" report.xml
+    ```
+
+    The connection string comes from an environment variable, so no password is in the code. Store it as a masked CI variable.
+
+    **Green Notes**
+    - **One `COPY` instead of one `INSERT` per row** (reduces E and time): a report with thousands of tests is exactly the case where batching pays off. A loop with `execute()` would send one statement per test, every pipeline run. In Green Metrics Tool micro-benchmarks on PostgreSQL, loading 500,000 rows in batches of 5,000 used about 22× less CPU energy with `COPY` than with one `execute()` per row.
+    - **Rows are streamed, one transaction**: the generator feeds `COPY` row by row, so the list of results is never built in memory. If the script fails halfway, nothing is saved, so you never get half a report.
+
+    *Not applied:* `COPY` is not worth it for a few rows per run. With batches of only about 100 rows, the same benchmark showed small differences, so a plain `INSERT` would be fine there.
+verify:
+  static_only: needs a PostgreSQL server and the psycopg package

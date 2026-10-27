@@ -50,31 +50,25 @@ messages:
     - **Impact:** reduces E on the login node for every chunk. In Green Metrics Tool micro-benchmarks on 100 MB of text, xz at its default level used about 29× more energy than zstd. That compared energy only, not output size. xz compresses smaller, so keep it only if the link is the bottleneck.
 
     #### [Low] Double quotes on literals without expansion
-    - **Where:** the `Content-Type` and `Content-Encoding` headers, and `echo "done"`
+    - **Where:** the `Content-Type` and `Content-Encoding` headers, and the final `echo`
     - **Issue:** Bash scans double-quoted text for `$`, backticks and backslashes. Single quotes skip that.
     - **Fix:** Use single quotes for these literals. Keep double quotes where a variable expands.
     - **Impact:** reduces E slightly. In Green Metrics Tool micro-benchmarks, a 6,200-character literal in a loop of 1,000,000 iterations used about 24% less CPU energy with single quotes. For short headers the absolute saving is tiny.
 
+    Replace the loop and the last line with:
+
     ```bash
-     for chunk in "$RUN_DIR"/out/step_*.json; do
-    -  step=$(basename "$chunk" .json)
-    -  xz -9e -c "$chunk" > "/tmp/$step.json.xz"
-    -  curl -sS -f -X POST "$COLLECTOR" \
-    -    -H "Content-Type: application/json" \
-    -    -H "Content-Encoding: xz" \
-    +  zstd -q -c "$chunk" | curl -sS -f -X POST "$COLLECTOR" \
-    +    -H 'Content-Type: application/json' \
-    +    -H 'Content-Encoding: zstd' \
-         -H "X-Run-Id: $(basename "$RUN_DIR")" \
-         -H "Authorization: Bearer $TOKEN" \
-    -    --data-binary "@/tmp/$step.json.xz"
-    -  rm "/tmp/$step.json.xz"
-    +    --data-binary @-
-     done
-    -echo "done"
-    +echo 'done'
+    for chunk in "$RUN_DIR"/out/step_*.json; do
+      zstd -q -c "$chunk" | curl -sS -f -X POST "$COLLECTOR" \
+        -H 'Content-Type: application/json' \
+        -H 'Content-Encoding: zstd' \
+        -H "X-Run-Id: $(basename "$RUN_DIR")" \
+        -H "Authorization: Bearer $TOKEN" \
+        --data-binary @-
+    done
+    echo 'done'
     ```
 
-    `pipefail` is already set, so a failing `zstd` still stops the script.
+    The `step` variable and the `rm` are gone. `pipefail` is already set, so a failing `zstd` still stops the script.
 verify:
   static_only: needs curl, a remote collector and the zstd binary

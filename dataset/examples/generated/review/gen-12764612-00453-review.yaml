@@ -1,0 +1,99 @@
+id: gen-12764612-00453-review
+category: review
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import math
+    import subprocess
+
+    class DurationGate:
+        def __init__(self, baseline_mean, baseline_var, z_limit=3.0):
+            self.mean = baseline_mean
+            self.var = baseline_var
+            self.z_limit = z_limit
+            self.flagged = []
+
+        def scan(self, durations):
+            for i, d in enumerate(durations):
+                z = (math.log(d + 1) - self.mean) / math.sqrt(self.var)
+                if abs(z) > self.z_limit:
+                    self.flagged.append(i)
+            return self.flagged
+
+    def notify(branch, flagged):
+        cmd = f"curl -s -X POST $HOOK_URL -d 'branch={branch} slow={len(flagged)}'"
+        subprocess.run(cmd, shell=True)
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (CI job-duration check)
+
+    #### [Security] Shell command built from a branch name
+    - **Where:** `notify`, the f-string passed to `subprocess.run(..., shell=True)`
+    - **Issue:** branch names are user-controlled. A name with a quote and `;` can run arbitrary commands on the runner, where the hook URL and other secrets live.
+    - **Fix:** pass an argument list and no shell. Let curl encode the values.
+
+    #### [Bug] `flagged` grows across calls
+    - **Where:** `self.flagged.append(i)` in `scan`
+    - **Issue:** the list lives on the instance. A second `scan` call adds to the first result, and the caller gets a reference to the shared list. Indexes from different batches get mixed.
+    - **Fix:** build a fresh list per call and store it afterwards.
+
+    #### [Low] Loop-invariant work repeated per sample
+    - **Where:** `math.sqrt(self.var)` and the `math.log`, `self.mean` lookups inside the loop
+    - **Issue:** `math.sqrt(self.var)` gives the same value on every pass, so it is one extra call per duration. The attribute lookups are repeated per pass too.
+    - **Fix:** compute `std` once and bind `log`, `mean` and `limit` to locals before the loop.
+    - **Impact:** reduces E slightly. The sqrt removal is a counting argument: N calls become 1. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local saved only about 4-5% in a 10,000,000-iteration loop. Worth it only if you scan very large duration lists.
+
+    ```python
+    import math
+    import os
+    import subprocess
+
+    class DurationGate:
+        def __init__(self, baseline_mean, baseline_var, z_limit=3.0):
+            self.mean = baseline_mean
+            self.var = baseline_var
+            self.z_limit = z_limit
+            self.flagged = []
+
+        def scan(self, durations):
+            log = math.log
+            mean = self.mean
+            std = math.sqrt(self.var)
+            limit = self.z_limit
+            flagged = []
+            for i, d in enumerate(durations):
+                if abs((log(d + 1) - mean) / std) > limit:
+                    flagged.append(i)
+            self.flagged = flagged
+            return flagged
+
+    def notify(branch, flagged):
+        subprocess.run(
+            [
+                "curl", "-s", "-X", "POST", os.environ["HOOK_URL"],
+                "--data-urlencode", f"branch={branch}",
+                "--data-urlencode", f"slow={len(flagged)}",
+            ],
+            check=True,
+        )
+    ```
+
+    **Already good:** `scan` makes one pass and streams the durations, so it needs no extra copy of the data.
+verify:
+  green_block: 0
+  equivalence:
+    driver: |-
+      import random
+      random.seed(5)
+      g = DurationGate(5.0, 1.2, 2.5)
+      data = [random.randint(1, 20000) for _ in range(3000)]
+      print(g.scan(data))

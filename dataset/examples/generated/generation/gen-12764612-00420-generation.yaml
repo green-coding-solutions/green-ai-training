@@ -1,0 +1,74 @@
+id: gen-12764612-00420-generation
+category: generation
+language: sql
+sql_dialect: postgres
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    I need a psql script for our monthly smart-meter import. The vendor sends one CSV per month, about 4 million rows, with a header line. Columns: meter_id, read_at, kwh, quality_flag. quality_flag is empty for most rows, and an empty value should be stored as NULL.
+
+    Target table (Postgres 16):
+
+    ```sql
+    CREATE TABLE meter_readings (
+        meter_id     integer       NOT NULL,
+        read_at      timestamptz   NOT NULL,
+        kwh          numeric(12,3) NOT NULL,
+        quality_flag text,
+        PRIMARY KEY (meter_id, read_at)
+    );
+    ```
+
+    Requirements:
+    - I run it as a CLI step in a cron job, file name is different each month
+    - if the job runs twice for the same file, nothing must be duplicated and it must not fail
+    - the vendor sometimes sends the same (meter_id, read_at) twice in one file, the first one is fine
+    - if anything breaks halfway, the table must stay unchanged
+    - I want to see how many rows were really added
+
+    Currently another team member generates one INSERT per line with a small shell script, but that takes hours. Please write the SQL part.
+- role: assistant
+  content: |
+    Load the file with `COPY` into a temporary staging table, then insert from there in one statement. Everything runs in one transaction.
+
+    ```sql
+    -- load_readings.sql
+    \set ON_ERROR_STOP on
+
+    BEGIN;
+
+    CREATE TEMP TABLE readings_stage (LIKE meter_readings INCLUDING DEFAULTS) ON COMMIT DROP;
+
+    \copy readings_stage (meter_id, read_at, kwh, quality_flag) FROM pstdin WITH (FORMAT csv, HEADER true)
+
+    INSERT INTO meter_readings (meter_id, read_at, kwh, quality_flag)
+    SELECT meter_id, read_at, kwh, quality_flag
+    FROM readings_stage
+    ON CONFLICT (meter_id, read_at) DO NOTHING;
+
+    COMMIT;
+    ```
+
+    Run it with the file on stdin, so the file name is not part of the script:
+
+    ```bash
+    psql -d metering -f load_readings.sql < readings_2026-09.csv
+    ```
+
+    psql prints `INSERT 0 <n>` for the insert step. `<n>` is the number of rows really added. On a second run with the same file it is `0`.
+
+    - `ON_ERROR_STOP` makes psql stop at the first error. The open transaction is then rolled back, so `meter_readings` stays unchanged.
+    - In CSV mode an unquoted empty value is read as NULL, so `quality_flag` works without extra code.
+    - `ON CONFLICT DO NOTHING` skips rows that already exist and also repeated pairs inside the same file. The first row wins. This is not guaranteed if the order of rows in the file matters, since the staging table has no order. If you need a specific row to win, add a sequence column to the staging table.
+    - `COPY` only checks the data types. A bad value, such as a `kwh` that is not a number, aborts the whole load by design.
+
+    **Green Notes**
+    - **`COPY` instead of one `INSERT` per row** (reduces E): one streaming load replaces millions of statements and round trips. In Green Metrics Tool micro-benchmarks, `COPY` used about 22× less CPU energy than one insert per row when writing in batches of 5,000 rows.
+    - **One set-based insert from the staging table** (reduces E): the conflict check and the final write run inside Postgres in a single statement, not once per row in a shell loop.
+    - **Temp table with `ON COMMIT DROP`** (reduces storage): the staging data leaves nothing behind and is not written to the WAL.
+verify:
+  static_only: PostgreSQL dialect with psql meta-commands (\copy from pstdin)

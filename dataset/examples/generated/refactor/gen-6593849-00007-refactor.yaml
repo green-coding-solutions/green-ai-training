@@ -1,0 +1,71 @@
+id: gen-6593849-00007-refactor
+category: refactor
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    hi, i am new to bash. this script runs every night from cron on our image classifier server. it packs the saved requests (the uploaded jpg files and the prediction jsonl files) from yesterday. but the server fans get loud and everything is slow for a long time at night. is something wrong with my script? can you make it better
+
+    ```bash
+    #!/bin/bash
+    # nightly archive of classifier captures
+    DAY=$(date -d yesterday +%Y-%m-%d)
+    SRC=/var/lib/classifier/captures/$DAY
+    DEST=/mnt/archive/classifier
+
+    mkdir -p $DEST
+    cd $SRC
+    tar -cf - . | xz -9e > $DEST/captures-$DAY.tar.xz
+    rm -rf $SRC
+
+    find $DEST -name 'captures-*.tar.xz' -mtime +60 -delete
+    echo "archived $DAY"
+    ```
+
+    we keep the archives 60 days for audits and sometimes for retraining.
+- role: assistant
+  content: |
+    The slow part is `xz -9e`. It is the most expensive way to compress, and most of the folder is jpg files, which are already compressed and can't shrink much more. There are also two bugs that can lose data.
+
+    ```bash
+    #!/bin/bash
+    set -o pipefail
+
+    DAY=$(date -d yesterday +%Y-%m-%d)
+    SRC="/var/lib/classifier/captures/$DAY"
+    DEST='/mnt/archive/classifier'
+    OUT="$DEST/captures-$DAY.tar.zst"
+
+    mkdir -p "$DEST"
+    cd "$SRC" || exit 1
+
+    if tar -cf - . | zstd -q -f -o "$OUT"; then
+        rm -rf "$SRC"
+    else
+        rm -f "$OUT"
+        echo "archive failed for $DAY" >&2
+        exit 1
+    fi
+
+    find "$DEST" -name 'captures-*.tar.*' -mtime +60 -delete
+    echo "archived $DAY"
+    ```
+
+    To read an archive later: `zstd -dc captures-2026-10-25.tar.zst | tar -xf -`. Old `.tar.xz` files still work with your normal `tar -xf`.
+
+    **Bugs fixed**
+    - `cd $SRC` had no check. If yesterday's folder was missing, `tar` would pack whatever folder cron started in. Now the script stops.
+    - `rm -rf $SRC` ran even when `tar` or `xz` failed, so a failed night could delete the only copy. Now `set -o pipefail` catches a failure in the pipe, and the source is removed only after the archive was written fine.
+    - Variables are now in double quotes, so paths with spaces don't break.
+
+    **Green Notes**
+    - **Fast codec for data compressed every night** (reduces E): in Green Metrics Tool micro-benchmarks on English text, compressing 100 MB with xz used about 29× the CPU energy of zstd at its default level. Your `-9e` setting costs even more than the xz default. zstd also compresses your jpg files quickly and doesn't waste effort on them.
+    - **Compression still pays off for 60 days of storage:** one estimate puts the break-even at about 0.15 days for zstd and about 7 days for xz. So both beat no compression for your retention time. The measurements compare energy, not file size. xz usually makes smaller files, so keep it only if disk space is really tight.
+    - The cleanup `find` now matches both `.tar.xz` and `.tar.zst`, so old archives are still deleted after 60 days.
+verify:
+  static_only: needs zstd, xz and the server's cron paths

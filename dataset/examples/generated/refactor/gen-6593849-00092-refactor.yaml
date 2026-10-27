@@ -1,0 +1,85 @@
+id: gen-6593849-00092-refactor
+category: refactor
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    Weekly log digest site. A cron job renders the HTML, JS, CSS and JSON summaries into /srv/log-digest/site once a night, and nginx serves them to the ops team. Diff only please.
+
+    ```nginx
+    server {
+        listen 80;
+        server_name digest.ops.internal;
+        root /srv/log-digest/site;
+
+        gzip on;
+        gzip_comp_level 9;
+        gzip_min_length 256;
+        gzip_vary on;
+        gzip_types text/plain text/css text/html application/json application/javascript image/svg+xml;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location /raw/ {
+            autoindex on;
+        }
+
+        location /api/ {
+            proxy_pass http://127.0.0.1:8081;
+            proxy_set_header Host $host;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    ```diff
+     server {
+         listen 80;
+         server_name digest.ops.internal;
+         root /srv/log-digest/site;
+
+    -    gzip on;
+    -    gzip_comp_level 9;
+    -    gzip_min_length 256;
+    -    gzip_vary on;
+    -    gzip_types text/plain text/css text/html application/json application/javascript image/svg+xml;
+    +    gzip_static on;
+    +    gzip_vary on;
+
+         location / {
+             try_files $uri $uri/ =404;
+         }
+
+         location /raw/ {
+             autoindex on;
+         }
+
+         location /api/ {
+             proxy_pass http://127.0.0.1:8081;
+             proxy_set_header Host $host;
+    +        gzip on;
+    +        gzip_comp_level 5;
+    +        gzip_types application/json;
+         }
+     }
+    ```
+
+    Add this as the last step of the nightly job, after the site is rendered:
+
+    ```bash
+    find /srv/log-digest/site -type f \( -name '*.html' -o -name '*.css' -o -name '*.js' -o -name '*.json' -o -name '*.svg' -o -name '*.txt' \) -exec gzip -9 -k -f {} +
+    ```
+
+    **Green Notes**
+    - **Precompressed static files** (reduces E): the site only changes once a night, so compressing on every request repeats the same work. In Green Metrics Tool nginx benchmarks with 2,000 text requests, per-request gzip at level 5 used ~54 J and precompressed files ~14 J, so compressing per request cost about 4× more CPU energy. Level 9 is fine here, because each file is compressed once.
+    - **Dynamic `/api/` stays compressed per request** (reduces network): those responses have no precompressed file. A moderate level keeps the CPU cost low.
+
+    Keep the original files next to the `.gz` files. Clients that don't send `Accept-Encoding: gzip` get the plain file. Make sure `gzip_static` is available in your nginx build (`nginx -V 2>&1 | grep -o with-http_gzip_static_module`). Debian and Ubuntu packages include it.
+verify:
+  static_only: nginx config, not executable in the sandbox

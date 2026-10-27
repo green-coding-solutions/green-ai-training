@@ -1,0 +1,48 @@
+id: gen-6593849-00029-no-change
+category: no-change
+language: sql
+patterns:
+- batch-db-writes
+- context-tradeoff
+facts:
+- F-PG-INSERT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    ```sql
+    -- flush of the gateway buffer after reconnect
+    BEGIN;
+
+    INSERT INTO sensor_readings (gateway_id, sensor_id, read_at, value, unit)
+    SELECT 'gw-017', t.sensor_id, t.read_at, t.value, 'C'
+    FROM unnest(
+        ARRAY[1, 1, 2, 2, 3, 3]::int[],
+        ARRAY['2026-10-26 08:00:00+00', '2026-10-26 08:00:30+00',
+              '2026-10-26 08:00:00+00', '2026-10-26 08:00:30+00',
+              '2026-10-26 08:00:00+00', '2026-10-26 08:00:30+00']::timestamptz[],
+        ARRAY[21.4, 21.5, 19.8, 19.9, 23.1, 23.0]::numeric[]
+    ) AS t(sensor_id, read_at, value)
+    ON CONFLICT (gateway_id, sensor_id, read_at) DO NOTHING;
+
+    UPDATE gateway_status
+    SET last_flush_at = now()
+    WHERE gateway_id = 'gw-017';
+
+    COMMIT;
+    ```
+
+    ?
+- role: assistant
+  content: |
+    This is already efficient. I would not change it.
+
+    - **One statement for the whole buffer.** The readings go in through `unnest` over arrays. That is one round trip and one commit for all rows, not one `INSERT` per reading.
+    - **Resends are safe.** `ON CONFLICT ... DO NOTHING` skips rows the server already has, so an overlapping flush after a reconnect creates no duplicates and needs no extra lookup.
+    - **Small bookkeeping.** The `UPDATE` touches a single row inside the same transaction, so it adds no extra commit.
+
+    Switching to `COPY` would not pay off at this size. In Green Metrics Tool micro-benchmarks with batches of 100 rows, one-by-one inserts, `executemany` and `COPY` were all within a small range of each other, because per-batch overhead dominates. `COPY` only pulled far ahead with big batches: with 5,000 rows per batch it used about 22× less energy than one insert per row. `COPY` also cannot do `ON CONFLICT` directly, so you would need a staging table, which adds work.
+
+    Only consider `COPY` into a staging table plus one `INSERT ... SELECT ... ON CONFLICT DO NOTHING` if a flush can regularly grow to thousands of rows, for example after a long offline period.
+verify:
+  static_only: Postgres-specific unnest with ON CONFLICT, cannot run in SQLite

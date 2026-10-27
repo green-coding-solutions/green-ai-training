@@ -1,0 +1,85 @@
+id: gen-6593849-00040-generation
+category: generation
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    ```python
+    #!/usr/bin/env python3
+    import argparse
+    import csv
+    import sys
+
+    import torch
+
+    FEATURES = ["tenure_months", "monthly_spend", "support_tickets", "logins_30d", "plan_tier"]
+
+
+    def load_model(path):
+        model = torch.jit.load(path, map_location="cpu")
+        model.eval()
+        return model
+
+
+    def score_rows(model, rows, batch_size=256):
+        # model takes a float32 tensor (n, 5) and returns one logit per row, shape (n, 1)
+        # TODO: return a list with the churn probability for every row, same order as rows
+        raise NotImplementedError
+
+
+    def main():
+        p = argparse.ArgumentParser(description="Score customers for churn risk")
+        p.add_argument("csv_in")
+        p.add_argument("csv_out")
+        p.add_argument("--model", default="models/churn.pt")
+        args = p.parse_args()
+
+        with open(args.csv_in, newline="") as f:
+            rows = list(csv.DictReader(f))
+
+        model = load_model(args.model)
+        scores = score_rows(model, rows)
+
+        with open(args.csv_out, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["customer_id", "churn_score"])
+            for row, s in zip(rows, scores):
+                w.writerow([row["customer_id"], f"{s:.4f}"])
+        print(f"scored {len(rows)} customers", file=sys.stderr)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    ?
+- role: assistant
+  content: |
+    Here is `score_rows`. The rest of the file stays as it is.
+
+    ```python
+    def score_rows(model, rows, batch_size=256):
+        scores = []
+        with torch.no_grad():
+            for start in range(0, len(rows), batch_size):
+                chunk = rows[start:start + batch_size]
+                x = torch.tensor(
+                    [[float(r[name]) for name in FEATURES] for r in chunk],
+                    dtype=torch.float32,
+                )
+                logits = model(x).squeeze(1)
+                scores.extend(torch.sigmoid(logits).tolist())
+        return scores
+    ```
+
+    The output has one score per input row, in the same order. An empty CSV gives an empty list.
+
+    **Green Notes**
+    - **`torch.no_grad()` around inference** (reduces E): the model is only evaluated here, so autograd does not need to record the graph. In Green Metrics Tool micro-benchmarks, 100,000 CPU inferences used about 14% less energy with `no_grad()` than without. The result values stay the same.
+    - **One forward pass per 256 rows:** the model is called once per chunk, not once per row, so the per-call overhead is paid far less often.
+verify:
+  static_only: needs PyTorch and a TorchScript model file, not available in the stdlib + numpy test environment

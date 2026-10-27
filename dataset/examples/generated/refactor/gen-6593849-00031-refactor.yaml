@@ -1,0 +1,148 @@
+id: gen-6593849-00031-refactor
+category: refactor
+language: python
+patterns:
+- memoize
+- simple-conditions
+facts:
+- F-LRU
+- F-COND
+messages:
+- role: user
+  content: |
+    Hello, can you make this more fast and clean? This is the billing helper from our shop REST API. Every cart line call vat_rate, and classify_upstream is call after every request to payment provider. We have many request in the day and CPU of the server is high sometimes. Sorry for my english.
+
+    ```python
+    from decimal import Decimal, ROUND_HALF_UP
+
+    VAT_TABLE = """
+    DE:standard=19,food=7,books=7
+    FR:standard=20,food=5.5,books=5.5
+    NL:standard=21,food=9,books=9
+    ES:standard=21,food=10,books=4
+    IT:standard=22,food=10,books=4
+    PL:standard=23,food=5,books=5
+    """
+
+
+    def vat_rate(country, category):
+        rules = {}
+        for line in VAT_TABLE.strip().splitlines():
+            code, rest = line.split(":")
+            rules[code] = dict(item.split("=") for item in rest.split(","))
+        table = rules[country.upper()]
+        return Decimal(table.get(category, table["standard"])) / 100
+
+
+    def classify_upstream(status):
+        if status >= 200 and status < 300:
+            return "ok"
+        elif status >= 500 and status < 600 and status != 501:
+            return "retry"
+        elif status == 429 or status == 408:
+            return "retry"
+        elif status >= 400 and status < 500:
+            return "fail"
+        else:
+            return "fail"
+
+
+    def quote(lines, country):
+        total = Decimal("0")
+        for line in lines:
+            net = Decimal(str(line["price"])) * line["qty"]
+            gross = net * (1 + vat_rate(country, line["category"]))
+            total += gross.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return total
+    ```
+- role: assistant
+  content: |
+    ```python
+    from decimal import Decimal, ROUND_HALF_UP
+    from functools import lru_cache
+
+    VAT_TABLE = """
+    DE:standard=19,food=7,books=7
+    FR:standard=20,food=5.5,books=5.5
+    NL:standard=21,food=9,books=9
+    ES:standard=21,food=10,books=4
+    IT:standard=22,food=10,books=4
+    PL:standard=23,food=5,books=5
+    """
+
+
+    @lru_cache(maxsize=512)
+    def vat_rate(country, category):
+        rules = {}
+        for line in VAT_TABLE.strip().splitlines():
+            code, rest = line.split(":")
+            rules[code] = dict(item.split("=") for item in rest.split(","))
+        table = rules[country.upper()]
+        return Decimal(table.get(category, table["standard"])) / 100
+
+
+    def classify_upstream(status):
+        family = status // 100
+        if family == 2:
+            return "ok"
+        if status == 408 or status == 429:
+            return "retry"
+        if family == 5 and status != 501:
+            return "retry"
+        return "fail"
+
+
+    def quote(lines, country):
+        total = Decimal("0")
+        for line in lines:
+            net = Decimal(str(line["price"])) * line["qty"]
+            gross = net * (1 + vat_rate(country, line["category"]))
+            total += gross.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return total
+    ```
+
+    **Green Notes**
+    - **Memoize repeated pure computations** (reduces E): `vat_rate` parsed the whole table again for every cart line, but there are only a few countries and categories, so almost every call is a repeat. With `lru_cache` the work is done once per pair. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over 200 distinct inputs used about 9× less CPU energy with `lru_cache` (~43 J vs ~4.7 J). This only works because inputs repeat. With mostly unique inputs, a cache is just overhead.
+    - **Bounded cache:** `maxsize=512` is needed because `country` and `category` come from the request. Without a limit, someone could send random values and fill your memory. The result is a `Decimal`, which cannot be changed, so sharing it between calls is safe. An unknown country still raises `KeyError`, and errors are not cached.
+    - **Simple equality conditions** (reduces E): `classify_upstream` now computes `status // 100` once and then compares for equality, instead of chains of range checks. In Green Metrics Tool micro-benchmarks, simple equality branches used about 16% less CPU energy than complex range and modulo conditions over 10,000,000 classifications. For one cheap function this is small. It is the cache that matters most here.
+
+    Behavior is the same. Every status code gives the same result as before, and `quote` is unchanged.
+verify:
+  test: |
+    from decimal import Decimal
+    assert classify_upstream(204) == "ok"
+    assert classify_upstream(299) == "ok"
+    assert classify_upstream(300) == "fail"
+    assert classify_upstream(408) == "retry"
+    assert classify_upstream(429) == "retry"
+    assert classify_upstream(404) == "fail"
+    assert classify_upstream(501) == "fail"
+    assert classify_upstream(503) == "retry"
+    assert classify_upstream(600) == "fail"
+    assert vat_rate("DE", "food") == Decimal("0.07")
+    assert vat_rate("de", "gadgets") == Decimal("0.19")
+    lines = [{"price": 10.5, "qty": 3, "category": "food"}]
+    first = quote(lines, "DE")
+    second = quote(lines, "DE")
+    assert first == second == Decimal("33.71")
+    assert vat_rate.cache_info().hits >= 1
+    try:
+        quote(lines, "XX")
+        raise SystemExit("expected KeyError")
+    except KeyError:
+        pass
+  equivalence:
+    driver: |-
+      for s in [-1, 100, 199, 200, 204, 299, 300, 301, 400, 404, 408, 429, 499, 500, 501, 502, 503, 599, 600]:
+          print(s, classify_upstream(s))
+      lines = [
+          {"price": 10.5, "qty": 3, "category": "food"},
+          {"price": 20, "qty": 1, "category": "gadgets"},
+          {"price": "4.99", "qty": 10, "category": "books"},
+      ]
+      for c in ["DE", "fr", "PL", "ES", "nl", "IT"]:
+          print(c, quote(lines, c))
+      try:
+          quote(lines, "XX")
+      except KeyError as e:
+          print("KeyError", e)

@@ -1,0 +1,111 @@
+id: gen-6593849-00266-review
+category: review
+language: python
+patterns:
+- memoize
+- torch-no-grad
+facts:
+- F-LRU
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    hi, i am doing my master thesis in chemistry and i wrote this script to get reaction rates for a big simulation grid (a few million cells). it works and the numbers look right but it runs for many hours on my uni PC and i dont know why. temperatures in the grid file have only one decimal (like 311.4). can you look if something is wrong?
+
+    ```python
+    import math
+    import torch
+
+    model = torch.load("surrogate.pt")
+    model.eval()
+
+    THETA_ROT = 0.39  # K, rotational temperature
+
+
+    def partition_weight(temp_k, n_levels=2000):
+        total = 0.0
+        for j in range(n_levels):
+            total += (2 * j + 1) * math.exp(-j * (j + 1) * THETA_ROT / temp_k)
+        return total
+
+
+    def predict_rates(temps, pressures):
+        rates = []
+        for t, p in zip(temps, pressures):
+            w = partition_weight(round(t, 1))
+            x = torch.tensor([[t, p, w]], dtype=torch.float32)
+            y = model(x)
+            rates.append(y.item())
+        return rates
+
+
+    if __name__ == "__main__":
+        temps = [300.0 + (i % 400) / 10 for i in range(20000)]
+        pressures = [1.0 + (i % 7) * 0.5 for i in range(20000)]
+        out = predict_rates(temps, pressures)
+        print(len(out), out[:3])
+    ```
+- role: assistant
+  content: |
+    **Workload:** AI/ML (per-cell inference loop in a scientific script)
+
+    #### [Security] `torch.load` on a pickle file
+    - **Where:** `model = torch.load("surrogate.pt")`
+    - **Issue:** by default `torch.load` unpickles the file, and a bad pickle can run code. This matters if the file ever comes from someone else.
+    - **Fix:** `torch.load("surrogate.pt", weights_only=True)`. This works if the file holds a `state_dict` or plain tensors. If you saved the whole model object, load a `state_dict` into your model class instead.
+
+    #### [High] The same partition sum is recomputed for every cell
+    - **Where:** `partition_weight(round(t, 1))`
+    - **Issue:** the function is pure and loops over all levels each time. Your temperatures have one decimal, so only a few hundred distinct values exist, but you call it millions of times. Nearly all of that work repeats an earlier result.
+    - **Fix:** add `functools.lru_cache` with a size limit. The argument is already rounded, so it makes a good cache key.
+    - **Impact:** reduces E: one computation per distinct temperature instead of one per cell. In Green Metrics Tool micro-benchmarks with 200 distinct inputs, caching used about 9× less CPU energy than recomputing. This only holds because your inputs repeat. If every temperature were unique, the cache would only add overhead.
+
+    #### [Medium] Inference builds an autograd graph you never use
+    - **Where:** `y = model(x)`
+    - **Issue:** outside `torch.no_grad()`, PyTorch records operations for backpropagation. You only read the output, so this is wasted work and memory.
+    - **Fix:** wrap the loop in `with torch.no_grad():`.
+    - **Impact:** reduces E and M. In Green Metrics Tool micro-benchmarks, 100,000 CPU inferences used about 14% less energy with `no_grad`. Results stay the same.
+
+    ```python
+    import math
+    from functools import lru_cache
+
+    import torch
+
+    model = torch.load("surrogate.pt", weights_only=True)
+    model.eval()
+
+    THETA_ROT = 0.39  # K, rotational temperature
+
+
+    @lru_cache(maxsize=4096)
+    def partition_weight(temp_k, n_levels=2000):
+        total = 0.0
+        for j in range(n_levels):
+            total += (2 * j + 1) * math.exp(-j * (j + 1) * THETA_ROT / temp_k)
+        return total
+
+
+    def predict_rates(temps, pressures):
+        rates = []
+        with torch.no_grad():
+            for t, p in zip(temps, pressures):
+                w = partition_weight(round(t, 1))
+                x = torch.tensor([[t, p, w]], dtype=torch.float32)
+                y = model(x)
+                rates.append(y.item())
+        return rates
+
+
+    if __name__ == "__main__":
+        temps = [300.0 + (i % 400) / 10 for i in range(20000)]
+        pressures = [1.0 + (i % 7) * 0.5 for i in range(20000)]
+        out = predict_rates(temps, pressures)
+        print(len(out), out[:3])
+    ```
+
+    The cache holds at most `maxsize` entries, so memory stays bounded. The output values do not change. To check the gain on your PC, compare `time python script.py` before and after on a smaller grid.
+
+    **Already good:** `model.eval()` is called, and the rounding of `t` before the call is what makes caching possible.
+verify:
+  static_only: needs torch and a saved model file (surrogate.pt), which are not available in the stdlib-only sandbox

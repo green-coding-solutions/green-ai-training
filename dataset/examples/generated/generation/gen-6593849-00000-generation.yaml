@@ -1,0 +1,67 @@
+id: gen-6593849-00000-generation
+category: generation
+language: bash
+patterns:
+- bash-quoting
+- bash-builtins
+facts:
+- F-BASH-QUOTES
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # packing slips for the warehouse
+    # input: orders.tsv  (order_id <TAB> customer <TAB> city <TAB> items, items separated by ;)
+    # one text file per order in slips/
+    # top: shop name + return policy text (same on every slip)
+    # then order id, ship to, items one per line
+    # bottom: support contact (same on every slip)
+    # about 30k orders on a busy day
+    # TODO
+    ```
+
+    ?
+- role: assistant
+  content: |
+    Here is the script. The fixed top and bottom text is defined once, and each slip is written with builtins only.
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    orders=${1:?usage: $0 orders.tsv [outdir]}
+    outdir=${2:-slips}
+    mkdir -p "$outdir"
+
+    header='ACME SHOP - PACKING SLIP
+    Returns are accepted within 30 days of delivery. Items must be unused and in the
+    original packaging. Please include this slip with your return and use the prepaid
+    label from your order email. Refunds are sent to the original payment method
+    within 5 working days after we receive the parcel.
+    ----------------------------------------'
+
+    footer='----------------------------------------
+    Questions? support@acme-shop.example or +1 555 0100 (Mon-Fri, 9-17)'
+
+    while IFS=$'\t' read -r order_id customer city items; do
+      [[ -n $order_id ]] || continue
+      safe_id=${order_id//[^A-Za-z0-9_-]/_}
+      {
+        printf '%s\n' "$header"
+        printf 'Order:   %s\nShip to: %s, %s\nItems:\n' "$order_id" "$customer" "$city"
+        IFS=';' read -r -a list <<< "$items"
+        printf '  - %s\n' "${list[@]}"
+        printf '%s\n' "$footer"
+      } > "$outdir/$safe_id.txt"
+    done < "$orders"
+    ```
+
+    The order id is cleaned before it becomes a file name, so a value like `../x` can't write outside `slips/`. The text blocks have no apostrophes, because they sit in single quotes.
+
+    **Green Notes**
+    - **Single quotes for literals** (reduces E): the header and footer need no expansion, so bash takes them as is. Double quotes stay only around variables, where expansion is needed. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal in a loop used about 24% less CPU energy with single quotes than with double quotes. The text here is much shorter and is assigned once, so expect a small saving. It adds up with long literals and many loop runs.
+    - **Builtins instead of subprocesses** (reduces E): `read`, `printf` and `${var//…/…}` run inside the shell, so the 30k-order loop starts no extra processes. Calls like `$(echo … | cut …)` in a loop start processes per line. In a Green Metrics Tool benchmark of a 20,000-line log summary, a builtin-only loop used about 300× less CPU energy than a version that ran `echo | cut` and `expr` for each field.
+verify:
+  static_only: bash script with file output, checked by review

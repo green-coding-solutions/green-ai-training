@@ -1,0 +1,142 @@
+id: gen-6593849-00039-review
+category: review
+language: bash
+patterns:
+- bash-builtins
+- bash-quoting
+facts:
+- F-BASH-SUBPROC
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    Could you review this script? It post-processes the hit files from our detector test runs. One file has one line per hit: `run channel counts flag`, space separated, flag is OK, NOISY or something else for dead channels. A typical file has around 400,000 lines and we run it on every file that comes out of the DAQ, on the cluster head node.
+
+    Requirements: it has to stay plain bash (bash 4.x, CentOS 7 and coreutils only, no python), the summary file must keep exactly the same format because another tool parses it, and I want it to stay readable for the students who maintain it. I'm mostly worried about correctness, but it also feels slow.
+
+    ```bash
+    #!/bin/bash
+    # summarize_hits.sh - summary for one detector run
+    # usage: summarize_hits.sh hits.txt
+
+    HITS_FILE="$1"
+    OUT_DIR="./summary"
+    mkdir -p "$OUT_DIR"
+
+    if [ ! -f "$HITS_FILE" ]; then
+      echo "Error: hits file not found"
+      exit 1
+    fi
+
+    total=0
+    good=0
+    noisy=0
+    dead=0
+    peak=0
+    peak_channel="none"
+
+    while read line; do
+      channel=$(echo "$line" | cut -d' ' -f2)
+      counts=$(echo "$line" | cut -d' ' -f3)
+      flag=$(echo "$line" | cut -d' ' -f4)
+
+      total=$(expr $total + $counts)
+      if [ "$counts" -gt "$peak" ]; then
+        peak=$counts
+        peak_channel=$channel
+      fi
+
+      if [ "$flag" = "OK" ]; then
+        good=$(expr $good + 1)
+      elif [ "$flag" = "NOISY" ]; then
+        noisy=$(expr $noisy + 1)
+      else
+        dead=$(expr $dead + 1)
+      fi
+    done < "$HITS_FILE"
+
+    {
+      echo "Total counts: $total"
+      echo "Peak channel: $peak_channel ($peak counts)"
+      echo "Good: $good  Noisy: $noisy  Dead: $dead"
+    } > "$OUT_DIR/summary.txt"
+
+    echo "Summary written to $OUT_DIR/summary.txt"
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (data pipeline step on a head node)
+
+    #### [Bug] Last line is dropped when the file has no trailing newline
+    - **Where:** `while read line; do ... done < "$HITS_FILE"`
+    - **Issue:** `read` returns failure on a final line without `\n`, so the loop ends before that line is processed. Its counts are missing from every total. Plain `read` without `-r` also treats backslashes as escapes.
+    - **Fix:** use `read -r` and also run the body when `read` hit end of file with data (see the rewrite below).
+    - **Impact:** correctness of the summary. Check whether your DAQ writes a final newline.
+
+    #### [High] Several processes started for every line
+    - **Where:** the three `$(echo "$line" | cut ...)` and the `$(expr ...)` calls inside the loop
+    - **Issue:** each `$(...)` forks a subshell, and `cut` and `expr` are external programs. That is several process starts per line, so about 400,000 lines mean millions of forks. Process starts dominate this loop, not the arithmetic. In Green Metrics Tool micro-benchmarks, summarizing a 20,000-line access log with this style of loop (`$(echo | cut)` and `$(expr)` per field) used ~1302 J and 238 s. The same loop with builtins only (`read -r` field splitting, `$(( ))`, `case`) used ~4.3 J and 0.72 s, about 300× less. A different script, but the same pattern.
+    - **Fix:** let `read` split the fields, use `$(( ))` for the arithmetic and `case` for the flag:
+      ```bash
+      #!/bin/bash
+      # summarize_hits.sh - summary for one detector run
+      # usage: summarize_hits.sh hits.txt
+
+      HITS_FILE="$1"
+      OUT_DIR='./summary'
+      mkdir -p "$OUT_DIR"
+
+      if [ ! -f "$HITS_FILE" ]; then
+        echo 'Error: hits file not found'
+        exit 1
+      fi
+
+      total=0
+      good=0
+      noisy=0
+      dead=0
+      peak=0
+      peak_channel='none'
+
+      while read -r run channel counts flag _ || [ -n "$run" ]; do
+        total=$(( total + counts ))
+        if (( counts > peak )); then
+          peak=$counts
+          peak_channel=$channel
+        fi
+
+        case $flag in
+          'OK')    good=$(( good + 1 )) ;;
+          'NOISY') noisy=$(( noisy + 1 )) ;;
+          *)       dead=$(( dead + 1 )) ;;
+        esac
+      done < "$HITS_FILE"
+
+      {
+        echo "Total counts: $total"
+        echo "Peak channel: $peak_channel ($peak counts)"
+        echo "Good: $good  Noisy: $noisy  Dead: $dead"
+      } > "$OUT_DIR/summary.txt"
+
+      echo "Summary written to $OUT_DIR/summary.txt"
+      ```
+      The summary lines are unchanged, so the parser on the other side keeps working. This version is still plain bash and still reads fine.
+    - **Impact:** E, per input file and large. This is the term that matters in this script.
+
+    #### [Medium] One `awk` pass would be cheaper still
+    - **Where:** the whole loop
+    - **Issue:** even with builtins, bash runs the loop body once per line in the interpreter. In the same benchmark, one `awk` pass used ~1.0 J and 0.21 s, about 4× less than the builtin loop.
+    - **Fix:** if awk is available on the head node (it is on CentOS 7), replace the loop with one call and print the same three summary lines from its `END` block. It is Medium because you said readability for students matters. The builtin version above already removes almost all of the cost.
+    - **Impact:** E, per input file, a further bounded gain.
+
+    #### [Low] Double quotes on literals that need no expansion
+    - **Where:** `OUT_DIR="./summary"`, `"Error: hits file not found"`, `peak_channel="none"`, `"OK"`, `"NOISY"`
+    - **Issue:** these strings contain no `$`, backtick or backslash, so single quotes say "literal" and bash does not scan them. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal in a loop used about 24% less CPU energy with single quotes. Your literals are short, so the saving here is tiny. It is a consistency fix, applied in the rewrite above.
+    - **Fix:** single quotes for plain literals. Keep double quotes where a variable must expand (`"Total counts: $total"`, `"$OUT_DIR/summary.txt"`, `"$HITS_FILE"`). Do not remove quotes around variables.
+    - **Impact:** E, minor.
+
+    **Behavior notes for the rewrite:** `read` splits on runs of whitespace, while `cut -d' '` split on every single space. For files with single spaces between fields the result is identical. A non-numeric `counts` value now counts as 0 (or aborts with a syntax error if it contains symbols) instead of making `expr` print an error. If your DAQ can emit such lines, filter them first.
+
+    **Already good:** `mkdir -p`, the file check before reading, input redirected into the loop with `< "$HITS_FILE"` (no pipe, so the counters survive the loop), and the grouped `{ ...; } > file` for the output.
+verify:
+  static_only: bash script reading a user-supplied hits file; review example with static findings

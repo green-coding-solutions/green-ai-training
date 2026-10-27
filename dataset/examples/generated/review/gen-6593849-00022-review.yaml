@@ -1,0 +1,77 @@
+id: gen-6593849-00022-review
+category: review
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    hi, i am a physics student and i wrote this to integrate a gaussian wave packet for my lab report. it gives the right numbers but runs slow when i put n = 5 million and scan many k values. is something wrong with it? i dont know python so well
+
+    ```python
+    import math
+
+
+    def packet_integral(a, b, n, k0, sigma):
+        """Left Riemann sum of exp(-x^2 / 2 sigma^2) * cos(k0 x) from a to b."""
+        h = (b - a) / n
+        total = 0.0
+        for i in range(n):
+            x = a + i * h
+            total += math.exp(-x * x / (2 * sigma * sigma)) * math.cos(k0 * x)
+        return total * h
+
+
+    def scan(a, b, n, ks, sigma):
+        return [(k0, packet_integral(a, b, n, k0, sigma)) for k0 in ks]
+
+
+    if __name__ == "__main__":
+        ks = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+        for k0, value in scan(-10.0, 10.0, 5_000_000, ks, 1.0):
+            print(f"k0={k0:.1f}  integral={value:.8f}")
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (numerical computation)
+
+    Nothing is wrong with the result. The code does what the docstring says, and the loop is easy to read.
+
+    #### [Low] `math.exp` and `math.cos` are looked up on every iteration
+    - **Where:** the `for i in range(n)` loop in `packet_integral`
+    - **Issue:** each pass finds `exp` and `cos` again by looking up the name `math` and then the attribute. With millions of iterations per k value, that lookup repeats millions of times for nothing.
+    - **Fix:** bind the two functions to local names once, before the loop. The arithmetic and the order of the sum stay the same, so the output is identical.
+
+      ```python
+      import math
+
+
+      def packet_integral(a, b, n, k0, sigma):
+          """Left Riemann sum of exp(-x^2 / 2 sigma^2) * cos(k0 x) from a to b."""
+          exp, cos = math.exp, math.cos
+          h = (b - a) / n
+          total = 0.0
+          for i in range(n):
+              x = a + i * h
+              total += exp(-x * x / (2 * sigma * sigma)) * cos(k0 * x)
+          return total * h
+      ```
+    - **Impact:** reduces E a little. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local before a 10,000,000-iteration loop saved about 4-5%. Expect a small gain, not a big one. The time goes mostly into the `exp` and `cos` calls themselves. If you only run this a few times, it is also fine to leave it as it is.
+
+    **Already good:** the function returns a value instead of printing, so you can reuse it in `scan`. The `if __name__ == "__main__":` block keeps the script importable.
+verify:
+  module: true
+  green_block: 0
+  test: |
+    expected0 = math.sqrt(2 * math.pi)
+    assert abs(packet_integral(-10.0, 10.0, 2000, 0.0, 1.0) - expected0) < 1e-9
+    expected5 = math.sqrt(2 * math.pi) * math.exp(-12.5)
+    assert abs(packet_integral(-10.0, 10.0, 2000, 5.0, 1.0) - expected5) < 1e-9
+    assert len(scan(-10.0, 10.0, 100, [0.0, 1.0], 1.0)) == 2
+  equivalence:
+    driver: |-
+      for k in (0.0, 1.0, 2.5, 5.0):
+          print(k, repr(packet_integral(-10.0, 10.0, 20000, k, 1.0)))
+      print(scan(-5.0, 5.0, 1000, [0.0, 3.0], 0.8))

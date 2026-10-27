@@ -1,0 +1,61 @@
+id: gen-12764612-00416-generation
+category: generation
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    hi, i need python script for our greenhouse gateway (raspberry pi 4, no gpu). the sensors send one json line on stdin every 5 second, like {"ts": 1767000000, "temp": 3.4, "hum": 81.0}. we have model models/frost.pt (torchscript), input is the last 24 readings as tensor [1, 24, 2] (temp, hum) and output is one number, frost risk from 0 to 1. when risk is more than 0.7 it should print a ALERT line. sometimes the sensor send broken lines, script should not crash. thanks!
+- role: assistant
+  content: |
+    ```python
+    import json
+    import sys
+    from collections import deque
+
+    import torch
+
+    WINDOW = 24
+    THRESHOLD = 0.7
+
+
+    def main(model_path="models/frost.pt"):
+        model = torch.jit.load(model_path, map_location="cpu")
+        model.eval()
+
+        window = deque(maxlen=WINDOW)
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                reading = json.loads(line)
+                window.append((float(reading["temp"]), float(reading["hum"])))
+            except (ValueError, KeyError, TypeError):
+                print(f"skipped bad line: {line[:80]}", file=sys.stderr)
+                continue
+
+            if len(window) < WINDOW:
+                continue
+
+            x = torch.tensor([list(window)], dtype=torch.float32)  # [1, 24, 2]
+            with torch.no_grad():
+                risk = model(x).item()
+
+            if risk > THRESHOLD:
+                print(f"ALERT ts={reading.get('ts')} frost_risk={risk:.2f}", flush=True)
+
+
+    if __name__ == "__main__":
+        main(*sys.argv[1:2])
+    ```
+
+    Broken lines are skipped and logged to stderr. The script waits until it has 24 good readings before it scores. Run it with `python frost_gateway.py` or give another model path as the first argument.
+
+    **Green Notes**
+    - **`torch.no_grad()` for inference** (reduces E): the model only predicts here, so PyTorch does not need to build the autograd graph on each forward pass. In Green Metrics Tool micro-benchmarks of 100,000 PyTorch CPU inferences, without `torch.no_grad()` used ~157 J and with it ~135 J, about 14% less. This runs once per reading on a small CPU, all day, so it adds up. `model.eval()` is there for correct behavior, not for energy.
+verify:
+  static_only: needs torch and a TorchScript model file

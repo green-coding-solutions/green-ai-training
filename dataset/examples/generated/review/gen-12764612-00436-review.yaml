@@ -1,0 +1,72 @@
+id: gen-12764612-00436-review
+category: review
+language: sql
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    ```sql
+    CREATE TABLE sim_runs (
+        id            bigserial PRIMARY KEY,
+        project_id    integer NOT NULL,
+        owner_id      integer NOT NULL REFERENCES users(id),
+        name          text NOT NULL,
+        status        text NOT NULL,       -- queued / running / done / failed
+        solver        text NOT NULL,
+        started_at    timestamptz,
+        finished_at   timestamptz,
+        wall_seconds  numeric,
+        max_residual  double precision,
+        input_deck    text,                -- full solver input, often 200 KB+
+        solver_log    text,                -- full log, often several MB
+        result_summary jsonb,
+        -- ... about 25 more config_* columns
+        created_at    timestamptz NOT NULL DEFAULT now()
+    );
+
+    -- run list on the dashboard: name, status, solver, times, residual, owner
+    SELECT r.*, u.display_name AS owner
+    FROM sim_runs r
+    JOIN users u ON u.id = r.owner_id
+    WHERE r.project_id = %(project_id)s
+      AND r.status <> 'failed'
+    ORDER BY r.finished_at DESC
+    LIMIT 25;
+    ```
+
+    ?
+- role: assistant
+  content: |
+    **Workload:** web (dashboard backed by a database)
+
+    #### [Bug] Running and queued runs sort first
+    - **Where:** `ORDER BY r.finished_at DESC`
+    - **Issue:** in PostgreSQL, `NULL` sorts first in descending order. Runs that have not finished have `finished_at = NULL`, so they fill the top of the list, ahead of the newest finished runs. With many queued runs, the 25 rows may contain no finished run at all. Rows with equal timestamps also have no fixed order.
+    - **Fix:** use `ORDER BY r.finished_at DESC NULLS LAST, r.id DESC`. If the dashboard should show running runs, filter on `status` instead.
+
+    #### [High] `SELECT r.*` reads the large text columns
+    - **Where:** `SELECT r.*`
+    - **Issue:** the dashboard shows 8 small fields, but `r.*` also reads `input_deck`, `solver_log`, `result_summary` and the ~25 `config_*` columns for every row. `input_deck` and `solver_log` are by far the biggest. The server has to read, copy and send them, and the client has to parse them, then throw them away.
+    - **Fix:** name the columns the list needs. Load the log and input deck in the run detail query, by `id`, when someone opens one run.
+    - **Impact:** reduces E on the database server and client, plus network and memory. In Green Metrics Tool micro-benchmarks on a 52-column table with large text columns, reading 2,500 rows with 10 named columns instead of `SELECT *` used about 7× less CPU energy. The saving grows with the size of the skipped columns.
+
+    ```sql
+    SELECT r.id, r.name, r.status, r.solver,
+           r.started_at, r.finished_at, r.wall_seconds, r.max_residual,
+           u.display_name AS owner
+    FROM sim_runs r
+    JOIN users u ON u.id = r.owner_id
+    WHERE r.project_id = %(project_id)s
+      AND r.status <> 'failed'
+    ORDER BY r.finished_at DESC NULLS LAST, r.id DESC
+    LIMIT 25;
+    ```
+
+    **Already good:** the query is parameterized, so there is no injection risk, and `LIMIT 25` keeps the result small.
+verify:
+  static_only: Postgres-specific syntax (NULLS LAST, psycopg named parameters) that SQLite cannot run

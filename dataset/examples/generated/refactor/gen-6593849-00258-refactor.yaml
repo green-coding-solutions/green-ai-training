@@ -1,0 +1,113 @@
+id: gen-6593849-00258-refactor
+category: refactor
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```python
+    class TempBridge:
+        def __init__(self, cfg, publisher):
+            self.cfg = cfg
+            self.publisher = publisher
+            self.dropped = 0
+
+        def convert_batch(self, raw_values):
+            out = []
+            for raw in raw_values:
+                if raw < self.cfg.min_raw or raw > self.cfg.max_raw:
+                    self.dropped += 1
+                    continue
+                volts = raw * self.cfg.vref / self.cfg.full_scale
+                temp = (volts - self.cfg.offset_v) / self.cfg.mv_per_c * 1000.0
+                out.append(round(temp, self.cfg.digits))
+            return out
+
+        def flush(self, raw_values):
+            temps = self.convert_batch(raw_values)
+            if temps:
+                self.publisher.send(temps)
+            return len(temps)
+    ```
+- role: assistant
+  content: |
+    ```python
+    class TempBridge:
+        def __init__(self, cfg, publisher):
+            self.cfg = cfg
+            self.publisher = publisher
+            self.dropped = 0
+
+        def convert_batch(self, raw_values):
+            cfg = self.cfg
+            min_raw, max_raw = cfg.min_raw, cfg.max_raw
+            vref, full_scale = cfg.vref, cfg.full_scale
+            offset_v, mv_per_c, digits = cfg.offset_v, cfg.mv_per_c, cfg.digits
+
+            out = []
+            for raw in raw_values:
+                if raw < min_raw or raw > max_raw:
+                    self.dropped += 1
+                    continue
+                volts = raw * vref / full_scale
+                temp = (volts - offset_v) / mv_per_c * 1000.0
+                out.append(round(temp, digits))
+            return out
+
+        def flush(self, raw_values):
+            temps = self.convert_batch(raw_values)
+            if temps:
+                self.publisher.send(temps)
+            return len(temps)
+    ```
+
+    **Green Notes**
+    - **Hoist loop-invariant lookups** (reduces E): `self.cfg.<field>` was resolved two attribute levels deep, up to eight times per reading. The config values are now read once per batch. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local before a 10,000,000-iteration loop saved about 4-5%. Expect a gain of that size at most, and only for large batches.
+
+    The output is identical, with the same arithmetic in the same order. This assumes `cfg` is not changed while a batch is being converted. If another thread can update calibration values mid-batch, the old code would pick up the change and this version would not. `flush` has nothing to hoist, so I left it as it was.
+verify:
+  test: |
+    from types import SimpleNamespace
+
+    class Pub:
+        def __init__(self):
+            self.sent = []
+        def send(self, x):
+            self.sent.append(x)
+
+    cfg = SimpleNamespace(min_raw=10, max_raw=4000, vref=3.3, full_scale=4095,
+                          offset_v=0.5, mv_per_c=10.0, digits=2)
+    pub = Pub()
+    b = TempBridge(cfg, pub)
+    res = b.convert_batch([5, 100, 2000, 4001, 4000])
+    assert len(res) == 3
+    assert b.dropped == 2
+    assert b.flush([100, 2000]) == 2
+    assert len(pub.sent) == 1
+    assert b.flush([1]) == 0
+    assert len(pub.sent) == 1
+  equivalence:
+    driver: |-
+      from types import SimpleNamespace
+
+      class Pub:
+          def __init__(self):
+              self.sent = []
+          def send(self, x):
+              self.sent.append(x)
+
+      cfg = SimpleNamespace(min_raw=10, max_raw=4000, vref=3.3, full_scale=4095,
+                            offset_v=0.5, mv_per_c=10.0, digits=2)
+      pub = Pub()
+      b = TempBridge(cfg, pub)
+      raws = [(i * 37) % 4200 for i in range(2000)]
+      print(b.convert_batch(raws)[:20])
+      print(b.dropped)
+      print(b.flush(raws[:500]))
+      print(len(pub.sent), pub.sent[0][:5])
+      print(b.dropped)

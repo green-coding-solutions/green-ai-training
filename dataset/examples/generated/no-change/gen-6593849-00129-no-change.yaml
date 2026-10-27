@@ -1,0 +1,56 @@
+id: gen-6593849-00129-no-change
+category: no-change
+language: nginx
+patterns:
+- text-compression
+- none
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    hi, i am new to nginx. i made a small web page where our team can see the summary of the parsed logs (error counts per service, top 20 slow endpoints). a script build the page after every nightly parse and put the files in /srv/logsummary/site. my colegue said my config is maybe wrong because i dont have any "gzip on" line. is something wrong? the page seems fast
+
+    ```nginx
+    server {
+        listen 80;
+        server_name logsummary.internal;
+
+        root /srv/logsummary/site;
+        index index.html;
+
+        gzip off;
+        gzip_static on;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location ~* \.(png|woff2)$ {
+            expires 7d;
+            add_header Cache-Control "public";
+        }
+
+        access_log /var/log/nginx/logsummary.access.log;
+    }
+    ```
+
+    the build script ends with this line:
+
+    ```bash
+    find /srv/logsummary/site -type f \( -name '*.html' -o -name '*.css' -o -name '*.js' -o -name '*.json' \) -exec gzip -k -9 {} +
+    ```
+- role: assistant
+  content: |
+    Nothing is wrong. This setup is already a good one, and adding `gzip on` would make it worse.
+
+    - **`gzip_static on`** makes nginx send the `.gz` files your build script creates. Each file is compressed once per night, not on every request. In Green Metrics Tool micro-benchmarks with 2,000 requests for text assets, precompressed files used about 14 J, and gzip level 5 on every request used about 54 J. That is about 4× more CPU energy for per-request compression.
+    - **`gzip off`** is right for the same reason. The pages are static, so compressing them again on each request would repeat the same work.
+    - **`-k`** in your `gzip` command keeps the original files. Browsers that don't accept gzip still get the plain file.
+    - You don't compress PNG and WOFF2 files. They are already compressed, so gzip would only cost CPU and gain nothing.
+
+    Compression itself should stay on for real networks, because text gets about 10× smaller in transfer. You already have that through the `.gz` files.
+
+    One small thing: if you add new file types later (for example `.svg` or `.csv`), add them to the `find` list in the build script. nginx only sends a `.gz` file if it exists.
+verify:
+  static_only: nginx config, no runnable code

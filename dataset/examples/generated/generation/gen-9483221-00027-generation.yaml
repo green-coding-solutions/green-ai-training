@@ -1,0 +1,59 @@
+id: gen-9483221-00027-generation
+category: generation
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    hello, I make REST api with fastapi for our parcel delivery company. we have small pytorch model who guess the delivery time in minutes. class is DeliveryNet in model.py (4 inputs: distance_km, weight_kg, hour of day, is_weekend, 1 output) and the weigths are saved as state_dict in models/delivery.pt. we run only on cpu. can you write the endpoint POST /eta, it get a list of parcels and give back the minutes for every parcel? thanks!
+- role: assistant
+  content: |
+    Here is the endpoint. It assumes `DeliveryNet` returns shape `(n, 1)`.
+
+    ```python
+    import torch
+    from fastapi import FastAPI
+    from pydantic import BaseModel, Field
+
+    from model import DeliveryNet
+
+    MODEL_PATH = "models/delivery.pt"
+
+    model = DeliveryNet()
+    model.load_state_dict(torch.load(MODEL_PATH, map_location="cpu", weights_only=True))
+    model.eval()
+
+    app = FastAPI()
+
+
+    class Parcel(BaseModel):
+        distance_km: float = Field(ge=0)
+        weight_kg: float = Field(ge=0)
+        hour: int = Field(ge=0, le=23)
+        is_weekend: bool
+
+
+    class EtaRequest(BaseModel):
+        parcels: list[Parcel] = Field(min_length=1, max_length=500)
+
+
+    @app.post("/eta")
+    def eta(req: EtaRequest) -> dict:
+        x = torch.tensor(
+            [[p.distance_km, p.weight_kg, p.hour, float(p.is_weekend)] for p in req.parcels],
+            dtype=torch.float32,
+        )
+        with torch.inference_mode():
+            minutes = model(x).squeeze(1)
+        return {"eta_minutes": [round(m, 1) for m in minutes.tolist()]}
+    ```
+
+    **Green Notes**
+    - **No autograd during inference** (reduces E): `torch.inference_mode()` stops PyTorch from building the gradient graph for every request, and you never call `backward()` here. In Green Metrics Tool micro-benchmarks, 100,000 CPU inferences used about 14% less energy with `torch.no_grad()` than without it. `inference_mode()` disables gradients in the same way, but that benchmark measured `no_grad()`.
+    - **`model.eval()`** is for correct results, not for energy: it turns off dropout and uses the running statistics of batch norm, if your model has them.
+    - *Not applied:* anything heavier, like quantization or a custom runtime. For a small model on CPU, it would need accuracy checks first and is not worth it now.
+verify:
+  static_only: needs torch, fastapi and a local model.py with trained weights

@@ -1,0 +1,75 @@
+id: gen-6593849-00228-review
+category: review
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    hi, im not sure whats wrong with my dockerfile but our CI is slow when it builds it. its for a small flask app that gets webhooks from github and posts a message to our slack channel. can you take a look?
+
+    ```dockerfile
+    FROM python:3.12
+
+    RUN apt-get update && apt-get install -y build-essential git curl vim
+
+    WORKDIR /app
+    COPY . .
+
+    RUN pip install -r requirements.txt
+    RUN pip install pytest black mypy ipython
+
+    ENV SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T0123/B0456/abcdef123456
+
+    EXPOSE 5000
+    CMD ["python", "app.py"]
+    ```
+
+    requirements.txt only has flask and requests.
+- role: assistant
+  content: |
+    **Workload:** CI/CD and infrastructure (image built in CI)
+
+    #### [Security] Slack webhook URL is baked into the image
+    - **Where:** `ENV SLACK_WEBHOOK_URL=...`
+    - **Issue:** anyone who can pull the image can read the URL, and it stays in the image history and in your git repo. The container also runs as root.
+    - **Fix:** remove the line and pass the value at run time (`docker run -e SLACK_WEBHOOK_URL=...` or your platform's secret store). Rotate the URL that is in the file now, because it has already leaked. Add a normal user as shown in the fixed file below.
+
+    #### [High] Full base image plus build and dev tools
+    - **Where:** `FROM python:3.12`, the `apt-get install` line, `pip install pytest black mypy ipython`
+    - **Issue:** flask and requests are pure Python, so they don't need a compiler, git, curl or vim. Test and lint tools are not needed at run time either. They make every build, pull and stored copy of the image larger. In Green Metrics Tool micro-benchmarks, building a small Flask image from `python:3.12` with build tools and dev packages used ~885 J, and ~124 J with `python:3.12-slim` and runtime dependencies only, about 7× less. Serving 2,000 requests afterwards cost the same with both images, so the saving is in the build, pull and storage, and it repeats on every CI run.
+    - **Fix:** use the slim base, drop the `apt-get` line, and run `pytest`, `black` and `mypy` in a separate CI step, not in the image.
+    - **Impact:** E and M, on every build and pull. Run time stays the same.
+
+    #### [Medium] Source is copied before dependencies are installed
+    - **Where:** `COPY . .` followed by `pip install`
+    - **Issue:** any change to any file invalidates the layer, so `pip install` runs again on every push even when `requirements.txt` did not change.
+    - **Fix:** copy `requirements.txt` first, install, then copy the rest. Add `--no-cache-dir` so pip's download cache is not stored in the image.
+    - **Impact:** E, the dependency layer is reused from the build cache when only code changed. The measurement above was without a build cache, so this comes on top.
+
+    Fixed file:
+
+    ```dockerfile
+    FROM python:3.12-slim
+
+    WORKDIR /app
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY . .
+
+    RUN useradd --create-home app
+    USER app
+
+    EXPOSE 5000
+    CMD ["python", "app.py"]
+    ```
+
+    If you add a package later that needs to compile, first check if it ships a wheel. Only then add the build tools, and do it in a separate build stage.
+
+    **Already good:** a short, clear `CMD` in exec form, and a pinned Python minor version.
+verify:
+  static_only: Dockerfile review, needs a Docker build

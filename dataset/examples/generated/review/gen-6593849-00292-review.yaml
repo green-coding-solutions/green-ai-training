@@ -1,0 +1,121 @@
+id: gen-6593849-00292-review
+category: review
+language: python
+patterns:
+- async-concurrent-io
+- memoize
+facts:
+- F-LRU
+- F-HTTP
+messages:
+- role: user
+  content: |
+    Review please. Internal CLI, finance runs it by hand on expense exports (a few thousand rows, a handful of currencies). Just give me the diff, no essay.
+
+    ```python
+    import csv
+    import sys
+
+    import requests
+
+    RATES_URL = "https://api.fxrates.example/v1/latest"
+
+
+    def get_rate(currency, target="EUR"):
+        if currency == target:
+            return 1.0
+        resp = requests.get(
+            RATES_URL,
+            params={"base": currency, "symbols": target},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()["rates"][target]
+
+
+    def main(path, target="EUR"):
+        total = 0.0
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                rate = get_rate(row["currency"], target)
+                converted = float(row["amount"]) * rate
+                total += converted
+                print(f'{row["date"]},{row["amount"]},{row["currency"]},{round(converted, 2)}')
+        print(f"total,{round(total, 2)}")
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1])
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (small CLI, but one blocking HTTP call per row)
+
+    #### [High] Same rate fetched once per row
+    - **Where:** `get_rate` called inside the row loop
+    - **Issue:** the rate depends only on the currency, and there are a handful of currencies for thousands of rows. Nearly every request repeats an earlier one.
+    - **Fix:** fetch each distinct currency once and look it up in a dict.
+    - **Impact:** reduces E and network from one request per row to one per currency. In Green Metrics Tool micro-benchmarks, caching a repeated pure computation (1,000,000 calls over only a few distinct inputs) used about 9× less CPU energy. The benefit depends on inputs repeating, and here they do.
+
+    #### [Medium] Remaining requests run one after another
+    - **Where:** the blocking `requests.get`
+    - **Issue:** the distinct-currency requests are independent, but each waits for the previous one.
+    - **Fix:** fetch them together with `httpx.AsyncClient` and `asyncio.gather`.
+    - **Impact:** mostly less wall time. In Green Metrics Tool micro-benchmarks with 10 requests, async used about 7% less CPU energy and about 17% less wall time. With a handful of currencies, expect a small gain. It is worth it only because you already make several calls.
+
+    #### [Low] Rates can change during a run
+    - **Where:** per-row fetching
+    - **Issue:** two rows with the same currency can get different rates.
+    - **Fix:** the one-rate-per-currency fix above also gives consistent rates per run.
+
+    ```python
+    import asyncio
+    import csv
+    import sys
+
+    import httpx
+
+    RATES_URL = "https://api.fxrates.example/v1/latest"
+
+
+    async def fetch_rate(client, currency, target):
+        resp = await client.get(
+            RATES_URL, params={"base": currency, "symbols": target}, timeout=10
+        )
+        resp.raise_for_status()
+        return currency, resp.json()["rates"][target]
+
+
+    async def load_rates(currencies, target):
+        wanted = sorted(set(currencies) - {target})
+        async with httpx.AsyncClient() as client:
+            pairs = await asyncio.gather(
+                *(fetch_rate(client, c, target) for c in wanted)
+            )
+        rates = dict(pairs)
+        rates[target] = 1.0
+        return rates
+
+
+    def main(path, target="EUR"):
+        with open(path, newline="") as f:
+            rows = list(csv.DictReader(f))
+        rates = asyncio.run(load_rates((r["currency"] for r in rows), target))
+        total = 0.0
+        for row in rows:
+            converted = float(row["amount"]) * rates[row["currency"]]
+            total += converted
+            print(f'{row["date"]},{row["amount"]},{row["currency"]},{round(converted, 2)}')
+        print(f"total,{round(total, 2)}")
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1])
+    ```
+
+    **Behavior change:** rates are now fetched before any output. A failing rate lookup stops the run before it prints partial results. The file is read fully into memory first, which is fine for this size.
+
+    **Already good:** the request has a timeout, and `raise_for_status()` is called.
+verify:
+  green_block: 0
+  static_only: needs network access and the third-party packages httpx and requests

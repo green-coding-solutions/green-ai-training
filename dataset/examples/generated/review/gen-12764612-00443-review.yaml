@@ -1,0 +1,127 @@
+id: gen-12764612-00443-review
+category: review
+language: python
+patterns:
+- deque-or-append
+- regex-precompile
+facts:
+- F-LISTINS
+- F-REGEX
+messages:
+- role: user
+  content: |
+    review pls
+
+    ```python
+    import re
+    import time
+
+    MAX_RECENT = 500
+    recent = []
+
+
+    def handle_frame(line):
+        m = re.match(r"^(\w+);(\d+);(-?\d+\.\d+);(\w+)$", line.strip())
+        if not m:
+            return None
+        sensor, ts, value, unit = m.groups()
+        reading = {"sensor": sensor, "ts": int(ts), "value": float(value), "unit": unit}
+        recent.insert(0, reading)
+        if len(recent) > MAX_RECENT:
+            recent.pop()
+        return reading
+
+
+    def latest(n=20):
+        return recent[:n]
+
+
+    def run(port):
+        while True:
+            try:
+                line = port.readline().decode()
+                if line:
+                    handle_frame(line)
+            except:
+                pass
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (always-on IoT gateway, runs per incoming frame)
+
+    #### [Bug] Bare `except: pass` hides every error
+    - **Where:** `run`
+    - **Issue:** a bare `except` also catches `KeyboardInterrupt` and `SystemExit`, so you cannot stop the loop cleanly. A dead serial port or a bad frame fails silently, and the loop keeps spinning.
+    - **Fix:** catch only what you expect and log it.
+
+    #### [Medium] Front insert on every frame
+    - **Where:** `recent.insert(0, reading)` and `recent.pop()`
+    - **Issue:** each insert at index 0 shifts the whole list, so the cost per frame grows with the list size. Your cap of 500 keeps it bounded, but a `deque(maxlen=...)` does the insert and the trim in O(1). In Green Metrics Tool micro-benchmarks, 1,000,000 front inserts into a growing list used ~1515 J, and 1,000,000 appends used ~1.2 J. Your list is capped, so the gap will be much smaller. The direction is the same.
+    - **Fix:** `deque(maxlen=MAX_RECENT)` with `appendleft`. The oldest item drops off by itself, and the order stays newest first.
+    - **Impact:** reduces E on every frame. Slicing does not work on a deque, so `latest` uses `islice`.
+
+    #### [Low] Regex pattern passed inline on every frame
+    - **Where:** `re.match(r"...", line.strip())`
+    - **Issue:** the pattern is a constant. Python's `re` caches compiled patterns, so the saving is small. In Green Metrics Tool micro-benchmarks, 1,000,000 matches with a precompiled pattern used ~18 J against ~21 J inline, about 18% less. It is still free to do, and it names the frame format.
+    - **Fix:** compile once at module level.
+    - **Impact:** small reduction in E per frame.
+
+    ```python
+    import logging
+    import re
+    from collections import deque
+    from itertools import islice
+
+    MAX_RECENT = 500
+    FRAME_RE = re.compile(r"^(\w+);(\d+);(-?\d+\.\d+);(\w+)$")
+    recent = deque(maxlen=MAX_RECENT)
+
+    log = logging.getLogger(__name__)
+
+
+    def handle_frame(line):
+        m = FRAME_RE.match(line.strip())
+        if not m:
+            return None
+        sensor, ts, value, unit = m.groups()
+        reading = {"sensor": sensor, "ts": int(ts), "value": float(value), "unit": unit}
+        recent.appendleft(reading)
+        return reading
+
+
+    def latest(n=20):
+        return list(islice(recent, n))
+
+
+    def run(port):
+        while True:
+            try:
+                line = port.readline().decode()
+                if line:
+                    handle_frame(line)
+            except (UnicodeDecodeError, OSError):
+                log.exception("bad frame or port error")
+    ```
+
+    **Already good:** the cap on `recent` keeps memory bounded, and bad frames return `None` instead of raising.
+verify:
+  module: true
+  test: |
+    recent.clear()
+    assert handle_frame("garbage") is None
+    for i in range(700):
+        handle_frame(f"s{i % 5};{1000 + i};{i / 10:.1f};C")
+    assert len(recent) == 500
+    assert latest(1)[0]["ts"] == 1699
+    assert latest(1000)[-1]["ts"] == 1200
+  equivalence:
+    driver: |-
+      for i in range(700):
+          handle_frame(f"s{i % 5};{1000 + i};{i / 10:.1f};C\n")
+          if i % 100 == 0:
+              handle_frame("bad line")
+      handle_frame("s9;5;-3.5;K")
+      print(len(recent))
+      print(latest(3))
+      print(latest(1000)[-1])
+      print(len(latest()))

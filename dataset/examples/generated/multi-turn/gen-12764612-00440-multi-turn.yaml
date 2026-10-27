@@ -1,0 +1,112 @@
+id: gen-12764612-00440-multi-turn
+category: multi-turn
+language: javascript
+patterns:
+- css-animations
+facts:
+- F-ANIM
+messages:
+- role: user
+  content: |
+    I need a small Node CLI script, no dependencies, `render-report.js results.json [out.html]`. It reads a JSON file like `{ "title": "...", "running": true, "jobs": [{ "name": "...", "status": "ok|failed|running", "seconds": 12.4 }] }` and writes one self-contained HTML file. Requirements:
+    - a table of jobs with a colored status
+    - while `running` is true, show an indeterminate progress bar and a small pulsing dot next to the title
+    - job names come from users, so they must be escaped
+    - the page stays open on a wall monitor all day during our nightly batch
+- role: assistant
+  content: |
+    ```js
+    #!/usr/bin/env node
+    'use strict';
+    const fs = require('node:fs');
+
+    const [, , inPath, outPath = 'report.html'] = process.argv;
+    if (!inPath) {
+      console.error('usage: render-report.js results.json [out.html]');
+      process.exit(1);
+    }
+
+    const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+    const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ESC[c]);
+
+    const { title, running, jobs } = JSON.parse(fs.readFileSync(inPath, 'utf8'));
+
+    const rows = jobs
+      .map(
+        (j) =>
+          `<tr><td>${esc(j.name)}</td>` +
+          `<td class="st st-${esc(j.status)}">${esc(j.status)}</td>` +
+          `<td>${Number(j.seconds).toFixed(1)} s</td></tr>`
+      )
+      .join('\n');
+
+    const html = `<!doctype html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <title>${esc(title)}</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 2rem; }
+      h1 { display: flex; align-items: center; gap: .6rem; }
+      .dot { width: .7rem; height: .7rem; border-radius: 50%; background: #2a9d4b; animation: pulse 1.6s ease-in-out infinite; }
+      .bar { height: .4rem; background: #e5e7eb; overflow: hidden; margin-bottom: 1.5rem; }
+      .bar > span { display: block; height: 100%; width: 30%; background: #2563eb; animation: slide 1.4s linear infinite; }
+      table { border-collapse: collapse; width: 100%; }
+      td { padding: .4rem .8rem; border-bottom: 1px solid #e5e7eb; }
+      .st-ok { color: #1a7f37; } .st-failed { color: #c62828; } .st-running { color: #2563eb; }
+      @keyframes pulse { 0%, 100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.5); opacity: .4; } }
+      @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+      @media (prefers-reduced-motion: reduce) { .dot, .bar > span { animation: none; } }
+    </style>
+    </head>
+    <body>
+    <h1>${esc(title)}${running ? '<span class="dot"></span>' : ''}</h1>
+    ${running ? '<div class="bar"><span></span></div>' : ''}
+    <table>
+    ${rows}
+    </table>
+    </body>
+    </html>
+    `;
+
+    fs.writeFileSync(outPath, html);
+    ```
+
+    **Green Notes**
+    - **CSS keyframes instead of JS-driven animation** (reduces E): the pulse and the bar use `@keyframes` on `transform` and `opacity`, with no script running. That matters on a page that stays open all day. In Green Metrics Tool browser micro-benchmarks, a 20-second animation used about 145 J as CSS `@keyframes` and about 161 J with `requestAnimationFrame` style updates, about 10% less.
+    - Animations stop for visitors who prefer reduced motion, and they are not rendered at all when `running` is false.
+- role: user
+  content: |
+    thanks. one problem: the bar should show real progress, not just slide. the batch writes progress.json every second ({"percent": 63, "done": false}) and the page should follow it smoothly. I was going to do the easing myself with requestAnimationFrame, I like having control. also the dot must stop when done is true
+- role: assistant
+  content: |
+    You can keep the control. The page only needs to set one value per second. The browser can do the easing between values, so no per-frame JS loop is needed.
+
+    Replace the bar rule in the generated CSS and add the script at the end of the body:
+
+    ```html
+    <style>
+      .bar > span { display: block; height: 100%; width: 100%; transform: scaleX(0); transform-origin: left;
+                    transition: transform .8s ease-out; animation: none; }
+      .is-done .dot { animation: none; }
+    </style>
+    <script>
+      const fill = document.querySelector('.bar > span');
+      async function refresh() {
+        const res = await fetch('progress.json', { cache: 'no-store' });
+        const { percent, done } = await res.json();
+        fill.style.transform = `scaleX(${Math.min(Math.max(percent, 0), 100) / 100})`;
+        document.body.classList.toggle('is-done', done);
+      }
+      setInterval(refresh, 1000);
+      refresh();
+    </script>
+    ```
+
+    **Green Notes**
+    - **CSS transition instead of an rAF loop** (reduces E): the script wakes once per second and writes one `transform` value. The 0.8 s `ease-out` is done by the browser. Change the duration or the easing curve (`cubic-bezier(...)`) to tune it. The same reasoning as for keyframes applies: in Green Metrics Tool micro-benchmarks, CSS-driven animation used about 10% less CPU energy than JS style updates.
+    - Dot: the `is-done` class stops it with CSS only, so nothing runs after the batch finishes.
+
+    If you need a curve CSS can't express, say so. Then an rAF loop is the right tool, and it should run only while the value is changing.
+verify:
+  static_only: Node CLI generating HTML/CSS; animation behavior needs a browser

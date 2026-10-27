@@ -1,0 +1,105 @@
+id: gen-12764612-00404-generation
+category: generation
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    Our ETL PR previews are deployed from this workflow and never get removed. Diff only: delete the preview when the PR closes, and add a nightly sweep for anything that got orphaned. Previews don't need the 3 replicas either.
+
+    ```yaml
+    name: etl-preview
+    on:
+      pull_request:
+        types: [opened, synchronize, reopened]
+
+    jobs:
+      deploy:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+          - uses: azure/setup-helm@v4
+          - run: echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > kubeconfig
+          - name: Deploy preview
+            env:
+              KUBECONFIG: kubeconfig
+            run: |
+              helm upgrade --install etl-pr-${{ github.event.number }} ./deploy/chart \
+                --namespace etl-pr-${{ github.event.number }} --create-namespace \
+                --set image.tag=${{ github.sha }} \
+                --set scheduler.replicas=3 \
+                --set worker.replicas=3 \
+                --set postgres.enabled=true \
+                --set redis.enabled=true
+    ```
+- role: assistant
+  content: |
+    ```diff
+     name: etl-preview
+     on:
+       pull_request:
+    -    types: [opened, synchronize, reopened]
+    +    types: [opened, synchronize, reopened, closed]
+    +  schedule:
+    +    - cron: '0 2 * * *'
+
+     jobs:
+       deploy:
+    +    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+         runs-on: ubuntu-latest
+         steps:
+           - uses: actions/checkout@v4
+           - uses: azure/setup-helm@v4
+           - run: echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > kubeconfig
+           - name: Deploy preview
+             env:
+               KUBECONFIG: kubeconfig
+             run: |
+               helm upgrade --install etl-pr-${{ github.event.number }} ./deploy/chart \
+                 --namespace etl-pr-${{ github.event.number }} --create-namespace \
+                 --set image.tag=${{ github.sha }} \
+    -            --set scheduler.replicas=3 \
+    -            --set worker.replicas=3 \
+    +            --set scheduler.replicas=1 \
+    +            --set worker.replicas=1 \
+                 --set postgres.enabled=true \
+                 --set redis.enabled=true
+    +          kubectl label namespace etl-pr-${{ github.event.number }} env=preview --overwrite
+    +
+    +  teardown:
+    +    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    +    runs-on: ubuntu-latest
+    +    steps:
+    +      - run: echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > kubeconfig
+    +      - name: Delete preview namespace
+    +        env:
+    +          KUBECONFIG: kubeconfig
+    +        run: kubectl delete namespace etl-pr-${{ github.event.number }} --ignore-not-found --wait=false
+    +
+    +  sweep:
+    +    if: github.event_name == 'schedule'
+    +    runs-on: ubuntu-latest
+    +    steps:
+    +      - run: echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > kubeconfig
+    +      - name: Delete previews older than 3 days
+    +        env:
+    +          KUBECONFIG: kubeconfig
+    +        run: |
+    +          kubectl get namespaces -l env=preview -o json \
+    +            | jq -r --argjson max 259200 '.items[]
+    +                | select((now - (.metadata.creationTimestamp | fromdateiso8601)) > $max)
+    +                | .metadata.name' \
+    +            | xargs -r kubectl delete namespace --wait=false
+    ```
+
+    **Green Notes**
+    - **Tear down on close** (reduces E and M): a preview that is gone uses no CPU and holds no memory. In Green Metrics Tool micro-benchmarks, trimming an idle preview from 3 app replicas, Postgres, Redis and a worker to 1 replica and Postgres saved only about 3% CPU energy over 60 seconds. So the real saving is removing the environment, not trimming it.
+    - **Nightly sweep** (reduces E and M): it catches previews whose close event failed or was missed. Adjust the 3-day limit to your review cycle.
+    - **1 replica per service** (reduces M): previews don't need high availability. This is a behavior change, so don't use it where a preview tests failover or load.
+
+    The sweep only matches namespaces labeled `env=preview`. Previews deployed before this change need the label once: `kubectl label namespace etl-pr-<n> env=preview`.
+verify:
+  static_only: GitHub Actions workflow needs a cluster and secrets

@@ -1,0 +1,101 @@
+id: gen-9483221-00035-refactor
+category: refactor
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```python
+    import sys
+
+    import numpy as np
+    import torch
+    from torch.utils.data import DataLoader, TensorDataset
+
+    THRESHOLD = 0.82
+
+
+    def load_model(path):
+        model = torch.jit.load(path, map_location="cpu")
+        model.eval()
+        return model
+
+
+    def score_windows(model, windows, batch_size=256):
+        loader = DataLoader(TensorDataset(torch.from_numpy(windows)), batch_size=batch_size)
+        scores = []
+        for (batch,) in loader:
+            recon = model(batch)
+            err = ((recon - batch) ** 2).mean(dim=1)
+            scores.append(err.detach().numpy())
+        return np.concatenate(scores)
+
+
+    def main(model_path, windows_path):
+        model = load_model(model_path)
+        windows = np.load(windows_path).astype(np.float32)
+        scores = score_windows(model, windows)
+        flagged = np.flatnonzero(scores > THRESHOLD)
+        print(f"{len(flagged)} of {len(scores)} windows above {THRESHOLD}")
+        for i in flagged[:20]:
+            print(i, round(float(scores[i]), 4))
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1], sys.argv[2])
+    ```
+- role: assistant
+  content: |
+    ```python
+    import sys
+
+    import numpy as np
+    import torch
+    from torch.utils.data import DataLoader, TensorDataset
+
+    THRESHOLD = 0.82
+
+
+    def load_model(path):
+        model = torch.jit.load(path, map_location="cpu")
+        model.eval()
+        return model
+
+
+    def score_windows(model, windows, batch_size=256):
+        loader = DataLoader(TensorDataset(torch.from_numpy(windows)), batch_size=batch_size)
+        scores = []
+        with torch.no_grad():
+            for (batch,) in loader:
+                recon = model(batch)
+                err = ((recon - batch) ** 2).mean(dim=1)
+                scores.append(err.numpy())
+        return np.concatenate(scores)
+
+
+    def main(model_path, windows_path):
+        model = load_model(model_path)
+        windows = np.load(windows_path).astype(np.float32)
+        scores = score_windows(model, windows)
+        flagged = np.flatnonzero(scores > THRESHOLD)
+        print(f"{len(flagged)} of {len(scores)} windows above {THRESHOLD}")
+        for i in flagged[:20]:
+            print(i, round(float(scores[i]), 4))
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1], sys.argv[2])
+    ```
+
+    **Green Notes**
+    - **`torch.no_grad()` around the scoring loop** (reduces E): `model.eval()` only switches layers like dropout and batch norm. It does not stop PyTorch from recording the graph for backprop on every forward pass. Inference never calls `backward()`, so that work is wasted on every batch. In Green Metrics Tool micro-benchmarks, 100,000 PyTorch CPU inferences used ~157 J without `torch.no_grad()` and ~135 J with it, about 14% less.
+    - **`.detach()` removed:** tensors made under `no_grad` carry no graph, so `.numpy()` works directly. The scores are identical.
+
+    Only use `no_grad` where you never need gradients. Keep it out of training and fine-tuning code.
+verify:
+  static_only: needs torch and a TorchScript model file

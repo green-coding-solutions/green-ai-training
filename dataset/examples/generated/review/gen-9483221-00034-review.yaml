@@ -1,0 +1,82 @@
+id: gen-9483221-00034-review
+category: review
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    Hello, can you look on my Dockerfile please? It is for logrollup, a small service what reads our app logs, make hourly summaries and send them to Loki. Gitlab build it on every push to all branches and the pipeline is slow, my lead say the image is too big. I dont know whats wrong with it.
+
+    ```dockerfile
+    FROM python:3.12
+
+    RUN apt-get update && apt-get install -y build-essential git curl vim
+    RUN pip install pytest black mypy ipython
+
+    WORKDIR /app
+    COPY . /app
+    RUN pip install -r requirements.txt
+
+    ENV LOKI_URL=http://loki:3100
+    ENV LOKI_TOKEN=glsa_9f2c71d0b8e44a1e
+
+    EXPOSE 9102
+    CMD ["python", "-m", "logrollup.main", "--config", "config/rollup.yaml"]
+    ```
+
+    requirements.txt has orjson, python-dateutil, prometheus-client, pyyaml, requests.
+- role: assistant
+  content: |
+    **Workload:** data pipeline (image built in CI on every push)
+
+    #### [Security] Loki token is baked into the image
+    - **Where:** `ENV LOKI_TOKEN=...`
+    - **Issue:** anyone who can pull the image can read the token with `docker inspect` or `docker history`. It also stays in the image layers after you change it.
+    - **Fix:** remove the line, rotate this token, and pass the new one at runtime (`docker run -e LOKI_TOKEN`, or a secret in your orchestrator).
+
+    #### [High] Full base image with compilers and dev tools
+    - **Where:** `FROM python:3.12`, the `apt-get install` line, the `pip install pytest black mypy ipython` line
+    - **Issue:** your five dependencies are all normally installed from prebuilt wheels, so `build-essential`, `git`, `curl`, `vim` and the dev tools are not needed to run the service. They make the build slower and the image bigger, and every push, pull and stored copy pays for it again.
+    - **Fix:** use the slim base and install only runtime dependencies. Run tests and linting in a separate CI job, not in the production image.
+    - **Impact:** E and M, on every build. In Green Metrics Tool micro-benchmarks, building a small Flask app image with the full base plus build tools and dev tools used ~885 J. The slim base with runtime dependencies only used ~124 J, about 7× less. Serving requests afterwards cost the same with both images, so the saving is in the build, the pull and the storage, not in the running service.
+
+    #### [Medium] Source is copied before dependencies are installed
+    - **Where:** `COPY . /app` before `pip install -r requirements.txt`
+    - **Issue:** every code change invalidates the layer cache, so all dependencies are installed again on each push. `COPY .` also puts `.git`, `.env` and local files into the image unless you have a `.dockerignore`. `pip` also keeps its download cache in the layer.
+    - **Fix:** copy `requirements.txt` first, install, then copy the source. Use `--no-cache-dir` and add a `.dockerignore`.
+    - **Impact:** E per build. Most pushes only change code, so the dependency layer can come from cache.
+
+    Fixed version:
+
+    ```dockerfile
+    FROM python:3.12-slim
+
+    WORKDIR /app
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY logrollup/ logrollup/
+    COPY config/ config/
+
+    ENV LOKI_URL=http://loki:3100
+
+    EXPOSE 9102
+    CMD ["python", "-m", "logrollup.main", "--config", "config/rollup.yaml"]
+    ```
+
+    `.dockerignore`:
+
+    ```text
+    .git
+    .env
+    tests/
+    __pycache__/
+    ```
+
+    If a package later needs a compiler, build it in a separate builder stage and copy only the result into the slim image. Do not put the compiler back into the final image.
+verify:
+  static_only: Dockerfile review, needs a container build

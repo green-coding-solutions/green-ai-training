@@ -1,0 +1,145 @@
+id: gen-6593849-00185-review
+category: review
+language: python
+patterns:
+- select-columns
+- hoist-invariants
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+- F-ATTR
+messages:
+- role: user
+  content: |
+    Can you review this report class for our CI cost dashboard? Requirements: it runs nightly on the scheduler host and sums up estimated kWh per runner type for all jobs since a given day. We keep about 400k jobs per month in the `ci_jobs` table. The table is wide (around 40 columns, including `log_text`, `env_dump` and `artifacts_json`, which can be a few hundred KB per job). The output must stay exactly the same, because the dashboard parses it. I'm looking for correctness problems first, then anything that makes it wasteful.
+
+    ```python
+    import sqlite3
+
+
+    class RunnerEnergyReport:
+        """Estimated energy per runner type for finished CI jobs."""
+
+        def __init__(self, conn, cfg):
+            self.conn = conn
+            self.conn.row_factory = sqlite3.Row
+            self.cfg = cfg
+
+        def build(self, since_day):
+            cur = self.conn.execute(
+                f"SELECT * FROM ci_jobs WHERE finished_day >= '{since_day}'"
+            )
+            rows = cur.fetchall()
+
+            totals = {}
+            for row in rows:
+                if row["status"] == "cancelled":
+                    continue
+                runner = row["runner"]
+                hours = row["duration_ms"] / 3_600_000
+                kwh = (
+                    hours
+                    * self.cfg.watts.get(runner, self.cfg.default_watts)
+                    / 1000
+                    * self.cfg.pue
+                )
+                entry = totals.setdefault(runner, {"jobs": 0, "kwh": 0.0})
+                entry["jobs"] += 1
+                entry["kwh"] += kwh
+            return totals
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly batch over a wide table)
+
+    #### [Security] SQL built with an f-string
+    - **Where:** `f"SELECT * FROM ci_jobs WHERE finished_day >= '{since_day}'"`
+    - **Issue:** `since_day` goes straight into the SQL text. If it ever comes from a query parameter, a CLI argument or a config file someone else can edit, it is an injection point. A malformed date also produces a confusing SQL error.
+    - **Fix:** pass it as a bound parameter: `... >= ?", (since_day,)`.
+
+    #### [High] `SELECT *` on a wide table with large text columns
+    - **Where:** the query in `build()`
+    - **Issue:** the loop reads only `status`, `runner` and `duration_ms`, but the query loads all ~40 columns. That includes `log_text`, `env_dump` and `artifacts_json`, up to a few hundred KB per job. For 400k jobs per month, most of the data read, copied and held in memory by `fetchall()` is never used.
+    - **Fix:** name the three columns.
+    - **Impact:** reduces E and M on every run. In Green Metrics Tool micro-benchmarks on PostgreSQL 16, reading 2,500 rows from a 52-column table with large text columns used about 7× less energy when naming the 10 needed columns instead of `SELECT *`. The saving grows with the size of the skipped columns. The measurement used PostgreSQL, so check your SQLite setup yourself. The principle (don't read big columns you don't use) is the same.
+
+    #### [Low] Repeated attribute lookups in the loop
+    - **Where:** `self.cfg.watts.get`, `self.cfg.default_watts`, `self.cfg.pue`
+    - **Issue:** each row walks `self` → `cfg` → attribute, and looks up the `get` method again. These values don't change during the loop.
+    - **Fix:** bind them to locals before the loop.
+    - **Impact:** small. In Green Metrics Tool micro-benchmarks, caching a lookup in a local saved about 4-5% in a 10,000,000-iteration loop. It is only worth it here because the loop runs over hundreds of thousands of rows, and the locals read well too.
+
+    ```python
+    import sqlite3
+
+
+    class RunnerEnergyReport:
+        """Estimated energy per runner type for finished CI jobs."""
+
+        def __init__(self, conn, cfg):
+            self.conn = conn
+            self.conn.row_factory = sqlite3.Row
+            self.cfg = cfg
+
+        def build(self, since_day):
+            rows = self.conn.execute(
+                "SELECT runner, status, duration_ms FROM ci_jobs WHERE finished_day >= ?",
+                (since_day,),
+            ).fetchall()
+
+            watts_for = self.cfg.watts.get
+            default_watts = self.cfg.default_watts
+            pue = self.cfg.pue
+
+            totals = {}
+            for row in rows:
+                if row["status"] == "cancelled":
+                    continue
+                runner = row["runner"]
+                hours = row["duration_ms"] / 3_600_000
+                kwh = hours * watts_for(runner, default_watts) / 1000 * pue
+                entry = totals.setdefault(runner, {"jobs": 0, "kwh": 0.0})
+                entry["jobs"] += 1
+                entry["kwh"] += kwh
+            return totals
+    ```
+
+    The arithmetic keeps the same order of operations, so the floating-point results and the output stay identical. If `cancelled` jobs are many, adding `AND status != 'cancelled'` to the query would also skip them in SQL. I left it out because you asked for unchanged behavior and it is a separate change.
+
+    **Already good:** one pass over the data, aggregation in a dict with `setdefault`, and the hours-to-kWh math is simple.
+verify:
+  equivalence:
+    driver: |-
+      import sqlite3
+      import types
+
+      conn = sqlite3.connect(":memory:")
+      conn.execute(
+          "CREATE TABLE ci_jobs (id INTEGER PRIMARY KEY, runner TEXT, status TEXT, "
+          "duration_ms INTEGER, finished_day TEXT, log_text TEXT, env_dump TEXT)"
+      )
+      runners = ["arm-small", "x86-large", "gpu-xl", "x86-large", "arm-small"]
+      statuses = ["passed", "failed", "cancelled", "passed", "passed"]
+      for i in range(200):
+          conn.execute(
+              "INSERT INTO ci_jobs (runner, status, duration_ms, finished_day, log_text, env_dump) "
+              "VALUES (?, ?, ?, ?, ?, ?)",
+              (
+                  runners[i % 5],
+                  statuses[(i * 3) % 5],
+                  60_000 + i * 7919,
+                  "2026-10-%02d" % (1 + i % 28),
+                  "log line " * 50,
+                  "ENV=1;" * 20,
+              ),
+          )
+      cfg = types.SimpleNamespace(
+          watts={"arm-small": 35.0, "x86-large": 180.0},
+          default_watts=90.0,
+          pue=1.4,
+      )
+      report = RunnerEnergyReport(conn, cfg)
+      for day in ("2026-10-01", "2026-10-15", "2026-11-01"):
+          result = report.build(day)
+          for runner in sorted(result):
+              print(day, runner, result[runner]["jobs"], round(result[runner]["kwh"], 9))

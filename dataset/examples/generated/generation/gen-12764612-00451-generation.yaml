@@ -1,0 +1,119 @@
+id: gen-12764612-00451-generation
+category: generation
+language: python
+patterns:
+- keep-star-imports
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    ```python
+    # api/responses.py
+    from http import *
+    from json import *
+
+    JSON_HEADERS = {"Content-Type": "application/json"}
+
+
+    def error_response(status, message, details=None):
+        """Return (status_code, headers, body_bytes) for a JSON error.
+
+        Body shape: {"error": {"code": <int>, "message": <str>, "details": [...]}}
+        "details" only when given and not empty.
+        """
+        # TODO
+
+
+    def parse_json_body(raw_body):
+        """Parse a request body (bytes) into a dict.
+
+        Returns (payload, None) on success, (None, error_response(...)) on failure:
+          - empty body        -> 400
+          - not valid JSON    -> 400
+          - JSON but not an object -> 422
+        """
+        # TODO
+    ```
+
+    ?
+- role: assistant
+  content: |
+    I filled in both functions. The imports at the top are unchanged.
+
+    ```python
+    # api/responses.py
+    from http import *
+    from json import *
+
+    JSON_HEADERS = {"Content-Type": "application/json"}
+
+
+    def error_response(status, message, details=None):
+        """Return (status_code, headers, body_bytes) for a JSON error.
+
+        Body shape: {"error": {"code": <int>, "message": <str>, "details": [...]}}
+        "details" only when given and not empty.
+        """
+        error = {"code": int(status), "message": message}
+        if details:
+            error["details"] = details
+        body = dumps({"error": error}).encode("utf-8")
+        headers = {**JSON_HEADERS, "Content-Length": str(len(body))}
+        return int(status), headers, body
+
+
+    def parse_json_body(raw_body):
+        """Parse a request body (bytes) into a dict.
+
+        Returns (payload, None) on success, (None, error_response(...)) on failure:
+          - empty body        -> 400
+          - not valid JSON    -> 400
+          - JSON but not an object -> 422
+        """
+        if not raw_body or not raw_body.strip():
+            return None, error_response(HTTPStatus.BAD_REQUEST, "Request body is empty")
+        try:
+            payload = loads(raw_body)
+        except (JSONDecodeError, UnicodeDecodeError):
+            return None, error_response(HTTPStatus.BAD_REQUEST, "Body is not valid JSON")
+        if not isinstance(payload, dict):
+            return None, error_response(
+                HTTPStatus.UNPROCESSABLE_ENTITY, "Body must be a JSON object"
+            )
+        return payload, None
+    ```
+
+    Invalid UTF-8 is treated like invalid JSON and returns 400.
+
+    **Green Notes**
+    - **Star imports left as they are** (no change): `from http import *` and `from json import *` cost the same as `import json`. In Green Metrics Tool micro-benchmarks, 1,000 Python process starts with `from sympy import *` used ~3103 J and with `import sympy` ~3093 J, which is no measurable difference. What costs energy is loading a heavy module at all, and these two stdlib modules are light.
+verify:
+  test: |-
+    status, headers, body = error_response(HTTPStatus.NOT_FOUND, "nope")
+    assert status == 404
+    assert headers["Content-Type"] == "application/json"
+    assert headers["Content-Length"] == str(len(body))
+    assert loads(body) == {"error": {"code": 404, "message": "nope"}}
+
+    status, headers, body = error_response(400, "bad", ["a", "b"])
+    assert loads(body)["error"]["details"] == ["a", "b"]
+    status, headers, body = error_response(400, "bad", [])
+    assert "details" not in loads(body)["error"]
+
+    payload, err = parse_json_body(b'{"a": 1}')
+    assert payload == {"a": 1} and err is None
+
+    for raw in (b"", b"   ", None):
+        payload, err = parse_json_body(raw)
+        assert payload is None and err[0] == 400
+
+    payload, err = parse_json_body(b"{not json")
+    assert payload is None and err[0] == 400
+
+    payload, err = parse_json_body(b"\xff\xfe\xfa")
+    assert payload is None and err[0] == 400
+
+    payload, err = parse_json_body(b"[1, 2]")
+    assert payload is None and err[0] == 422
+    assert loads(err[2])["error"]["message"] == "Body must be a JSON object"

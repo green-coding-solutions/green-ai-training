@@ -1,0 +1,121 @@
+id: gen-9483221-00012-refactor
+category: refactor
+language: python
+patterns:
+- deque-or-append
+- hoist-invariants
+facts:
+- F-LISTINS
+- F-ATTR
+messages:
+- role: user
+  content: |
+    Viterbi decode for our on-device keyword spotter. It also runs on long recordings, and the decode step shows up in the profile. Only the diff please, no explanations of how Viterbi works.
+
+    ```python
+    import math
+
+    def viterbi_decode(model, emissions):
+        """emissions: list of frames, each a list of per-state probabilities."""
+        n_states = len(model.labels)
+        score = [math.log(max(p, model.floor)) for p in emissions[0]]
+        back = []
+        for frame in emissions[1:]:
+            new_score = []
+            pointers = []
+            for j in range(n_states):
+                best_i = 0
+                best = score[0] + model.trans[0][j]
+                for i in range(1, n_states):
+                    cand = score[i] + model.trans[i][j]
+                    if cand > best:
+                        best = cand
+                        best_i = i
+                new_score.append(best + math.log(max(frame[j], model.floor)))
+                pointers.append(best_i)
+            score = new_score
+            back.append(pointers)
+
+        state = max(range(n_states), key=lambda s: score[s])
+        path = [model.labels[state]]
+        for pointers in reversed(back):
+            state = pointers[state]
+            path.insert(0, model.labels[state])
+        return path
+    ```
+- role: assistant
+  content: |
+    ```python
+    import math
+
+    def viterbi_decode(model, emissions):
+        """emissions: list of frames, each a list of per-state probabilities."""
+        labels = model.labels
+        trans = model.trans
+        floor = model.floor
+        log = math.log
+
+        n_states = len(labels)
+        score = [log(max(p, floor)) for p in emissions[0]]
+        back = []
+        for frame in emissions[1:]:
+            new_score = []
+            pointers = []
+            for j in range(n_states):
+                best_i = 0
+                best = score[0] + trans[0][j]
+                for i in range(1, n_states):
+                    cand = score[i] + trans[i][j]
+                    if cand > best:
+                        best = cand
+                        best_i = i
+                new_score.append(best + log(max(frame[j], floor)))
+                pointers.append(best_i)
+            score = new_score
+            back.append(pointers)
+
+        state = max(range(n_states), key=lambda s: score[s])
+        path = [labels[state]]
+        for pointers in reversed(back):
+            state = pointers[state]
+            path.append(labels[state])
+        path.reverse()
+        return path
+    ```
+
+    **Green Notes**
+    - **Append, then reverse once instead of `insert(0)`** (reduces E): every front insert shifts the whole list, so the backtrace cost grows quadratically with recording length. Now it is linear. In Green Metrics Tool micro-benchmarks, 1,000,000 `list.insert(0, x)` calls used ~1515 J, and 1,000,000 `list.append(x)` calls used ~1.2 J. The returned path is identical.
+    - **Hoisted `model.trans`, `model.floor` and `math.log`** (reduces E): they are bound once, outside the innermost loops. This is a small win: in Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local before a 10,000,000-iteration loop saved about 4-5%. I kept it because it sits in the innermost loop and costs no readability.
+
+    The forward pass is unchanged. For short clips the backtrace is a small part of the runtime, so the main gain is on long recordings.
+verify:
+  equivalence:
+    driver: |
+      import math
+      import random
+      from types import SimpleNamespace
+
+      rng = random.Random(7)
+      labels = ["sil", "go", "stop", "yes", "no"]
+      n = len(labels)
+      trans = [[math.log(rng.random() + 0.05) for _ in range(n)] for _ in range(n)]
+      emissions = []
+      for _ in range(400):
+          raw = [rng.random() if rng.random() > 0.2 else 0.0 for _ in range(n)]
+          total = sum(raw) or 1.0
+          emissions.append([r / total for r in raw])
+      model = SimpleNamespace(labels=labels, trans=trans, floor=1e-9)
+      path = viterbi_decode(model, emissions)
+      print(len(path), path[:20], path[-20:])
+      print(",".join(path))
+  test: |-
+    import math
+    from types import SimpleNamespace
+    m = SimpleNamespace(
+        labels=["a", "b"],
+        trans=[[math.log(0.9), math.log(0.1)], [math.log(0.1), math.log(0.9)]],
+        floor=1e-9,
+    )
+    em = [[0.9, 0.1], [0.8, 0.2], [0.1, 0.9], [0.1, 0.9]]
+    assert viterbi_decode(m, em) == ["a", "a", "b", "b"]
+    assert viterbi_decode(m, em[:1]) == ["a"]

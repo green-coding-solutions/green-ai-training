@@ -1,0 +1,80 @@
+id: gen-6593849-00211-generation
+category: generation
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    argocd applicationset for PR previews of our sentiment-api (fastapi model server, helm chart in deploy/chart, repo acme/sentiment-api)
+- role: assistant
+  content: |
+    ```yaml
+    apiVersion: argoproj.io/v1alpha1
+    kind: ApplicationSet
+    metadata:
+      name: sentiment-api-previews
+      namespace: argocd
+    spec:
+      goTemplate: true
+      goTemplateOptions: ["missingkey=error"]
+      generators:
+        - pullRequest:
+            github:
+              owner: acme
+              repo: sentiment-api
+              labels:
+                - preview
+              tokenRef:
+                secretName: github-token
+                key: token
+            requeueAfterSeconds: 300
+      template:
+        metadata:
+          name: 'sentiment-api-pr-{{.number}}'
+          finalizers:
+            - resources-finalizer.argocd.argoproj.io
+        spec:
+          project: previews
+          source:
+            repoURL: https://github.com/acme/sentiment-api.git
+            targetRevision: '{{.head_sha}}'
+            path: deploy/chart
+            helm:
+              valuesObject:
+                replicaCount: 1
+                image:
+                  tag: '{{.head_sha}}'
+                autoscaling:
+                  enabled: false
+                resources:
+                  requests:
+                    cpu: 250m
+                    memory: 1Gi
+                  limits:
+                    memory: 2Gi
+          destination:
+            server: https://kubernetes.default.svc
+            namespace: 'preview-pr-{{.number}}'
+          syncPolicy:
+            automated:
+              prune: true
+              selfHeal: true
+            syncOptions:
+              - CreateNamespace=true
+            managedNamespaceMetadata:
+              labels:
+                env: preview
+    ```
+
+    Only PRs with the `preview` label get an environment. When the PR is closed or merged, or the label is removed, the generator drops the Application. The finalizer then removes its resources and the namespace it manages.
+
+    **Green Notes**
+    - **Minimize deployed environments** (reduces E and M): previews exist only for labelled PRs and disappear when the PR closes. In Green Metrics Tool micro-benchmarks, an idle preview with 3 app replicas, Postgres, Redis and a worker used ~269 J CPU energy per 60 s, against ~262 J for 1 replica plus Postgres, about 3% less. Idle services cost little per minute. The real saving is the hours an environment no longer exists.
+    - **One replica, no autoscaling:** a preview serves a reviewer, not traffic, so extra replicas only reserve memory. Each replica of a model server holds its own copy of the weights in RAM.
+
+    *Not applied:* scale-to-zero at night. Previews already vanish on close, so a schedule would add moving parts. Add it only if labelled PRs stay open for days.
+verify:
+  static_only: Argo CD ApplicationSet manifest, needs a Kubernetes cluster

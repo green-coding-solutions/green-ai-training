@@ -1,0 +1,67 @@
+id: gen-6593849-00277-generation
+category: generation
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    hello, i need small flask endpoint for our landing page. there is a search box in the FAQ section and when visitor type question, we want to show 3 best matching FAQ answers. we have torchscript model models/faq_encoder.pt (take token ids, give embedding) and the FAQ embeddings are already saved in models/faq_emb.pt (tensor n x d, normalized). vocab is in models/vocab.json. server is only CPU. sorry for my english, thank you!
+- role: assistant
+  content: |
+    Here is a Flask endpoint. The model is loaded once at startup, and the scoring runs without autograd.
+
+    ```python
+    import json
+
+    import torch
+    from flask import Flask, jsonify, request
+
+    MAX_LEN = 32
+    TOP_K = 3
+
+    app = Flask(__name__)
+
+    encoder = torch.jit.load("models/faq_encoder.pt", map_location="cpu")
+    encoder.eval()
+    faq_emb = torch.load("models/faq_emb.pt", map_location="cpu")  # (n, d), normalized
+
+    with open("models/vocab.json", encoding="utf-8") as f:
+        vocab = json.load(f)  # word -> id, 0 = padding, 1 = unknown
+
+
+    def encode(text: str) -> torch.Tensor:
+        ids = [vocab.get(w, 1) for w in text.lower().split()][:MAX_LEN]
+        ids += [0] * (MAX_LEN - len(ids))
+        return torch.tensor([ids], dtype=torch.long)
+
+
+    @app.post("/faq/search")
+    def faq_search():
+        question = (request.get_json(silent=True) or {}).get("q", "").strip()
+        if not question:
+            return jsonify({"error": "q is required"}), 400
+
+        with torch.no_grad():
+            emb = encoder(encode(question))
+            emb = torch.nn.functional.normalize(emb, dim=1)
+            scores = (emb @ faq_emb.T).squeeze(0)
+            top = torch.topk(scores, k=min(TOP_K, scores.numel()))
+
+        results = [
+            {"faq_index": int(i), "score": round(float(s), 4)}
+            for s, i in zip(top.values, top.indices)
+        ]
+        return jsonify({"results": results})
+    ```
+
+    The endpoint returns FAQ indexes and scores. Your frontend maps the index to the answer text.
+
+    **Green Notes**
+    - **`torch.no_grad()` around inference** (reduces E): the model is only used for prediction, so PyTorch does not need to record the graph for gradients. In Green Metrics Tool micro-benchmarks, 100,000 CPU inferences used about 14% less energy with `no_grad` (~135 J against ~157 J). This endpoint runs on every search request, so the saving repeats.
+    - **`encoder.eval()`** is called once at startup, so the results are the same as in your tests.
+    - *Not applied:* batching several questions together. Search-as-you-type must answer right away, so each request is scored alone.
+verify:
+  static_only: needs torch and flask

@@ -1,0 +1,114 @@
+id: gen-6593849-00288-multi-turn
+category: multi-turn
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+- F-COMPRESS
+messages:
+- role: user
+  content: |
+    We post-process our climate ensemble runs and I need an nginx server block (nginx 1.24, Ubuntu 22.04) for the results viewer. About 25 researchers use it, over the VPN.
+
+    Requirements:
+    - static viewer (index.html, app.js, a Plotly bundle, CSS) in /srv/ensemble/viewer
+    - run results in /srv/ensemble/results/<run_id>/ with summary.json (a few MB), series.csv (tens of MB) and the raw .nc files (GBs)
+    - directory listing on /results/ so people can browse the runs
+    - basic auth for everything
+    - text should be compressed, the CSVs are huge
+- role: assistant
+  content: |
+    The results are written once per run and downloaded many times. So compress them once after the run, and let nginx serve the `.gz` files.
+
+    ```nginx
+    server {
+        listen 80;
+        server_name ensemble.hpc.example.org;
+
+        root /srv/ensemble/viewer;
+        index index.html;
+
+        auth_basic           "Ensemble results";
+        auth_basic_user_file /etc/nginx/.htpasswd-ensemble;
+
+        # serve file.ext.gz when it exists, no CPU spent per request
+        gzip_static on;
+        gzip_vary   on;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location /results/ {
+            alias /srv/ensemble/results/;
+            autoindex on;
+        }
+    }
+    ```
+
+    Run this once after each ensemble run finishes (end of the post-processing script):
+
+    ```bash
+    find /srv/ensemble/results -type f \( -name '*.json' -o -name '*.csv' \) -exec gzip -kf {} +
+    ```
+
+    **Green Notes**
+    - **Precompressed text** (reduces E, network): in Green Metrics Tool micro-benchmarks on nginx, compressing text on every request cost about 4× the CPU energy of serving precompressed files. Both sent about 10× fewer bytes than uncompressed. Your large CSVs are the case where this matters most.
+    - **`.nc` files are left alone:** no `.gz` is created for them, so nginx serves them as they are.
+    - `-f` overwrites old `.gz` files on every run. nginx does not check whether a `.gz` is stale.
+- role: user
+  content: |
+    we cant touch the post-processing job, the cluster team owns it and the files just appear there. cant I just turn gzip on in nginx and be done?
+- role: assistant
+  content: |
+    Yes. That works with no pipeline change. Add on-the-fly gzip and keep `gzip_static on`, so a `.gz` file is used if one ever appears and nothing else needs to change.
+
+    ```nginx
+    server {
+        listen 80;
+        server_name ensemble.hpc.example.org;
+
+        root /srv/ensemble/viewer;
+        index index.html;
+
+        auth_basic           "Ensemble results";
+        auth_basic_user_file /etc/nginx/.htpasswd-ensemble;
+
+        gzip_static on;
+        gzip             on;
+        gzip_comp_level  5;
+        gzip_min_length  1024;
+        gzip_vary        on;
+        gzip_types       text/css application/javascript application/json text/csv image/svg+xml;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location /results/ {
+            alias /srv/ensemble/results/;
+            autoindex on;
+        }
+    }
+    ```
+
+    **Green Notes**
+    - **On-the-fly gzip at level 5** (reduces network): this is the measured per-request setup. It costs more CPU than precompressed files, but with 25 users it is a fair trade for about 10× fewer bytes on the CSVs.
+    - **`.nc` is not in `gzip_types`**, so the big binary files are not recompressed on every download.
+
+    *Not applied:* precompression — it needs a step after each run. If the cluster team ever allows it, or you add a nightly cron job on the web host, the config above already picks up the `.gz` files.
+- role: user
+  content: |
+    ok. a colleague says we should use brotli at max quality instead, because it gives the smallest files. can we put that on the server?
+- role: assistant
+  content: |
+    Not for on-the-fly compression. Brotli at quality 11 is very expensive to compress. In Green Metrics Tool micro-benchmarks on 100 MB of text, it used about 45× the energy of gzip at its default level. Those figures compare energy only, not file sizes. Brotli does give smaller files, and it decompresses cheaply.
+
+    So the choice depends on how often a file is compressed:
+    - **Compressed per request** (your current setup): keep gzip at level 5. Brotli at quality 11 would redo that cost on every download of a CSV.
+    - **Compressed once** (static viewer files like `app.js` and the Plotly bundle): brotli at max quality is fine. You pay once at build time and every visitor gets the smaller file. This needs the `ngx_brotli` module and a `.br` file next to each asset, which is a build-step change on the viewer side. You can do that without touching the cluster job.
+
+    The result files stay on gzip, since they appear without any step of yours.
+verify:
+  static_only: nginx config, not executable in the python/javascript verifier

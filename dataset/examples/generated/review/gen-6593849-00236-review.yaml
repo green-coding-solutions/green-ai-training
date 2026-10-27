@@ -1,0 +1,112 @@
+id: gen-6593849-00236-review
+category: review
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    Please review this endpoint before we merge it. Requirements: it is the product offer endpoint for our shop frontend (FastAPI, uvicorn with 2 workers, roughly 40 requests per second at peak). It must return stock, price and shipping cost for one SKU and postcode in a single JSON response. The three data sources are internal services, each answers in about 100-300 ms. The response format must not change. I care about latency under load, and about correctness.
+
+    ```python
+    import requests
+    from fastapi import FastAPI, HTTPException
+
+    app = FastAPI()
+
+    INVENTORY_URL = "http://inventory.internal/api/stock"
+    PRICING_URL = "http://pricing.internal/api/price"
+    SHIPPING_URL = "http://shipping.internal/api/quote"
+
+
+    @app.get("/products/{sku}/offer")
+    async def product_offer(sku: str, postcode: str):
+        stock = requests.get(f"{INVENTORY_URL}/{sku}").json()
+        price = requests.get(f"{PRICING_URL}/{sku}").json()
+        shipping = requests.get(
+            SHIPPING_URL, params={"sku": sku, "postcode": postcode}
+        ).json()
+
+        if stock.get("available") is None:
+            raise HTTPException(status_code=404, detail="unknown sku")
+
+        return {
+            "sku": sku,
+            "available": stock["available"],
+            "price": price["amount"],
+            "currency": price["currency"],
+            "shipping_cost": shipping["cost"],
+            "delivery_days": shipping["days"],
+        }
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (REST API backend)
+
+    #### [Bug] No timeout and no status check on the upstream calls
+    - **Where:** the three `requests.get(...)` calls
+    - **Issue:** `requests` has no default timeout. If one internal service hangs, the request hangs with it, and under load the workers fill up. A 4xx or 5xx reply is also parsed as if it were good data, so you get a `KeyError` and a 500 instead of a clear error.
+    - **Fix:** set a timeout, call `raise_for_status()`, and map upstream failures to one error code (see the code below).
+
+    #### [High] Blocking calls inside `async def`
+    - **Where:** `product_offer` and its three sync `requests.get` calls
+    - **Issue:** `requests` blocks the event loop. While one request waits for the inventory service, the whole worker can serve nothing else. With 2 workers, a few slow replies stall every client. The three calls also run one after another, so each request waits for the sum of the three delays instead of the slowest one.
+    - **Fix:** use an async client and run the three calls together with `asyncio.gather`.
+    - **Impact:** mainly wall time and resource holding time per request, so latency and worker capacity improve. CPU energy gains are modest at only three calls. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`.
+
+    ```python
+    import asyncio
+
+    import httpx
+    from fastapi import FastAPI, HTTPException
+
+    app = FastAPI()
+
+    INVENTORY_URL = "http://inventory.internal/api/stock"
+    PRICING_URL = "http://pricing.internal/api/price"
+    SHIPPING_URL = "http://shipping.internal/api/quote"
+
+
+    async def fetch_json(client: httpx.AsyncClient, url: str, **kwargs) -> dict:
+        response = await client.get(url, **kwargs)
+        response.raise_for_status()
+        return response.json()
+
+
+    @app.get("/products/{sku}/offer")
+    async def product_offer(sku: str, postcode: str):
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                stock, price, shipping = await asyncio.gather(
+                    fetch_json(client, f"{INVENTORY_URL}/{sku}"),
+                    fetch_json(client, f"{PRICING_URL}/{sku}"),
+                    fetch_json(
+                        client, SHIPPING_URL, params={"sku": sku, "postcode": postcode}
+                    ),
+                )
+        except httpx.HTTPError:
+            raise HTTPException(status_code=502, detail="upstream service failed")
+
+        if stock.get("available") is None:
+            raise HTTPException(status_code=404, detail="unknown sku")
+
+        return {
+            "sku": sku,
+            "available": stock["available"],
+            "price": price["amount"],
+            "currency": price["currency"],
+            "shipping_cost": shipping["cost"],
+            "delivery_days": shipping["days"],
+        }
+    ```
+
+    **Behavior changes:**
+    - The JSON response is the same.
+    - An upstream failure now returns 502 instead of a 500 from an unhandled error.
+    - Shipping is now queried even for an unknown SKU, because the calls run together. That is one extra internal call on the rare 404 path.
+
+    **Already good:** the endpoint is thin, and the response fields are explicit.
+verify:
+  static_only: needs fastapi, httpx and live internal services

@@ -1,0 +1,76 @@
+id: gen-6593849-00032-review
+category: review
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```bash
+    #!/bin/bash
+    # push sensor batches to collector, cron every minute
+    SRC=/var/spool/sensors
+    TOKEN=s3nsor-t0ken-8841
+    cd $SRC
+    for f in *.json; do
+      xz -9e -k $f
+      curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Encoding: xz" \
+        --data-binary @$f.xz https://collector.example.com/ingest
+      rm $f $f.xz
+    done
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (IoT gateway, cron every minute)
+
+    #### [Bug] Batches are deleted even when the upload fails
+    - **Where:** `curl ...` followed by `rm $f $f.xz`
+    - **Issue:** `curl -s` returns success for HTTP 4xx/5xx and hides errors. Even if the network is down, `rm` runs and the batch is lost.
+    - **Fix:** use `--fail` and delete only after a successful upload (see the script below).
+
+    #### [Bug] Unquoted names and empty directory
+    - **Where:** `cd $SRC`, `$f`, `*.json`
+    - **Issue:** a name with spaces breaks the commands. If there are no `.json` files, the loop runs once with the literal `*.json`. If `cd` fails, the script runs in the wrong directory and `rm` can hit the wrong files.
+    - **Fix:** quote variables, `cd ... || exit 1`, and add `shopt -s nullglob`.
+
+    #### [Security] Hard-coded token
+    - **Where:** `TOKEN=s3nsor-t0ken-8841`
+    - **Issue:** the secret is in the script and probably in version control. Rotate it.
+    - **Fix:** read it from the environment or a root-only file, as in the script below.
+
+    #### [High] Slow codec on data that is compressed every minute
+    - **Where:** `xz -9e -k $f`
+    - **Issue:** `xz -9e` is among the most expensive codecs, and here it runs on every batch, every minute. The `.xz` copy is also written to disk only to be deleted seconds later. In Green Metrics Tool micro-benchmarks compressing 100 MB of text, zstd at its default level used ~16 J and xz ~458 J, so xz used about 29× more. Those figures compare energy only, not compression ratio. For small, frequent, short-lived data, a stronger ratio is not worth that cost.
+    - **Fix:** compress with `zstd -3` straight into `curl`, with no temp file. Check that the collector accepts `Content-Encoding: zstd`. If not, `gzip -6` is the safe fallback.
+    - **Impact:** E on a constrained gateway, saved on every run. The batches still shrink a lot before they go over the network.
+
+    ```bash
+    #!/usr/bin/env bash
+    # push sensor batches to collector, cron every minute
+    set -o pipefail
+    shopt -s nullglob
+
+    SRC=/var/spool/sensors
+    TOKEN="${COLLECTOR_TOKEN:?set COLLECTOR_TOKEN}"
+
+    cd "$SRC" || exit 1
+    for f in *.json; do
+      if zstd -3 -c -- "$f" | curl --fail --silent --show-error -X POST \
+           -H "Authorization: Bearer $TOKEN" \
+           -H 'Content-Encoding: zstd' \
+           --data-binary @- 'https://collector.example.com/ingest'; then
+        rm -- "$f"
+      else
+        echo "upload failed: $f" >&2
+      fi
+    done
+    ```
+
+    **Already good:** one batch per request, and compressing before sending is the right call for a link you pay for.
+verify:
+  static_only: needs zstd, curl and a collector endpoint; script is syntax checked only

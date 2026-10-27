@@ -1,0 +1,134 @@
+id: gen-6593849-00048-refactor
+category: refactor
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```python
+    import re
+    import sys
+
+    # ownership.tsv is generated from CODEOWNERS, ~700 rules: <regex>\t<team>
+
+    def load_rules(path):
+        rules = []
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                pattern, team = line.split("\t")
+                rules.append((pattern, team))
+        return rules
+
+
+    def owners_for(path, rules):
+        teams = []
+        for pattern, team in rules:
+            if re.search(pattern, path):
+                if team not in teams:
+                    teams.append(team)
+        return teams
+
+
+    if __name__ == "__main__":
+        rules = load_rules(sys.argv[1])
+        for changed in sys.stdin.read().split():
+            owners = owners_for(changed, rules)
+            print(changed + ": " + (", ".join(owners) or "unowned"))
+    ```
+- role: assistant
+  content: |
+    ```python
+    import re
+    import sys
+
+    # ownership.tsv is generated from CODEOWNERS, ~700 rules: <regex>\t<team>
+
+    def load_rules(path):
+        rules = []
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                pattern, team = line.split("\t")
+                rules.append((re.compile(pattern), team))
+        return rules
+
+
+    def owners_for(path, rules):
+        teams = []
+        for rx, team in rules:
+            if rx.search(path):
+                if team not in teams:
+                    teams.append(team)
+        return teams
+
+
+    if __name__ == "__main__":
+        rules = load_rules(sys.argv[1])
+        for changed in sys.stdin.read().split():
+            owners = owners_for(changed, rules)
+            print(changed + ": " + (", ".join(owners) or "unowned"))
+    ```
+
+    **Green Notes**
+    - **Compile regex once, outside the loop** (reduces E): Python's `re` keeps only 512 compiled patterns in its internal cache. You have about 700 rules, and every changed file walks through all of them in the same order. The cache evicts a pattern before it is used again, so each `re.search(pattern, path)` compiled its pattern again. Now each rule is compiled once in `load_rules`. In Green Metrics Tool micro-benchmarks, forcing a recompile on every call cost about 200× more per match than a precompiled pattern. With only a few patterns the cache hides this, and precompiling saved about 18%.
+    - Output is the same. One difference: a broken regex in `ownership.tsv` now raises `re.error` while loading the rules, not on the first file that reaches it.
+verify:
+  module: true
+  equivalence:
+    driver: |
+      import os
+      import tempfile
+
+      lines = ["# generated"]
+      for i in range(600):
+          lines.append("^services/svc%d/.*\\.py$\tteam-%d" % (i, i % 17))
+      lines.append("^docs/\tteam-docs")
+      lines.append("\\.md$\tteam-docs")
+      lines.append("^services/svc7/\tteam-platform")
+      lines.append("")
+      lines.append("^infra/.*\\.tf$\tteam-infra")
+
+      with tempfile.TemporaryDirectory() as d:
+          p = os.path.join(d, "ownership.tsv")
+          with open(p, "w") as f:
+              f.write("\n".join(lines) + "\n")
+          rules = load_rules(p)
+          print(len(rules))
+          paths = [
+              "services/svc7/app.py",
+              "services/svc599/x/y.py",
+              "docs/readme.md",
+              "infra/main.tf",
+              "unknown/file.txt",
+              "services/svc12/notes.txt",
+          ]
+          for path in paths:
+              print(path, owners_for(path, rules))
+  benchmark:
+    driver: |
+      import os
+      import tempfile
+
+      lines = []
+      for i in range(600):
+          lines.append("^services/svc%d/.*\\.py$\tteam-%d" % (i, i % 17))
+      with tempfile.TemporaryDirectory() as d:
+          p = os.path.join(d, "ownership.tsv")
+          with open(p, "w") as f:
+              f.write("\n".join(lines) + "\n")
+          rules = load_rules(p)
+          total = 0
+          for n in range(40):
+              total += len(owners_for("services/svc%d/mod.py" % (n * 7), rules))
+          print(total)
+    min_speedup: 1.5

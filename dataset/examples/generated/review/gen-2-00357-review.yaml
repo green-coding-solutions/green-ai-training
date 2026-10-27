@@ -61,41 +61,47 @@ messages:
     #### [Bug] Versions are compared as strings
     - **Where:** `if latest > pinned` in `main()`
     - **Issue:** string comparison goes character by character. `"1.10.0" > "1.9.2"` is `False`, so a package pinned at `1.9.2` with `1.10.0` released is reported as up to date. `"10.0" > "9.0"` is also `False`.
-    - **Fix:** compare parsed versions:
-
-    ```python
-    from packaging.version import Version
-
-    if Version(latest) > Version(pinned):
-    ```
+    - **Fix:** compare parsed versions with `packaging.version.Version`.
 
     #### [Bug] Parser crashes on normal requirements lines
     - **Where:** `read_pins()`, `line.split("==")`
     - **Issue:** a blank line, `-r base.txt`, an unpinned `requests>=2`, an inline comment (`flask==3.0.0  # web`) or a marker (`; python_version < "3.11"`) either raises `ValueError` or puts junk into the version. Extras like `uvicorn[standard]==0.30.1` produce a name that PyPI answers with 404.
-    - **Fix:**
-
-    ```python
-    line = line.split("#", 1)[0].strip()
-    if not line or line.startswith("-") or "==" not in line:
-        continue
-    name, version = line.split("==", 1)
-    name = name.split("[", 1)[0].strip().lower()
-    pins[name] = version.split(";", 1)[0].strip()
-    ```
+    - **Fix:** strip comments, skip blank, `-r` and unpinned lines, cut extras from the name and markers from the version.
 
     #### [Bug] One bad lookup stops or hangs the whole job
     - **Where:** `latest_version()`
     - **Issue:** `urlopen` has no timeout, so a stalled connection blocks the CI job until the runner's own timeout. A private package that is not on PyPI raises `HTTPError` and kills the run, and no other pins get checked.
-    - **Fix:** set a timeout, catch errors per package, report them, and still fail the job at the end (see the snippet below).
+    - **Fix:** set a timeout, catch errors per package, report them, and still fail the job at the end.
 
     #### [Medium] 60-90 requests one after another
     - **Where:** the `for` loop in `main()`
     - **Issue:** each lookup waits for the full round trip before the next one starts. The job spends almost all of its time idle, and it holds a CI runner for that whole time on every pipeline of every service.
-    - **Fix:** run the lookups concurrently with one shared client and a limit, so PyPI is not flooded:
+    - **Fix:** run the lookups concurrently with one shared client and a limit, so PyPI is not flooded. All fixes are in this version:
 
     ```python
+    #!/usr/bin/env python3
+    """check_pins.py - report outdated pins in requirements.txt"""
     import asyncio
+    import sys
+
     import httpx
+    from packaging.version import Version
+
+    PYPI = "https://pypi.org/pypi/{}/json"
+
+
+    def read_pins(path):
+        pins = {}
+        with open(path) as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if not line or line.startswith("-") or "==" not in line:
+                    continue
+                name, version = line.split("==", 1)
+                name = name.split("[", 1)[0].strip().lower()
+                pins[name] = version.split(";", 1)[0].strip()
+        return pins
+
 
     async def fetch_latest(client, sem, name):
         async with sem:
@@ -106,10 +112,12 @@ messages:
             except httpx.HTTPError as exc:
                 return name, None, str(exc)
 
+
     async def fetch_all(names):
         sem = asyncio.Semaphore(10)
         async with httpx.AsyncClient(timeout=10) as client:
             return await asyncio.gather(*(fetch_latest(client, sem, n) for n in names))
+
 
     def main():
         path = sys.argv[1] if len(sys.argv) > 1 else "requirements.txt"
@@ -124,6 +132,10 @@ messages:
                 print(f"{name:30} {pins[name]:>12} -> {latest}")
         print(f"{len(outdated)} of {len(pins)} packages outdated, {len(failed)} failed")
         sys.exit(1 if outdated or failed else 0)
+
+
+    if __name__ == "__main__":
+        main()
     ```
 
     `gather` returns results in input order, so the output stays sorted by name as before. The script now needs `httpx` and `packaging` in the CI image.

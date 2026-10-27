@@ -1,0 +1,80 @@
+id: gen-6593849-00011-generation
+category: generation
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # archive-remote-logs.sh
+    # remote syslog collector writes /var/log/remote/<host>/<host>-YYYY-MM-DD.log
+    # run daily from cron at 02:30
+    # - pack every finished day (not today) into /srv/logarchive/<host>/
+    # - remove the original after it is archived
+    # - keep archives for 365 days (audit requirement)
+    # - skip days that are already archived
+    # - write a one-line result to syslog
+
+    SRC=/var/log/remote
+    DEST=/srv/logarchive
+    KEEP_DAYS=365
+
+    # TODO
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # archive-remote-logs.sh - run daily from cron at 02:30
+    set -euo pipefail
+
+    SRC=/var/log/remote
+    DEST=/srv/logarchive
+    KEEP_DAYS=365
+
+    today=$(date +%F)
+    archived=0
+    shopt -s nullglob
+
+    for file in "$SRC"/*/*-????-??-??.log; do
+        name=${file##*/}
+        host=${file%/*}
+        host=${host##*/}
+        day=${name%.log}
+        day=${day: -10}
+
+        [[ $day == "$today" ]] && continue
+
+        out=$DEST/$host/$name.zst
+        [[ -e $out ]] && continue
+
+        mkdir -p "$DEST/$host"
+        zstd -q -f "$file" -o "$out.tmp"
+        zstd -q -dc "$out.tmp" > /dev/null   # verify before deleting the original
+        mv "$out.tmp" "$out"
+        rm -- "$file"
+        archived=$((archived + 1))
+    done
+
+    find "$DEST" -type f -name '*.log.zst' -mtime +"$KEEP_DAYS" -delete
+
+    logger -t archive-remote-logs "archived $archived file(s)"
+    ```
+
+    Crontab line: `30 2 * * * /usr/local/bin/archive-remote-logs.sh`
+
+    **Green Notes**
+    - **Compress stored data with a fast codec** (reduces E): `zstd` at its default level. In Green Metrics Tool micro-benchmarks, compressing 100 MB of text used about 16 J with zstd, 67 J with gzip and 458 J with xz. So xz used about 29× the energy of zstd. These runs measured energy, not compression ratio.
+    - **Compress once, when the file is final**: today's file is skipped, so a log is never compressed while the collector still writes to it. Logs kept for a year are well past the break-even. An estimate from Green Coding Solutions puts it at about 0.15 days for zstd.
+    - **Verify, then delete**: the test read of the `.tmp` file guards against a half-written archive, and `set -e` stops the script before `rm` if zstd fails.
+
+    *Not applied:* `xz` or a high zstd level. If disk space for the 365-day archive becomes the problem, a stronger level trades extra compression energy for smaller files. Decide that with the real log sizes.
+verify:
+  static_only: writes to /var/log and /srv, needs zstd and cron

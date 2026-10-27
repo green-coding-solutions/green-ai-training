@@ -1,0 +1,84 @@
+id: gen-6593849-00038-refactor
+category: refactor
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    Hello, we have a small gateway on a farm (arm board, collects readings from the tanks sensors). After network is down for some hours, the backlog is big and the replay step is very slow, the cpu stay on 100% for long time. I think the problem is in this function but I am not sure. Can you clean it or make better pls? Output must stay same, the cloud wants old readings first.
+
+    ```python
+    import json
+    import logging
+
+    log = logging.getLogger("gw.backlog")
+
+
+    def load_chain(path):
+        by_id = {}
+        last_id = None
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                by_id[rec["id"]] = rec
+                last_id = rec["id"]
+        return by_id, last_id
+
+
+    def chronological(by_id, last_id, limit=None):
+        # every reading points to the one before it with "prev"
+        out = []
+        cur = last_id
+        while cur is not None and cur in by_id:
+            rec = by_id[cur]
+            out.insert(0, rec)
+            if limit and len(out) >= limit:
+                break
+            cur = rec.get("prev")
+        log.info("replaying %d readings", len(out))
+        return out
+    ```
+- role: assistant
+  content: |
+    Yes, the problem is in `chronological`. `load_chain` is fine and stays as it is.
+
+    ```python
+    def chronological(by_id, last_id, limit=None):
+        # every reading points to the one before it with "prev"
+        out = []
+        cur = last_id
+        while cur is not None and cur in by_id:
+            rec = by_id[cur]
+            out.append(rec)
+            if limit and len(out) >= limit:
+                break
+            cur = rec.get("prev")
+        out.reverse()  # newest-first -> oldest-first, one pass
+        log.info("replaying %d readings", len(out))
+        return out
+    ```
+
+    **Green Notes**
+    - **Avoid front insertion** (reduces E): `out.insert(0, rec)` moves every item already in the list on each call, so a big backlog gets slower and slower (quadratic). Now each reading is appended in constant time and the list is reversed once at the end. In Green Metrics Tool micro-benchmarks, 1,000,000 `list.insert(0, x)` calls used about 1515 J of CPU energy, and 1,000,000 `list.append(x)` calls used about 1.2 J. That is over 1000× less. Your own saving depends on backlog size: with a few hundred readings there is almost no difference.
+
+    The output is identical: same records, oldest first. `limit` still keeps the newest `limit` readings.
+verify:
+  test: |-
+    import logging
+    log = logging.getLogger("gw.backlog")
+    recs = {i: {"id": i, "prev": (i - 1 if i > 0 else None), "v": i * 2} for i in range(6)}
+    assert [r["id"] for r in chronological(recs, 5)] == [0, 1, 2, 3, 4, 5]
+    assert [r["id"] for r in chronological(recs, 5, limit=3)] == [3, 4, 5]
+    assert chronological(recs, None) == []
+    assert chronological(recs, 99) == []
+    broken = {3: {"id": 3, "prev": 2}, 2: {"id": 2, "prev": 1}}
+    assert [r["id"] for r in chronological(broken, 3)] == [2, 3]
+    big = {i: {"id": i, "prev": i - 1 if i else None} for i in range(20000)}
+    out = chronological(big, 19999)
+    assert out[0]["id"] == 0 and out[-1]["id"] == 19999 and len(out) == 20000

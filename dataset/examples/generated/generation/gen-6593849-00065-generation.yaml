@@ -1,0 +1,61 @@
+id: gen-6593849-00065-generation
+category: generation
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    func that downloads the last 30 daily csv exports (GET https://reports.example.com/api/v1/exports/YYYY-MM-DD.csv) into ./exports, for our nightly etl
+- role: assistant
+  content: |
+    The 30 downloads are independent, so they run concurrently instead of one after another:
+
+    ```python
+    import asyncio
+    from datetime import date, timedelta
+    from pathlib import Path
+
+    import httpx
+
+    BASE_URL = "https://reports.example.com/api/v1/exports"
+
+
+    async def _fetch_day(client: httpx.AsyncClient, sem: asyncio.Semaphore,
+                         day: date, out_dir: Path) -> Path:
+        async with sem:
+            resp = await client.get(f"{BASE_URL}/{day.isoformat()}.csv")
+        resp.raise_for_status()
+        path = out_dir / f"{day.isoformat()}.csv"
+        path.write_bytes(resp.content)
+        return path
+
+
+    async def download_exports(days: int = 30, out_dir: str = "exports",
+                               max_concurrency: int = 8) -> list[Path]:
+        out = Path(out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        today = date.today()
+        wanted = [today - timedelta(days=i) for i in range(1, days + 1)]
+        sem = asyncio.Semaphore(max_concurrency)
+        async with httpx.AsyncClient(timeout=30) as client:
+            return await asyncio.gather(
+                *(_fetch_day(client, sem, d, out) for d in wanted)
+            )
+
+
+    if __name__ == "__main__":
+        files = asyncio.run(download_exports())
+        print(f"downloaded {len(files)} files")
+    ```
+
+    Files come back in order, newest day first. If one day fails, `raise_for_status()` raises and the whole call fails, so the nightly job stops instead of loading partial data.
+
+    **Green Notes**
+    - **Concurrent network I/O** (reduces E): the job spends most of its time waiting on the server, and concurrent requests overlap that wait. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sequential `urllib`. For small request counts the gain is mostly wall time.
+    - **Semaphore limit** (reduces E): at most 8 requests are in flight, so the reports server isn't hit with all 30 at once.
+    - *Not applied:* for one or two files, a plain synchronous download is simpler and just as efficient.
+verify:
+  static_only: needs httpx and network access

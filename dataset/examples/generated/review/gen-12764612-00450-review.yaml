@@ -1,0 +1,86 @@
+id: gen-12764612-00450-review
+category: review
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    hi, i wrote this script for our CI server, it runs at the end of every pipeline job (about 80 jobs a day). It packs the build folder so we can download it later. Artifacts stay 3 days. It works, but a colleague said it is slow and "maybe not good", and i dont know what is wrong. Can you look?
+
+    The build folder has test logs, junit xml files, a coverage report (html), browser test screenshots (png) and the built .jar.
+
+    ```bash
+    #!/bin/bash
+    # pack build output after pipeline run
+
+    BUILD_DIR=/var/ci/builds/$CI_JOB_ID
+    OUT=/var/ci/artifacts
+
+    mkdir -p $OUT
+    cd $BUILD_DIR
+    tar -cf - . | xz -9e > $OUT/build-$CI_JOB_ID.tar.xz
+    echo "packed $CI_JOB_ID"
+
+    # remove old artifacts
+    find $OUT -name "*.tar.xz" -mtime +3 -exec rm {} \;
+
+    # clean build dir
+    rm -rf $BUILD_DIR/*
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (CI/CD)
+
+    #### [Bug] The script can delete the wrong files and hides failed archives
+    - **Where:** `cd $BUILD_DIR`, the `tar | xz` pipe, `rm -rf $BUILD_DIR/*`
+    - **Issue:** three problems add up:
+      - If `CI_JOB_ID` is empty, `BUILD_DIR` becomes `/var/ci/builds/` and the last line deletes the build folders of all jobs.
+      - If `cd` fails, the script goes on and packs the current folder.
+      - If `tar` or `xz` fails (for example, disk full), nothing stops the script. It still deletes the build folder, so the only copy is gone and you are left with a broken archive.
+    - **Fix:** stop on errors, check the variable, quote every variable, and write to a temporary file that is renamed only when the packing worked.
+
+    #### [High] `xz -9e` for artifacts that live 3 days
+    - **Where:** `xz -9e`
+    - **Issue:** xz at its strongest setting is one of the most expensive codecs, and this runs on every job. In Green Metrics Tool micro-benchmarks, compressing 100 MB of text used about 16 J with zstd and about 458 J with xz (default level), about 29× more. Those figures compare energy only, not file size. xz usually makes smaller files. But by a Green Coding Solutions estimate (not a direct measurement), xz only pays off against storage cost when the data is kept about 7 days, zstd already after about 0.15 days. Your artifacts are deleted after 3 days, so the stronger codec does not pay back.
+    - **Fix:** use zstd with its default level.
+    - **Impact:** E, on every job, about 80 times a day. Also, your jobs finish sooner.
+
+    #### [Low] Files that are already compressed go through the compressor too
+    - **Where:** the `.png` screenshots and the `.jar` in the build folder
+    - **Issue:** PNG and JAR (a zip file) are already compressed, so compressing them again costs CPU and saves almost nothing. The logs, xml and html parts are the ones that shrink.
+    - **Fix:** if the screenshots are big, put them in a separate plain `tar` and compress only the rest. For a small folder this is not worth the extra complexity, so you can skip it.
+    - **Impact:** E, small.
+
+    Here is the script with the changes:
+
+    ```bash
+    #!/bin/bash
+    set -euo pipefail
+
+    : "${CI_JOB_ID:?CI_JOB_ID is not set}"
+    BUILD_DIR="/var/ci/builds/${CI_JOB_ID}"
+    OUT='/var/ci/artifacts'
+
+    mkdir -p "$OUT"
+    tmp="${OUT}/build-${CI_JOB_ID}.tar.zst.part"
+
+    tar -C "$BUILD_DIR" -cf - . | zstd -q -f -o "$tmp"
+    mv "$tmp" "${OUT}/build-${CI_JOB_ID}.tar.zst"
+    echo "packed ${CI_JOB_ID}"
+
+    # remove old artifacts
+    find "$OUT" -name 'build-*.tar.zst' -mtime +3 -delete
+
+    # clean build dir (only reached if packing worked)
+    rm -rf "$BUILD_DIR"/*
+    ```
+
+    Old `.tar.xz` files from before are not matched by the new `find`. Delete them once by hand, or keep the old pattern in the `find` for a few days. People who download artifacts need `zstd` installed (`tar --zstd -xf file.tar.zst`).
+
+    **Already good:** you stream `tar` into the compressor, so no big temporary tar file is written, and you remove old artifacts instead of keeping them forever.
+verify:
+  static_only: CI bash script that needs /var/ci paths, a CI_JOB_ID and the zstd binary

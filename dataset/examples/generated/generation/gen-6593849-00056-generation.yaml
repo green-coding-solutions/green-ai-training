@@ -1,0 +1,79 @@
+id: gen-6593849-00056-generation
+category: generation
+language: bash
+patterns:
+- bash-quoting
+- bash-builtins
+facts:
+- F-BASH-QUOTES
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    I need a bash script that makes shipping labels for our warehouse printers (Zebra, ZPL format). Requirements:
+
+    - Input: a CSV file `orders.csv` with header `order_id,name,street,city,zip,country`. No quoted commas in the data, but the file comes from Windows so it may have CRLF line endings.
+    - Output: one file with one ZPL label per order, so we can send it to the printer in one go. Usually 2,000 to 5,000 orders per run.
+    - Each label shows the order id, the name, the street, "zip city" and the country, plus a barcode of the order id.
+    - Input and output paths come from the command line. Stop with a usage message if they are missing.
+    - Names sometimes contain `^` or `~`. Those are ZPL control characters and have wrecked labels before, so please handle that.
+    - Cut every text field to 40 characters because the label is small.
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    if [[ $# -ne 2 ]]; then
+        printf 'usage: %s orders.csv labels.zpl\n' "$0" >&2
+        exit 1
+    fi
+
+    in=$1
+    out=$2
+
+    # Sets REPLY: control characters replaced, cut to 40 characters.
+    # No command substitution, so no process is started per field.
+    clean() {
+        local s=${1//[~^]/ }
+        REPLY=${s:0:40}
+    }
+
+    {
+        read -r _    # skip the header line
+        while IFS=, read -r id name street city zip country; do
+            country=${country%$'\r'}    # CRLF input
+            [[ -n $id ]] || continue
+
+            clean "$id";      id=$REPLY
+            clean "$name";    name=$REPLY
+            clean "$street";  street=$REPLY
+            clean "$city";    city=$REPLY
+            clean "$zip";     zip=$REPLY
+            clean "$country"; country=$REPLY
+
+            printf '^XA^CI28^PW812^LL600
+    ^FO40,40^A0N,36,36^FDOrder %s^FS
+    ^FO40,100^A0N,34,34^FD%s^FS
+    ^FO40,145^A0N,34,34^FD%s^FS
+    ^FO40,190^A0N,34,34^FD%s %s^FS
+    ^FO40,235^A0N,34,34^FD%s^FS
+    ^FO40,320^BCN,110,Y,N,N^FD%s^FS
+    ^XZ
+    ' "$id" "$name" "$street" "$zip" "$city" "$country" "$id"
+        done
+    } < "$in" > "$out"
+    ```
+
+    Notes on the behavior:
+
+    - Order ids are used as-is in the barcode after `^` and `~` are removed. If your ids can contain other characters, check how the printer handles them.
+    - A line that has fewer than six fields still gets a label, with empty fields. Add a check if you want to reject those lines.
+    - The template is a plain `printf` format. The `%s` slots are filled by the arguments, so a name can never be read as a format string.
+
+    **Green Notes**
+    - **Single quotes for the template and usage text** (reduces E): the label template has no `$`, backticks or backslash escapes, so single quotes let bash take it as is. Double quotes would make bash scan it on every pass. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal 1,000,000 times used about 24% less CPU energy with single quotes. This template is short and runs a few thousand times, so expect a much smaller saving here. It costs nothing, though. Variables such as `"$in"` and `"$id"` keep their double quotes.
+    - **Builtins inside the loop** (reduces E): `read -r` with `IFS=,`, `${var//…}`, `${var:0:40}` and `printf` run inside the shell. Calling `cut`, `sed` or `tr` through `$(…)` per field would start several processes per order. In Green Metrics Tool micro-benchmarks of a log-summary loop, builtins used about 300× less energy than a loop that forked `echo | cut` and `expr` for each field. The `clean` function returns its result in `REPLY` for the same reason.
+    - **One output redirect** (reduces E): the file is opened once for the whole loop, not once per label.
+verify:
+  static_only: bash script reading and writing files, no python or javascript to test

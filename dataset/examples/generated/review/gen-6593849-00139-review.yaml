@@ -1,0 +1,87 @@
+id: gen-6593849-00139-review
+category: review
+language: javascript
+patterns:
+- minify-assets
+facts:
+- F-MINIFY
+messages:
+- role: user
+  content: |
+    hi, I am a PhD student, not a web developer. I made a small page that plots spectra from our lab instrument (about 40 KB of JS after bundling, used by maybe 15 people in our group). My supervisor said "the build looks off" but did not say what. Can you look? I dont know what is wrong
+
+    ```javascript
+    // build.js
+    const esbuild = require('esbuild');
+    const fs = require('fs');
+
+    const isProd = process.env.NODE_ENV === 'production';
+
+    // clean old build
+    fs.rmSync('public', { recursive: true, force: true });
+    fs.mkdirSync('public');
+    fs.copyFileSync('src/index.html', 'public/index.html');
+
+    esbuild
+      .build({
+        entryPoints: ['src/spectrum-viewer.js'],
+        bundle: true,
+        outfile: 'public/spectrum.js',
+        minify: false,
+        sourcemap: 'inline',
+        target: ['es2019'],
+        logLevel: 'info',
+      })
+      .catch(() => process.exit(1));
+    ```
+
+    The measured spectra are JSON files in `public/data/`, the page loads them with fetch.
+- role: assistant
+  content: |
+    **Workload:** web (small internal page, build script)
+
+    #### [Bug] The build deletes your measurement data
+    - **Where:** `fs.rmSync('public', { recursive: true, force: true })`
+    - **Issue:** this removes the whole `public/` folder, including `public/data/` with the spectra. Only `index.html` is copied back, so the page has nothing to load after a build.
+    - **Fix:** remove only the files the build creates:
+      ```javascript
+      fs.rmSync('public/spectrum.js', { force: true });
+      fs.mkdirSync('public', { recursive: true });
+      ```
+
+    #### [Low] `isProd` is never used, so production ships unminified code with an inline source map
+    - **Where:** `minify: false` and `sourcemap: 'inline'`
+    - **Issue:** the `isProd` flag is set but not read. Every build, also the one you deploy, has full variable names and the source map embedded in the bundle. This makes the file several times bigger than needed.
+    - **Fix:**
+      ```javascript
+      minify: isProd,
+      sourcemap: isProd ? false : 'inline',
+      ```
+    - **Impact:** mostly network bytes, not CPU. In Green Metrics Tool micro-benchmarks of 50 cold page loads of a small page, unminified sources used ~837 J and an esbuild minified build ~822 J, about 2% less, which is within measurement noise. For 15 users on a fast network, you will not see a difference in energy. It is still a free change, because the flag already exists. Keep the source map in dev builds, where it helps with debugging.
+
+    ```javascript
+    const esbuild = require('esbuild');
+    const fs = require('fs');
+
+    const isProd = process.env.NODE_ENV === 'production';
+
+    fs.rmSync('public/spectrum.js', { force: true });
+    fs.mkdirSync('public', { recursive: true });
+    fs.copyFileSync('src/index.html', 'public/index.html');
+
+    esbuild
+      .build({
+        entryPoints: ['src/spectrum-viewer.js'],
+        bundle: true,
+        outfile: 'public/spectrum.js',
+        minify: isProd,
+        sourcemap: isProd ? false : 'inline',
+        target: ['es2019'],
+        logLevel: 'info',
+      })
+      .catch(() => process.exit(1));
+    ```
+
+    **Already good:** esbuild bundles into one file, so the page makes one script request. No extra tooling is needed for a page this size.
+verify:
+  static_only: needs the esbuild package and a file system layout

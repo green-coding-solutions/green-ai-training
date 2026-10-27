@@ -1,0 +1,56 @@
+id: gen-6593849-00223-no-change
+category: no-change
+language: python
+patterns:
+- hoist-invariants
+- context-tradeoff
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    Diff only please. Is it worth binding `hashlib.sha256` and `os.path.join` to locals here? Release-check CLI, runs once per deploy over a few hundred artifacts.
+
+    ```python
+    import hashlib
+    import json
+    import os
+    import sys
+
+
+    def verify(root, manifest_path):
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+
+        bad = []
+        for name, expected in manifest.items():
+            path = os.path.join(root, name)
+            if not os.path.exists(path):
+                bad.append((name, "missing"))
+                continue
+            h = hashlib.sha256()
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+            if h.hexdigest() != expected:
+                bad.append((name, "mismatch"))
+        return bad
+
+
+    if __name__ == "__main__":
+        problems = verify(sys.argv[1], sys.argv[2])
+        for name, why in problems:
+            print(f"{name}: {why}")
+        sys.exit(1 if problems else 0)
+    ```
+- role: assistant
+  content: |
+    No diff. Leave it as is.
+
+    - **Wrong cost centre:** each iteration opens a file, reads it in 1 MiB chunks and hashes it. Disk reads and SHA-256 dominate. Two attribute lookups per file are lost in that.
+    - **Small effect even in the best case:** in Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local before a 10,000,000-iteration loop saved about 4-5%. That loop did almost nothing else. Yours runs a few hundred iterations with heavy work in each.
+    - **Readability:** `os.path.join` and `hashlib.sha256` are clear as written. Locals would add two lines for no measurable gain.
+
+    Binding locals only makes sense in a very tight loop with millions of cheap iterations. This is not one.
+verify:
+  static_only: no code change in the answer; the pasted script works on files and needs no test

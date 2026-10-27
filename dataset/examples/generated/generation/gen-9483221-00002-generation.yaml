@@ -1,0 +1,61 @@
+id: gen-9483221-00002-generation
+category: generation
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    cli tool: repo names as args (owner/name), prints latest release tag of each from github api
+- role: assistant
+  content: |
+    ```python
+    import argparse
+    import asyncio
+
+    import httpx
+
+    API = "https://api.github.com/repos/{}/releases/latest"
+    MAX_PARALLEL = 8
+
+
+    async def latest_tag(client: httpx.AsyncClient, sem: asyncio.Semaphore, repo: str) -> str:
+        async with sem:
+            try:
+                resp = await client.get(API.format(repo))
+                if resp.status_code == 404:
+                    return "no releases"
+                resp.raise_for_status()
+                return resp.json()["tag_name"]
+            except httpx.HTTPError as exc:
+                return f"error: {exc}"
+
+
+    async def run(repos: list[str]) -> list[str]:
+        sem = asyncio.Semaphore(MAX_PARALLEL)
+        async with httpx.AsyncClient(timeout=10, headers={"Accept": "application/vnd.github+json"}) as client:
+            return await asyncio.gather(*(latest_tag(client, sem, r) for r in repos))
+
+
+    def main() -> None:
+        parser = argparse.ArgumentParser(description="Print the latest release tag of GitHub repos")
+        parser.add_argument("repos", nargs="+", metavar="owner/name")
+        args = parser.parse_args()
+
+        for repo, tag in zip(args.repos, asyncio.run(run(args.repos))):
+            print(f"{repo}\t{tag}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **Concurrent network calls** (reduces idle time, some E): the requests run together on one shared connection pool, so the total wait is about the slowest call, not the sum. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used about 7% less CPU energy (~8.4 J vs ~9.1 J) and about 17% less wall time (2.6 s vs 3.1 s) than sequential `urllib`. For small request counts the gain is mostly wall time.
+    - **Bounded parallelism**: the semaphore caps open requests at 8, so a long list does not open hundreds of sockets at once or trip API rate limits.
+
+    Output keeps the order of the arguments. A failed repo prints an error on its own line and does not stop the others. With a single repo, async gives no gain.
+verify:
+  static_only: needs network access and the third-party package httpx

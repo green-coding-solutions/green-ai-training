@@ -1,0 +1,55 @@
+id: gen-9483221-00028-conceptual
+category: conceptual
+language: text
+patterns:
+- avoid-exception-flow
+- context-tradeoff
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    ```python
+    def summarize(lines):
+        by_status = {}
+        by_ip = {}
+        for line in lines:
+            parts = line.split()
+            ip, status = parts[0], parts[8]
+            try:
+                by_status[status] += 1
+            except KeyError:
+                by_status[status] = 1
+            try:
+                by_ip[ip] += 1
+            except KeyError:
+                by_ip[ip] = 1
+        return by_status, by_ip
+    ```
+
+    ?
+- role: assistant
+  content: |
+    You probably want to know whether the `try/except KeyError` is a problem. It depends on how often the key is missing. The cost is in raising the exception, not in the `try`.
+
+    - **`by_status`: fine as it is.** A log has a handful of status codes. The `KeyError` fires only the first time each code appears, so it is rare.
+    - **`by_ip`: worth changing.** Many IPs are seen only once or twice, so the miss happens on a large share of lines. Each miss raises and catches an exception.
+
+    In Green Metrics Tool micro-benchmarks with 10,000,000 dict lookups where about half the keys were missing, `dict.get(key, default)` used about 12% less CPU energy than `try/except KeyError` (~67 J vs ~76 J). When misses are rare, `try/except` is cheap. Don't extrapolate that figure to your logs. Your miss rate decides it.
+
+    ```python
+    def count_ips(lines):
+        by_ip = {}
+        for line in lines:
+            ip = line.split()[0]
+            by_ip[ip] = by_ip.get(ip, 0) + 1
+        return by_ip
+    ```
+
+    The result is identical. The only change is that a missing key no longer raises.
+
+    Rule of thumb: use `get` (or `in`) when misses are common or unpredictable. Keep `try/except` when a miss is truly exceptional. For a script that runs once on a small file, the difference is not worth a change.
+verify:
+  test: |-
+    assert count_ips(["a x", "b y", "a z"]) == {"a": 2, "b": 1}
+    assert count_ips([]) == {}

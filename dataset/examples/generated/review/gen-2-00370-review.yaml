@@ -79,9 +79,14 @@ messages:
     - **Fix:** generate the name on the server. The JSON shape stays the same. Only the file name inside `retro_url` changes.
 
     ```python
+    import os
     import uuid
 
-    out_path = os.path.join(DITHER_DIR, str(site_id), f"hero-{uuid.uuid4().hex}.png")
+    DITHER_DIR = "/srv/pagebuilder/media/dithered"
+
+
+    def build_out_path(site_id):
+        return os.path.join(DITHER_DIR, str(site_id), f"hero-{uuid.uuid4().hex}.png")
     ```
 
     #### [Bug] `levels` is not validated
@@ -90,13 +95,17 @@ messages:
     - **Fix:** validate the value before use.
 
     ```python
-    try:
-        levels = int(request.form.get("levels", 4))
-    except ValueError:
-        return jsonify({"error": "levels must be an integer"}), 400
-    if not 2 <= levels <= 256:
-        return jsonify({"error": "levels must be between 2 and 256"}), 400
+    def parse_levels(raw):
+        try:
+            levels = int(raw)
+        except ValueError:
+            return None, "levels must be an integer"
+        if not 2 <= levels <= 256:
+            return None, "levels must be between 2 and 256"
+        return levels, None
     ```
+
+    In `upload_hero`, call `parse_levels(request.form.get("levels", 4))` and return `jsonify({"error": message}), 400` when the message is set.
 
     #### [High] Error diffusion runs as a pure Python loop over every pixel
     - **Where:** `floyd_steinberg`, the nested `for y` / `for x` loop
@@ -104,6 +113,7 @@ messages:
     - **Fix:** compile the function as it is with Numba. Leave the loop body unchanged.
 
     ```python
+    import numpy as np
     from numba import njit
 
 
@@ -129,12 +139,12 @@ messages:
         return img.astype(np.uint8)
     ```
 
+    - **Impact:** E on every retro upload, plus shorter request time and lower pod CPU. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples in a pure Python loop used ~40 J, while the same loop under Numba `@njit` used ~9.5 J, about 4× less. Your loop does a bit more work per pixel, so profile one large upload before and after to see the effect on your pods.
+
     Notes on the change:
     - Pass `levels` as an `int`, as the endpoint already does. That way Numba compiles a single version.
     - Don't turn on `fastmath`. Without it, the float operations run in the same order, and `round` rounds half to even like Python's. Before rollout, check the pixel-identical requirement: run old and new on a set of stored heroes and compare the PNG bytes.
     - The first call in each process compiles the function. `cache=True` stores the compiled code on disk, so a gunicorn restart can reuse it. Point `NUMBA_CACHE_DIR` at a writable path in the container. Calling the function once at import with a tiny array keeps the compile out of the first customer's request.
-
-    - **Impact:** E on every retro upload, plus shorter request time and pod CPU. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples in a pure Python loop used ~40 J, while the same loop under Numba `@njit` used ~9.5 J, about 4× less. Your loop does a bit more work per pixel, so profile one large upload before and after to see the effect on your pods.
 
     **Already good:** `thumbnail` caps the image size before dithering, and the grayscale conversion happens once in Pillow, outside the loop.
 verify:

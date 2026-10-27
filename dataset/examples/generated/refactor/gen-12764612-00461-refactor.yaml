@@ -1,0 +1,84 @@
+id: gen-12764612-00461-refactor
+category: refactor
+language: python
+patterns:
+- select-columns
+- keep-star-imports
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    hi, this is the endpoint for product list in our shop API (flask + postgres 16, psycopg 3). its called very much from the category pages and the app. Can you make it more clean and faster? Our products table have around 50 columns, some are big text like description and specs. Sorry for my english.
+
+    ```python
+    from flask import *
+    import psycopg
+    from psycopg.rows import dict_row
+
+    app = Flask(__name__)
+    conn = psycopg.connect("dbname=shop", row_factory=dict_row)
+
+    PAGE_SIZE = 24
+
+
+    @app.route("/api/products")
+    def list_products():
+        category = request.args.get("category", "")
+        page = int(request.args.get("page", 1))
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT * FROM products WHERE category = '{category}' "
+            f"AND active = true ORDER BY id LIMIT {PAGE_SIZE} OFFSET {(page - 1) * PAGE_SIZE}"
+        )
+        rows = cur.fetchall()
+        result = []
+        for r in rows:
+            result.append({
+                "id": r["id"],
+                "name": r["name"],
+                "slug": r["slug"],
+                "price": r["price"],
+                "thumb_url": r["thumb_url"],
+            })
+        return jsonify(result)
+    ```
+- role: assistant
+  content: |
+    ```python
+    from flask import *
+    import psycopg
+    from psycopg.rows import dict_row
+
+    app = Flask(__name__)
+    conn = psycopg.connect("dbname=shop", row_factory=dict_row)
+
+    PAGE_SIZE = 24
+
+
+    @app.route("/api/products")
+    def list_products():
+        category = request.args.get("category", "")
+        page = max(int(request.args.get("page", 1)), 1)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, name, slug, price, thumb_url "
+                "FROM products "
+                "WHERE category = %s AND active = true "
+                "ORDER BY id LIMIT %s OFFSET %s",
+                (category, PAGE_SIZE, (page - 1) * PAGE_SIZE),
+            )
+            return jsonify(cur.fetchall())
+    ```
+
+    **Security issue fixed:** the old query put `category` from the URL directly into the SQL string. Anyone could send `category=' OR '1'='1` or worse. It now uses `%s` placeholders, so psycopg sends the values separately.
+
+    **Green Notes**
+    - **Select only the needed columns** (reduces E, network): `SELECT *` reads and sends all ~50 columns, including the big `description` and specs text, and your code then throws most of them away. Now the query names the 5 columns the response uses. In Green Metrics Tool micro-benchmarks on a 52-column products table with large text columns, naming 10 columns used about 5.5-7× less CPU energy than `SELECT *`. The saving grows with the size of the columns you skip. Your real gain depends on how big your text columns are.
+    - **No copy loop:** the rows already have exactly the keys you return, so `jsonify(cur.fetchall())` is enough. This is less code and one less pass per request.
+    - **Star import left as it is:** `from flask import *` looks bad, but in Green Metrics Tool micro-benchmarks star imports and normal imports showed no measurable energy difference. I did not change it. Change it only if you want it for style.
+    - **Behavior notes:** `page` is now at least 1, so `page=0` or a negative page no longer gives a negative OFFSET error. If you add more fields to the API later, add them to the column list.
+verify:
+  static_only: needs Flask and a running PostgreSQL server

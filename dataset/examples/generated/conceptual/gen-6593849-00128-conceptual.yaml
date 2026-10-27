@@ -1,0 +1,40 @@
+id: gen-6593849-00128-conceptual
+category: conceptual
+language: text
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    We maintain a nightly ETL job written in bash. It takes delimited export files from three source systems, filters rows, sums amounts per customer group and writes a summary file. Right now the main loop is `while read line; do region=$(echo "$line" | cut -d, -f3); amt=$(expr $amt + $x) ...`. It works, but it's slow.
+
+    Requirements from the team: the next maintainer only knows basic bash, we don't want to add new languages or dependencies, and the output must stay byte-identical. We are debating two options: (a) keep the loop but replace the `echo | cut` and `expr` calls with bash builtins, or (b) throw out the loop and do the whole thing in one awk call. Which one is better, also from an energy point of view? Does it depend on anything?
+- role: assistant
+  content: |
+    Both beat what you have. The big win is removing the per-line processes. Which of the two you pick is a smaller question.
+
+    In Green Metrics Tool micro-benchmarks, a 20,000-line log was summarized with identical output in three ways:
+    - **`while read` with `$(echo | cut)` and `$(expr)`:** about 10 processes per line, ~1302 J and 238 s.
+    - **Same loop with builtins only** (`read -r` field splitting, `$(( ))`, `case`): ~4.3 J and 0.72 s, about 300× less.
+    - **One `awk` pass over the file:** ~1.0 J and 0.21 s, about 4× less than the builtin loop.
+
+    So (a) already removes almost all of the cost. (b) is cheaper again, but the step from (a) to (b) is small next to the step from your current loop to (a).
+
+    How to choose:
+    - **Pick (a)** if the loop has branching logic that is hard to express in awk, or if readability for the next maintainer matters most. Process starts were the cost, and the builtin loop has none.
+    - **Pick (b)** if the job is just filter, group and sum. awk is usually installed wherever bash is, so it adds no dependency, and it is the cheapest of the three.
+
+    ```bash
+    awk -F, '$2 == "paid" { total[$3] += $5 } END { for (g in total) print g, total[g] }' export.csv | sort
+    ```
+
+    Things to check before you switch, because the output must stay identical:
+    - **Quoted fields.** If a CSV field can contain a comma inside quotes, `IFS=,` splitting and `awk -F,` both break. You would need a real CSV parser for those files.
+    - **Number format.** `$(( ))` only does integers. If amounts have decimals, the builtin loop cannot sum them, and awk can.
+    - **Output order.** awk's `for (g in total)` has no defined order. Pipe it to `sort`, as above, so the file stays stable.
+
+    Compare old and new output with `diff` on one real night's data. To measure the saving on your own files, run both versions under `/usr/bin/time` or `perf stat` and compare CPU time. Don't extrapolate from the figures above, because they come from one log format and one machine.
+verify:
+  static_only: conceptual answer

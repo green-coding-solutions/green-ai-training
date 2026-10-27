@@ -1,0 +1,61 @@
+id: gen-6593849-00249-generation
+category: generation
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # weekly jenkins backup, cron sunday 03:00
+    JENKINS_HOME=/var/lib/jenkins
+    DEST=/mnt/backup/jenkins
+    KEEP_DAYS=60
+
+    # TODO: pack jobs/ config.xml credentials.xml secrets/ users/ (no workspace)
+    # TODO: compress
+    # TODO: delete backups older than KEEP_DAYS
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # weekly jenkins backup, cron sunday 03:00
+    set -euo pipefail
+    umask 077
+
+    JENKINS_HOME=/var/lib/jenkins
+    DEST=/mnt/backup/jenkins
+    KEEP_DAYS=60
+
+    stamp=$(date +%F)
+    tmp="$DEST/.jenkins-$stamp.tar.zst.part"
+    out="$DEST/jenkins-$stamp.tar.zst"
+
+    mkdir -p "$DEST"
+    trap 'rm -f "$tmp"' EXIT
+
+    tar -C "$JENKINS_HOME" --exclude='workspace' -cf - \
+        jobs config.xml credentials.xml secrets users \
+      | zstd -T0 -q -f -o "$tmp"
+
+    mv "$tmp" "$out"
+
+    find "$DEST" -maxdepth 1 -name 'jenkins-*.tar.zst' -mtime +"$KEEP_DAYS" -delete
+    ```
+
+    The archive is written to a `.part` file and renamed at the end. A failed run never leaves a broken backup that looks valid. `credentials.xml` and `secrets/` are in the archive, so `umask 077` keeps it readable by the owner only. Restore with `tar --zstd -xf jenkins-YYYY-MM-DD.tar.zst -C "$JENKINS_HOME"`.
+
+    **Green Notes**
+    - **Fast codec for stored data** (reduces E): the backup is text-heavy (XML configs, build logs) and is compressed every week, so the codec cost repeats. In Green Metrics Tool micro-benchmarks on 100 MB of English text, zstd at its default level used about 16 J, gzip about 67 J and xz about 458 J to compress. Those figures compare energy only, not archive size. xz usually gives smaller files.
+    - **Compress while packing** (reduces M): `tar` pipes straight into `zstd`, so no uncompressed tarball is written to disk first.
+    - **Retention** (reduces storage): old backups are deleted after 60 days, so stored copies don't pile up.
+
+    *Not applied:* a stronger codec like `xz`. It costs far more energy per run, and it only pays off if the backups are kept for a long time or the link to the backup host is slow.
+verify:
+  static_only: bash cron script that needs a Jenkins home, zstd and a backup mount

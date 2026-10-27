@@ -1,0 +1,113 @@
+id: gen-6593849-00180-refactor
+category: refactor
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    ```python
+    import re
+    from collections import Counter
+
+    LINE_RE = re.compile(r'^(\S+) \S+ \S+ \[([^\]]+)\] "(\S+) (\S+)[^"]*" (\d{3}) (\d+|-)')
+
+
+    def load_blocklist(path):
+        with open(path) as f:
+            return [line.strip() for line in f if line.strip() and not line.startswith("#")]
+
+
+    def summarize(log_path, blocklist_path):
+        blocked = load_blocklist(blocklist_path)
+        status_counts = Counter()
+        bytes_total = 0
+        dropped = 0
+        with open(log_path) as f:
+            for line in f:
+                m = LINE_RE.match(line)
+                if m is None:
+                    continue
+                ip, status, size = m.group(1), m.group(5), m.group(6)
+                if ip in blocked:
+                    dropped += 1
+                    continue
+                status_counts[status[0] + "xx"] += 1
+                if size != "-":
+                    bytes_total += int(size)
+        return status_counts, bytes_total, dropped
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```python
+    import re
+    from collections import Counter
+
+    LINE_RE = re.compile(r'^(\S+) \S+ \S+ \[([^\]]+)\] "(\S+) (\S+)[^"]*" (\d{3}) (\d+|-)')
+
+
+    def load_blocklist(path):
+        with open(path) as f:
+            return {line.strip() for line in f if line.strip() and not line.startswith("#")}
+
+
+    def summarize(log_path, blocklist_path):
+        blocked = load_blocklist(blocklist_path)
+        status_counts = Counter()
+        bytes_total = 0
+        dropped = 0
+        with open(log_path) as f:
+            for line in f:
+                m = LINE_RE.match(line)
+                if m is None:
+                    continue
+                ip, status, size = m.group(1), m.group(5), m.group(6)
+                if ip in blocked:
+                    dropped += 1
+                    continue
+                status_counts[status[0] + "xx"] += 1
+                if size != "-":
+                    bytes_total += int(size)
+        return status_counts, bytes_total, dropped
+    ```
+
+    **Green Notes**
+    - **Set for repeated membership tests** (reduces E): `ip in blocked` runs once per log line. On a list, each test scans the blocklist, so the cost is lines × blocklist size. On a set, each test is O(1), so building the set once is O(n) and the loop stays linear in the log size. In Green Metrics Tool micro-benchmarks, a single lookup on a list was cheaper than converting it to a set first (the set route used about 50% more). The set pays off here only because you look up once per line, over many lines.
+    - **Left as is:** the regex is already compiled at module level, and the rest of the loop is fine.
+
+    The counts and byte totals are identical. Duplicate blocklist entries collapse into one, which does not change any result. If the blocklist is tiny and the log is short, the difference is not measurable.
+verify:
+  module: true
+  test: |
+    import os, tempfile
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "b.txt")
+    with open(p, "w") as f:
+        f.write("# comment\n1.1.1.1\n\n2.2.2.2\n1.1.1.1\n")
+    s = load_blocklist(p)
+    assert isinstance(s, set)
+    assert s == {"1.1.1.1", "2.2.2.2"}
+  equivalence:
+    driver: |-
+      import os, tempfile
+      d = tempfile.mkdtemp()
+      bp = os.path.join(d, "block.txt")
+      lp = os.path.join(d, "access.log")
+      with open(bp, "w") as f:
+          f.write("# blocked\n10.0.0.1\n\n10.0.0.2\n10.0.0.1\n")
+      lines = [
+          '10.0.0.1 - - [01/Jan/2026:10:00:00 +0000] "GET /a HTTP/1.1" 200 120',
+          '10.0.0.3 - - [01/Jan/2026:10:00:01 +0000] "GET /b HTTP/1.1" 404 50',
+          '10.0.0.2 - - [01/Jan/2026:10:00:02 +0000] "POST /c HTTP/1.1" 500 10',
+          '10.0.0.4 - - [01/Jan/2026:10:00:03 +0000] "GET /d HTTP/1.1" 304 -',
+          'garbage line',
+          '10.0.0.5 - - [01/Jan/2026:10:00:04 +0000] "GET /e HTTP/1.1" 200 300',
+      ]
+      with open(lp, "w") as f:
+          f.write("\n".join(lines) + "\n")
+      counts, total, dropped = summarize(lp, bp)
+      print(sorted(counts.items()), total, dropped)

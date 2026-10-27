@@ -1,0 +1,103 @@
+id: gen-12764612-00406-refactor
+category: refactor
+language: javascript
+patterns:
+- minify-assets
+facts:
+- F-MINIFY
+messages:
+- role: user
+  content: |
+    Our deploy-approval page (internal, about 40 people use it, served from the CI runner host) is built by a small Node script in the pipeline. Someone wrote a hand-made "minifier" with regexes. Last week it broke the build when I added an API URL, and I don't trust it anymore.
+
+    Requirements:
+    - Keep it CommonJS, the CI image has Node 18 and our other scripts use `require`.
+    - Keep the file order. The files share globals, there are no imports.
+    - Keep the output name `dist/app.<hash>.js` and `dist/manifest.json`, the HTML template reads the manifest.
+    - `esbuild` is already in our devDependencies, so use that.
+    - Keep the `console.*` calls, the page logs errors there on purpose.
+
+    ```javascript
+    // scripts/build-ui.js
+    const fs = require('fs');
+    const path = require('path');
+    const crypto = require('crypto');
+
+    const SRC = path.join(__dirname, '..', 'ui');
+    const OUT = path.join(__dirname, '..', 'dist');
+    const ORDER = ['config.js', 'api.js', 'render.js', 'main.js'];
+
+    function strip(code) {
+      return code
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/\/\/.*$/gm, '')
+        .replace(/\n\s*\n/g, '\n');
+    }
+
+    fs.mkdirSync(OUT, { recursive: true });
+
+    let bundle = '';
+    for (const f of ORDER) {
+      bundle += fs.readFileSync(path.join(SRC, f), 'utf8') + '\n';
+    }
+
+    const min = strip(bundle);
+    const hash = crypto.createHash('md5').update(min).digest('hex').slice(0, 8);
+    const name = `app.${hash}.js`;
+
+    fs.writeFileSync(path.join(OUT, name), min);
+    fs.writeFileSync(
+      path.join(OUT, 'manifest.json'),
+      JSON.stringify({ 'app.js': name }, null, 2)
+    );
+    console.log(`built ${name} (${min.length} bytes)`);
+    ```
+- role: assistant
+  content: |
+    ```javascript
+    // scripts/build-ui.js
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const crypto = require('node:crypto');
+    const esbuild = require('esbuild');
+
+    const SRC = path.join(__dirname, '..', 'ui');
+    const OUT = path.join(__dirname, '..', 'dist');
+    const ORDER = ['config.js', 'api.js', 'render.js', 'main.js'];
+
+    const source = ORDER
+      .map((f) => fs.readFileSync(path.join(SRC, f), 'utf8'))
+      .join('\n');
+
+    // No bundling, so top-level names stay global and the files still share them.
+    const { code: min } = esbuild.transformSync(source, {
+      minify: true,
+      target: 'es2019',
+      legalComments: 'none',
+    });
+
+    const hash = crypto.createHash('md5').update(min).digest('hex').slice(0, 8);
+    const name = `app.${hash}.js`;
+
+    fs.mkdirSync(OUT, { recursive: true });
+    fs.writeFileSync(path.join(OUT, name), min);
+    fs.writeFileSync(
+      path.join(OUT, 'manifest.json'),
+      JSON.stringify({ 'app.js': name }, null, 2)
+    );
+    console.log(`built ${name} (${Buffer.byteLength(min)} bytes)`);
+    ```
+
+    **Bug fixed:** the `//.*$` regex cut every line at the first `//`, also inside strings. A line like `const API = 'https://ci.internal/api';` became `const API = 'https:`, which is a syntax error. The same regex can damage regex literals and template strings. esbuild parses the code, so this cannot happen.
+
+    **Green Notes**
+    - **Minify web assets** (reduces network): the script still minifies, now with a real parser that also shortens local names and whitespace, so the file gets smaller than with comment stripping. In Green Metrics Tool measurements of 50 cold page loads of a small booking page, minified JS and CSS used about 2% less client CPU energy (~822 J vs ~837 J), which is within measurement noise. For a small page used by 40 people on the company network, this saves bytes, not measurable CPU. Keep the step because it is cheap and now correct, but do not expect a visible energy change.
+
+    *Not applied:* bundling, code splitting and tree shaking. Four small files used by 40 people do not need them, and they would force you to add imports.
+
+    Behavior notes:
+    - `console.*` calls are kept, as you asked. esbuild's `drop: ['console']` would also remove `console.error`.
+    - The hash is now taken from the esbuild output. The file name only changes when the shipped code changes.
+    - `target: 'es2019'` is a safe default for browsers on a company network. Raise it if you know your browsers are newer.
+verify:
+  static_only: needs the esbuild package and the ui/ source files

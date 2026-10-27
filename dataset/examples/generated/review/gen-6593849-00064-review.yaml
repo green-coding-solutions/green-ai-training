@@ -1,0 +1,85 @@
+id: gen-6593849-00064-review
+category: review
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import json
+    import logging
+
+    log = logging.getLogger("gateway")
+
+    # register address -> (name, scale, unit)
+    REGISTER_MAP = {
+        0x0010: ("supply_temp", 0.1, "C"),
+        0x0011: ("return_temp", 0.1, "C"),
+        0x0020: ("pump_speed", 1.0, "rpm"),
+        0x0021: ("flow_rate", 0.01, "m3/h"),
+        0x0030: ("valve_pos", 0.5, "%"),
+    }
+
+
+    def decode_block(start, words):
+        """words: raw values from one contiguous Modbus read.
+        Most addresses in a block are unused, so they are skipped."""
+        readings = {}
+        for offset, raw in enumerate(words):
+            addr = start + offset
+            try:
+                name, scale, unit = REGISTER_MAP[addr]
+            except KeyError:
+                continue
+            readings[name] = {"value": round(raw * scale, 2), "unit": unit}
+        return readings
+
+
+    def to_payload(device_id, readings):
+        log.debug("publishing %d readings for %s", len(readings), device_id)
+        return json.dumps({"device": device_id, "readings": readings})
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (gateway polling loop)
+
+    #### [Medium] Exception raised for every unused register
+    - **Where:** `decode_block`, the `try/except KeyError` around `REGISTER_MAP[addr]`
+    - **Issue:** your own comment says most addresses in a block are unused. So the miss is the normal case, and each miss raises and catches a `KeyError`. Raising is the expensive part. In Green Metrics Tool micro-benchmarks, 10,000,000 dict lookups with about half of the keys missing used ~67 J with `dict.get` and ~76 J with `try/except KeyError`, about 12% less with `get`. The gain is modest, but it repeats for every register of every poll, and the `get` version is not harder to read.
+    - **Fix:** use `get` and test for `None`. Behavior and output order stay the same.
+    - **Impact:** E, a small but steady saving on the gateway CPU. It grows with the share of unused addresses.
+
+    ```python
+    def decode_block(start, words):
+        """words: raw values from one contiguous Modbus read.
+        Most addresses in a block are unused, so they are skipped."""
+        readings = {}
+        for offset, raw in enumerate(words):
+            entry = REGISTER_MAP.get(start + offset)
+            if entry is None:
+                continue
+            name, scale, unit = entry
+            readings[name] = {"value": round(raw * scale, 2), "unit": unit}
+        return readings
+    ```
+
+    If a block ever had almost only mapped registers, `try/except` would be fine too, because it is cheap when misses are rare.
+
+    **Already good:** the map is a module-level dict built once. The debug log uses lazy `%` formatting, so no string is built when debug logging is off.
+verify:
+  equivalence:
+    driver: |-
+      blocks = [
+          (0x000C, list(range(100, 164))),
+          (0x0100, list(range(1, 33))),
+          (0x0010, [215, 198]),
+          (0x001F, [1500, 342, 7, 8, 9]),
+          (0x0030, [120]),
+      ]
+      for start, words in blocks:
+          print(to_payload("gw-1", decode_block(start, words)))

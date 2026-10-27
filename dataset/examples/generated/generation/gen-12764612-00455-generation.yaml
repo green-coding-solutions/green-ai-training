@@ -1,0 +1,130 @@
+id: gen-12764612-00455-generation
+category: generation
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    Hello, we are small team (6 dev) and I must write github actions workflow for preview of pull requests. We have one linux VM with docker and docker compose, I can login by ssh. Our repo have docker-compose.yml with flask api, postgres and redis, the api port is taken from APP_PORT variable. Every PR should get his own copy so the QA colleague can click and test. I dont know whats the best way to organise it, please make the workflow. Secrets PREVIEW_SSH_KEY, PREVIEW_KNOWN_HOSTS and PREVIEW_TARGET (user@host) already exist in the repo.
+- role: assistant
+  content: |
+    This workflow runs one compose project per PR on the VM, with the port `20000 + PR number`. It removes the preview when the PR closes, and a nightly job removes forgotten ones.
+
+    ```yaml
+    name: PR preview
+
+    on:
+      pull_request:
+        types: [opened, reopened, synchronize, closed]
+      schedule:
+        - cron: '17 2 * * *'
+
+    env:
+      PREVIEW_ROOT: /srv/previews
+
+    jobs:
+      deploy:
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.event.action != 'closed' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        runs-on: ubuntu-latest
+        concurrency:
+          group: preview-${{ github.event.number }}
+          cancel-in-progress: true
+        steps:
+          - uses: actions/checkout@v4
+
+          - name: Prepare SSH
+            env:
+              SSH_KEY: ${{ secrets.PREVIEW_SSH_KEY }}
+              KNOWN_HOSTS: ${{ secrets.PREVIEW_KNOWN_HOSTS }}
+            run: |
+              install -m 700 -d ~/.ssh
+              printf '%s\n' "$SSH_KEY" > ~/.ssh/id_preview
+              chmod 600 ~/.ssh/id_preview
+              printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+          - name: Sync sources and start preview
+            env:
+              TARGET: ${{ secrets.PREVIEW_TARGET }}
+              PR: ${{ github.event.number }}
+            run: |
+              DIR="$PREVIEW_ROOT/pr-$PR"
+              SSH='ssh -i ' && SSH="ssh -i $HOME/.ssh/id_preview"
+              $SSH "$TARGET" "mkdir -p '$DIR'"
+              rsync -az --delete --exclude '.git' --exclude '.last-deploy' \
+                -e "$SSH" ./ "$TARGET:$DIR/"
+              $SSH "$TARGET" "cd '$DIR' && touch .last-deploy && \
+                APP_PORT=$((20000 + PR)) docker compose -p 'pr-$PR' up -d --build --remove-orphans"
+              echo "Preview: http://${TARGET#*@}:$((20000 + PR))" >> "$GITHUB_STEP_SUMMARY"
+
+      teardown:
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.event.action == 'closed' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        runs-on: ubuntu-latest
+        steps:
+          - name: Prepare SSH
+            env:
+              SSH_KEY: ${{ secrets.PREVIEW_SSH_KEY }}
+              KNOWN_HOSTS: ${{ secrets.PREVIEW_KNOWN_HOSTS }}
+            run: |
+              install -m 700 -d ~/.ssh
+              printf '%s\n' "$SSH_KEY" > ~/.ssh/id_preview
+              chmod 600 ~/.ssh/id_preview
+              printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+          - name: Remove preview
+            env:
+              TARGET: ${{ secrets.PREVIEW_TARGET }}
+              PR: ${{ github.event.number }}
+            run: |
+              DIR="$PREVIEW_ROOT/pr-$PR"
+              ssh -i ~/.ssh/id_preview "$TARGET" "if [ -d '$DIR' ]; then \
+                cd '$DIR' && docker compose -p 'pr-$PR' down -v --remove-orphans; fi; rm -rf '$DIR'"
+
+      sweep:
+        if: github.event_name == 'schedule'
+        runs-on: ubuntu-latest
+        steps:
+          - name: Prepare SSH
+            env:
+              SSH_KEY: ${{ secrets.PREVIEW_SSH_KEY }}
+              KNOWN_HOSTS: ${{ secrets.PREVIEW_KNOWN_HOSTS }}
+            run: |
+              install -m 700 -d ~/.ssh
+              printf '%s\n' "$SSH_KEY" > ~/.ssh/id_preview
+              chmod 600 ~/.ssh/id_preview
+              printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+          - name: Remove previews not deployed for 3 days
+            env:
+              TARGET: ${{ secrets.PREVIEW_TARGET }}
+            run: |
+              ssh -i ~/.ssh/id_preview "$TARGET" 'bash -s' <<'EOF'
+              set -eu
+              cd /srv/previews
+              find . -mindepth 2 -maxdepth 2 -name .last-deploy -mtime +3 -printf '%h\n' |
+              while read -r d; do
+                name=$(basename "$d")
+                (cd "$d" && docker compose -p "$name" down -v --remove-orphans)
+                rm -rf "$d"
+              done
+              EOF
+    ```
+
+    Notes:
+    - Every push to the same PR replaces the running preview, and an older run is cancelled when a new push comes.
+    - PRs from forks are skipped. They get no secrets, and you do not want to run foreign code on your VM.
+    - The compose file must use `${APP_PORT}` for the published port. Database and Redis ports should not be published, so PRs do not clash.
+
+    **Green Notes**
+    - **Minimize environments** (reduces E, M): a preview exists only while its PR is open. It is removed with its volumes on close or merge, and the nightly sweep removes forgotten ones after 3 days. In Green Metrics Tool micro-benchmarks, an idle preview with 3 app replicas, Postgres, Redis and a worker used about 3% more CPU energy over 60 seconds than one with 1 replica and Postgres. The real saving is in hours: an environment that no longer exists costs nothing.
+    - **One shared VM** (reduces M): all previews run as compose projects on the one host you already have, so no new machine is reserved for each PR.
+verify:
+  static_only: GitHub Actions workflow that needs an SSH target and repository secrets

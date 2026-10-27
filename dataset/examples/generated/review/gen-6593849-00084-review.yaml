@@ -1,0 +1,82 @@
+id: gen-6593849-00084-review
+category: review
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    review pls
+
+    ```dockerfile
+    FROM python:3.12
+
+    RUN apt-get update && apt-get install -y build-essential git curl vim htop
+
+    WORKDIR /app
+    COPY . .
+
+    RUN pip install -r requirements.txt
+    RUN pip install pytest black mypy ipython
+
+    ENV MODBUS_HOST=192.168.10.20
+    ENV MQTT_BROKER=mqtt.plant.local
+    ENV MQTT_USER=gateway
+    ENV MQTT_PASSWORD=Gw-2024-modbus!
+
+    EXPOSE 9100
+    CMD ["python", "poll.py"]
+    ```
+
+    requirements.txt is pymodbus, paho-mqtt, pyyaml. It reads modbus registers and pushes them to mqtt. CI builds it on every push.
+- role: assistant
+  content: |
+    **Workload:** mixed (IoT gateway service, container build in CI)
+
+    #### [Security] Password is baked into the image
+    - **Where:** `ENV MQTT_PASSWORD=...`
+    - **Issue:** anyone who can pull the image can read the password with `docker history` or `docker inspect`. It also stays in every old layer and in your registry.
+    - **Fix:** remove the `MQTT_USER` and `MQTT_PASSWORD` lines and pass them at run time (`docker run -e MQTT_PASSWORD=...`, or a secrets file / orchestrator secret). Rotate this password, because it is already in the image history.
+
+    #### [Security] Container runs as root
+    - **Where:** no `USER` instruction
+    - **Issue:** the poller talks to a field network. If it is compromised, the attacker is root in the container.
+    - **Fix:** create a system user and switch to it (see the Dockerfile below).
+
+    #### [High] Fat base image with build and dev tools
+    - **Where:** `FROM python:3.12`, the `apt-get install` line, and `pip install pytest black mypy ipython`
+    - **Issue:** your three dependencies are pure Python and need no compiler. `build-essential`, `git`, `curl`, `vim`, `htop` and the dev tools are never used at run time, but CI downloads, installs and stores them on every push. In Green Metrics Tool measurements of a small Flask app image built without cache, a `python:3.12` image with build tools and dev tools used about 7× more energy to build than `python:3.12-slim` with runtime dependencies only. Serving requests afterwards cost the same, so the saving is in every build, pull and stored copy.
+    - **Fix:** use `python:3.12-slim`, drop the `apt-get` line and the dev tools. Run tests in a separate CI job or a separate dev image.
+    - **Impact:** E on every CI build, pull and registry copy. Run-time energy stays the same.
+
+    #### [Medium] Source is copied before dependencies
+    - **Where:** `COPY . .` before `pip install`
+    - **Issue:** any code change invalidates the layer cache, so pip reinstalls everything on every push. The two separate `pip install` steps also add extra layers.
+    - **Fix:** copy `requirements.txt` first, install, then copy the source. Add `--no-cache-dir` so pip's download cache does not end up in the image.
+    - **Impact:** E on CI builds. Most pushes only change code, so the dependency layer is reused.
+
+    ```dockerfile
+    FROM python:3.12-slim
+
+    WORKDIR /app
+
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY . .
+
+    RUN useradd --system --no-create-home gateway
+    USER gateway
+
+    ENV MODBUS_HOST=192.168.10.20 \
+        MQTT_BROKER=mqtt.plant.local
+
+    EXPOSE 9100
+    CMD ["python", "poll.py"]
+    ```
+
+    **Already good:** `WORKDIR` is set, and `CMD` uses the exec form, so the process gets stop signals directly.
+verify:
+  static_only: Dockerfile review, no runnable code

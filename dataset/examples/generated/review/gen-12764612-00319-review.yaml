@@ -42,49 +42,51 @@ messages:
 
     #### [Bug] Default `since` is fixed when the server starts
     - **Where:** `since=datetime.now() - timedelta(days=7)` in the signature
-    - **Issue:** Python evaluates default values once, when the function is defined. After the process runs for a few days, "last 7 days" is really "since the last deploy". The window gets longer and longer.
-    - **Fix:** use `since=None` and compute it inside the function (see code below).
+    - **Issue:** Python evaluates default values once, when the function is defined. After the process runs for a few days, "last 7 days" really means "since the last deploy". The window keeps growing.
+    - **Fix:** use `since=None` and compute the date inside the function (see the code below).
 
     #### [High] `insert(0, ...)` for every matching row
     - **Where:** `feed.insert(0, {...})` in `build_feed`
-    - **Issue:** each front insert shifts the whole list, so the loop is O(n²) for n matching events. That is why users with many events see a slow feed. In Green Metrics Tool micro-benchmarks, 1,000,000 `list.insert(0, x)` calls used ~1515 J of CPU energy and 1,000,000 `list.append(x)` calls ~1.2 J. The code also builds the whole feed and then throws away everything after `limit`.
-    - **Fix:** walk the rows from newest to oldest, append, and stop at `limit`:
-      ```python
-      from datetime import *
-      import json
+    - **Issue:** each front insert shifts the whole list, so the loop is O(n²) for n matching events. This is why users with many events see a slow feed. In Green Metrics Tool micro-benchmarks, 1,000,000 `list.insert(0, x)` calls used ~1515 J of CPU energy and 1,000,000 `list.append(x)` calls used ~1.2 J. The code also builds the whole feed and then throws away everything after `limit`.
+    - **Fix:** walk the rows from newest to oldest, append, and stop at `limit`.
+    - **Impact:** E and M on every feed request. The work is now linear and stops early.
+
+    Fixed version (bug and finding):
+
+    ```python
+    from datetime import *
+    import json
 
 
-      def build_feed(rows, user_id, limit=50, since=None):
-          # rows come from the db ordered oldest first
-          if since is None:
-              since = datetime.now() - timedelta(days=7)
-          feed = []
-          for row in reversed(rows):
-              if len(feed) >= limit:
-                  break
-              if row["user_id"] != user_id:
-                  continue
-              if row["created"] < since:
-                  continue
-              feed.append({
-                  "id": row["id"],
-                  "text": row["text"],
-                  "created": row["created"].isoformat(),
-              })
-          return feed
+    def build_feed(rows, user_id, limit=50, since=None):
+        # rows come from the db ordered oldest first
+        if since is None:
+            since = datetime.now() - timedelta(days=7)
+        feed = []
+        for row in reversed(rows):
+            if len(feed) >= limit:
+                break
+            if row["user_id"] != user_id:
+                continue
+            if row["created"] < since:
+                continue
+            feed.append({
+                "id": row["id"],
+                "text": row["text"],
+                "created": row["created"].isoformat(),
+            })
+        return feed
 
 
-      def feed_response(rows, user_id):
-          return json.dumps({"items": build_feed(rows, user_id)})
-      ```
-      The result is the same: newest first, at most `limit` items. `rows` must be a list or tuple, because `reversed()` needs a sequence. If it is a generator, call `list(rows)` first.
-    - **Impact:** E and M on every feed request. Work is now linear and ends early. Better still, if the SQL query can filter by user and date and `ORDER BY created DESC LIMIT 50`, you do not need to load all rows into Python.
+    def feed_response(rows, user_id):
+        return json.dumps({"items": build_feed(rows, user_id)})
+    ```
 
-    #### [Low] The star import
-    - **Where:** `from datetime import *`
-    - **Issue:** nothing to fix. In Green Metrics Tool micro-benchmarks, `from x import *` and `import x` used the same energy (no measurable difference), so I left it as it is. It is not the reason for the slow feed.
+    The result is the same: newest first, at most `limit` items. `rows` must be a list or tuple, because `reversed()` needs a sequence. If it is a generator, call `list(rows)` first.
 
-    **Already good:** the `json.dumps` call is done once per response, and the filter conditions are simple checks.
+    **About the imports:** they are not the problem. In Green Metrics Tool micro-benchmarks, `from x import *` and `import x` showed no measurable energy difference, so I left `from datetime import *` as it is.
+
+    **Already good:** `json.dumps` runs once per response, and the filter conditions are simple checks.
 verify:
   equivalence:
     driver: |-

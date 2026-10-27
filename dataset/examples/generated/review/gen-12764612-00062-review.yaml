@@ -1,6 +1,6 @@
 id: gen-12764612-00062-review
 category: review
-language: javascript
+language: html
 patterns:
 - css-animations
 - lazy-load-images
@@ -10,60 +10,73 @@ facts:
 messages:
 - role: user
   content: |
-    Please review the front-end script of our IoT gateway status page. The gateway is a small box in the plant, it serves this page and the camera snapshots itself. The page is open all day on a wall tablet and sometimes on a laptop when a technician checks a sensor.
+    Please review the status page of our IoT gateway. The gateway is a small box in the plant. It serves this page and the camera snapshots itself. The page is open all day on a wall tablet, and sometimes on a laptop when a technician checks a sensor.
 
     Requirements:
     - no frameworks, plain JS, must work in Firefox ESR
     - sensor tiles refresh every 5 s
     - a green "link ok" LED in the header that pulses softly
-    - below the sensor tiles there is a "Cameras" section with a snapshot of every camera (about 30 JPEGs, loaded once)
+    - below the sensor tiles there is a "Cameras" section with a snapshot of every camera (about 30 JPEGs, the gateway renders the list into the template)
 
     Is there anything I should fix? Bugs and security things too please.
 
-    ```js
-    // gateway-ui/app.js
-    const grid = document.getElementById('sensor-grid');
-    const gallery = document.getElementById('snapshots');
-    const led = document.getElementById('link-led');
+    ```html
+    <!-- gateway-ui/index.html (rendered by the gateway) -->
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <title>Gateway status</title>
+      <link rel="stylesheet" href="/static/app.css">
+    </head>
+    <body>
+      <header>
+        <span id="link-led" class="led"></span> Link
+      </header>
 
-    async function refreshSensors() {
-      const res = await fetch('/api/sensors');
-      const sensors = await res.json();
-      grid.innerHTML = sensors.map(s =>
-        `<div class="tile ${s.online ? 'on' : 'off'}">
-           <h3>${s.name}</h3>
-           <span>${s.value} ${s.unit}</span>
-         </div>`
-      ).join('');
-    }
+      <main>
+        <section id="sensor-grid"></section>
 
-    async function loadSnapshots() {
-      const res = await fetch('/api/cameras');
-      const cams = await res.json();
-      gallery.innerHTML = '';
-      cams.forEach(c => {
-        const img = document.createElement('img');
-        img.src = `/snap/${c.id}.jpg`;
-        img.width = 320;
-        img.height = 240;
-        img.alt = c.name;
-        gallery.appendChild(img);
-      });
-    }
+        <h2>Cameras</h2>
+        <section id="snapshots">
+          <img src="/snap/cam01.jpg" width="320" height="240" alt="Hall A entrance">
+          <img src="/snap/cam02.jpg" width="320" height="240" alt="Hall A press line">
+          <img src="/snap/cam03.jpg" width="320" height="240" alt="Hall B loading dock">
+          <img src="/snap/cam04.jpg" width="320" height="240" alt="Hall B compressor">
+          <!-- ... one img per camera, about 30 in total ... -->
+        </section>
+      </main>
 
-    // soft pulse for the link LED
-    let start = null;
-    function pulse(ts) {
-      if (start === null) start = ts;
-      const t = ((ts - start) % 2000) / 2000;
-      led.style.opacity = 0.35 + 0.65 * (0.5 + 0.5 * Math.sin(t * 2 * Math.PI));
-      requestAnimationFrame(pulse);
-    }
-    requestAnimationFrame(pulse);
+      <script>
+        const grid = document.getElementById('sensor-grid');
+        const led = document.getElementById('link-led');
 
-    refreshSensors();
-    setInterval(refreshSensors, 5000);
-    loadSnapshots();
+        async function refreshSensors() {
+          const res = await fetch('/api/sensors');
+          const sensors = await res.json();
+          grid.innerHTML = sensors.map(s =>
+            `<div class="tile ${s.online ? 'on' : 'off'}">
+               <h3>${s.name}</h3>
+               <span>${s.value} ${s.unit}</span>
+             </div>`
+          ).join('');
+        }
+
+        // soft pulse for the link LED
+        let start = null;
+        function pulse(ts) {
+          if (start === null) start = ts;
+          const t = ((ts - start) % 2000) / 2000;
+          led.style.opacity = 0.35 + 0.65 * (0.5 + 0.5 * Math.sin(t * 2 * Math.PI));
+          requestAnimationFrame(pulse);
+        }
+        requestAnimationFrame(pulse);
+
+        refreshSensors();
+        setInterval(refreshSensors, 5000);
+      </script>
+    </body>
+    </html>
     ```
 - role: assistant
   content: |
@@ -73,7 +86,7 @@ messages:
     - **Where:** `refreshSensors`, `<h3>${s.name}</h3>`
     - **Issue:** sensor names come from the field devices. A name like `<img src=x onerror=...>` runs script in the page, and the page can reach `/api/*` on the gateway. The same is true for `s.unit` and `s.value`.
     - **Fix:** build the tiles with DOM calls and `textContent`:
-      ```js
+      ```javascript
       function tile(s) {
         const div = document.createElement('div');
         div.className = s.online ? 'tile on' : 'tile off';
@@ -95,7 +108,7 @@ messages:
     #### [Medium] JS animation loop for the LED runs all day
     - **Where:** `pulse()` with `requestAnimationFrame`
     - **Issue:** a script callback runs on every frame to set one inline style, for as long as the tablet shows the page. In Green Metrics Tool micro-benchmarks of a 20-second animation in a real browser, a `requestAnimationFrame` loop with style updates used ~161 J of CPU energy and CSS `@keyframes` ~145 J, about 10% less. The gap is small per minute, but this page never closes.
-    - **Fix:** let the browser run the animation. Delete `pulse`, `start` and the `requestAnimationFrame` call, and add:
+    - **Fix:** let the browser run the animation. Delete `pulse`, `start` and the `requestAnimationFrame` call, and add to `app.css`:
       ```css
       @keyframes link-pulse {
         0%, 100% { opacity: 0.35; }
@@ -105,22 +118,18 @@ messages:
         animation: link-pulse 2s ease-in-out infinite;
       }
       ```
-    - **Impact:** E on the client, small but constant. The curve is slightly different from your sine, `ease-in-out` is close enough for a soft pulse.
+    - **Impact:** E on the client, small but constant. The curve is slightly different from your sine. `ease-in-out` is close enough for a soft pulse.
 
     #### [Medium] All camera snapshots load immediately
-    - **Where:** `loadSnapshots`, the `img` elements
+    - **Where:** the `<img>` tags in `#snapshots`
     - **Issue:** every JPEG is requested when the page opens, although the cameras sit below the sensor tiles. Your gateway serves them too, so each page load costs it work for images nobody looks at. In Green Metrics Tool micro-benchmarks of an article with 15 photos, loading below-the-fold images lazily used about 12% less CPU energy on loads without scrolling. When the visitor scrolled to the end there was no difference.
-    - **Fix:** one line, before `src`:
-      ```js
-      img.loading = 'lazy';
+    - **Fix:** add `loading="lazy"` in the template:
+      ```html
+      <img src="/snap/cam01.jpg" width="320" height="240" alt="Hall A entrance" loading="lazy">
       ```
-      You already set `width` and `height`, so the layout will not jump. If the camera section can start inside the first screen on the wall tablet, leave the first row eager:
-      ```js
-      img.loading = i < 4 ? 'eager' : 'lazy';
-      ```
-      (use `cams.forEach((c, i) => { ... })`).
+      You already set `width` and `height`, so the layout will not jump. If the camera section can start inside the first screen on the wall tablet, leave the first row without `loading="lazy"`.
     - **Impact:** E, network and gateway load per page open. It only helps when people do not scroll to the cameras. Technicians who always scroll down get no saving, but also no loss.
 
     **Already good:** images have fixed `width` and `height`, the tiles refresh with a plain 5 s timer, and the snapshots load once instead of being polled.
 verify:
-  static_only: browser DOM code (document, fetch, requestAnimationFrame), needs a browser
+  static_only: browser page with DOM code (document, fetch, requestAnimationFrame), needs a browser

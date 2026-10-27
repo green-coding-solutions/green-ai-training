@@ -1,0 +1,166 @@
+id: gen-6593849-00282-review
+category: review
+language: python
+patterns:
+- torch-no-grad
+- simple-conditions
+facts:
+- F-NOGRAD
+- F-COND
+messages:
+- role: user
+  content: |
+    Please review this script. It runs in our GitLab pipeline on every push to main, on a shared CPU-only runner (no GPU). It reads the log of a failed job, classifies every line with a small PyTorch model and writes a JSON summary. If any line is classified as "block", the job fails.
+
+    Requirements:
+    - Keep the CLI arguments and the JSON output format as they are (other jobs read the file).
+    - Logs can have up to a few hundred thousand lines.
+    - The model has a dropout layer and was trained with 8 output classes.
+
+    I want to know about correctness problems first. Then tell me if there is anything that makes it needlessly expensive to run, because this runs a lot.
+
+    ```python
+    #!/usr/bin/env python3
+    """Triage a failed CI job log: classify each line and write a summary."""
+    import argparse
+    import json
+    import sys
+
+    import torch
+
+    from triage.features import encode_lines  # returns float tensor (n, 256)
+
+    model = torch.load("models/ci_triage.pt", weights_only=False)
+
+
+    def action_for(cls: int) -> str:
+        if cls >= 0 and cls < 2:
+            return "ignore"
+        elif cls >= 2 and cls % 3 == 2:
+            return "retry"
+        elif cls > 2 and cls < 5:
+            return "notify_owner"
+        elif cls >= 6 and cls <= 7:
+            return "block"
+        return "ignore"
+
+
+    def classify(lines, batch_size=512):
+        feats = encode_lines(lines)
+        actions = []
+        for i in range(0, len(feats), batch_size):
+            logits = model(feats[i:i + batch_size])
+            for cls in logits.argmax(dim=1).tolist():
+                actions.append(action_for(cls))
+        return actions
+
+
+    def main():
+        p = argparse.ArgumentParser()
+        p.add_argument("log")
+        p.add_argument("--out", default="triage.json")
+        args = p.parse_args()
+
+        with open(args.log, encoding="utf-8", errors="replace") as f:
+            lines = [line.rstrip("\n") for line in f]
+
+        summary = {}
+        for action in classify(lines):
+            summary[action] = summary.get(action, 0) + 1
+
+        with open(args.out, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, sort_keys=True)
+
+        if summary.get("block", 0) > 0:
+            sys.exit(1)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    **Workload:** AI/ML (CPU inference in a CI job, per log line)
+
+    #### [Bug] Model is still in training mode
+    - **Where:** after `torch.load(...)`
+    - **Issue:** you said the model has a dropout layer. Without `model.eval()`, dropout stays active during inference. Lines get randomly different classes between runs, and a random "block" can fail your pipeline.
+    - **Fix:** call `model.eval()` once after loading. Scores can change slightly after this fix, because they now become deterministic.
+
+    #### [High] Autograd tracks every forward pass
+    - **Where:** `model(feats[i:i + batch_size])` in `classify`
+    - **Issue:** PyTorch builds a computation graph for a backward pass that never happens. This costs CPU time and memory for every batch, on every push.
+    - **Fix:** put `@torch.inference_mode()` on `classify`.
+    - **Impact:** reduces E for every line classified. In Green Metrics Tool micro-benchmarks, 100,000 CPU inferences used about 14% less energy with `torch.no_grad()`.
+
+    #### [Low] Range and modulo guards in `action_for`
+    - **Where:** `action_for`, called once per log line
+    - **Issue:** the chain mixes range checks with a modulo test, but it only maps a class id to an action. In Green Metrics Tool micro-benchmarks, 10,000,000 classifications with simple equality branches used about 16% less CPU energy than complex range/modulo conditions. Here it is small next to the model forward pass, so this is a cleanup more than a real saving.
+    - **Fix:** use plain equality checks. For ids 0 to 7 the result is the same as before. Ids of 8 or more cannot happen with 8 output classes. The old code would have mapped 8 to "retry", the new code maps it to "ignore".
+    - **Impact:** E, a small saving per line.
+
+    Fixed script (CLI and JSON format unchanged):
+
+    ```python
+    #!/usr/bin/env python3
+    """Triage a failed CI job log: classify each line and write a summary."""
+    import argparse
+    import json
+    import sys
+
+    import torch
+
+    from triage.features import encode_lines  # returns float tensor (n, 256)
+
+    model = torch.load("models/ci_triage.pt", weights_only=False)
+    model.eval()
+
+
+    def action_for(cls: int) -> str:
+        if cls == 2 or cls == 5:
+            return "retry"
+        if cls == 3 or cls == 4:
+            return "notify_owner"
+        if cls == 6 or cls == 7:
+            return "block"
+        return "ignore"
+
+
+    @torch.inference_mode()
+    def classify(lines, batch_size=512):
+        feats = encode_lines(lines)
+        actions = []
+        for i in range(0, len(feats), batch_size):
+            logits = model(feats[i:i + batch_size])
+            for cls in logits.argmax(dim=1).tolist():
+                actions.append(action_for(cls))
+        return actions
+
+
+    def main():
+        p = argparse.ArgumentParser()
+        p.add_argument("log")
+        p.add_argument("--out", default="triage.json")
+        args = p.parse_args()
+
+        with open(args.log, encoding="utf-8", errors="replace") as f:
+            lines = [line.rstrip("\n") for line in f]
+
+        summary = {}
+        for action in classify(lines):
+            summary[action] = summary.get(action, 0) + 1
+
+        with open(args.out, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, sort_keys=True)
+
+        if summary.get("block", 0) > 0:
+            sys.exit(1)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Already good:** the lines are encoded once and run through the model in batches, and `argmax` is taken per batch instead of per line.
+verify:
+  static_only: needs torch, the triage.features module and the trained model file

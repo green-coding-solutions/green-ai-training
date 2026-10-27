@@ -1,0 +1,86 @@
+id: gen-6593849-00081-refactor
+category: refactor
+language: python
+patterns:
+- regex-precompile
+- vectorize-or-jit
+facts:
+- F-REGEX
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    fix this, nightly job takes forever (~6M lines per file)
+
+    ```python
+    import re
+
+    def load_latencies(path):
+        vals = []
+        with open(path) as f:
+            for line in f:
+                m = re.match(r'^\S+ \S+ "(?:GET|POST) (\S+) HTTP/1\.\d" (\d{3}) (\d+)ms$', line.strip())
+                if m and m.group(2) != "404":
+                    vals.append(int(m.group(3)))
+        return vals
+
+    def bucketize(latencies, width=25, max_bucket=40):
+        counts = [0] * (max_bucket + 1)
+        for ms in latencies:
+            b = int(ms // width)
+            if b > max_bucket:
+                b = max_bucket
+            counts[b] += 1
+        return counts
+
+    def report(path):
+        counts = bucketize(load_latencies(path))
+        for i, c in enumerate(counts):
+            if c:
+                print(f"{i * 25:>4}ms+ {c}")
+    ```
+- role: assistant
+  content: |
+    ```python
+    import re
+
+    import numpy as np
+    from numba import njit
+
+    LINE_RE = re.compile(r'^\S+ \S+ "(?:GET|POST) (\S+) HTTP/1\.\d" (\d{3}) (\d+)ms$')
+
+    def load_latencies(path):
+        vals = []
+        with open(path) as f:
+            for line in f:
+                m = LINE_RE.match(line.strip())
+                if m and m.group(2) != "404":
+                    vals.append(int(m.group(3)))
+        return np.array(vals, dtype=np.int64)
+
+    @njit(cache=True)
+    def bucketize(latencies, width=25, max_bucket=40):
+        counts = np.zeros(max_bucket + 1, dtype=np.int64)
+        for i in range(latencies.shape[0]):
+            b = latencies[i] // width
+            if b > max_bucket:
+                b = max_bucket
+            counts[b] += 1
+        return counts
+
+    def report(path):
+        counts = bucketize(load_latencies(path))
+        for i, c in enumerate(counts):
+            if c:
+                print(f"{i * 25:>4}ms+ {c}")
+    ```
+
+    **Green Notes**
+    - **JIT the counting loop** (reduces E): `bucketize` is a pure numeric loop that runs once per line. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples in a pure Python loop used about 4× more CPU energy than the same loop with Numba `@njit`. `cache=True` keeps the compiled code between nightly runs, so the compile cost is paid once.
+    - **Compile the regex once** (reduces E): the pattern is now a module constant. This is a small win. In the same benchmarks, a precompiled pattern used about 18% less than an inline `re.match` over 1,000,000 matches, because Python's `re` caches compiled patterns anyway.
+    - The regex parsing still runs in plain Python. Only the counting moved into Numba.
+    - `bucketize` now returns a NumPy array instead of a list. The printed report is the same.
+
+    *Not applied:* Numba for tiny inputs. With only a few thousand lines the compile step costs more than it saves, and the extra dependency is not worth it.
+verify:
+  static_only: answer uses numba, which is not available in stdlib + numpy

@@ -1,0 +1,73 @@
+id: gen-6593849-00004-generation
+category: generation
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    hi, im new to python and not sure what is wrong with my script. i have a csv export of our shop order lines (columns order_id, sku, variant, qty), around 1 million lines every month. the variant column looks like `Size: XL / Color: Navy` or only `Color: Red` or sometimes empty. i need a function that gives me size and color from this text, and then count how many units we sold for every size + color. my first try works but feels slow. can you write it the right way?
+- role: assistant
+  content: |
+    Here is a version that reads the file once and parses each variant text with a cached function:
+
+    ```python
+    import csv
+    import sys
+    from collections import Counter
+    from functools import lru_cache
+
+
+    @lru_cache(maxsize=4096)
+    def parse_variant(label):
+        """Return (size, color) from 'Size: XL / Color: Navy'. Missing parts are None."""
+        parts = {}
+        for chunk in label.split("/"):
+            key, sep, value = chunk.partition(":")
+            if sep:
+                parts[key.strip().lower()] = value.strip()
+        return parts.get("size"), parts.get("color")
+
+
+    def units_by_variant(path):
+        totals = Counter()
+        with open(path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                totals[parse_variant(row["variant"])] += int(row["qty"])
+        return totals
+
+
+    if __name__ == "__main__":
+        for (size, color), units in units_by_variant(sys.argv[1]).most_common():
+            print(f"{size or '-'}\t{color or '-'}\t{units}")
+    ```
+
+    Run it with `python variants.py orders.csv`. It prints one line per size and color, best sellers first.
+
+    **Green Notes**
+    - **Memoize repeated pure computations** (reduces E): a shop has only a small set of distinct variant texts, but they repeat on millions of lines. With `lru_cache`, each text is split and parsed once, and every repeat is a cache hit. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over 200 distinct inputs used ~43 J uncached and ~4.7 J with `lru_cache`, about 9× less CPU energy. Your savings depend on how much the variant texts repeat.
+    - **Safe to cache:** the function returns a tuple, which cannot be changed by the caller. If it returned a dict, one caller could change the cached value for everyone.
+    - **Bounded cache:** `maxsize` keeps memory fixed. If almost every variant text were unique, the cache would only add overhead, so remove it in that case.
+verify:
+  module: true
+  test: |-
+    import csv, os, tempfile
+    assert parse_variant("Size: XL / Color: Navy") == ("XL", "Navy")
+    assert parse_variant("Color: Red") == (None, "Red")
+    assert parse_variant("") == (None, None)
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "orders.csv")
+    with open(p, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["order_id", "sku", "variant", "qty"])
+        w.writerow([1, "A", "Size: XL / Color: Navy", 2])
+        w.writerow([2, "A", "Size: XL / Color: Navy", 3])
+        w.writerow([3, "B", "Color: Red", 1])
+        w.writerow([4, "C", "", 4])
+    t = units_by_variant(p)
+    assert t[("XL", "Navy")] == 5
+    assert t[(None, "Red")] == 1
+    assert t[(None, None)] == 4
+    assert parse_variant.cache_info().hits >= 1

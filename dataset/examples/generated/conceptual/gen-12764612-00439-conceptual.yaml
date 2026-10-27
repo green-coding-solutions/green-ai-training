@@ -1,0 +1,55 @@
+id: gen-12764612-00439-conceptual
+category: conceptual
+language: text
+patterns:
+- async-concurrent-io
+- context-tradeoff
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    We're discussing whether to rewrite the extract step of our nightly ETL with asyncio and I'd like a clear answer before we spend sprint time on it.
+
+    Setup: a partner API with about 20 list endpoints. We fetch them one after another with `requests`, about 400 calls in total, and the whole extract takes roughly 15 minutes. Then a pandas transform and a load into Postgres. The job runs on a small VM from cron at 02:00. The partner API allows about 10 requests per second.
+
+    Requirements for the answer: does async actually reduce energy here, or just wall time? What would make it not worth it? And what should we watch out for if we do it? Short and honest please, no marketing.
+- role: assistant
+  content: |
+    Mostly wall time, and only some energy. It is worth it only under certain conditions.
+
+    **What was measured.** In Green Metrics Tool micro-benchmarks with 10 HTTP requests, sync `urllib` used ~9.1 J and 3.1 s. Async `httpx` used ~8.4 J and 2.6 s. That is about 7% less CPU energy and about 17% less wall time. For small request counts the gain is mostly wall time. I would not scale those figures to your 400 calls. The benchmark does not cover your API, rate limit or payload sizes.
+
+    **Why the saving is mostly time.** While a sync client waits for a response, the CPU is mostly idle. Concurrency overlaps that waiting. The CPU work (TLS, JSON parsing) stays about the same. So the saving comes from the VM, the worker slot and the job's memory being held for less time, not from less computation.
+
+    **When it is not worth it:**
+
+    - **The VM runs 24/7 anyway.** A shorter job then just means more idle time on the same machine.
+    - **The transform and load dominate.** Async does not speed up pandas or Postgres work.
+    - **Pages depend on each other.** If page N+1 needs a cursor from page N, that chain stays sequential. Only the 20 endpoints can run in parallel.
+    - **The rate limit is the bottleneck.** At 10 requests per second, 400 calls take about 40 s at best. You cannot go faster, and bursts that trigger 429 retries waste work.
+
+    **If you do it:**
+
+    - Cap concurrency with a semaphore, set below the partner's limit.
+    - Run the 20 endpoints concurrently, but keep paging inside each endpoint sequential.
+    - Collect results with `asyncio.gather`, which keeps result order the same as the input order.
+
+    ```python
+    import asyncio
+    import httpx
+
+    async def fetch_all(urls, limit=8):
+        sem = asyncio.Semaphore(limit)
+        async with httpx.AsyncClient(timeout=30) as client:
+            async def get(url):
+                async with sem:
+                    r = await client.get(url)
+                    r.raise_for_status()
+                    return r.json()
+            return await asyncio.gather(*(get(u) for u in urls))
+    ```
+
+    **Decision rule.** First time the stages. If the extract is most of the 15 minutes and the VM is shut down or reused when the job ends, do it. If not, keep the simple sync code. To check, compare `time` and `perf stat` for the old and new extract on the same run, or use the Green Metrics Tool with a usage scenario.
+verify:
+  static_only: conceptual answer

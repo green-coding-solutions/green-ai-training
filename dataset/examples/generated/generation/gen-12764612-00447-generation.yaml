@@ -1,0 +1,65 @@
+id: gen-12764612-00447-generation
+category: generation
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    ```python
+    import math
+    from dataclasses import dataclass
+
+    @dataclass
+    class WaitPolicy:
+        scale: float
+        cap: float
+        weight: float
+
+    def wait_scores(wait_seconds, policy):
+        """Score every CI job queue wait for the runner autoscaler.
+
+        wait_seconds: iterable of floats, one per job, can be millions
+        per nightly run.
+        score = min(log1p(wait / policy.scale), policy.cap) * policy.weight
+        Negative waits (clock skew between scheduler and runner) count as 0.
+        Return a list of scores in input order.
+        """
+        ...
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```python
+    import math
+
+    def wait_scores(wait_seconds, policy):
+        log1p = math.log1p
+        scale = policy.scale
+        cap = policy.cap
+        weight = policy.weight
+        return [
+            min(log1p(max(w, 0) / scale), cap) * weight
+            for w in wait_seconds
+        ]
+    ```
+
+    **Green Notes**
+    - **Hoist loop-invariant lookups** (reduces E): `math.log1p`, `policy.scale`, `policy.cap` and `policy.weight` are looked up once, not once per job. With millions of waits per run, that removes several attribute lookups per element. The gain is small. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local before a 10,000,000-iteration loop saved about 4-5%. It only matters because this loop runs on every job.
+    - **List comprehension** keeps the per-element work in one tight loop, with no repeated `append` calls.
+
+    The code assumes `policy` does not change while the function runs. If another thread can change it, read the values once per batch, as done here.
+verify:
+  test: |-
+    from types import SimpleNamespace
+    p = SimpleNamespace(scale=30.0, cap=3.0, weight=2.0)
+    r = wait_scores([0, -5, 30, 1e9], p)
+    assert len(r) == 4
+    assert r[0] == 0
+    assert r[1] == 0
+    assert abs(r[2] - math.log1p(1.0) * 2.0) < 1e-12
+    assert r[3] == 6.0
+    assert wait_scores([], p) == []

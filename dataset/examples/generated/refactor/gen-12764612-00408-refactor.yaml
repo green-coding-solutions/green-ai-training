@@ -1,0 +1,86 @@
+id: gen-12764612-00408-refactor
+category: refactor
+language: python
+patterns:
+- keep-star-imports
+- string-join
+facts:
+- F-IMPORT
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    hello, i have script what make daily error report from our app logs, it is run by cron on log server and some logs are big (few million lines). can you optimize it please? my colleague say the imports on top are bad also, maybe they make it slow, i dont know
+
+    ```python
+    from os.path import *
+    from collections import *
+
+    def build_report(path):
+        counts = Counter()
+        report = ""
+        with open(path) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                level = parts[2]
+                counts[level] += 1
+                if level == "ERROR":
+                    report += basename(path) + ": " + line.strip() + "\n"
+        report += "\nSummary\n"
+        for level, n in sorted(counts.items()):
+            report += level + ": " + str(n) + "\n"
+        return report
+    ```
+- role: assistant
+  content: |
+    ```python
+    from os.path import *
+    from collections import *
+
+    def build_report(path):
+        counts = Counter()
+        chunks = []
+        with open(path) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                level = parts[2]
+                counts[level] += 1
+                if level == "ERROR":
+                    chunks.append(f"{basename(path)}: {line.strip()}\n")
+        chunks.append("\nSummary\n")
+        chunks.extend(f"{level}: {n}\n" for level, n in sorted(counts.items()))
+        return "".join(chunks)
+    ```
+
+    **Green Notes**
+    - **Join strings instead of `+=` in loops** (reduces E): the report grows with every ERROR line, so on big logs the `+=` string is built again and again. Collecting the pieces in a list and joining once does the copy work one time. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces used ~469 J with `+=` and ~1.8 J with `"".join()`, roughly 260× less.
+    - *Not changed:* the star imports. In Green Metrics Tool micro-benchmarks, 1,000 Python process starts used ~3103 J with `from sympy import *` and ~3093 J with `import sympy`, so there is no measurable energy difference. Your colleague's idea will not make the script faster or greener, so I left the imports as they are. What costs energy is loading a heavy module at all, and `os.path` and `collections` are light.
+
+    The report text is exactly the same as before.
+verify:
+  equivalence:
+    driver: |-
+      import os
+      import tempfile
+
+      lines = [
+          "2026-10-01 10:00:00 INFO started",
+          "2026-10-01 10:00:01 ERROR disk full",
+          "short",
+          "2026-10-01 10:00:02 WARN slow query",
+          "2026-10-01 10:00:03 ERROR timeout on db",
+          "2026-10-01 10:00:04 INFO done",
+      ]
+      lines = [l.replace("2026-10-01 ", "2026-10-01_") for l in lines]
+      d = tempfile.mkdtemp()
+      p = os.path.join(d, "app.log")
+      with open(p, "w") as f:
+          f.write("\n".join(lines) + "\n")
+      print(build_report(p))
+      empty = os.path.join(d, "empty.log")
+      open(empty, "w").close()
+      print(repr(build_report(empty)))

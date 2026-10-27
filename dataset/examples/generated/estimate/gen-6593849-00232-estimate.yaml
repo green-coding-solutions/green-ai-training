@@ -1,0 +1,58 @@
+id: gen-6593849-00232-estimate
+category: estimate
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    Log tailer for our ingest hosts. It keeps every parsed line of the session in memory, newest first, and the UI asks for the top 100.
+
+    ```python
+    class LogTail:
+        def __init__(self, path):
+            self.path = path
+            self.entries = []
+            self.offset = 0
+
+        def poll(self):
+            with open(self.path) as f:
+                f.seek(self.offset)
+                for line in f:
+                    level, _, msg = line.rstrip("\n").partition(" ")
+                    self.entries.insert(0, (level, msg))
+                self.offset = f.tell()
+
+        def newest(self, n=100):
+            return self.entries[:n]
+    ```
+
+    Sessions can run for days, a busy host writes millions of lines. What would we save by fixing the `insert(0, ...)`? Diff only please.
+- role: assistant
+  content: |
+    ```diff
+    +from itertools import islice
+    +
+     class LogTail:
+         ...
+             def poll(self):
+                 ...
+    -                self.entries.insert(0, (level, msg))
+    +                self.entries.append((level, msg))
+                 ...
+             def newest(self, n=100):
+    -            return self.entries[:n]
+    +            return list(islice(reversed(self.entries), n))
+    ```
+
+    **Saving:** large, and it grows with the list. In Green Metrics Tool micro-benchmarks, 1,000,000 × `list.insert(0, x)` used ~1515 J of CPU energy. 1,000,000 × `list.append(x)` used ~1.2 J. That is over 1000× less. Every front insert shifts all existing items, so the cost per line rises as the session list grows. `append` is O(1), and `newest()` now reads the last `n` items in reverse, which is O(n).
+
+    Limits of that number:
+    - The benchmark grew one list to 1,000,000 items. It is not your workload, so don't scale it to your hosts. If you kept only a few hundred entries, the shift would cost little and the saving would be small. For multi-day sessions with millions of lines, you are in the case that was measured.
+    - Behavior is the same: `newest()` still returns newest first. Only `entries` itself is now oldest first, so check for other code that reads it directly.
+
+    To get your own number, replay a fixed log file of realistic size through `poll()` with each version. Run it in a Green Metrics Tool usage scenario, or compare CPU time with `perf stat` or `time`.
+verify:
+  static_only: answer is a diff of the pasted class, not a standalone runnable block

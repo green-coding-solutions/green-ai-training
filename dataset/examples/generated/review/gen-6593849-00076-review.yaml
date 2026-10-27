@@ -1,0 +1,147 @@
+id: gen-6593849-00076-review
+category: review
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    Hello, can you please review my webhook. Our payment provider call it when a order is paid. Sometimes it is slow and then the other pages of our API are waiting too, I dont understand why. We use FastAPI, 1 worker.
+
+    ```python
+    import requests
+    from fastapi import FastAPI, Request
+
+    app = FastAPI()
+
+    STOCK_URL = "https://stock.internal.example/api/reserve"
+    INVOICE_URL = "https://billing.internal.example/api/invoices"
+    MAIL_URL = "https://mail.internal.example/api/send"
+    API_KEY = "sk_live_9f3a1c7e42b8d05a"
+
+
+    @app.post("/webhooks/order-paid")
+    async def order_paid(request: Request):
+        order = await request.json()
+        headers = {"Authorization": "Bearer " + API_KEY}
+
+        reserved = []
+        for item in order["items"]:
+            r = requests.post(
+                STOCK_URL,
+                json={"sku": item["sku"], "qty": item["qty"]},
+                headers=headers,
+            )
+            if r.status_code == 200:
+                reserved.append(item["sku"])
+
+        inv = requests.post(
+            INVOICE_URL,
+            json={"order_id": order["id"], "total": order["total"]},
+            headers=headers,
+        )
+        invoice_id = inv.json()["invoice_id"]
+
+        try:
+            requests.post(
+                MAIL_URL,
+                json={"to": order["email"], "template": "paid", "invoice": invoice_id},
+                headers=headers,
+            )
+        except:
+            pass
+
+        return {"reserved": reserved, "invoice_id": invoice_id}
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (webhook handler)
+
+    #### [Security] Live API key in the source code
+    - **Where:** `API_KEY = "sk_live_..."`
+    - **Issue:** the key is in your repository and in every copy of it. Anyone who can read the code can call your billing and stock services.
+    - **Fix:** rotate this key now and load the new one from the environment: `os.environ["INTERNAL_API_KEY"]`.
+
+    #### [Bug] Failed invoice call is not handled
+    - **Where:** `inv.json()["invoice_id"]`
+    - **Issue:** if the billing service answers with an error, this raises `KeyError` and the webhook returns 500. The payment provider will then retry, and the stock is reserved a second time for the same order.
+    - **Fix:** call `raise_for_status()` on the invoice response. Also make the stock call safe to repeat, for example by sending the order id with it, if the stock service supports that.
+
+    #### [Bug] Bare `except: pass` hides mail errors
+    - **Where:** the mail call
+    - **Issue:** every error is dropped silently, even `KeyboardInterrupt`. You will never know that customers get no mail.
+    - **Fix:** catch `httpx.HTTPError` only and write a log line.
+
+    #### [High] Blocking calls inside `async def`
+    - **Where:** all `requests.post(...)` calls
+    - **Issue:** `requests` is blocking. In an `async def` handler it freezes the event loop, so with one worker no other request is served until all calls are done. This is why your other pages wait. The calls also run one after another: N stock calls, then the invoice, then the mail.
+    - **Fix:** use an async client and run the independent calls together. The stock calls and the invoice call do not need each other, so they can run at the same time. The mail needs `invoice_id`, so it stays after them.
+      ```python
+      import asyncio
+      import logging
+      import os
+      from contextlib import asynccontextmanager
+
+      import httpx
+      from fastapi import FastAPI, Request
+
+      logger = logging.getLogger(__name__)
+
+      STOCK_URL = "https://stock.internal.example/api/reserve"
+      INVOICE_URL = "https://billing.internal.example/api/invoices"
+      MAIL_URL = "https://mail.internal.example/api/send"
+
+
+      @asynccontextmanager
+      async def lifespan(app: FastAPI):
+          app.state.http = httpx.AsyncClient(
+              timeout=10,
+              headers={"Authorization": "Bearer " + os.environ["INTERNAL_API_KEY"]},
+          )
+          yield
+          await app.state.http.aclose()
+
+
+      app = FastAPI(lifespan=lifespan)
+
+
+      async def reserve(http: httpx.AsyncClient, item: dict):
+          r = await http.post(STOCK_URL, json={"sku": item["sku"], "qty": item["qty"]})
+          return item["sku"] if r.status_code == 200 else None
+
+
+      @app.post("/webhooks/order-paid")
+      async def order_paid(request: Request):
+          order = await request.json()
+          http = request.app.state.http
+
+          results, inv = await asyncio.gather(
+              asyncio.gather(*(reserve(http, i) for i in order["items"])),
+              http.post(INVOICE_URL, json={"order_id": order["id"], "total": order["total"]}),
+          )
+          reserved = [sku for sku in results if sku]
+          inv.raise_for_status()
+          invoice_id = inv.json()["invoice_id"]
+
+          try:
+              await http.post(
+                  MAIL_URL,
+                  json={"to": order["email"], "template": "paid", "invoice": invoice_id},
+              )
+          except httpx.HTTPError:
+              logger.warning("mail for order %s failed", order["id"], exc_info=True)
+
+          return {"reserved": reserved, "invoice_id": invoice_id}
+      ```
+    - **Impact:** M and wall time. The worker stays free for other requests, and the handler needs about as long as its slowest call plus the mail, not the sum of all calls. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, sync `urllib` used ~9.1 J and 3.1 s, async `httpx` ~8.4 J and 2.6 s. That is about 7% less CPU energy and about 17% less wall time. So the gain is mostly time, not CPU. One shared client also reuses connections instead of opening new ones.
+
+    #### [Medium] No timeouts
+    - **Where:** every `requests.post(...)`
+    - **Issue:** `requests` waits without limit by default. One stuck service can hold the webhook, and its retries, forever.
+    - **Fix:** the shared client above sets `timeout=10`.
+
+    **Already good:** the handler is small, and the email is correctly done last because it needs the invoice id.
+verify:
+  static_only: needs network access to internal services and FastAPI and httpx packages

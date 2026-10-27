@@ -1,0 +1,108 @@
+id: gen-6593849-00225-review
+category: review
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    Review of our GitLab review-app job for the ETL repo. Diff only please, no essay.
+
+    ```yaml
+    stages: [test, deploy]
+
+    variables:
+      NAMESPACE: etl-previews
+
+    run_tests:
+      stage: test
+      image: python:3.12-slim
+      script:
+        - pip install --no-cache-dir -r requirements.txt
+        - pytest -q
+
+    deploy_review:
+      stage: deploy
+      image: alpine/helm:3.14.0
+      script:
+        - >
+          helm upgrade --install etl-$CI_COMMIT_REF_SLUG ./chart
+          --namespace $NAMESPACE --create-namespace
+          --set image.tag=$CI_COMMIT_SHA
+          --set replicaCount=3
+          --set postgres.enabled=true
+          --set redis.enabled=true
+          --set worker.enabled=true
+          --set worker.pollSeconds=5
+          --set db.password=$PREVIEW_DB_PASSWORD
+      environment:
+        name: review/$CI_COMMIT_REF_SLUG
+        url: https://$CI_COMMIT_REF_SLUG.etl-preview.example.com
+      rules:
+        - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (CI/CD for preview environments)
+
+    #### [Bug] Helm release name can exceed the 53-character limit
+    - **Where:** `etl-$CI_COMMIT_REF_SLUG`
+    - **Issue:** a branch slug can be up to 63 characters. Helm rejects release names longer than 53, so long branch names fail to deploy.
+    - **Fix:** use the MR number: `etl-mr-$CI_MERGE_REQUEST_IID`. It is short, unique and easy to reuse in the stop job.
+
+    #### [High] Preview is never removed
+    - **Where:** `deploy_review`, the `environment` block
+    - **Issue:** there is no `on_stop` job and no `auto_stop_in`. Every MR leaves a full environment running after the merge, until someone cleans it up by hand.
+    - **Fix:** add a stop job and an expiry (see the diff below).
+    - **Impact:** reduces E and M for every hour the environment would otherwise exist. In Green Metrics Tool micro-benchmarks, an idle preview environment with 3 app replicas, Postgres, Redis and a polling worker used only about 3% more CPU energy per minute than one with 1 replica and Postgres. Machine energy differed by less than 1%. The saving is in environments that no longer exist, not in trimming idle services.
+
+    #### [Low] 3 replicas and a 5 s polling worker in a preview
+    - **Where:** `replicaCount=3`, `worker.pollSeconds=5`
+    - **Issue:** previews don't need production redundancy. Idle replicas cost little CPU, but they reserve memory and cluster capacity.
+    - **Fix:** `replicaCount=1`. Keep the worker only if the MR needs it.
+
+    ```yaml
+    deploy_review:
+      stage: deploy
+      image: alpine/helm:3.14.0
+      script:
+        - >
+          helm upgrade --install etl-mr-$CI_MERGE_REQUEST_IID ./chart
+          --namespace $NAMESPACE --create-namespace
+          --set image.tag=$CI_COMMIT_SHA
+          --set replicaCount=1
+          --set postgres.enabled=true
+          --set redis.enabled=true
+          --set worker.enabled=true
+          --set worker.pollSeconds=5
+          --set db.password=$PREVIEW_DB_PASSWORD
+      environment:
+        name: review/mr-$CI_MERGE_REQUEST_IID
+        url: https://mr-$CI_MERGE_REQUEST_IID.etl-preview.example.com
+        on_stop: stop_review
+        auto_stop_in: 2 days
+      rules:
+        - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+    stop_review:
+      stage: deploy
+      image: alpine/helm:3.14.0
+      variables:
+        GIT_STRATEGY: none
+      script:
+        - helm uninstall etl-mr-$CI_MERGE_REQUEST_IID --namespace $NAMESPACE --ignore-not-found
+      environment:
+        name: review/mr-$CI_MERGE_REQUEST_IID
+        action: stop
+      rules:
+        - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+          when: manual
+    ```
+
+    GitLab runs `stop_review` when the MR is merged or the branch is deleted. `GIT_STRATEGY: none` lets it run after the branch is gone. The preview URL changes with the new naming, so update any links that use it.
+
+    **Already good:** `run_tests` uses a slim image and `--no-cache-dir`, and the preview job only runs for merge request pipelines.
+verify:
+  static_only: GitLab CI YAML for Helm and Kubernetes, nothing runnable with stdlib

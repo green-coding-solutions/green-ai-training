@@ -1,0 +1,90 @@
+id: gen-6593849-00194-review
+category: review
+language: bash
+patterns:
+- compress-transmitted
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    Review of our gateway summary job. Runs hourly on ~300 LTE gateways (ARM, bash 5). Just the diff please, no essay.
+
+    ```bash
+    #!/bin/bash
+    # hourly: summarize sensor readings, upload summary + raw log
+    LOG=/var/lib/gw/readings.log
+    OUT=/tmp/gw-summary.txt
+    URL=https://collector.example.net/v1/summary
+
+    # line format: <ts> <sensor> <status> <millivolts>
+    declare -A n
+    declare -A bad
+    while read -r line; do
+        sensor=$(echo "$line" | cut -d' ' -f2)
+        status=$(echo "$line" | cut -d' ' -f3)
+        n[$sensor]=$(expr ${n[$sensor]:-0} + 1)
+        if [ "$status" != "ok" ]; then
+            bad[$sensor]=$(expr ${bad[$sensor]:-0} + 1)
+        fi
+    done < $LOG
+
+    for s in "${!n[@]}"; do
+        echo "$s ${n[$s]} ${bad[$s]:-0}"
+    done | sort > $OUT
+
+    cp $LOG /tmp/readings.raw
+    xz -9 -k /tmp/readings.raw
+    curl -s -X POST -F "summary=@$OUT" -F "raw=@/tmp/readings.raw.xz" $URL
+    rm -f $LOG
+    ```
+- role: assistant
+  content: |
+    **Workload:** IoT gateway script (runs hourly on many devices)
+
+    #### [Bug] Log is deleted even when the upload fails
+    - **Where:** `curl -s ... $URL` followed by `rm -f $LOG`
+    - **Issue:** `curl -s` returns success on an HTTP 4xx/5xx, and the `rm` runs whatever happens. A failed or rejected upload on a flaky LTE link loses the hour's readings. Lines the daemon appends between the read and the `rm` are lost too.
+    - **Fix:**
+      ```bash
+      curl -sS --fail -X POST -F "summary=@$OUT" -F "raw=@$RAW.zst" "$URL" && rm -f "$LOG"
+      ```
+      If the daemon reopens its log on SIGHUP, rename the file first and upload the renamed copy to close the append race.
+
+    #### [Security] Predictable files in /tmp
+    - **Where:** `/tmp/gw-summary.txt`, `/tmp/readings.raw`
+    - **Issue:** fixed names in a shared directory allow symlink tricks, and two overlapping runs overwrite each other. Unquoted `$LOG`, `$OUT` and `$URL` also break on spaces.
+    - **Fix:**
+      ```bash
+      tmp=$(mktemp -d) || exit 1
+      trap 'rm -rf "$tmp"' EXIT
+      OUT=$tmp/summary.txt
+      RAW=$tmp/readings.raw
+      ```
+
+    #### [High] Several processes started per log line
+    - **Where:** the `while read` loop
+    - **Issue:** every line starts two `cut` pipelines, two `echo`s and one or two `expr` calls. Process starts dominate shell scripts. In Green Metrics Tool micro-benchmarks on a 20,000-line access log, a loop with `$(echo | cut)` and `$(expr)` used ~1302 J. The same loop with builtins used ~4.3 J, and one `awk` pass used ~1.0 J, over 1000× less, with identical output. The log size on your gateways may differ, but the per-line cost pattern is the same, and a small ARM CPU feels it more.
+    - **Fix:** replace the loop and the output `for` with one `awk` pass:
+      ```bash
+      awk '{ n[$2]++; if ($3 != "ok") bad[$2]++ }
+           END { for (s in n) print s, n[s], bad[s] + 0 }' "$LOG" | sort > "$OUT"
+      ```
+      The output is the same for single-space-separated lines. `awk` splits on runs of whitespace, `cut -d' '` does not.
+    - **Impact:** E on every gateway, every hour. This is the largest saving in the script.
+
+    #### [Medium] `xz -9` for data that is compressed every hour
+    - **Where:** `cp $LOG /tmp/readings.raw` and `xz -9 -k`
+    - **Issue:** `xz` is the most expensive common codec for data you compress often. In Green Metrics Tool micro-benchmarks on 100 MB of text, xz used ~458 J and zstd at its default level ~16 J, about 29× less. These figures compare energy only, not file size. xz usually gives smaller files, and you pay per MB. Compare the sizes on a real log before you switch, and try a higher zstd level if the bytes matter more.
+    - **Fix:**
+      ```bash
+      zstd -q -c "$LOG" > "$RAW.zst"
+      ```
+      This also drops the extra `cp`. The collector must accept `.zst` instead of `.xz`.
+    - **Impact:** E on the gateway for each run. Bytes sent over LTE may go up slightly.
+
+    **Already good:** the data is compressed before it is sent, and `declare -A` is not an issue once `awk` does the counting.
+verify:
+  static_only: bash script needs gateway log files, zstd and a network endpoint

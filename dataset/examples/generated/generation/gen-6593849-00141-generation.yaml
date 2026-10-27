@@ -1,0 +1,71 @@
+id: gen-6593849-00141-generation
+category: generation
+language: python
+patterns:
+- deque-or-append
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    We have an ETL step that rebuilds the history of a ledger account from a nightly export. Each record is a dict like `{"id": "tx_91", "prev_id": "tx_90", "amount": 12.5}`. The first record of an account has `prev_id = None`. The export is not sorted, and records of many accounts are mixed in one file, but I only pass the records of one account plus the id of its newest record (the head).
+
+    Please write `rebuild_chain(records, head_id)` with these requirements:
+    - return the records as a list, oldest first, by following `prev_id` from the head back to the start
+    - chains can be a few million records long for old accounts
+    - raise `KeyError` if a `prev_id` points to a record that is not in the input
+    - raise `ValueError` if the chain has a cycle (we had corrupt exports before)
+    - records that are not on the chain are ignored
+- role: assistant
+  content: |
+    ```python
+    def rebuild_chain(records, head_id):
+        """Return the records of one account, oldest first, by walking prev_id from head_id."""
+        by_id = {r["id"]: r for r in records}
+
+        chain = []
+        seen = set()
+        current = head_id
+        while current is not None:
+            if current in seen:
+                raise ValueError(f"cycle detected at record {current!r}")
+            record = by_id.get(current)
+            if record is None:
+                raise KeyError(current)
+            seen.add(current)
+            chain.append(record)
+            current = record["prev_id"]
+
+        chain.reverse()
+        return chain
+    ```
+
+    **Green Notes**
+    - **Append, then reverse once** (reduces E): the walk goes newest to oldest, but the result must be oldest first. `chain.insert(0, record)` would shift the whole list on every step, so the work grows quadratically with chain length. In Green Metrics Tool micro-benchmarks, 1,000,000 `list.insert(0, x)` calls used about 1515 J and 1,000,000 `list.append(x)` calls used about 1.2 J. `append` plus one `reverse()` is O(n) in total.
+    - If you need to consume the chain while still building it, use `collections.deque` with `appendleft`, which is O(1). For a finished list as the return value, `reverse()` is simpler.
+    - The `seen` set and the `by_id` dict give O(1) lookups per step, so cycle detection adds no extra scan.
+verify:
+  test: |-
+    recs = [
+        {"id": "c", "prev_id": "b", "amount": 3},
+        {"id": "a", "prev_id": None, "amount": 1},
+        {"id": "x", "prev_id": None, "amount": 99},
+        {"id": "b", "prev_id": "a", "amount": 2},
+    ]
+    assert [r["id"] for r in rebuild_chain(recs, "c")] == ["a", "b", "c"]
+    assert [r["id"] for r in rebuild_chain(recs, "a")] == ["a"]
+    assert rebuild_chain(recs, None) == []
+    try:
+        rebuild_chain([{"id": "b", "prev_id": "zzz"}], "b")
+        raise SystemExit("expected KeyError")
+    except KeyError:
+        pass
+    try:
+        rebuild_chain([{"id": "a", "prev_id": "b"}, {"id": "b", "prev_id": "a"}], "a")
+        raise SystemExit("expected ValueError")
+    except ValueError:
+        pass
+    n = 200000
+    big = [{"id": i, "prev_id": i - 1 if i else None} for i in range(n)]
+    out = rebuild_chain(big, n - 1)
+    assert len(out) == n and out[0]["id"] == 0 and out[-1]["id"] == n - 1

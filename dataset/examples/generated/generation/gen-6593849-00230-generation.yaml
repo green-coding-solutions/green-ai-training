@@ -1,0 +1,79 @@
+id: gen-6593849-00230-generation
+category: generation
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    hello, I need a python function for our REST API (we have 4 languages: en, de, fr, es). It must read the Accept-Language header from the request and give back the best language we support. Header can look like `de-DE,de;q=0.9,en;q=0.8`. If nothing match, use english. Every request call this, so it should not be slow. Thx!
+- role: assistant
+  content: |
+    The header is parsed by a pure function. Browsers send only a few distinct header strings, so the result is cached by the raw header value.
+
+    ```python
+    from functools import lru_cache
+
+    SUPPORTED = ("en", "de", "fr", "es")
+    DEFAULT = "en"
+
+
+    @lru_cache(maxsize=512)
+    def pick_language(header: str) -> str:
+        """Return the best supported language for an Accept-Language header."""
+        if not header:
+            return DEFAULT
+
+        candidates = []
+        for position, part in enumerate(header.split(",")):
+            piece = part.strip()
+            if not piece:
+                continue
+            tag, *params = [p.strip() for p in piece.split(";")]
+            q = 1.0
+            for param in params:
+                if param.startswith("q="):
+                    try:
+                        q = float(param[2:])
+                    except ValueError:
+                        q = 0.0
+            if q <= 0:
+                continue
+            # highest q first, then the order in the header
+            candidates.append((-q, position, tag.lower()))
+
+        candidates.sort()
+        for _, _, tag in candidates:
+            if tag == "*":
+                return DEFAULT
+            base = tag.split("-")[0]
+            if base in SUPPORTED:
+                return base
+        return DEFAULT
+
+
+    # In a request handler:
+    #   lang = pick_language(request.headers.get("Accept-Language", ""))
+    ```
+
+    The function returns a plain string, so sharing the cached value between requests is safe.
+
+    **Green Notes**
+    - **Memoize repeated pure computations** (reduces E): the same few header strings arrive again and again, so the parsing runs once per distinct header instead of once per request. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over 200 distinct inputs used about 9× less CPU energy with `lru_cache` (~4.7 J vs ~43 J).
+    - **Bounded cache** (reduces M): `maxsize=512` keeps memory fixed, even if a client sends many strange headers. Old entries are dropped first.
+    - *Not applied:* caching on the full request or on user data. This only works because the function depends on one string and nothing else. If most inputs were unique, the cache would only add overhead.
+  verify:
+    test: |-
+      assert pick_language("de-DE,de;q=0.9,en;q=0.8") == "de"
+      assert pick_language("fr;q=0.5, es;q=0.8") == "es"
+      assert pick_language("") == "en"
+      assert pick_language("zh,ja;q=0.7") == "en"
+      assert pick_language("de;q=0, fr;q=0.2") == "fr"
+      assert pick_language("*") == "en"
+      assert pick_language("en-GB,en;q=abc") == "en"
+      before = pick_language.cache_info().hits
+      pick_language("fr;q=0.5, es;q=0.8")
+      assert pick_language.cache_info().hits == before + 1
+      assert pick_language.cache_info().maxsize == 512

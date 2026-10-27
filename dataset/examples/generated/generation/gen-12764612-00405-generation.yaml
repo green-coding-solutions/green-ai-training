@@ -1,0 +1,86 @@
+id: gen-12764612-00405-generation
+category: generation
+language: python
+patterns:
+- simple-conditions
+facts:
+- F-COND
+messages:
+- role: user
+  content: |
+    hi, i am beginner in python. i have big log files from an old app. every line starts with a number, then a | and then the text, like this:
+
+    30|2024-03-02 10:11:12|disk space low
+    10|2024-03-02 10:11:13|cache refreshed
+
+    the numbers are always 10, 20, 30, 40 or 50 (debug, info, warning, error, critical). i want a function that reads the file and tells me how many lines each level has. i am not sure how to write the if part, maybe with >= and <= ? thank you
+- role: assistant
+  content: |
+    The codes are exact values, so you don't need ranges. Plain `==` checks are enough.
+
+    ```python
+    from collections import Counter
+
+
+    def level_name(code):
+        if code == 10:
+            return "DEBUG"
+        elif code == 20:
+            return "INFO"
+        elif code == 30:
+            return "WARNING"
+        elif code == 40:
+            return "ERROR"
+        elif code == 50:
+            return "CRITICAL"
+        return "UNKNOWN"
+
+
+    def count_levels(path):
+        counts = Counter()
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                code_text, sep, _ = line.partition("|")
+                if not sep or not code_text.isdigit():
+                    counts["UNKNOWN"] += 1
+                    continue
+                counts[level_name(int(code_text))] += 1
+        return counts
+
+
+    if __name__ == "__main__":
+        import sys
+
+        for name, n in count_levels(sys.argv[1]).most_common():
+            print(f"{name}: {n}")
+    ```
+
+    The file is read line by line, so a big file does not fill your memory. Blank lines are skipped. Lines that don't start with a number and `|` are counted as `UNKNOWN`.
+
+    **Green Notes**
+    - **Simple equality conditions** (reduces E): the level check runs once per log line, so it is a hot path on big files. In Green Metrics Tool micro-benchmarks (10,000,000 classifications), simple equality branches used about 16% less CPU energy than complex range or modulo conditions.
+    - **Streaming read** (reduces M): one line in memory at a time instead of loading the whole file.
+    - *Not applied:* ranges. If other apps write codes like 15 or 35, you would need `<` or `>=` checks. For exact codes, equality is simpler and cheaper.
+verify:
+  module: true
+  test: |-
+    import os, tempfile
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "a.log")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("30|2024-03-02 10:11:12|disk space low\n")
+        f.write("10|2024-03-02 10:11:13|cache refreshed\n")
+        f.write("\n")
+        f.write("30|x|y\n")
+        f.write("50|x|y\n")
+        f.write("garbage line\n")
+        f.write("77|x|y\n")
+    c = count_levels(p)
+    assert c["WARNING"] == 2
+    assert c["DEBUG"] == 1
+    assert c["CRITICAL"] == 1
+    assert c["UNKNOWN"] == 2
+    assert c["INFO"] == 0 and c["ERROR"] == 0
+    assert level_name(20) == "INFO" and level_name(40) == "ERROR"

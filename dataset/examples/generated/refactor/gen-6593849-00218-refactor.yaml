@@ -1,0 +1,76 @@
+id: gen-6593849-00218-refactor
+category: refactor
+language: bash
+patterns:
+- bash-quoting
+facts:
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    We have a small gateway (Raspberry Pi class) in a cold storage hall. It reads sensor lines from a spool file and turns each one into a JSON line for the uplink. It runs as a service and the spool gets a few thousand lines per batch.
+
+    Requirements: same output byte for byte, still plain bash (no jq, no python on the box), and our linter wants single quotes where nothing is expanded. Please clean it up with that in mind.
+
+    ```bash
+    #!/usr/bin/env bash
+    # forward sensor readings to the uplink spool
+    set -u
+
+    SPOOL_IN="/var/spool/gw/readings.txt"
+    SPOOL_OUT="/var/spool/gw/uplink.ndjson"
+    GW_ID="${GW_ID:-gw-017}"
+
+    echo "gw-uplink: start, reading from $SPOOL_IN"
+
+    while read -r sensor value ts; do
+      if [[ "$sensor" == "#"* ]]; then
+        continue
+      fi
+      if [[ "$value" == "NaN" ]]; then
+        echo "gw-uplink: skip $sensor, no value" >&2
+        continue
+      fi
+      meta="\"fw\":\"2.4.1\",\"unit\":\"celsius\",\"site\":\"cold-store-3\",\"schema\":\"https://schemas.example.com/gw/v2\",\"qos\":1"
+      line="{\"gw\":\"$GW_ID\",\"sensor\":\"$sensor\",\"value\":$value,\"ts\":$ts,$meta}"
+      echo "$line" >> "$SPOOL_OUT"
+    done < "$SPOOL_IN"
+
+    echo "gw-uplink: done"
+    ```
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # forward sensor readings to the uplink spool
+    set -u
+
+    SPOOL_IN='/var/spool/gw/readings.txt'
+    SPOOL_OUT='/var/spool/gw/uplink.ndjson'
+    GW_ID="${GW_ID:-gw-017}"
+
+    echo "gw-uplink: start, reading from $SPOOL_IN"
+
+    while read -r sensor value ts; do
+      if [[ "$sensor" == '#'* ]]; then
+        continue
+      fi
+      if [[ "$value" == 'NaN' ]]; then
+        echo "gw-uplink: skip $sensor, no value" >&2
+        continue
+      fi
+      meta='"fw":"2.4.1","unit":"celsius","site":"cold-store-3","schema":"https://schemas.example.com/gw/v2","qos":1'
+      line="{\"gw\":\"$GW_ID\",\"sensor\":\"$sensor\",\"value\":$value,\"ts\":$ts,$meta}"
+      echo "$line" >> "$SPOOL_OUT"
+    done < "$SPOOL_IN"
+
+    echo 'gw-uplink: done'
+    ```
+
+    **Green Notes**
+    - **Single quotes for literals without expansion** (reduces E): `meta`, the paths, `'#'*`, `'NaN'` and the last message need no expansion, so they are single-quoted. Bash does not scan them for `$`, backticks or backslashes. `meta` also loses all its `\"` escapes, so it is easier to read. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal in a loop 1,000,000 times used ~314 J with double quotes and ~237 J with single quotes, about 24% less. Your literals are far shorter and the loop is far smaller, so expect a much smaller absolute saving. It is free, though, because `meta` is assigned once per reading.
+    - *Not applied:* the `line=` assignment, the start message and the skip message stay double-quoted, because they expand variables. The quotes around every variable stay as they are.
+
+    The output is identical: the single-quoted `meta` holds exactly the same characters as before.
+verify:
+  static_only: reads and writes spool files under /var/spool/gw

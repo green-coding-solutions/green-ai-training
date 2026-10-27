@@ -1,0 +1,92 @@
+id: gen-6593849-00149-review
+category: review
+language: bash
+patterns:
+- compress-stored
+- bash-builtins
+facts:
+- F-COMPRESS-CODECS
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    hi, i wrote this script to pack the log files of our sensor gateway. it runs from cron every 15 minutes and it works but the box feels slow when it runs. i dont know what is wrong, can you check it?
+
+    ```bash
+    #!/bin/bash
+    # archive gateway logs
+    SRC=/var/lib/gateway/logs
+    DEST=/mnt/backup/gateway
+    cd $SRC
+
+    for f in $(ls *.log); do
+        base=$(echo $f | sed 's/\.log$//')
+        day=$(date +%Y-%m-%d)
+        bzip2 -9 -c $f > $DEST/$base-$day.log.bz2
+        rm $f
+        echo "archived $f" >> /var/log/archive.log
+    done
+
+    # delete archives older than 30 days
+    find $DEST -name "*.bz2" -mtime +30 -exec rm {} \;
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (cron, every 15 minutes)
+
+    #### [Bug] The original log is deleted even if packing failed
+    - **Where:** `bzip2 ... > $DEST/...` followed by `rm $f`
+    - **Issue:** `rm` runs no matter what `bzip2` returned. If the backup disk is full or not mounted, you get an empty or partial archive and the log is gone.
+    - **Fix:** delete the log only when the compression command succeeded (see the full script below).
+
+    #### [Bug] Unquoted variables and `for f in $(ls ...)`
+    - **Where:** `cd $SRC`, `$(ls *.log)`, `$f`, `$DEST/...`, `find $DEST`
+    - **Issue:** a file name with a space is split into two words, and the wrong files get touched. `cd` also keeps going if it fails, and then `rm` runs in the wrong folder.
+    - **Fix:** loop over the glob directly, quote every variable, and stop if `cd` fails.
+
+    #### [High] Two extra processes per file
+    - **Where:** `$(echo $f | sed ...)` and `$(date +%Y-%m-%d)` inside the loop
+    - **Issue:** each is a subshell plus a program start (`echo | sed` is even two programs). Starting processes is usually the main cost in shell loops. In Green Metrics Tool micro-benchmarks, a log-summary loop with `$(echo | cut)` and `$(expr)` per line used ~1302 J, while the same loop with builtins only used ~4.3 J.
+    - **Fix:** `${f%.log}` strips the suffix with no process. The date is the same for the whole run, so compute it once with the `printf` builtin before the loop.
+    - **Impact:** E, a large cut for the loop itself. It grows with the number of files per run.
+
+    #### [Medium] `bzip2 -9` for data that is compressed all day
+    - **Where:** `bzip2 -9 -c`
+    - **Issue:** you compress every 15 minutes, so the compression cost is paid 96 times a day. Keeping the logs 30 days is a good reason to compress them. But bzip2 is one of the slower codecs. In Green Metrics Tool micro-benchmarks on 100 MB of text, compressing used ~106 J with bzip2 and ~16 J with zstd. Decompressing used ~52 J with bzip2 and ~5.3 J with zstd. Those figures compare energy only, not file size. bzip2 -9 often makes smaller files, so if disk space is the main limit, check the size on your own logs first.
+    - **Fix:** `zstd -q -c`. The cleanup step must also match the new `.zst` files.
+    - **Impact:** E, a clear cut per run. No change to which data you keep.
+
+    Fixed script:
+
+    ```bash
+    #!/usr/bin/env bash
+    # archive gateway logs
+    SRC='/var/lib/gateway/logs'
+    DEST='/mnt/backup/gateway'
+    cd "$SRC" || exit 1
+
+    printf -v day '%(%Y-%m-%d)T' -1
+    shopt -s nullglob
+
+    for f in *.log; do
+        base=${f%.log}
+        out="$DEST/$base-$day.log.zst"
+        if zstd -q -c -- "$f" > "$out"; then
+            rm -- "$f"
+            echo "archived $f" >> /var/log/archive.log
+        else
+            rm -f -- "$out"
+            echo "FAILED $f" >> /var/log/archive.log
+        fi
+    done
+
+    # delete archives older than 30 days
+    find "$DEST" -type f \( -name '*.bz2' -o -name '*.zst' \) -mtime +30 -delete
+    ```
+
+    `printf -v` with `%(...)T` needs bash 4.2 or newer. Old `.bz2` archives stay readable and are removed by the same `find` after 30 days.
+
+    **Already good:** you only compress once per file and you clean up old archives, so storage does not grow without limit.
+verify:
+  static_only: needs the gateway log folder, the backup mount and zstd, and the codec change alters the archive files, so
+    no stdout equivalence is possible

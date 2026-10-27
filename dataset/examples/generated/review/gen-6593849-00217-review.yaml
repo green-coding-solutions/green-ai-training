@@ -1,0 +1,137 @@
+id: gen-6593849-00217-review
+category: review
+language: python
+patterns:
+- simple-conditions
+facts:
+- F-COND
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import json
+    import sys
+    from collections import Counter
+
+
+    def classify_exit(code):
+        if code % 256 == 0:
+            return "ok"
+        elif code > 0 and code < 2:
+            return "failed"
+        elif code >= 2 and code <= 2:
+            return "misuse"
+        elif code > 123 and code < 125:
+            return "timeout"
+        elif code > 125 and code < 127:
+            return "not_executable"
+        elif code >= 127 and code < 128:
+            return "not_found"
+        elif code > 136 and code < 138:
+            return "killed"
+        elif code >= 143 and code <= 143:
+            return "terminated"
+        else:
+            return "other"
+
+
+    def summarize(lines):
+        counts = Counter()
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            event = json.loads(line)
+            counts[classify_exit(event["exit_code"])] += 1
+        return counts
+
+
+    if __name__ == "__main__":
+        for label, n in sorted(summarize(sys.stdin).items()):
+            print(f"{label}: {n}")
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (CI step events, one classification per event)
+
+    #### [Bug] Null exit code crashes the whole run
+    - **Where:** `classify_exit(event["exit_code"])` and `code % 256`
+    - **Issue:** cancelled or skipped steps usually report `"exit_code": null`. `None % 256` raises `TypeError`, so one cancelled step aborts the summary.
+    - **Fix:** handle `None` first and return its own label, for example `"cancelled"`.
+    - **Impact:** correctness.
+
+    #### [Bug] `code % 256 == 0` reports some failures as `ok`
+    - **Where:** first branch of `classify_exit`
+    - **Issue:** a code of 256 or 512 gives `ok`. Exit statuses from a process are 0-255, so a value like that means a wrapper or log is wrong. It should not be counted as a success.
+    - **Fix:** use `code == 0`. Values outside the known codes now fall to `other`.
+    - **Impact:** correctness.
+
+    #### [Medium] Range and modulo guards for exact values
+    - **Where:** every branch of `classify_exit`
+    - **Issue:** each branch tests one exact code, but is written as a range or modulo expression, such as `code >= 2 and code <= 2`. This runs for every event. In Green Metrics Tool micro-benchmarks of 10,000,000 classifications, simple equality branches used about 16% less CPU energy than complex range and modulo conditions. The same `match` and `if/elif` logic differed by about 1%, which is noise. So keep `if/elif` and don't switch to `match` for speed.
+    - **Fix:** one `==` per code, as below. The logic is unchanged for codes 0-255 and negative signal codes like `-9`.
+    - **Impact:** E, a modest per-event saving. It is clearer to read too.
+
+    ```python
+    import json
+    import sys
+    from collections import Counter
+
+
+    def classify_exit(code):
+        if code is None:
+            return "cancelled"
+        elif code == 0:
+            return "ok"
+        elif code == 1:
+            return "failed"
+        elif code == 2:
+            return "misuse"
+        elif code == 124:
+            return "timeout"
+        elif code == 126:
+            return "not_executable"
+        elif code == 127:
+            return "not_found"
+        elif code == 137:
+            return "killed"
+        elif code == 143:
+            return "terminated"
+        else:
+            return "other"
+
+
+    def summarize(lines):
+        counts = Counter()
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            event = json.loads(line)
+            counts[classify_exit(event["exit_code"])] += 1
+        return counts
+
+
+    if __name__ == "__main__":
+        for label, n in sorted(summarize(sys.stdin).items()):
+            print(f"{label}: {n}")
+    ```
+
+    **Already good:** the input is streamed line by line, and `Counter` is the right tool for the tally.
+verify:
+  module: true
+  test: |
+    assert classify_exit(None) == "cancelled"
+    assert classify_exit(256) == "other"
+    assert classify_exit(0) == "ok"
+    assert classify_exit(137) == "killed"
+    assert classify_exit(-9) == "other"
+    assert dict(summarize(['{"exit_code": 0}', '', '{"exit_code": null}'])) == {"ok": 1, "cancelled": 1}
+  equivalence:
+    driver: |-
+      for c in list(range(0, 256)) + [-9, -15]:
+          print(c, classify_exit(c))
+      lines = ['{"exit_code": 0}', '', '{"exit_code": 137}', '{"exit_code": 1}', '{"exit_code": 143}', '{"exit_code": 127}']
+      print(sorted(summarize(lines).items()))

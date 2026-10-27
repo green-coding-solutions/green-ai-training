@@ -53,31 +53,31 @@ messages:
 
     #### [Bug] `expr` fails on short or odd lines
     - **Where:** `total_ms=$(expr $total_ms + $ms)`
-    - **Issue:** if a line is blank or has fewer than 4 fields, `$ms` is empty and `expr` stops with a syntax error. The line is not counted in the total, and you get error messages in the output. `read line` without `-r` also eats backslashes.
+    - **Issue:** if a line is blank or has fewer than 4 fields, `$ms` is empty and `expr` stops with a syntax error. That line is left out of the total, and error messages show up in the output. `read line` without `-r` also eats backslashes.
     - **Fix:** only count lines that have a numeric 4th field (done in the awk version below).
     - **Impact:** correctness of the totals.
 
     #### [Bug] `for f in $(ls ...)` and unquoted paths
     - **Where:** `for f in $(ls $LOGDIR/*.log)`, `done < $f`, `> $OUT`
-    - **Issue:** a file name or folder with a space breaks into several words. If `$1` is empty, the glob looks in the wrong place without any warning.
-    - **Fix:** loop over the glob directly and quote the variables: `"$LOGDIR"/*.log`, `< "$f"`, `> "$OUT"`. Check that `$1` is a directory.
+    - **Issue:** a file or folder name with a space splits into several words. If `$1` is empty, the glob looks in the wrong place and gives no warning.
+    - **Fix:** loop over the glob directly and quote the variables: `"$LOGDIR"/*.log`, `< "$f"`, `> "$OUT"`. Check that `$1` is set.
     - **Impact:** correctness.
 
     #### [High] Several processes started for every line
     - **Where:** the `$(echo $line | cut ...)` lines and every `$(expr ...)`
-    - **Issue:** each command substitution forks a subshell, and `cut` and `expr` are new processes. With 50k lines per file, that is hundreds of thousands of process starts per file, and process starts are what make this slow. In Green Metrics Tool micro-benchmarks, a log summary loop of this kind over a 20,000-line file (about 10 processes per line) used ~1302 J and 238 s. The same loop with only builtins (`read -r`, `$(( ))`, `case`) used ~4.3 J and 0.72 s, about 300× less. One `awk` pass used ~1.0 J and 0.21 s, over 1000× less than the subprocess loop.
-    - **Fix:** one `awk` call over all files. The output is the same:
+    - **Issue:** each command substitution forks a subshell, and every `cut` and `expr` is a new process. With 50k lines per file, that is hundreds of thousands of process starts per file. Those process starts are what make the script slow. In Green Metrics Tool micro-benchmarks, a log summary loop like this over a 20,000-line file (about 10 processes per line) used ~1302 J and 238 s. The same loop with builtins only (`read -r`, `$(( ))`, `case`) used ~4.3 J and 0.72 s, about 300× less. One `awk` pass used ~1.0 J and 0.21 s, over 1000× less than the subprocess loop.
+    - **Fix:** one `awk` call over all files. The output format stays the same:
       ```bash
       #!/bin/bash
       logdir=${1:?usage: summary.sh LOGDIR}
       out=summary.txt
 
       awk '
-        $3 == "CONVERGED" { conv++ }
-        $3 == "DIVERGED"  { div++ }
-        $3 == "MAXITER"   { maxit++ }
-        $4 ~ /^[0-9]+$/   { total_ms += $4 }
-        NF >= 4           { lines++ }
+        $3 ~ /^CONVERGED$/ { conv++ }
+        $3 ~ /^DIVERGED$/  { div++ }
+        $3 ~ /^MAXITER$/   { maxit++ }
+        $4 ~ /^[0-9]+$/    { total_ms += $4 }
+        NF >= 4            { lines++ }
         END {
           printf "runs: %d\n", lines
           printf "converged: %d\n", conv
@@ -87,15 +87,15 @@ messages:
         }
       ' "$logdir"/*.log > "$out"
       ```
-      If you want to stay in pure bash, use `while read -r run iters status ms`, `case "$status"` and `(( conv++ ))`. This needs no `cut` or `expr` and is still far cheaper than the original, but `awk` is the cheapest.
-    - **Impact:** E, by orders of magnitude, on every nightly run. The run time should drop from hours to seconds.
+      If you want to stay in pure bash, use `while read -r run iters status ms`, `case "$status"` and `(( conv++ ))`. That needs no `cut` or `expr` and is still much cheaper than the original, but `awk` is the cheapest option.
+    - **Impact:** E, by orders of magnitude, on every nightly run. The run should take seconds instead of hours.
 
     #### [Low] Double quotes on literals without expansion
-    - **Where:** `"CONVERGED"`, `"DIVERGED"`, `"MAXITER"` inside the loop
-    - **Issue:** Bash scans double-quoted text for `$`, backticks and backslashes. Single quotes are taken as they are. In Green Metrics Tool micro-benchmarks, a 6,200-character literal in a loop used about 24% less CPU energy with single quotes. For short words like these, the saving is tiny, so this only matters if you keep the loop.
-    - **Fix:** use `'CONVERGED'` and so on. Keep the double quotes around `"$status"`, `"$f"` and the other variables, because those need them.
+    - **Where:** the status words CONVERGED, DIVERGED and MAXITER in the `[ ... ]` tests
+    - **Issue:** Bash scans double-quoted text for `$`, backticks and backslashes. It takes single-quoted text as it is. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal in a loop used about 24% less CPU energy with single quotes. For short words like these, the saving is tiny, so this only matters if you keep the bash loop.
+    - **Fix:** write the status words in single quotes, for example `'CONVERGED'`. Keep the double quotes around `"$status"`, `"$f"` and the other variables, because they need them.
     - **Impact:** E, low.
 
-    **Already good:** the counters are initialised to 0, and the status checks use quoted variables.
+    **Already good:** the counters start at 0, and the status tests quote their variables.
 verify:
   static_only: bash script that needs a directory of log files

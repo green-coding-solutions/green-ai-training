@@ -1,0 +1,54 @@
+id: gen-6593849-00239-refactor
+category: refactor
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    hi, im new to ci stuff. i made this deploy script for our gitlab pipeline, it builds the docker image and sends it to the staging server. it works but the pipeline feels slow and i dont know whats wrong. can you look?
+
+    ```bash
+    #!/bin/bash
+    # deploy to staging
+    TAG=$CI_COMMIT_SHORT_SHA
+    IMAGE=registry.local/shop-api:$TAG
+    STAGING_HOST=staging-1.internal
+
+    docker build -t $IMAGE .
+    echo "Sending image to $STAGING_HOST"
+    docker save $IMAGE | xz -9e | ssh deploy@$STAGING_HOST "xz -d | docker load"
+    ssh deploy@$STAGING_HOST "IMAGE=$IMAGE docker compose -f /srv/shop/compose.yml up -d"
+    echo "done"
+    ```
+- role: assistant
+  content: |
+    The slow part is `xz -9e`. It is one of the most CPU-hungry compressors, and this step runs on every push. It sends the image over a fast internal network, so you pay a lot of CPU for little gain. I switched it to zstd.
+
+    ```bash
+    #!/bin/bash
+    set -euo pipefail
+
+    TAG=$CI_COMMIT_SHORT_SHA
+    IMAGE=registry.local/shop-api:$TAG
+    STAGING_HOST=staging-1.internal
+
+    docker build -t "$IMAGE" .
+    echo "Sending image to $STAGING_HOST"
+    docker save "$IMAGE" | zstd | ssh "deploy@$STAGING_HOST" 'zstd -d | docker load'
+    ssh "deploy@$STAGING_HOST" "IMAGE=$IMAGE docker compose -f /srv/shop/compose.yml up -d"
+    echo 'done'
+    ```
+
+    **Green Notes**
+    - **Fast codec for data compressed often** (reduces E): this image is compressed on every pipeline run and used once. In Green Metrics Tool micro-benchmarks on 100 MB of English text, zstd at its default level used ~16 J and xz ~458 J, so xz used about 29× more energy. Decompression was also cheaper with zstd (~5.3 J vs ~11.7 J). The numbers are for text, so image layers will differ, but the order of magnitude is the point.
+    - **Not a compression-ratio comparison:** those measurements compare energy only. xz usually makes smaller files. That only matters on a slow or metered link. On an internal network it does not.
+
+    Other changes:
+    - `zstd` must be installed on the CI runner and on `staging-1`.
+    - I added `set -euo pipefail` and quoted the variables. Before, if `docker save` failed in the middle of the pipe, the script could carry on and print `done`. Now it stops.
+    - Quoting rule: double quotes only where a variable must expand (`$STAGING_HOST`, `$IMAGE`), single quotes for fixed text like the remote `zstd -d | docker load` command and the final `done` message.
+verify:
+  static_only: needs docker, ssh and a remote host

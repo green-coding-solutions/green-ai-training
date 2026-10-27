@@ -1,0 +1,72 @@
+id: gen-9483221-00021-review
+category: review
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    Hello, can you check this backup script for our webshop? It run from cron every 30 minutes, because we dont want to lose orders. Backups stay on the server 3 days and then are deleted. Database is about 2 GB. I am not sure it is good, a colleague wrote it long time ago.
+
+    ```bash
+    #!/bin/bash
+    # shop db backup
+    DB_PASS="Sh0p#2019"
+    BACKUP_DIR=/backups/shop
+    DATE=$(date +%Y%m%d-%H%M)
+
+    mysqldump -u shop -p$DB_PASS shopdb > $BACKUP_DIR/shop-$DATE.sql
+    bzip2 -9 $BACKUP_DIR/shop-$DATE.sql
+    echo "backup done $DATE" >> /var/log/shop-backup.log
+
+    find $BACKUP_DIR -name "*.sql.bz2" -mtime +3 -delete
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (cron, every 30 minutes)
+
+    #### [Security] Database password in the script and on the command line
+    - **Where:** `DB_PASS="Sh0p#2019"` and `-p$DB_PASS`
+    - **Issue:** the password is stored in plain text, and any user on the server can see it in `ps` while `mysqldump` runs. It is also unquoted, so the `#` and other special characters can break it.
+    - **Fix:** put the credentials in a root-only file (`chmod 600`) and use `--defaults-extra-file`. Change this password, because it is now in your repository and in this message.
+
+    #### [Bug] A failed dump is still compressed and reported as "done"
+    - **Where:** `mysqldump ... > file` followed by `bzip2` and `echo "backup done"`
+    - **Issue:** nothing checks the exit code. If `mysqldump` fails halfway, you get a partial file, and the log still says "backup done". You find out when you need the restore. Variables are also unquoted, so a path with spaces would break the script.
+    - **Fix:** `set -euo pipefail`, quote the variables, write to a temp name and rename only on success. Log the success line only after that.
+
+    #### [High] Slow, expensive codec for data compressed 48 times a day
+    - **Where:** `bzip2 -9`
+    - **Issue:** this dump is compressed every 30 minutes, so the codec cost is paid again and again. In Green Metrics Tool micro-benchmarks on 100 MB of text, bzip2 used about 106 J and zstd at its default level about 16 J, so about 6× less. The dump is also first written uncompressed and then read again by `bzip2`. Piping it straight into the compressor avoids that extra step.
+    - **Fix:** pipe `mysqldump` into `zstd`. Compression is still worth it here: the dumps live 3 days, and in an estimate based on the Green Coding Solutions concept, zstd compression pays off after the data is stored for about 0.15 days. That estimate is a lower bound, but 3 days is far above it.
+    - **Impact:** reduces E on every run, 48 times per day. These facts compare energy, not file size. bzip2 usually makes smaller files, so check the size of a few dumps after the change. At 3 days of retention, a somewhat larger file is a fair trade.
+
+    #### [Low] Old backups only match the old name
+    - **Where:** `find ... -name "*.sql.bz2"`
+    - **Issue:** after the switch, the new `.zst` files would never be deleted.
+    - **Fix:** match both names for the first 3 days, as in the script below.
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    BACKUP_DIR='/backups/shop'
+    DATE=$(date +%Y%m%d-%H%M)
+    OUT="$BACKUP_DIR/shop-$DATE.sql.zst"
+
+    mysqldump --defaults-extra-file=/etc/shop/backup.cnf shopdb \
+        | zstd -q -o "$OUT.tmp" || { rm -f "$OUT.tmp"; exit 1; }
+    mv "$OUT.tmp" "$OUT"
+    echo "backup done $DATE" >> /var/log/shop-backup.log
+
+    find "$BACKUP_DIR" \( -name '*.sql.zst' -o -name '*.sql.bz2' \) -mtime +3 -delete
+    ```
+
+    Restore with `zstd -dc shop-<date>.sql.zst | mysql --defaults-extra-file=/etc/shop/backup.cnf shopdb`. Test one restore after you deploy this.
+
+    **Already good:** you delete old backups automatically, so storage does not grow without limit.
+verify:
+  static_only: needs mysqldump, mysql and zstd with a running database

@@ -1,0 +1,92 @@
+id: gen-12764612-00412-generation
+category: generation
+language: javascript
+patterns:
+- dom-size
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    Hello, we run image classifier in batch every night and it write predictions.json, around 15000 objects like {id, label, confidence, latencyMs}. Label is text from our model, can be any string. I need javascript function `mountPredictions(root, predictions)` what show this in table, with columns id, label, confidence in percent and latency. Data scientists open it in morning for check results. Please write it, vanilla js, no framework. Thank you!
+- role: assistant
+  content: |
+    The function renders 100 rows per page, so the table never holds all 15,000 rows at once:
+
+    ```javascript
+    const PAGE_SIZE = 100;
+
+    export function mountPredictions(root, predictions) {
+      const pageCount = Math.max(1, Math.ceil(predictions.length / PAGE_SIZE));
+      let page = 0;
+
+      const prev = document.createElement('button');
+      prev.textContent = 'Previous';
+      const next = document.createElement('button');
+      next.textContent = 'Next';
+      const info = document.createElement('span');
+
+      const table = document.createElement('table');
+      table.innerHTML =
+        '<thead><tr><th>ID</th><th>Label</th><th>Confidence</th><th>Latency (ms)</th></tr></thead>';
+      const body = document.createElement('tbody');
+      table.append(body);
+
+      function render() {
+        const start = page * PAGE_SIZE;
+        const fragment = document.createDocumentFragment();
+
+        for (const p of predictions.slice(start, start + PAGE_SIZE)) {
+          const tr = document.createElement('tr');
+          const cells = [
+            p.id,
+            p.label,
+            (p.confidence * 100).toFixed(1) + '%',
+            p.latencyMs.toFixed(1),
+          ];
+          for (const value of cells) {
+            const td = document.createElement('td');
+            td.textContent = value; // text only, so a strange label cannot inject HTML
+            tr.append(td);
+          }
+          fragment.append(tr);
+        }
+
+        body.replaceChildren(fragment);
+        info.textContent = ` Page ${page + 1} of ${pageCount} (${predictions.length} rows) `;
+        prev.disabled = page === 0;
+        next.disabled = page >= pageCount - 1;
+      }
+
+      prev.addEventListener('click', () => { page -= 1; render(); });
+      next.addEventListener('click', () => { page += 1; render(); });
+
+      root.replaceChildren(prev, info, next, table);
+      render();
+    }
+
+    export async function loadPredictions(url) {
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`Failed to load ${url}: ${response.status}`);
+      }
+      return response.json();
+    }
+    ```
+
+    Use it like this:
+
+    ```javascript
+    import { mountPredictions, loadPredictions } from './predictions.js';
+
+    loadPredictions('predictions.json').then((data) =>
+      mountPredictions(document.getElementById('app'), data)
+    );
+    ```
+
+    **Green Notes**
+    - **Pagination instead of one huge table** (reduces E): the browser builds and lays out 100 rows, not 15,000. In Green Metrics Tool measurements, a 10,000-row table used about 56% less client CPU energy when paginated to 100 rows per page as a plain `<table>` built in a `DocumentFragment`, compared with all rows built from wrapper elements and appended one by one.
+    - **Plain cells, one fragment per page** (reduces E): each cell is a single `<td>` with no wrapper elements, and the rows are inserted into the page in one step.
+    - The browser's find-in-page only sees the current page. If your team needs to search all 15,000 rows, add a filter box that works on the `predictions` array and then re-renders.
+  verify:
+    static_only: needs a browser DOM (document, fetch)

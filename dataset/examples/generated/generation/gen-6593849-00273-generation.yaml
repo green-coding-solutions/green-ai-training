@@ -1,0 +1,72 @@
+id: gen-6593849-00273-generation
+category: generation
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    hi, im marine biology student and not so good with python. for my thesis I need the newest water level from 12 tide stations (NOAA, I have the station numbers in a list). I want function what give me back dict station -> level in meters. I try some things with a for loop but it feels slow and I dont know whats wrong. can you write it? the url is https://api.tidesandcurrents.noaa.gov/api/prod/datagetter and I think it needs product=water_level and date=latest
+- role: assistant
+  content: |
+    The loop is slow because it waits for each station to answer before it asks the next one. These requests don't depend on each other, so this version sends them together.
+
+    ```python
+    import asyncio
+
+    import httpx
+
+    URL = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
+
+
+    async def fetch_level(client, station):
+        params = {
+            "station": station,
+            "product": "water_level",
+            "date": "latest",
+            "datum": "MLLW",
+            "time_zone": "gmt",
+            "units": "metric",
+            "format": "json",
+        }
+        try:
+            resp = await client.get(URL, params=params)
+            resp.raise_for_status()
+            body = resp.json()
+            return station, float(body["data"][-1]["v"])
+        except (httpx.HTTPError, KeyError, IndexError, ValueError):
+            # no data or a failed request: keep going with the other stations
+            return station, None
+
+
+    async def get_water_levels(stations, max_parallel=6):
+        limit = asyncio.Semaphore(max_parallel)
+
+        async with httpx.AsyncClient(timeout=15) as client:
+
+            async def one(station):
+                async with limit:
+                    return await fetch_level(client, station)
+
+            pairs = await asyncio.gather(*(one(s) for s in stations))
+        return dict(pairs)
+
+
+    if __name__ == "__main__":
+        stations = ["9414290", "9410170", "8518750", "8443970", "8723214", "9447130"]
+        levels = asyncio.run(get_water_levels(stations))
+        for station, level in levels.items():
+            print(station, level)
+    ```
+
+    A station with no data, or a failed request, gets `None` instead of stopping the whole run. Check for `None` before you use the values in your analysis.
+
+    Call it from normal code with `asyncio.run(get_water_levels(my_list))`.
+
+    **Green Notes**
+    - **Concurrent network calls** (reduces idle time): the 12 requests overlap, so the script no longer sits idle while it waits for each answer. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used ~8.4 J and 2.6 s, and sync `urllib` used ~9.1 J and 3.1 s. That is about 7% less CPU energy and about 17% less wall time. With this few requests, the gain is mostly wall time.
+    - **Limited parallelism** (reduces load): the semaphore keeps at most 6 requests in flight, so the NOAA server is not hit with everything at once.
+verify:
+  static_only: needs network access and httpx

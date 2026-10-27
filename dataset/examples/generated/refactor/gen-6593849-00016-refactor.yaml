@@ -1,0 +1,85 @@
+id: gen-6593849-00016-refactor
+category: refactor
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```python
+    import math
+
+    class OrderPricer:
+        def __init__(self, tax_rate, discount_pct, rounding_step):
+            self.tax_rate = tax_rate
+            self.discount_pct = discount_pct
+            self.rounding_step = rounding_step
+            self.currency = "EUR"
+
+        def price_lines(self, lines):
+            totals = []
+            for qty, unit_cents in lines:
+                net = qty * unit_cents
+                net = net - net * self.discount_pct // 100
+                gross = net + net * self.tax_rate // 100
+                gross = math.ceil(gross / self.rounding_step) * self.rounding_step
+                totals.append(gross)
+            return totals
+
+        def label(self, cents):
+            return f"{cents / 100:.2f} {self.currency}"
+    ```
+- role: assistant
+  content: |
+    ```python
+    import math
+
+    class OrderPricer:
+        def __init__(self, tax_rate, discount_pct, rounding_step):
+            self.tax_rate = tax_rate
+            self.discount_pct = discount_pct
+            self.rounding_step = rounding_step
+            self.currency = "EUR"
+
+        def price_lines(self, lines):
+            discount_pct = self.discount_pct
+            tax_rate = self.tax_rate
+            step = self.rounding_step
+            ceil = math.ceil
+            totals = []
+            append = totals.append
+            for qty, unit_cents in lines:
+                net = qty * unit_cents
+                net = net - net * discount_pct // 100
+                gross = net + net * tax_rate // 100
+                append(ceil(gross / step) * step)
+            return totals
+
+        def label(self, cents):
+            return f"{cents / 100:.2f} {self.currency}"
+    ```
+
+    **Green Notes**
+    - **Hoist loop-invariant lookups** (reduces E): `self.discount_pct`, `self.tax_rate`, `self.rounding_step`, `math.ceil` and `totals.append` are now looked up once per call, not once per order line. The output is identical.
+    - **Expect a small gain.** In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local before a 10,000,000-iteration loop saved about 4-5%. It only matters when you price very many lines. For orders with a few lines the difference is negligible.
+    - This assumes the pricer's settings do not change while `price_lines` runs. If another thread can change them mid-call, the old code would pick up the change and this version would not.
+    - `label` is not in a loop, so it is unchanged.
+verify:
+  module: true
+  test: |
+    p = OrderPricer(19, 10, 5)
+    assert p.price_lines([(2, 1000), (1, 999)]) == [2145, 1075]
+    assert p.price_lines([]) == []
+    assert p.label(1234) == "12.34 EUR"
+  equivalence:
+    driver: |-
+      import random
+      random.seed(11)
+      lines = [(random.randint(1, 9), random.randint(50, 20000)) for _ in range(500)]
+      for args in [(19, 10, 5), (7, 0, 1), (25, 15, 10)]:
+          print(args, sum(OrderPricer(*args).price_lines(lines)))
+          print(OrderPricer(*args).price_lines(lines)[:10])

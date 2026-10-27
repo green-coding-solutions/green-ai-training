@@ -1,0 +1,105 @@
+id: gen-9483221-00049-generation
+category: generation
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    ```python
+    import numpy as np
+    from fastapi import FastAPI, HTTPException
+
+    app = FastAPI()
+
+    # loaded at startup: ~2,000 sensor traces of ~5,000 points each, float64
+    TRACES: dict[str, np.ndarray] = {}
+
+
+    def dtw_distance(a, b, band):
+        """DTW distance between two 1D series. Squared difference as cost,
+        Sakoe-Chiba band of `band` steps, return sqrt of the total cost."""
+        ...
+
+
+    @app.post("/match")
+    def match(payload: dict):
+        """Rank stored sensor traces by DTW distance to the query trace."""
+        query = np.asarray(payload["query"], dtype=np.float64)
+        band = int(payload.get("band", 50))
+        ranked = sorted(
+            (dtw_distance(query, trace, band), name)
+            for name, trace in TRACES.items()
+        )
+        return [{"name": name, "distance": d} for d, name in ranked[:10]]
+    ```
+
+    ?
+- role: assistant
+  content: |
+    Here is `dtw_distance`, compiled with Numba, plus a small guard for empty queries:
+
+    ```python
+    import numpy as np
+    from fastapi import FastAPI, HTTPException
+    from numba import njit
+
+    app = FastAPI()
+
+    # loaded at startup: ~2,000 sensor traces of ~5,000 points each, float64
+    TRACES: dict[str, np.ndarray] = {}
+
+
+    @njit(cache=True)
+    def dtw_distance(a, b, band):
+        """DTW distance between two 1D series. Squared difference as cost,
+        Sakoe-Chiba band of `band` steps, return sqrt of the total cost."""
+        n = a.shape[0]
+        m = b.shape[0]
+        w = max(band, abs(n - m))  # the band must be wide enough to reach the corner
+        prev = np.full(m + 1, np.inf)
+        curr = np.full(m + 1, np.inf)
+        prev[0] = 0.0
+        for i in range(1, n + 1):
+            curr[:] = np.inf
+            lo = max(1, i - w)
+            hi = min(m, i + w)
+            for j in range(lo, hi + 1):
+                d = a[i - 1] - b[j - 1]
+                best = prev[j - 1]
+                if prev[j] < best:
+                    best = prev[j]
+                if curr[j - 1] < best:
+                    best = curr[j - 1]
+                curr[j] = d * d + best
+            prev, curr = curr, prev
+        return np.sqrt(prev[m])
+
+
+    # compile at import, so the first request does not pay for it
+    dtw_distance(np.zeros(4), np.zeros(4), 1)
+
+
+    @app.post("/match")
+    def match(payload: dict):
+        """Rank stored sensor traces by DTW distance to the query trace."""
+        query = np.asarray(payload["query"], dtype=np.float64)
+        if query.size == 0:
+            raise HTTPException(status_code=422, detail="query must not be empty")
+        band = int(payload.get("band", 50))
+        ranked = sorted(
+            (dtw_distance(query, trace, band), name)
+            for name, trace in TRACES.items()
+        )
+        return [{"name": name, "distance": d} for d, name in ranked[:10]]
+    ```
+
+    **Green Notes**
+    - **JIT-compile the hot numeric loop** (reduces E): every request runs this nested loop for each stored trace, which is millions of cell updates in plain Python. In Green Metrics Tool micro-benchmarks, a pure Python quantization loop over 10,000,000 samples used ~40 J and the same loop with Numba `@njit` ~9.5 J, about 4× less. That is a different loop, so read it as a direction, not a forecast for DTW.
+    - **Compile once** (reduces E): `cache=True` stores the compiled code on disk, and the warm-up call moves the one-time compile cost out of the first request.
+
+    Keep the traces as `float64` arrays. Another dtype triggers a second compile. The request handling stays plain Python, because only the inner loop is CPU-bound.
+verify:
+  static_only: needs numba and fastapi, which are beyond stdlib + numpy

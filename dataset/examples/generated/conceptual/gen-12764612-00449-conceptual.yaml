@@ -1,0 +1,62 @@
+id: gen-12764612-00449-conceptual
+category: conceptual
+language: text
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+messages:
+- role: user
+  content: |
+    ```python
+    import numpy as np
+
+
+    def load_series(conn, station_id, start, end):
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM buoy_readings "
+                "WHERE station_id = %s AND observed_at >= %s AND observed_at < %s "
+                "ORDER BY observed_at",
+                (station_id, start, end),
+            )
+            rows = cur.fetchall()
+
+        t = np.array([r[2] for r in rows], dtype="datetime64[s]")
+        temp = np.array([r[5] for r in rows], dtype=float)
+        sal = np.array([r[6] for r in rows], dtype=float)
+        wave = np.array([r[9] for r in rows], dtype=float)
+        return t, temp, sal, wave
+    ```
+
+    ?
+- role: assistant
+  content: |
+    If you are asking whether `SELECT *` is a problem here: it works, but it fetches every column and the code uses four of them.
+
+    Whether that costs real energy depends on the table:
+
+    - **Wide table with big columns** (raw payloads, JSON blobs, long text): it matters. In Green Metrics Tool micro-benchmarks on PostgreSQL 16, reading 2,500 rows 1,000 times from a 52-column table with large text columns used ~470 J with `SELECT *` and ~64 J when naming 10 columns, about 7× less. The saving grows with the size of the columns you skip.
+    - **Narrow table with small columns**: the difference is small. Don't bother.
+
+    There is also a correctness reason. Your code reads `r[5]`, `r[6]` and `r[9]` by position. If someone adds or reorders a column, the code silently reads the wrong data. Naming the columns fixes this too:
+
+    ```python
+    cur.execute(
+        "SELECT observed_at, water_temp_c, salinity_psu, wave_height_m "
+        "FROM buoy_readings "
+        "WHERE station_id = %s AND observed_at >= %s AND observed_at < %s "
+        "ORDER BY observed_at",
+        (station_id, start, end),
+    )
+    rows = cur.fetchall()
+
+    t = np.array([r[0] for r in rows], dtype="datetime64[s]")
+    temp = np.array([r[1] for r in rows], dtype=float)
+    sal = np.array([r[2] for r in rows], dtype=float)
+    wave = np.array([r[3] for r in rows], dtype=float)
+    ```
+
+    To see what it saves for you, run the query both ways on real data and compare the time and the bytes returned.
+verify:
+  static_only: conceptual answer, needs a PostgreSQL database

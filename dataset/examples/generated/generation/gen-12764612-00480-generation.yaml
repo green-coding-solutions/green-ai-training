@@ -1,0 +1,72 @@
+id: gen-12764612-00480-generation
+category: generation
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    hi, i am new with python and pytorch, so i am not sure how to do this right. in our lab we have a folder with many .npy files, every file is one vector with 64 numbers from a vibration sensor of a machine. a colleague gave me a model file vib_model.pt (he said it is torchscript) and it gives 2 numbers, first is "normal" and second is "not normal". i need a small command line script: i give the folder and the model, and it prints the file name and the label for every file. we have no gpu, only normal laptops. can you write it?
+- role: assistant
+  content: |-
+    Here is a small CLI. It assumes the model takes a `(1, 64)` float tensor and returns two scores, where the higher one wins.
+
+    ```python
+    import argparse
+    import sys
+    from pathlib import Path
+
+    import numpy as np
+    import torch
+
+    LABELS = ("normal", "not normal")
+    VECTOR_SIZE = 64
+
+
+    def load_vector(path: Path) -> torch.Tensor:
+        vec = np.load(path).astype(np.float32).reshape(-1)
+        if vec.shape[0] != VECTOR_SIZE:
+            raise ValueError(f"expected {VECTOR_SIZE} values, got {vec.shape[0]}")
+        return torch.from_numpy(vec).unsqueeze(0)
+
+
+    def main() -> int:
+        parser = argparse.ArgumentParser(description="Label vibration vectors with a TorchScript model.")
+        parser.add_argument("folder", help="folder with .npy files")
+        parser.add_argument("--model", default="vib_model.pt", help="path to the TorchScript model")
+        args = parser.parse_args()
+
+        files = sorted(Path(args.folder).glob("*.npy"))
+        if not files:
+            print(f"No .npy files in {args.folder}", file=sys.stderr)
+            return 1
+
+        model = torch.jit.load(args.model, map_location="cpu")
+        model.eval()
+
+        with torch.no_grad():
+            for path in files:
+                try:
+                    x = load_vector(path)
+                except ValueError as err:
+                    print(f"{path.name}: skipped ({err})", file=sys.stderr)
+                    continue
+                scores = model(x)
+                label = LABELS[int(scores.argmax(dim=1))]
+                print(f"{path.name}\t{label}")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+
+    Run it like this: `python label_vibration.py data/ --model vib_model.pt`
+
+    `model.eval()` switches layers like dropout and batch norm to prediction mode. This is needed for correct results. If your model returns something other than two scores per row, change the `argmax` line.
+
+    **Green Notes**
+    - **`torch.no_grad()` for inference** (reduces E): you only predict here, so PyTorch does not need to record the data for training. In Green Metrics Tool micro-benchmarks, 100,000 PyTorch CPU inferences used about 14% less energy with `torch.no_grad()`. It does not change the output.
+    - **Model loaded once, outside the loop**: the file is read a single time, not once per vector.

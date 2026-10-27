@@ -1,0 +1,82 @@
+id: gen-12764612-00470-generation
+category: generation
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    I need a Python function for our supplier price feed import. Requirements:
+
+    - Input: a CSV from the supplier with columns `sku,price`. Usually 300-400k rows. Price is a string like `"12.90"`.
+    - We have `catalog_skus` (a list of ~150k SKUs from our DB) and `discontinued_skus` (a list of ~20k SKUs).
+    - Rows with a SKU that is not in our catalog must not be imported. I want a list of those unknown SKUs, each one only once, in the order they first appear.
+    - Rows with a discontinued SKU are skipped, but I only need the count.
+    - All other rows become `(sku, Decimal(price))` tuples, in file order. A SKU can appear several times in a feed and all rows are kept.
+    - Supplier SKUs are messy: spaces around them and mixed case. Our catalog uses upper case.
+
+    Please give me the function plus a small helper that reads the CSV.
+- role: assistant
+  content: |
+    ```python
+    import csv
+    from decimal import Decimal
+
+
+    def read_feed(path):
+        with open(path, newline="", encoding="utf-8") as f:
+            yield from csv.DictReader(f)
+
+
+    def filter_feed(rows, catalog_skus, discontinued_skus):
+        """Return (updates, unknown_skus, skipped_discontinued)."""
+        known = {s.upper() for s in catalog_skus}
+        discontinued = {s.upper() for s in discontinued_skus}
+
+        updates = []
+        unknown = {}  # dict keeps first-seen order, so each SKU is listed once
+        skipped = 0
+
+        for row in rows:
+            sku = row["sku"].strip().upper()
+            if sku not in known:
+                unknown.setdefault(sku, None)
+            elif sku in discontinued:
+                skipped += 1
+            else:
+                updates.append((sku, Decimal(row["price"])))
+
+        return updates, list(unknown), skipped
+    ```
+
+    Use it like this: `updates, unknown, skipped = filter_feed(read_feed("feed.csv"), catalog_skus, discontinued_skus)`.
+
+    `read_feed` is a generator, so the file is streamed and never fully loaded into memory.
+
+    **Green Notes**
+    - **Set for repeated membership tests** (reduces E): each row needs one or two lookups, so there are several hundred thousand lookups per feed. In a list, every lookup scans up to 150k entries. In a set, each lookup is O(1). The sets are built once, outside the loop, and they also do the upper-casing once per catalog entry instead of once per row.
+    - **Dict as ordered "seen" set:** `unknown.setdefault` removes duplicates and keeps first-seen order without a second pass.
+
+    *Not applied:* a set for a single check. In Green Metrics Tool micro-benchmarks, converting a 10,000,000-element list to a set for one lookup used about 50% more CPU energy than one linear scan. The set only pays off here because the lookups repeat for every row.
+verify:
+  test: |-
+    from decimal import Decimal
+    rows = [
+        {"sku": " ab1 ", "price": "9.90"},
+        {"sku": "zz9", "price": "1"},
+        {"sku": "old1", "price": "5"},
+        {"sku": "ZZ9", "price": "2"},
+        {"sku": "ab1", "price": "10.00"},
+        {"sku": "nope", "price": "3"},
+    ]
+    updates, unknown, skipped = filter_feed(rows, ["AB1", "old1", "Cd2"], ["OLD1"])
+    assert updates == [("AB1", Decimal("9.90")), ("AB1", Decimal("10.00"))], updates
+    assert unknown == ["ZZ9", "NOPE"], unknown
+    assert skipped == 1
+    import tempfile, os
+    p = os.path.join(tempfile.mkdtemp(), "feed.csv")
+    with open(p, "w", newline="") as f:
+        f.write("sku,price\nab1,1.50\n")
+    assert list(read_feed(p)) == [{"sku": "ab1", "price": "1.50"}]

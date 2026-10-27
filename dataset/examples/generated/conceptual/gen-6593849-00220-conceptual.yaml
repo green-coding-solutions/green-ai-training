@@ -1,0 +1,51 @@
+id: gen-6593849-00220-conceptual
+category: conceptual
+language: text
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    ```python
+    def format_predictions(ids, probs, labels):
+        out = ""
+        for i, p in zip(ids, probs):
+            k = max(range(len(p)), key=p.__getitem__)
+            out += f"{i}\t{labels[k]}\t{p[k]:.4f}\n"
+        return out
+
+    # called once per eval run on the full test set
+    with open("preds.tsv", "w") as f:
+        f.write(format_predictions(test_ids, test_probs, class_names))
+    ```
+
+    ?
+- role: assistant
+  content: |
+    I assume you are asking whether that `out +=` loop is a problem. For a large test set, yes. For a small one, no.
+
+    The f-string does not help. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces used ~469 J with `+=`, ~455 J with f-string concatenation in a loop, and ~1.8 J with `"".join()`. That is roughly 260× less CPU energy for `join`. The cost comes from copying a growing string again and again. That is why it hurts at hundreds of thousands of rows and not at a few hundred.
+
+    Collect the lines and join them once:
+
+    ```python
+    def format_predictions(ids, probs, labels):
+        lines = []
+        for i, p in zip(ids, probs):
+            k = max(range(len(p)), key=p.__getitem__)
+            lines.append(f"{i}\t{labels[k]}\t{p[k]:.4f}")
+        return "\n".join(lines) + "\n" if lines else ""
+    ```
+
+    The output is identical, including the trailing newline and the empty result for empty input.
+
+    When it does not matter:
+
+    - **Few pieces:** a top-5 label string per request, or a short header. Keep `+=` there if it reads better.
+    - **Writing to a file:** you can skip the big string and call `f.write(line)` per row, or `f.writelines(...)`, so the full output never sits in memory.
+
+    That benchmark used 1,000,000 pieces. To see your own saving, time one eval run before and after with `time` or `perf stat`.
+verify:
+  static_only: conceptual answer

@@ -1,0 +1,135 @@
+id: gen-12764612-00415-refactor
+category: refactor
+language: python
+patterns:
+- set-membership
+- regex-precompile
+facts:
+- F-MEMB
+- F-REGEX
+messages:
+- role: user
+  content: |
+    hello, we have this script in our CI pipeline, it read the pytest log after every run and say which tests failed for real and which are the known flaky one. the log can have 50k lines and the flaky list have around 1800 names. now it feel slow when many tests fail. can you make it better? sorry for my english
+
+    ```python
+    import re
+    import os
+
+
+    def load_flaky(path):
+        with open(path) as f:
+            return [line.strip() for line in f if line.strip()]
+
+
+    def scan_log(log_path, flaky_path):
+        flaky = load_flaky(flaky_path)
+        real, flaky_hits, slow = [], [], []
+        with open(log_path) as f:
+            for line in f:
+                line = line.rstrip("\n")
+                m = re.match(r"^FAILED\s+(\S+)::(\S+)\s+-\s+(.*)$", line)
+                if m:
+                    name = m.group(1) + "::" + m.group(2)
+                    if name in flaky:
+                        flaky_hits.append(name)
+                    else:
+                        real.append((name, m.group(3)))
+                    continue
+                d = re.search(r"^(\d+\.\d+)s call\s+(\S+)$", line)
+                if d and float(d.group(1)) > 5.0:
+                    slow.append((d.group(2), float(d.group(1))))
+        return real, flaky_hits, slow
+
+
+    def report(log_path, flaky_path):
+        real, flaky_hits, slow = scan_log(log_path, flaky_path)
+        print("real failures:", len(real))
+        for name, msg in real:
+            print("  ", name, "-", msg)
+        print("known flaky:", len(flaky_hits))
+        print("slow tests:", len(slow))
+        for name, secs in sorted(slow, key=lambda x: -x[1]):
+            print("  ", name, secs)
+        return 1 if real else 0
+    ```
+- role: assistant
+  content: |
+    ```python
+    import re
+
+    FAILED_RE = re.compile(r"^FAILED\s+(\S+)::(\S+)\s+-\s+(.*)$")
+    SLOW_RE = re.compile(r"^(\d+\.\d+)s call\s+(\S+)$")
+    SLOW_LIMIT = 5.0
+
+
+    def load_flaky(path):
+        with open(path) as f:
+            return [line.strip() for line in f if line.strip()]
+
+
+    def scan_log(log_path, flaky_path):
+        flaky = set(load_flaky(flaky_path))
+        real, flaky_hits, slow = [], [], []
+        with open(log_path) as f:
+            for line in f:
+                line = line.rstrip("\n")
+                m = FAILED_RE.match(line)
+                if m:
+                    name = m.group(1) + "::" + m.group(2)
+                    if name in flaky:
+                        flaky_hits.append(name)
+                    else:
+                        real.append((name, m.group(3)))
+                    continue
+                d = SLOW_RE.search(line)
+                if d:
+                    secs = float(d.group(1))
+                    if secs > SLOW_LIMIT:
+                        slow.append((d.group(2), secs))
+        return real, flaky_hits, slow
+
+
+    def report(log_path, flaky_path):
+        real, flaky_hits, slow = scan_log(log_path, flaky_path)
+        print("real failures:", len(real))
+        for name, msg in real:
+            print("  ", name, "-", msg)
+        print("known flaky:", len(flaky_hits))
+        print("slow tests:", len(slow))
+        for name, secs in sorted(slow, key=lambda x: -x[1]):
+            print("  ", name, secs)
+        return 1 if real else 0
+    ```
+
+    The output is the same as before. I also removed the unused `import os`, and the slow-time float is now parsed once instead of twice.
+
+    **Green Notes**
+    - **Set for repeated membership tests** (reduces E): `name in flaky` on a list scans up to 1800 names for every failed line, so a bad run with hundreds of failures does a lot of repeated scanning. A set makes each lookup O(1), and it is built once per run and used many times. Order of `flaky` is not needed, because it is only used for `in`. The hit and real lists keep the log order. This only pays off because there are many lookups: in Green Metrics Tool micro-benchmarks, one single `in` on a 10,000,000-element list used less energy than converting it to a set first (about 50% more for the set). If most runs have only 0-2 failures, the list was fine.
+    - **Regex compiled once at module level** (reduces E): in Green Metrics Tool micro-benchmarks, a precompiled pattern used about 18% less CPU energy than inline `re.match` over 1,000,000 matches. The win is small because Python's `re` already caches compiled patterns. It is still the cleaner form, and it keeps working if you later build a pattern from a variable (for example with an f-string per test suite), where the cache can be missed and recompiling costs far more per match.
+    - *Not applied:* anything else in the loop. Reading the log line by line is already good, and the rest is cheap compared to the lookups.
+verify:
+  equivalence:
+    driver: |-
+      import os
+      import tempfile
+
+      d = tempfile.mkdtemp()
+      log = os.path.join(d, "ci.log")
+      fl = os.path.join(d, "flaky.txt")
+      with open(fl, "w") as f:
+          f.write("tests/test_a.py::test_one\n\n tests/test_b.py::test_two \n")
+      lines = [
+          "collected 7 items",
+          "FAILED tests/test_a.py::test_one - AssertionError",
+          "FAILED tests/test_c.py::test_three - KeyError: 'x'",
+          "7.25s call     tests/test_d.py::test_slow",
+          "1.10s call     tests/test_e.py::test_fast",
+          "9.90s call     tests/test_f.py::test_slower",
+          "FAILED tests/test_b.py::test_two - timeout",
+          "5.00s call     tests/test_g.py::test_edge",
+          "done",
+      ]
+      with open(log, "w") as f:
+          f.write("\n".join(lines) + "\n")
+      print(report(log, fl))

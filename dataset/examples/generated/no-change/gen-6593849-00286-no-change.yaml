@@ -1,0 +1,85 @@
+id: gen-6593849-00286-no-change
+category: no-change
+language: python
+patterns:
+- memoize
+- context-tradeoff
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    hello, we have store finder endpoint in our REST api. The app send GPS of the phone and we return nearest stores. its called many times in a day and my boss say "add lru_cache on the distance function, then it is faster and use less energy". I am not sure it is good idea. can you add it?
+
+    ```python
+    import math
+
+    EARTH_RADIUS_KM = 6371.0088
+
+    STORES = [
+        {"id": "ber-01", "lat": 52.5200, "lon": 13.4050},
+        {"id": "ham-02", "lat": 53.5511, "lon": 9.9937},
+        {"id": "muc-03", "lat": 48.1351, "lon": 11.5820},
+        # ... about 120 stores loaded at start
+    ]
+
+
+    def haversine_km(lat1, lon1, lat2, lon2):
+        p1, p2 = math.radians(lat1), math.radians(lat2)
+        dphi = p2 - p1
+        dlmb = math.radians(lon2 - lon1)
+        a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
+        return 2 * EARTH_RADIUS_KM * math.asin(math.sqrt(a))
+
+
+    def nearest_stores(lat, lon, limit=3):
+        ranked = sorted(STORES, key=lambda s: haversine_km(lat, lon, s["lat"], s["lon"]))
+        return [s["id"] for s in ranked[:limit]]
+    ```
+- role: assistant
+  content: |
+    Your feeling is right. I would not add `lru_cache` here.
+
+    A cache only helps when the same inputs come back. Phone GPS values are floats with many decimals, and they change a little on every request. So almost every `(lat, lon, store_lat, store_lon)` key is new. Each call would still compute the distance, and it would also hash the four floats and store a new entry. That is extra work for no hits. With `maxsize=None` the cache also grows without limit, so memory goes up all day.
+
+    In Green Metrics Tool micro-benchmarks, `lru_cache` used about 9× less CPU energy (~43 J down to ~4.7 J for 1,000,000 calls). But that test used only 200 distinct inputs, so most calls were hits. With mostly unique inputs, caching only adds overhead.
+
+    Your code stays as it is:
+
+    ```python
+    import math
+
+    EARTH_RADIUS_KM = 6371.0088
+
+    STORES = [
+        {"id": "ber-01", "lat": 52.5200, "lon": 13.4050},
+        {"id": "ham-02", "lat": 53.5511, "lon": 9.9937},
+        {"id": "muc-03", "lat": 48.1351, "lon": 11.5820},
+    ]
+
+
+    def haversine_km(lat1, lon1, lat2, lon2):
+        p1, p2 = math.radians(lat1), math.radians(lat2)
+        dphi = p2 - p1
+        dlmb = math.radians(lon2 - lon1)
+        a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
+        return 2 * EARTH_RADIUS_KM * math.asin(math.sqrt(a))
+
+
+    def nearest_stores(lat, lon, limit=3):
+        ranked = sorted(STORES, key=lambda s: haversine_km(lat, lon, s["lat"], s["lon"]))
+        return [s["id"] for s in ranked[:limit]]
+    ```
+
+    Why it is already fine:
+    - It is one pure function and a sort over about 120 stores per request. That is cheap work.
+    - No state, no hidden memory growth.
+    - The stores are loaded once at start, not on each request.
+
+    When a cache could make sense: if many clients send the same coordinates, for example a fixed city centre or a geocoded address. Then round the input (for example to 3 decimals) and cache the whole `nearest_stores` result with a bounded `maxsize`. Check `cache_info()` in production first. If the hit rate is low, remove the cache.
+verify:
+  test: |-
+    assert nearest_stores(52.5, 13.4, 1) == ["ber-01"]
+    assert nearest_stores(48.1, 11.6, 1) == ["muc-03"]
+    assert len(nearest_stores(50.0, 10.0)) == 3
+    assert abs(haversine_km(52.52, 13.405, 52.52, 13.405)) < 1e-9

@@ -1,0 +1,161 @@
+id: gen-6593849-00096-review
+category: review
+language: html
+patterns:
+- lazy-load-images
+- dom-size
+facts:
+- F-LAZY-IMG
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    Please review the landing page for our city marathon. Requirements: the hero photo must show fast, the photo gallery stays, and the start list has to stay searchable by name or bib number. We have about 6,000 runners in `data/runners.json`. Mobile visitors are most of our traffic. Tell me what you would change and why.
+
+    ```html
+    <header class="hero">
+      <img src="img/start-line.jpg" alt="Runners at the start line" loading="lazy">
+      <h1>Lakeside Marathon 2027</h1>
+    </header>
+
+    <section id="gallery">
+      <h2>Last year</h2>
+      <img src="img/g01.jpg" alt="Finish arch">
+      <img src="img/g02.jpg" alt="Water station">
+      <img src="img/g03.jpg" alt="Kids run">
+      <img src="img/g04.jpg" alt="Medal table">
+      <img src="img/g05.jpg" alt="Lake view">
+      <img src="img/g06.jpg" alt="Volunteers">
+    </section>
+
+    <section id="startlist">
+      <h2>Start list</h2>
+      <input id="q" placeholder="Search name or bib">
+      <div id="list"></div>
+    </section>
+
+    <script>
+    fetch('data/runners.json').then(r => r.json()).then(runners => {
+      const list = document.getElementById('list');
+      function render(items) {
+        list.innerHTML = '';
+        items.forEach(r => {
+          const row = document.createElement('div');
+          row.className = 'row';
+          row.innerHTML =
+            '<div class="cell"><span class="bib">' + r.bib + '</span></div>' +
+            '<div class="cell"><span class="name">' + r.name + '</span></div>' +
+            '<div class="cell"><span class="club">' + r.club + '</span></div>' +
+            '<div class="cell"><span class="wave">' + r.wave + '</span></div>';
+          list.appendChild(row);
+        });
+      }
+      render(runners);
+      document.getElementById('q').addEventListener('input', e => {
+        const t = e.target.value.toLowerCase();
+        render(runners.filter(r => r.name.toLowerCase().includes(t) || String(r.bib) === t));
+      });
+    });
+    </script>
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (public landing page, mostly mobile)
+
+    #### [Security] Runner data is inserted as HTML
+    - **Where:** `row.innerHTML = ... r.name ... r.club`
+    - **Issue:** a name or club containing `<script>` or an `onerror=` attribute runs in every visitor's browser. Runner names usually come from a sign-up form, so treat them as untrusted.
+    - **Fix:** set `textContent` on each cell (see the code below).
+
+    #### [High] 6,000 rows with 3 elements each in the live DOM
+    - **Where:** `render(runners)` and the `.row` / `.cell` / `<span>` structure
+    - **Issue:** every visitor builds about 24,000 elements, and every keystroke in the search box throws them away and builds them again. The wrapper `div` and `span` around each value add nodes and no meaning.
+    - **Fix:** show 100 rows per page, use a plain `<table>`, build each page in a `DocumentFragment`, and filter first and then paginate. Search still covers all 6,000 runners.
+    - **Impact:** reduces E on the client for every page view, and memory on phones. In Green Metrics Tool micro-benchmarks, a 10,000-row table with wrappers around every cell used about 56% less CPU energy when paginated to 100 rows per page as a plain table. Your list is smaller, so expect a smaller gap.
+
+    #### [Medium] The hero image is lazy-loaded
+    - **Where:** `<img src="img/start-line.jpg" ... loading="lazy">`
+    - **Issue:** it is the first thing visitors see. Lazy loading delays it, which goes against your "hero must show fast" requirement.
+    - **Fix:** remove `loading="lazy"` and add `fetchpriority="high"`.
+
+    #### [Medium] Gallery images load eagerly
+    - **Where:** the six `<img>` tags in `#gallery`
+    - **Issue:** they are below the fold, but all of them are fetched and decoded on load.
+    - **Fix:** add `loading="lazy"`, plus `width` and `height` so the layout does not jump.
+    - **Impact:** reduces network and E for visitors who never scroll that far. In Green Metrics Tool micro-benchmarks, lazy loading below-the-fold photos used about 12% less energy on page loads without scrolling. When visitors scrolled to the end, there was no difference. It does not hurt, but it is not a big win for visitors who read the whole page.
+
+    ```html
+    <header class="hero">
+      <img src="img/start-line.jpg" alt="Runners at the start line" width="1600" height="900" fetchpriority="high">
+      <h1>Lakeside Marathon 2027</h1>
+    </header>
+
+    <section id="gallery">
+      <h2>Last year</h2>
+      <img src="img/g01.jpg" alt="Finish arch" width="800" height="533" loading="lazy">
+      <img src="img/g02.jpg" alt="Water station" width="800" height="533" loading="lazy">
+      <img src="img/g03.jpg" alt="Kids run" width="800" height="533" loading="lazy">
+      <img src="img/g04.jpg" alt="Medal table" width="800" height="533" loading="lazy">
+      <img src="img/g05.jpg" alt="Lake view" width="800" height="533" loading="lazy">
+      <img src="img/g06.jpg" alt="Volunteers" width="800" height="533" loading="lazy">
+    </section>
+
+    <section id="startlist">
+      <h2>Start list</h2>
+      <input id="q" type="search" placeholder="Search name or bib" aria-label="Search start list">
+      <table>
+        <thead><tr><th>Bib</th><th>Name</th><th>Club</th><th>Wave</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <p>
+        <button id="prev" type="button">Previous</button>
+        <span id="page"></span>
+        <button id="next" type="button">Next</button>
+      </p>
+    </section>
+
+    <script>
+    (async () => {
+      const runners = await (await fetch('data/runners.json')).json();
+      const PAGE_SIZE = 100;
+      const tbody = document.getElementById('rows');
+      const label = document.getElementById('page');
+      let matches = runners;
+      let page = 0;
+
+      function render() {
+        const pages = Math.max(1, Math.ceil(matches.length / PAGE_SIZE));
+        page = Math.min(page, pages - 1);
+        const frag = document.createDocumentFragment();
+        for (const r of matches.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)) {
+          const tr = frag.appendChild(document.createElement('tr'));
+          for (const v of [r.bib, r.name, r.club, r.wave]) {
+            tr.appendChild(document.createElement('td')).textContent = v;
+          }
+        }
+        tbody.replaceChildren(frag);
+        label.textContent = 'Page ' + (page + 1) + ' of ' + pages;
+        document.getElementById('prev').disabled = page === 0;
+        document.getElementById('next').disabled = page >= pages - 1;
+      }
+
+      document.getElementById('q').addEventListener('input', e => {
+        const t = e.target.value.trim().toLowerCase();
+        matches = t
+          ? runners.filter(r => r.name.toLowerCase().includes(t) || String(r.bib) === t)
+          : runners;
+        page = 0;
+        render();
+      });
+      document.getElementById('prev').addEventListener('click', () => { page--; render(); });
+      document.getElementById('next').addEventListener('click', () => { page++; render(); });
+      render();
+    })();
+    </script>
+    ```
+
+    Adjust `width` and `height` to the real image sizes. Style the `<table>` with your old `.row` and `.cell` rules if you need the same look.
+
+    **Already good:** the data loads as one JSON file, and the search runs in the browser with no server call per keystroke.
+verify:
+  static_only: HTML page with browser-only JavaScript and fetch of a JSON file; no stdlib-runnable code

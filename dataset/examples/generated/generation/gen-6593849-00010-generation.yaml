@@ -1,0 +1,85 @@
+id: gen-6593849-00010-generation
+category: generation
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    hi, I am new with pytorch and not sure how to do this right. every night we get a csv export of bank transactions from our accounting system. columns are `txn_id, booking_date, amount` and then 16 numeric feature columns `f1` to `f16` (already prepared by another step). my colleague trained a model and saved it as `models/txn_cat.pt` (torchscript, takes 16 floats, gives 6 scores). the classes are groceries, transport, housing, utilities, leisure, other. I need a python script that reads the csv and writes a new csv with the same columns plus a `category` column. there are around 2 million rows so I think it must not load everything in memory. we have no gpu.
+- role: assistant
+  content: |
+    The script reads the file in chunks of 4096 rows, so memory stays small. It calls `model.eval()` and runs the model without gradient tracking.
+
+    ```python
+    import csv
+    import sys
+
+    import torch
+
+    FEATURES = [f"f{i}" for i in range(1, 17)]
+    LABELS = ["groceries", "transport", "housing", "utilities", "leisure", "other"]
+    CHUNK_SIZE = 4096
+
+
+    def write_chunk(model, rows, writer):
+        x = torch.tensor(
+            [[float(row[name]) for name in FEATURES] for row in rows],
+            dtype=torch.float32,
+        )
+        with torch.no_grad():
+            scores = model(x)
+        for row, idx in zip(rows, scores.argmax(dim=1).tolist()):
+            row["category"] = LABELS[idx]
+            writer.writerow(row)
+
+
+    def classify_file(src, dst, model_path="models/txn_cat.pt"):
+        model = torch.jit.load(model_path, map_location="cpu")
+        model.eval()
+
+        with open(src, newline="") as fin, open(dst, "w", newline="") as fout:
+            reader = csv.DictReader(fin)
+            writer = csv.DictWriter(fout, fieldnames=reader.fieldnames + ["category"])
+            writer.writeheader()
+
+            rows = []
+            for row in reader:
+                rows.append(row)
+                if len(rows) == CHUNK_SIZE:
+                    write_chunk(model, rows, writer)
+                    rows = []
+            if rows:
+                write_chunk(model, rows, writer)
+
+
+    if __name__ == "__main__":
+        classify_file(sys.argv[1], sys.argv[2])
+    ```
+
+    Run it like this:
+
+    ```bash
+    python classify_transactions.py transactions.csv transactions_categorized.csv
+    ```
+
+    The `category` column is added at the end. All other columns are copied unchanged.
+
+    **Green Notes**
+    - **`torch.no_grad()` for inference** (reduces E, M): the job only predicts, so PyTorch does not need to record the graph for backpropagation. In Green Metrics Tool micro-benchmarks of 100,000 CPU inferences, running with `no_grad` used about 14% less energy than without it (~135 J vs ~157 J). The job runs every night, so this repeats with each run. The output is the same.
+    - **`model.eval()`** is also needed for correct results: it switches off training-only layers like dropout, in case your colleague's model has them.
+- role: user
+  content: |
+    thanks! one more question, can I use this also for the training? my colleague wants to retrain next week
+- role: assistant
+  content: |
+    No. Keep `torch.no_grad()` for prediction only. During training PyTorch must record the graph, because the backward pass needs it. If you wrap the training step in `no_grad`, the model will not learn.
+
+    Use it only in the evaluation or prediction part, as in this script.
+
+    **Green Notes**
+    - **`torch.no_grad()` for inference**: the saving only exists where no gradients are needed. Use it for validation and prediction, never around the training step.
+verify:
+  static_only: needs torch and a TorchScript model file

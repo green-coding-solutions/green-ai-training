@@ -58,29 +58,59 @@ messages:
     #### [Medium] Range and modulo guards in `classify`
     - **Where:** `classify(kind)`, called for every frame
     - **Issue:** each branch combines `%` and `<` or `>` checks, but the real question is "which of a few known codes is this?". The codes are 0 and 4 (temp), 1 and 5 (humidity), 2 (pressure), 3 and 7 (battery). Every frame pays for the arithmetic and the extra comparisons, and the rules are hard to read.
-    - **Fix:** plain equality checks, same results for every byte value:
-      ```python
-      def classify(kind):
-          if kind == 0 or kind == 4:
-              return "temp"
-          elif kind == 1 or kind == 5:
-              return "humidity"
-          elif kind == 2:
-              return "pressure"
-          elif kind == 3 or kind == 7:
-              return "battery"
-          return "unknown"
-      ```
+    - **Fix:** plain equality checks. They give the same result for every byte value. The full file is below.
     - **Impact:** reduces E on a per-frame path. In Green Metrics Tool micro-benchmarks of 10,000,000 classifications, simple equality branches used about 16% less CPU energy than complex range/modulo conditions. The saving is small per frame and only matters at a high frame rate.
 
-    **Left as is:** `from struct import *`. In Green Metrics Tool micro-benchmarks, star imports and namespace imports showed no measurable energy difference, so changing it would not save anything. Changing it only adds churn.
+    **Left as is:** `from struct import *`. In Green Metrics Tool micro-benchmarks, star imports and namespace imports showed no measurable energy difference, so changing it would not save anything. It would only add churn.
 
     **Already good:** the frame size comes from `calcsize` once at module level, and `summarize` reads the data in a single pass.
+
+    Fixed file:
+
+    ```python
+    from struct import *
+    import sys
+
+    FRAME = '>HBH'
+    FRAME_LEN = calcsize(FRAME)
+
+
+    def parse_frame(buf):
+        dev, kind, raw = unpack(FRAME, buf[:FRAME_LEN])
+        return dev, kind, raw
+
+
+    def classify(kind):
+        if kind == 0 or kind == 4:
+            return "temp"
+        elif kind == 1 or kind == 5:
+            return "humidity"
+        elif kind == 2:
+            return "pressure"
+        elif kind == 3 or kind == 7:
+            return "battery"
+        return "unknown"
+
+
+    def summarize(data):
+        counts = {}
+        for off in range(0, len(data) - FRAME_LEN + 1, FRAME_LEN):
+            dev, kind, raw = parse_frame(data[off:off + FRAME_LEN])
+            name = classify(kind)
+            counts[name] = counts.get(name, 0) + 1
+        return counts
+
+
+    if __name__ == "__main__":
+        data = sys.stdin.buffer.read()
+        for name, n in sorted(summarize(data).items()):
+            print(name, n)
+    ```
 verify:
   module: true
   equivalence:
     driver: |
-      for k in list(range(0, 12)) + [255]:
+      for k in range(0, 256):
           print(k, classify(k))
       print(parse_frame(pack('>HBH', 7, 4, 512)))
       data = b''.join(pack(FRAME, i, i % 10, i) for i in range(100))
@@ -90,3 +120,4 @@ verify:
     assert classify(2) == "pressure"
     assert classify(6) == "unknown"
     assert classify(7) == "battery"
+    assert classify(255) == "unknown"

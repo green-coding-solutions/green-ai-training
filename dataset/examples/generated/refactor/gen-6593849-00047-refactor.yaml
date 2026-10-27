@@ -1,0 +1,62 @@
+id: gen-6593849-00047-refactor
+category: refactor
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```bash
+    #!/bin/bash
+    # archive orders-api access logs
+    LOG_DIR=/var/log/orders-api
+    ARCH=/srv/archive/orders-api
+
+    mkdir -p $ARCH
+    for f in $LOG_DIR/access-*.log; do
+      name=$(basename $f)
+      7z a -mx=9 $ARCH/$name.7z $f > /dev/null && rm $f
+    done
+
+    # keep 180 days
+    find $ARCH -name "*.7z" -mtime +180 -delete
+    ```
+- role: assistant
+  content: |
+    ```bash
+    #!/bin/bash
+    # archive orders-api access logs
+    set -u
+    shopt -s nullglob
+
+    LOG_DIR=/var/log/orders-api
+    ARCH=/srv/archive/orders-api
+    today=$(date +%F)
+
+    mkdir -p "$ARCH"
+    for f in "$LOG_DIR"/access-*.log; do
+      # today's log is still being written
+      [[ $f == "$LOG_DIR/access-$today.log" ]] && continue
+      out="$ARCH/${f##*/}.zst"
+      zstd -q -f -o "$out" "$f" && zstd -tq "$out" && rm -- "$f"
+    done
+
+    # keep 180 days
+    find "$ARCH" \( -name '*.zst' -o -name '*.7z' \) -mtime +180 -delete
+    ```
+
+    **Green Notes**
+    - **Fast codec for logs compressed every night** (reduces E): `7z -mx=9` is one of the most expensive ways to compress text. In Green Metrics Tool micro-benchmarks on 100 MB of English text, 7-Zip used ~724 J, gzip ~67 J and zstd at its default level ~16 J. Decompressing used ~19.8 J with 7-Zip and ~5.3 J with zstd. These figures compare energy, not file size. zstd files will be somewhat larger than 7z files. Only a very tight disk quota or a slow link would justify the 7z cost.
+    - **Verify before delete** (correctness): `zstd -t` checks the archive before the original log is removed.
+
+    Bug fixes:
+    - The old loop also matched today's log and deleted it while the API was still writing to it. It is now skipped.
+    - The unquoted variables would break on spaces in a path. They are quoted now.
+
+    Existing `.7z` files stay as they are. They are still removed by the 180-day cleanup, and `7z x` still opens them.
+verify:
+  static_only: bash script that needs 7z, zstd and system log paths

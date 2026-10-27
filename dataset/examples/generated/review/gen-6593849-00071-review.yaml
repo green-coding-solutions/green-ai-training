@@ -1,0 +1,78 @@
+id: gen-6593849-00071-review
+category: review
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    Review of our webhook relay image please. It receives GitLab webhooks and triggers deploy jobs. CI builds it on every push to every branch. Diff only, I don't need the whole file back.
+
+    ```dockerfile
+    FROM python:3.12
+
+    RUN apt-get update && apt-get install -y build-essential git curl vim
+
+    WORKDIR /app
+    COPY . .
+
+    RUN pip install -r requirements.txt
+    RUN pip install pytest black mypy ipython
+
+    ENV GITLAB_WEBHOOK_TOKEN=glwt-7f3a91c2d85e4b06
+    ENV PORT=8080
+
+    EXPOSE 8080
+    CMD ["gunicorn", "-b", "0.0.0.0:8080", "relay.app:app"]
+    ```
+
+    requirements.txt is flask, gunicorn, requests and pydantic.
+- role: assistant
+  content: |
+    **Workload:** cloud backend (container built in CI)
+
+    #### [Security] Webhook token baked into the image
+    - **Where:** `ENV GITLAB_WEBHOOK_TOKEN=...`
+    - **Issue:** the token is stored in the image layers. Anyone who can pull the image can read it, and it stays in the registry history after you rotate it.
+    - **Fix:** remove the line, inject the value at runtime (`docker run -e`, a CI/CD secret or your orchestrator's secret store), and rotate the current token.
+
+    #### [High] Dependency layer rebuilt on every push
+    - **Where:** `COPY . .` before `RUN pip install`
+    - **Issue:** any changed file invalidates the install layer, so every push to every branch reinstalls all packages.
+    - **Fix:** see the diff below. Copy `requirements.txt` first, install, then copy the source.
+    - **Impact:** E on every CI build. The install layer is rebuilt only when `requirements.txt` changes.
+
+    #### [High] Full base image, compiler toolchain and dev tools in the runtime image
+    - **Where:** `FROM python:3.12`, `apt-get install ... build-essential git curl vim`, `pip install pytest black mypy ipython`
+    - **Issue:** none of these are needed to run a Flask app with these four pure-Python dependencies. They make every build slower and every pull and stored copy larger.
+    - **Fix:** see the diff below. Use the slim base, runtime dependencies only, and run tests and linters in a separate CI job.
+    - **Impact:** E, storage and network on every build, push and pull. In Green Metrics Tool measurements of a comparable change for a small Flask app (slim base, runtime dependencies only, dependency layer first, no pip cache), the build used about 7× less energy. Serving requests afterwards cost the same, so the saving is in the build and distribution, not at runtime.
+
+    ```diff
+    -FROM python:3.12
+    -
+    -RUN apt-get update && apt-get install -y build-essential git curl vim
+    -
+    +FROM python:3.12-slim
+    +
+     WORKDIR /app
+    -COPY . .
+    -
+    -RUN pip install -r requirements.txt
+    -RUN pip install pytest black mypy ipython
+    -
+    -ENV GITLAB_WEBHOOK_TOKEN=glwt-7f3a91c2d85e4b06
+    +COPY requirements.txt .
+    +RUN pip install --no-cache-dir -r requirements.txt
+    +COPY . .
+    +
+     ENV PORT=8080
+    ```
+
+    If a future dependency has no wheel and must be compiled, install `build-essential` in a separate build stage and copy only the installed packages into the final image. Do not put it back in the runtime image.
+
+    **Already good:** `gunicorn` instead of the Flask dev server, and a fixed port with `EXPOSE`.
+verify:
+  static_only: Dockerfile review, no Python or JavaScript to execute

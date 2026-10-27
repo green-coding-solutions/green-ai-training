@@ -1,0 +1,95 @@
+id: gen-6593849-00216-review
+category: review
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```nginx
+    server {
+        listen 80;
+        server_name etl-dash.internal;
+
+        gzip on;
+        gzip_comp_level 9;
+        gzip_types text/css application/javascript application/json text/csv;
+        gzip_vary on;
+        gzip_proxied any;
+
+        location /reports {
+            alias /srv/etl/reports/;
+            autoindex on;
+        }
+
+        location /api/ {
+            proxy_pass http://127.0.0.1:8000;
+        }
+    }
+    ```
+
+    /srv/etl/reports gets new html, js and json files from our nightly pipeline.
+- role: assistant
+  content: |
+    **Workload:** data pipeline (static report server plus a small API)
+
+    #### [Security] `alias` path traversal
+    - **Where:** `location /reports` with `alias /srv/etl/reports/;`
+    - **Issue:** the location has no trailing slash but the alias has one. A request like `/reports../` maps to `/srv/etl/reports/../` and escapes the directory.
+    - **Fix:** use `location /reports/ { ... }` so both ends match.
+
+    #### [High] Static report files are compressed on every request
+    - **Where:** `gzip on` / `gzip_comp_level 9` applied to `/reports/`
+    - **Issue:** the pipeline writes these files once per night, but nginx re-compresses them for every download. Level 9 is also the most CPU-hungry gzip setting, with little size gain over lower levels.
+    - **Fix:** compress the files once after the pipeline run and serve them with `gzip_static on`. Rewrite the `.gz` files on every run (`-f`), because nginx serves an existing `.gz` even if it is older than the source file.
+    - **Impact:** reduces E on every request. In Green Metrics Tool micro-benchmarks of nginx serving text assets, compressing on every request cost about 4× the CPU energy of serving precompressed files. Compression itself still sent about 10× fewer bytes, so keep it for real networks.
+
+    #### [Medium] Level 9 on API responses
+    - **Where:** `gzip_comp_level 9` for `/api/`
+    - **Issue:** these responses are dynamic, so every one is compressed on the fly. The top level spends much more CPU for only a slightly smaller body.
+    - **Fix:** use a moderate level such as 5. Per-request compression stays on, because the network saving is real.
+    - **Impact:** reduces E per API response.
+
+    #### [Low] `text/csv` in `gzip_types` has no effect on reports
+    - **Where:** `gzip_types`
+    - **Issue:** if the exports are CSV files in `/reports/`, they also need a `.gz` copy for `gzip_static`.
+    - **Fix:** include `*.csv` in the precompress step below.
+
+    ```nginx
+    server {
+        listen 80;
+        server_name etl-dash.internal;
+
+        gzip on;
+        gzip_comp_level 5;
+        gzip_types text/css application/javascript application/json text/csv;
+        gzip_vary on;
+        gzip_proxied any;
+
+        location /reports/ {
+            alias /srv/etl/reports/;
+            autoindex on;
+            gzip_static on;
+        }
+
+        location /api/ {
+            proxy_pass http://127.0.0.1:8000;
+        }
+    }
+    ```
+
+    Add this as the last step of the nightly job. A high level is fine here, because each file is compressed once and served many times:
+
+    ```bash
+    find /srv/etl/reports -type f \( -name '*.html' -o -name '*.js' -o -name '*.css' -o -name '*.json' -o -name '*.csv' \) -exec gzip -9 -k -f {} +
+    ```
+
+    `gzip_static` needs nginx built with `ngx_http_gzip_static_module`. This is the case for the official and Debian packages. If a `.gz` file is missing, nginx falls back to compressing on the fly.
+
+    **Already good:** `gzip_vary on` is set, and the API is proxied to a local upstream.
+verify:
+  static_only: nginx config and shell step, needs a running nginx

@@ -1,0 +1,75 @@
+id: gen-6593849-00162-estimate
+category: estimate
+language: javascript
+patterns:
+- dom-size
+facts:
+- F-DOM-SIZE
+messages:
+- role: user
+  content: |
+    Our log search page renders every hit as a row, each cell wrapped in a div + span. Typical query returns ~10k rows. If I paginate to 100/page, what do we save? Only want the diff, plus a rough number if you have one.
+
+    ```javascript
+    function renderHits(hits) {
+      const tbody = document.querySelector('#hits tbody');
+      tbody.innerHTML = '';
+      for (const h of hits) {
+        const tr = document.createElement('tr');
+        for (const key of ['ts', 'level', 'service', 'message']) {
+          const td = document.createElement('td');
+          const wrap = document.createElement('div');
+          const span = document.createElement('span');
+          span.textContent = h[key];
+          wrap.appendChild(span);
+          td.appendChild(wrap);
+          tr.appendChild(td);
+        }
+        tbody.appendChild(tr);
+      }
+    }
+    ```
+- role: assistant
+  content: |
+    Diff:
+
+    ```diff
+    -function renderHits(hits) {
+    +const PAGE_SIZE = 100;
+    +
+    +function renderHits(hits, page = 0) {
+       const tbody = document.querySelector('#hits tbody');
+       tbody.innerHTML = '';
+    -  for (const h of hits) {
+    +  const frag = document.createDocumentFragment();
+    +  for (const h of hits.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)) {
+         const tr = document.createElement('tr');
+         for (const key of ['ts', 'level', 'service', 'message']) {
+           const td = document.createElement('td');
+    -      const wrap = document.createElement('div');
+    -      const span = document.createElement('span');
+    -      span.textContent = h[key];
+    -      wrap.appendChild(span);
+    -      td.appendChild(wrap);
+    +      td.textContent = h[key];
+           tr.appendChild(td);
+         }
+    -    tbody.appendChild(tr);
+    +    frag.appendChild(tr);
+       }
+    +  tbody.appendChild(frag);
+     }
+    ```
+
+    You need a prev/next control that calls `renderHits(hits, page)`. Cell text is the same, so only the styling that targeted the `div` or `span` wrappers needs a check.
+
+    **Green Notes**
+    - **Pagination** (reduces E, client): 10,000 rows become 100, so the browser builds and lays out one hundredth of the rows per query.
+    - **Fewer wrappers** (reduces E, client): each cell goes from three elements to one.
+    - **DocumentFragment** (reduces E, client): rows are added to the live DOM once, not one by one.
+
+    **Rough number:** I can't give you a figure for your page. In Green Metrics Tool micro-benchmarks, 30 page loads of a 10,000-row table with wrappers around every cell, appended row by row, used ~1036 J. The same data paginated to 100 rows per page as a plain table built in a fragment used ~457 J, about 56% less. Your table has 4 columns, not that benchmark's layout, so treat this as direction and order of magnitude only. Do not scale it to your query volume.
+
+    **To measure yours:** load the page with a typical query in both versions as a Green Metrics Tool usage scenario and compare CPU energy. A quick proxy is the Performance panel in DevTools: compare scripting plus rendering time for the same query.
+verify:
+  static_only: needs a browser DOM; the diff and snippets are not runnable in isolation

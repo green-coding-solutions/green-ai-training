@@ -1,0 +1,50 @@
+id: gen-9483221-00008-generation
+category: generation
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    Daily cron script. Payment webhook payloads land as one JSON file each in /var/spool/shop/webhooks/YYYY-MM-DD/. Archive yesterday's dir to /srv/archive/webhooks, remove the original only after the archive checks out, keep archives 180 days (chargeback window). Just the script, no walkthrough.
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    src_root='/var/spool/shop/webhooks'
+    dest_dir='/srv/archive/webhooks'
+    keep_days=180
+
+    day=$(date -d 'yesterday' +%F)
+    src="$src_root/$day"
+    out="$dest_dir/webhooks-$day.tar.zst"
+    tmp="$out.part"
+
+    if [[ ! -d $src ]]; then
+        echo "no webhook dir for $day" >&2
+        exit 0
+    fi
+
+    mkdir -p -- "$dest_dir"
+    trap 'rm -f -- "$tmp"' EXIT
+
+    tar -C "$src_root" -cf - -- "$day" | zstd -q -f -3 -T0 -o "$tmp"
+    zstd -tq -- "$tmp"
+    tar -I zstd -tf "$tmp" > /dev/null
+
+    mv -- "$tmp" "$out"
+    rm -rf -- "$src"
+
+    find "$dest_dir" -type f -name 'webhooks-*.tar.zst' -mtime +"$keep_days" -delete
+    ```
+
+    **Green Notes**
+    - **zstd at its default level** (reduces E): the archive is written every day and read rarely, so compression cost is what repeats. In Green Metrics Tool micro-benchmarks on 100 MB of text, zstd used about 4× less energy than gzip to compress, and xz used about 29× more than zstd. JSON payloads are text, so this fits.
+    - **One archive per day**: thousands of small files become a single compressed stream. Data kept for 180 days is well worth compressing once.
+    - *Not applied:* xz or other high-ratio codecs. Those measurements compare energy, not file size. Consider them only if storage space or a slow link to the archive host matters more.
+verify:
+  static_only: cron script that needs zstd, GNU date and a specific filesystem layout

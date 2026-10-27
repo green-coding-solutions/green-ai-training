@@ -1,0 +1,125 @@
+id: gen-9483221-00017-review
+category: review
+language: css
+patterns:
+- css-animations
+- minify-assets
+facts:
+- F-ANIM
+- F-MINIFY
+messages:
+- role: user
+  content: |
+    hi, i made a small status page for my flask api, it shows if the api is up. it works but on my old laptop the fan gets loud when the page is open. i dont know what is wrong, i am new to this. can you look at it?
+
+    style.css
+    ```css
+    body {
+      font-family: Arial, sans-serif;
+      background: #101820;
+      color: #eee;
+      margin: 0;
+      padding: 2rem;
+    }
+
+    .card {
+      max-width: 480px;
+      margin: 0 auto;
+      padding: 1.5rem;
+      border-radius: 8px;
+      background: #1b2733;
+    }
+
+    .status-ok { color: #4caf50; }
+    .status-down { color: #e53935; }
+
+    .spinner {
+      width: 24px;
+      height: 24px;
+      border: 3px solid #444;
+      border-top-color: #4caf50;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    ```
+
+    status.js
+    ```js
+    const spinner = document.querySelector('.spinner');
+    const label = document.getElementById('status');
+    let angle = 0;
+
+    function spin() {
+      angle = (angle + 3) % 360;
+      spinner.style.transform = 'rotate(' + angle + 'deg)';
+      requestAnimationFrame(spin);
+    }
+    spin();
+
+    async function check() {
+      try {
+        const res = await fetch('/api/health');
+        const data = await res.json();
+        label.textContent = data.status;
+        label.className = 'status-ok';
+      } catch (e) {
+        label.textContent = 'down';
+        label.className = 'status-down';
+      }
+    }
+
+    check();
+    setInterval(check, 5000);
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (small status page, runs in the visitor's browser)
+
+    #### [Bug] A failing API can show as "ok"
+    - **Where:** `check()` in `status.js`
+    - **Issue:** `fetch` only throws on network errors. If Flask answers with `503` and a JSON body, `res.json()` works, so the label gets the `status-ok` class (green) although the API reported a problem.
+    - **Fix:** treat a non-2xx answer as down.
+      ```js
+      const res = await fetch('/api/health');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      ```
+
+    #### [Medium] Spinner is animated with JavaScript, forever
+    - **Where:** `spin()` in `status.js`
+    - **Issue:** `requestAnimationFrame` runs your script on every frame and sets a new inline style each time. It never stops, even after the status is shown and the spinner no longer has a job. This is most likely why your fan runs.
+    - **Fix:** let the browser do the rotation with CSS, delete `spin()`, and hide the spinner after the first check.
+      ```css
+      .spinner {
+        width: 24px;
+        height: 24px;
+        border: 3px solid #444;
+        border-top-color: #4caf50;
+        border-radius: 50%;
+        display: inline-block;
+        animation: spin 1s linear infinite;
+      }
+
+      .spinner[hidden] { display: none; }
+
+      @keyframes spin {
+        to { transform: rotate(360deg); }
+      }
+      ```
+      ```js
+      const spinner = document.querySelector('.spinner');
+      // in check(), after the label is updated (also in the catch block):
+      spinner.hidden = true;
+      ```
+      The `.spinner[hidden]` rule is needed because `display: inline-block` would otherwise override the `hidden` attribute.
+    - **Impact:** E on the client, for as long as the page is open. In Green Metrics Tool micro-benchmarks of a 20-second animation, CSS `@keyframes` used about 10% less CPU energy than a `requestAnimationFrame` loop with style updates. A hidden element with a CSS animation costs nothing, while your JS loop would keep running.
+
+    #### [Low] Stylesheet is not minified
+    - **Where:** `style.css`
+    - **Issue:** the file is tiny. In Green Metrics Tool micro-benchmarks on small pages, minified assets used about 2% less client energy, which is within measurement noise. Minifying saves bytes on the network, not CPU.
+    - **Fix:** nothing needed now. Add a minify step only if the stylesheet or script grows a lot, or if you have many visitors on slow connections.
+    - **Impact:** network bytes only, negligible at this size.
+
+    **Already good:** a single small stylesheet, no web fonts, and a system font stack.
+verify:
+  static_only: CSS and browser animation, needs a real browser

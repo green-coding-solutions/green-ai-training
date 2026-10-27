@@ -1,0 +1,72 @@
+id: gen-12764612-00434-review
+category: review
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    hi, i am new to this. i wrote a script for our inference servers, it sends the prediction logs to the collector. it runs from cron every 2 minutes on each node. it works but my colleague said "something is off with the CPU on those boxes", i dont know what. can you look?
+
+    ```bash
+    #!/bin/bash
+    # ship prediction logs to collector
+    SRC=/var/lib/inference/predictions
+    OUT=/tmp/ship
+    mkdir -p $OUT
+
+    for f in $SRC/*.jsonl; do
+      name=$(basename $f)
+      xz -9e -k -c $f > $OUT/$name.xz
+      curl -s -X POST \
+        -H "Content-Type: application/x-xz" \
+        --data-binary @$OUT/$name.xz \
+        https://collector.internal.example.com/ingest/$name
+      rm $f $OUT/$name.xz
+    done
+    ```
+
+    the files are json lines, around 50 MB each, the collector reads them and throws them away after indexing.
+- role: assistant
+  content: |
+    **Workload:** data pipeline (cron, every 2 minutes per node)
+
+    #### [Bug] Logs are deleted even when the upload fails
+    - **Where:** `curl -s ...` followed by `rm $f ...`
+    - **Issue:** `curl -s` returns success on HTTP errors like 500 or 413, and the script never checks the result anyway. If the collector is down, the source file is still removed and the data is lost. The unquoted `$f`, `$OUT` and `$name` also break on paths with spaces.
+    - **Fix:** add `--fail`, delete the source only if `curl` succeeds, and quote the variables (see the full script below).
+
+    #### [High] Very expensive compressor for data that is sent every 2 minutes
+    - **Where:** `xz -9e -k -c "$f"`
+    - **Issue:** this compresses ~50 MB files again and again, on every node, all day. That is most likely your CPU load. In Green Metrics Tool micro-benchmarks on 100 MB of text, xz at its default level used ~458 J. zstd at its default level used ~16 J, so xz used about 29× more. `-9e` is even slower than the default xz level. Decompressing on the collector is cheaper with zstd too (~5.3 J vs ~11.7 J for 100 MB). The benchmark compares energy only, not file size. xz usually makes smaller files, but for JSON lines sent within your own network the small size gain is not worth that CPU cost.
+    - **Fix:** use zstd, and tell the collector to expect `application/zstd`.
+    - **Impact:** E on every node, large and continuous, because it repeats every 2 minutes.
+
+    ```bash
+    #!/bin/bash
+    # ship prediction logs to collector
+    SRC='/var/lib/inference/predictions'
+    OUT='/tmp/ship'
+    mkdir -p "$OUT"
+
+    for f in "$SRC"/*.jsonl; do
+      [ -e "$f" ] || continue
+      name=${f##*/}
+      zstd -q -f -o "$OUT/$name.zst" "$f" || continue
+      if curl -sS --fail -X POST \
+        -H 'Content-Type: application/zstd' \
+        --data-binary @"$OUT/$name.zst" \
+        "https://collector.internal.example.com/ingest/$name"; then
+        rm -f -- "$f"
+      fi
+      rm -f -- "$OUT/$name.zst"
+    done
+    ```
+
+    If the upload fails, the source file stays and the next cron run retries it. Check that the collector can decode zstd before you switch. If the link between the nodes and the collector is slow, you can raise the zstd level a little, but measure first.
+
+    **Already good:** compressing before sending is the right idea for 50 MB of JSON text. Writing the temp file to a separate folder and cleaning it up is also fine.
+verify:
+  static_only: needs network access to a collector, zstd and curl

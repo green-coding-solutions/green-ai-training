@@ -1,0 +1,69 @@
+id: gen-12764612-00444-generation
+category: generation
+language: python
+patterns:
+- keep-star-imports
+- torch-no-grad
+facts:
+- F-IMPORT
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    hi, im new to ml stuff. this is classify.py from our project, it runs our small image classifier (cat / dog / bird). my colleague said the top of the file "looks wrong" but he did not say why and i dont know what to fix
+
+    ```python
+    import torch
+    from torch.nn.functional import *
+    from torchvision import transforms
+    from PIL import Image
+
+    LABELS = ["cat", "dog", "bird"]
+
+    model = torch.jit.load("classifier.pt")
+    model.eval()
+
+    preprocess = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+    ])
+
+
+    def predict_one(path):
+        img = Image.open(path).convert("RGB")
+        x = preprocess(img).unsqueeze(0)
+        probs = softmax(model(x), dim=1)
+        return LABELS[int(probs.argmax(dim=1))]
+    ```
+
+    what i actually need is a function `predict_batch(paths)` that takes a list of image paths and gives back the list of labels. there can be a few thousand images. can you write it?
+- role: assistant
+  content: |
+    Add this below `predict_one`. It needs no new imports.
+
+    ```python
+    def _load(path):
+        with Image.open(path) as img:
+            return preprocess(img.convert("RGB"))
+
+
+    def predict_batch(paths, batch_size=32):
+        labels = []
+        with torch.no_grad():
+            for start in range(0, len(paths), batch_size):
+                chunk = paths[start:start + batch_size]
+                x = torch.stack([_load(p) for p in chunk])
+                best = model(x).argmax(dim=1)
+                labels.extend(LABELS[i] for i in best.tolist())
+        return labels
+    ```
+
+    The labels come back in the same order as `paths`. Images are processed in chunks of 32, so a few thousand files do not all sit in memory at once. Lower `batch_size` if memory is tight.
+
+    About the top of the file: `from torch.nn.functional import *` is a style issue, not a bug. Some linters flag it because you can't see where `softmax` comes from. If your team wants it, change it to `from torch.nn.functional import softmax`. It is not needed for speed or energy, so I left it as is.
+
+    **Green Notes**
+    - **`torch.no_grad()`** (reduces E): inference does not need gradient tracking, so PyTorch skips that work. In Green Metrics Tool micro-benchmarks of 100,000 CPU inferences, this used about 14% less energy. `predict_one` has no `no_grad` yet. Wrapping its model call in `with torch.no_grad():` gives the same benefit.
+    - **Star import left unchanged:** in Green Metrics Tool micro-benchmarks, `from x import *` and `import x` showed no measurable energy difference. What costs energy is loading a heavy module at all, and your file needs `torch` either way.
+verify:
+  static_only: needs torch, torchvision, Pillow and a TorchScript model file

@@ -1,0 +1,106 @@
+id: gen-6593849-00103-estimate
+category: estimate
+language: python
+patterns:
+- regex-precompile
+- context-tradeoff
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    We have a small internal CLI, `commitcheck`, that runs as a git commit-msg hook on every developer machine. We are about 40 developers. It checks the message with a few regexes. Now someone wants to add a `--history` mode for CI that checks the last 20k commits, and in review a colleague said "compile all these regexes, it saves energy".
+
+    Requirements for your answer: I need to tell my lead whether this is worth doing and roughly how much it saves. Please give me a number if you can, and tell me how I would verify it. Here is the current code:
+
+    ```python
+    import re
+    import sys
+
+
+    def check_message(lines):
+        errors = []
+        if not lines or not re.match(r"^(feat|fix|docs|chore|refactor|test)(\([a-z0-9-]+\))?: \S.{0,71}$", lines[0]):
+            errors.append("subject must look like 'type(scope): text', max 72 chars")
+        for n, line in enumerate(lines, 1):
+            if re.search(r"\s$", line):
+                errors.append(f"line {n}: trailing whitespace")
+        if len(lines) > 2 and not re.match(r"^Refs: [A-Z]{2,5}-\d+$", lines[-1]):
+            errors.append("last line must be 'Refs: ABC-123'")
+        return errors
+
+
+    def main():
+        with open(sys.argv[1]) as f:
+            lines = f.read().splitlines()
+        errors = check_message(lines)
+        for e in errors:
+            print(e, file=sys.stderr)
+        return 1 if errors else 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+- role: assistant
+  content: |
+    I can't give you a trustworthy number for your tool, and for the hook it is not worth changing anything.
+
+    In Green Metrics Tool micro-benchmarks, 1,000,000 regex matches used ~21 J with inline `re.match(pattern, s)` and ~18 J with a precompiled pattern, about 18% less. The gap is small because Python's `re` module caches compiled patterns internally. Your patterns are string literals, so they are compiled once and then served from that cache.
+
+    How this applies to your two cases:
+
+    - **Commit-msg hook:** each run starts a new process and checks a handful of lines. Process startup dominates by a wide margin, and the cache is empty at the start anyway, so each pattern is compiled once either way. Precompiling saves nothing measurable here. Leave it.
+    - **`--history` in CI:** this is a loop over many commits, so it is the only place where the benchmark applies. A precompiled version is cheap and clean, so do it there:
+
+    ```python
+    import re
+    import sys
+
+    SUBJECT = re.compile(r"(feat|fix|docs|chore|refactor|test)(\([a-z0-9-]+\))?: \S.{0,71}")
+    TRAILING_SPACE = re.compile(r"\s$")
+    REFS = re.compile(r"Refs: [A-Z]{2,5}-\d+")
+
+
+    def check_message(lines):
+        errors = []
+        if not lines or not SUBJECT.fullmatch(lines[0]):
+            errors.append("subject must look like 'type(scope): text', max 72 chars")
+        for n, line in enumerate(lines, 1):
+            if TRAILING_SPACE.search(line):
+                errors.append(f"line {n}: trailing whitespace")
+        if len(lines) > 2 and not REFS.fullmatch(lines[-1]):
+            errors.append("last line must be 'Refs: ABC-123'")
+        return errors
+
+
+    def main():
+        with open(sys.argv[1]) as f:
+            lines = f.read().splitlines()
+        errors = check_message(lines)
+        for e in errors:
+            print(e, file=sys.stderr)
+        return 1 if errors else 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+
+    The behavior is the same. `fullmatch` replaces the `^...$` anchors, and the lines come from `splitlines()`, so they never end in a newline.
+
+    Don't scale the 18% to your workload. The benchmark measured only the matching, while your CI job also spends energy on `git log`, process startup and the checkout. The regex part is likely a small share of the job.
+
+    To verify, run the `--history` mode on the same repo with both versions under `perf stat` (or compare CPU time with `time`), several runs each. For a proper energy figure, run both as usage scenarios in the Green Metrics Tool. If the difference is inside the run-to-run noise, tell your lead it is a tidy-up, not a saving.
+verify:
+  module: true
+  green_block: 0
+  test: |-
+    good = ["feat(api): add endpoint", "", "body text", "Refs: AB-12"]
+    assert check_message(good) == []
+    assert check_message(["fix: ok"]) == []
+    assert check_message(["bad subject"]) == ["subject must look like 'type(scope): text', max 72 chars"]
+    assert check_message([]) == ["subject must look like 'type(scope): text', max 72 chars"]
+    assert check_message(["fix: ok ", "", "x", "Refs: AB-1"]) == ["line 1: trailing whitespace"]
+    assert check_message(["fix: ok", "", "x", "Refs: nope"]) == ["last line must be 'Refs: ABC-123'"]
+    assert check_message(["fix: " + "a" * 73]) != []

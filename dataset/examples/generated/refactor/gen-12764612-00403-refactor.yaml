@@ -1,0 +1,58 @@
+id: gen-12764612-00403-refactor
+category: refactor
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    hi, i am a PhD student and not good with bash. i wrote this to copy my climate model results to the storage server after a run. it works but takes forever and the node fans go crazy. i dont know what is wrong with it. can you clean it up?
+
+    ```bash
+    #!/bin/bash
+    # send ensemble results to storage node
+    RUN_DIR=/scratch/climate/ensemble_07
+    DEST=storage01.lab.example
+
+    for member in $(ls $RUN_DIR); do
+      echo "sending $member"
+      tar cf - $RUN_DIR/$member | xz -9e | ssh $DEST "cat > /archive/ensemble_07/$member.tar.xz"
+    done
+    echo "done"
+    ```
+
+    each member folder has a few hundred csv and text files (station output, logs)
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    run_dir=/scratch/climate/ensemble_07
+    dest=storage01.lab.example
+    remote_dir=/archive/ensemble_07
+
+    for path in "$run_dir"/*/; do
+        member=${path%/}
+        member=${member##*/}
+        echo "sending $member"
+        tar -C "$run_dir" -cf - "$member" \
+            | zstd -q -3 \
+            | ssh "$dest" "cat > '$remote_dir/$member.tar.zst'"
+    done
+    echo 'done'
+    ```
+
+    **Green Notes**
+    - **Compress transmitted data with a fast codec** (reduces E): the slow part is `xz -9e`. Your files are text and CSV, so compression helps, but you compress each member once and send it once. A very strong codec only burns CPU on the compute node. In Green Metrics Tool micro-benchmarks with default settings on 100 MB of text, xz used about 29× more compression energy than zstd. `-9e` is slower still than the measured default level. `zstd -3` is the default level and is a good fit here.
+
+    Other changes:
+    - `for member in $(ls ...)` and the unquoted variables break on folder names with spaces. The glob and quoted variables are safe.
+    - `tar -C` stores `ensemble_07/member` paths relative to the run folder, not the full `/scratch/...` path.
+    - `set -euo pipefail` stops the script if tar, zstd or ssh fails. Before, it kept going and printed "done" even if sending failed. A failed member can leave a partial file on the storage server, so delete it before you resend.
+
+    Check that your tools on the storage server can read `.tar.zst` (`tar --zstd -xf` or `zstd -d`). The energy figures compare compression work only, not file size. xz makes smaller files, which can matter if the link is very slow or you keep the archives for years. If your members are mostly NetCDF or HDF5 files with internal compression, drop the `zstd` step. Compressing them again gains almost nothing.
+verify:
+  static_only: needs zstd, ssh access to a storage host and a scratch directory

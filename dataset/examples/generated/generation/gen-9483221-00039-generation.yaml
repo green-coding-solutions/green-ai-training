@@ -1,0 +1,46 @@
+id: gen-9483221-00039-generation
+category: generation
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    Hello, can you write me Dockerfile for our deploybot. Its a small flask app what receive webhooks from github and send a message to our slack channel. Files are app.py and requirements.txt (flask, gunicorn, requests). The app object in app.py is called `app`, port 5000. Our gitlab pipeline build the image for every merge request and again when we merge, so many builds in a day. Thanks!
+- role: assistant
+  content: |
+    ```dockerfile
+    FROM python:3.12-slim
+
+    ENV PYTHONDONTWRITEBYTECODE=1 \
+        PYTHONUNBUFFERED=1
+
+    WORKDIR /app
+
+    # Dependencies first, so this layer is reused when only app.py changes
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY app.py .
+
+    EXPOSE 5000
+
+    HEALTHCHECK --interval=30s --timeout=3s \
+      CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/')" || exit 1
+
+    CMD ["gunicorn", "--bind", "0.0.0.0:5000", "app:app"]
+    ```
+
+    The healthcheck calls `/`. Change the path if your app has a dedicated health route.
+
+    **Green Notes**
+    - **Slim base image, runtime dependencies only** (reduces E): `python:3.12-slim` without compilers, git or dev tools means less to download, build and store. In Green Metrics Tool micro-benchmarks of a small Flask app, the build of a `python:3.12-slim` image used about 7× less energy than a full `python:3.12` image with build tools and dev packages. Serving requests cost the same afterwards, so the saving is in the build, pull and stored copy. Your pipeline repeats that on every merge request.
+    - **Dependency layer before the source** (reduces E): a change in `app.py` does not reinstall packages when `requirements.txt` is unchanged.
+    - **`pip --no-cache-dir`** (reduces M): the pip download cache is not kept in the image layer.
+    - **Healthcheck with Python** (reduces M): no need to install `curl` just for the check.
+
+    *Not applied:* build tools like `build-essential`. Flask, gunicorn and requests install from wheels. If you later add a package that must compile, add only the system packages it needs.
+verify:
+  static_only: Dockerfile, cannot be built or run here

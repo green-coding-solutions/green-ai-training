@@ -1,0 +1,46 @@
+id: gen-6593849-00143-generation
+category: generation
+language: sql
+sql_dialect: postgres
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+messages:
+- role: user
+  content: |
+    I need the query for the device overview page of our IoT gateway admin UI (Postgres 16, called from the backend with named parameters). The table is `gateway_devices` with about 45 columns. Most are small (ids, flags, counters, timestamps), but it also has `last_payload_json` (JSONB, a few KB per row), `diagnostic_dump` (TEXT, can be large) and `firmware_notes` (TEXT).
+
+    Requirements:
+    - Only devices of one site (`:site_id`), skip decommissioned ones (`decommissioned_at IS NOT NULL` means decommissioned)
+    - The page shows a table with: device id, name, status, last seen, battery percent, signal strength (`rssi_dbm`) and firmware version
+    - Offline devices first, then the ones not seen for the longest time
+    - Paginated, `:page_size` rows per page and `:page_offset`
+    - A site can have up to 20,000 devices and the page refreshes every 30 seconds
+- role: assistant
+  content: |-
+    ```sql
+    SELECT device_id,
+           name,
+           status,
+           last_seen_at,
+           battery_pct,
+           rssi_dbm,
+           firmware_version
+    FROM gateway_devices
+    WHERE site_id = :site_id
+      AND decommissioned_at IS NULL
+    ORDER BY (status = 'offline') DESC,
+             last_seen_at ASC NULLS FIRST,
+             device_id
+    LIMIT :page_size OFFSET :page_offset;
+    ```
+
+    `device_id` at the end of the `ORDER BY` makes the page order stable, so rows don't jump between pages when timestamps are equal.
+
+    If a detail view needs `last_payload_json` or `diagnostic_dump`, load them with a separate query for one `device_id` when the user opens that device.
+
+    **Green Notes**
+    - **Select only the needed columns** (reduces E and network): the table page needs 7 of about 45 columns. `SELECT *` would also read and send the JSONB payload and the diagnostic text of every row, on every 30-second refresh, and the page never shows them. In Green Metrics Tool micro-benchmarks on a 52-column table with large text columns, naming 10 columns used about 5.5× to 7× less CPU energy than `SELECT *`. The saving grows with the size of the skipped columns.
+    - **`LIMIT` with a page size** (reduces E and network): each refresh moves one page of rows, not all 20,000 devices of the site.

@@ -1,0 +1,128 @@
+id: gen-12764612-00402-review
+category: review
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    ```python
+    #!/usr/bin/env python3
+    """Sort a downloads folder into subfolders by file type."""
+    import argparse
+    import os
+    import sys
+
+    FOLDERS = {
+        ".jpg": "images", ".jpeg": "images", ".png": "images", ".gif": "images",
+        ".pdf": "documents", ".docx": "documents", ".txt": "documents",
+        ".mp3": "audio", ".flac": "audio",
+        ".mp4": "video", ".mkv": "video",
+        ".zip": "archives", ".tar": "archives", ".gz": "archives",
+    }
+
+
+    def folder_for(name):
+        ext = os.path.splitext(name)[1].lower()
+        try:
+            return FOLDERS[ext]
+        except KeyError:
+            return "other"
+
+
+    def main():
+        parser = argparse.ArgumentParser(description="Sort files into folders by type")
+        parser.add_argument("directory")
+        args = parser.parse_args()
+        if not os.path.isdir(args.directory):
+            sys.exit("not a directory: " + args.directory)
+        for entry in os.scandir(args.directory):
+            if not entry.is_file():
+                continue
+            folder = folder_for(entry.name)
+            target_dir = os.path.join(args.directory, folder)
+            os.makedirs(target_dir, exist_ok=True)
+            os.rename(entry.path, os.path.join(target_dir, entry.name))
+            print(entry.name, "->", folder)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    ?
+- role: assistant
+  content: |
+    **Workload:** script (file organizer CLI)
+
+    #### [Bug] Existing files are overwritten silently
+    - **Where:** `os.rename(entry.path, os.path.join(target_dir, entry.name))`
+    - **Issue:** on Linux and macOS, `os.rename` replaces an existing target. If `images/photo.png` is already there from an earlier run, a new `photo.png` in the top folder destroys it. On Windows the same call raises an error instead.
+    - **Fix:** check the target first and skip (or rename) on a clash. The code below skips and reports it.
+
+    #### [Low] Exception used for a common miss
+    - **Where:** `folder_for`, the `try/except KeyError`
+    - **Issue:** a downloads folder holds many files with unknown extensions (`.exe`, `.iso`, no extension), so the `except` path runs often. Raising and catching an exception costs more than a plain lookup with a default.
+    - **Fix:** `FOLDERS.get(ext, "other")`. The result is the same.
+    - **Impact:** E, small. In Green Metrics Tool micro-benchmarks with about half of the keys missing, `dict.get` used about 12% less CPU energy than `try/except KeyError`. For a script that runs now and then, the file moves cost far more than the lookup, so this is mostly a cleanliness gain. When misses are rare, `try/except` is fine.
+
+    ```python
+    #!/usr/bin/env python3
+    """Sort a downloads folder into subfolders by file type."""
+    import argparse
+    import os
+    import sys
+
+    FOLDERS = {
+        ".jpg": "images", ".jpeg": "images", ".png": "images", ".gif": "images",
+        ".pdf": "documents", ".docx": "documents", ".txt": "documents",
+        ".mp3": "audio", ".flac": "audio",
+        ".mp4": "video", ".mkv": "video",
+        ".zip": "archives", ".tar": "archives", ".gz": "archives",
+    }
+
+
+    def folder_for(name):
+        ext = os.path.splitext(name)[1].lower()
+        return FOLDERS.get(ext, "other")
+
+
+    def main():
+        parser = argparse.ArgumentParser(description="Sort files into folders by type")
+        parser.add_argument("directory")
+        args = parser.parse_args()
+        if not os.path.isdir(args.directory):
+            sys.exit("not a directory: " + args.directory)
+        for entry in os.scandir(args.directory):
+            if not entry.is_file():
+                continue
+            folder = folder_for(entry.name)
+            target_dir = os.path.join(args.directory, folder)
+            target = os.path.join(target_dir, entry.name)
+            if os.path.exists(target):
+                print("skipped (already exists):", entry.name, file=sys.stderr)
+                continue
+            os.makedirs(target_dir, exist_ok=True)
+            os.rename(entry.path, target)
+            print(entry.name, "->", folder)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Already good:** the extension is lowercased, so `.JPG` and `.jpg` land in the same folder. `exist_ok=True` makes repeated runs safe, and the lookup table is a plain dict.
+verify:
+  module: true
+  test: |
+    assert folder_for("x.PNG") == "images"
+    assert folder_for("setup.exe") == "other"
+    assert folder_for("README") == "other"
+    assert folder_for("a.tar.gz") == "archives"
+  equivalence:
+    driver: |-
+      names = ["a.JPG", "b.txt", "c.exe", "README", "d.tar.gz", "e.MKV", ".bashrc", "f.flac", "g.iso"]
+      for n in names:
+          print(n, folder_for(n))

@@ -1,0 +1,136 @@
+id: gen-6593849-00251-refactor
+category: refactor
+language: html
+patterns:
+- css-animations
+facts:
+- F-ANIM
+messages:
+- role: user
+  content: |
+    hi, im not sure whats wrong but my log search page feels heavy and the fan on my laptop goes up after I search a few times. i use it for searching the archive of our server logs. can you look at it?
+
+    ```html
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <meta charset="utf-8">
+    <title>Log search</title>
+    <style>
+      body { font-family: sans-serif; margin: 24px; }
+      #loading { display: none; margin-top: 16px; }
+      #spinner { display: inline-block; width: 18px; height: 18px; border: 3px solid #ccc;
+                 border-top-color: #0a7; border-radius: 50%; vertical-align: middle; }
+      #track { position: relative; width: 300px; height: 6px; background: #eee;
+               margin-top: 8px; overflow: hidden; }
+      #bar { position: absolute; top: 0; left: -100px; width: 100px; height: 6px; background: #0a7; }
+      pre { background: #111; color: #ddd; padding: 12px; white-space: pre-wrap; }
+    </style>
+    </head>
+    <body>
+    <h2>Archive log search</h2>
+    <input id="q" placeholder="error code or text">
+    <button id="go">Search</button>
+    <div id="loading">
+      <span id="spinner"></span> Searching archive...
+      <div id="track"><div id="bar"></div></div>
+    </div>
+    <pre id="out"></pre>
+    <script>
+    var angle = 0, pos = -100, timer1, timer2;
+
+    function startLoading() {
+      document.getElementById('loading').style.display = 'block';
+      timer1 = setInterval(function () {
+        angle += 6;
+        document.getElementById('spinner').style.transform = 'rotate(' + angle + 'deg)';
+      }, 16);
+      timer2 = setInterval(function () {
+        pos += 3;
+        if (pos > 300) pos = -100;
+        document.getElementById('bar').style.left = pos + 'px';
+      }, 16);
+    }
+
+    function stopLoading() {
+      document.getElementById('loading').style.display = 'none';
+    }
+
+    document.getElementById('go').onclick = function () {
+      var q = document.getElementById('q').value;
+      startLoading();
+      fetch('/api/logs/search?q=' + encodeURIComponent(q))
+        .then(function (r) { return r.text(); })
+        .then(function (t) {
+          document.getElementById('out').textContent = t;
+          stopLoading();
+        });
+    };
+    </script>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    You found it. Your fan noise comes from the two `setInterval` timers that move the spinner and the bar. `stopLoading()` only hides the box. It never stops the timers, so they keep running after every search, and each new search adds two more. After a few searches, many timers write styles 60 times a second on a hidden element.
+
+    Here is the fixed page. The animations are now in CSS, and JavaScript only turns a class on and off.
+
+    ```html
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <meta charset="utf-8">
+    <title>Log search</title>
+    <style>
+      body { font-family: sans-serif; margin: 24px; }
+      #loading { display: none; margin-top: 16px; }
+      #loading.is-loading { display: block; }
+      #spinner { display: inline-block; width: 18px; height: 18px; border: 3px solid #ccc;
+                 border-top-color: #0a7; border-radius: 50%; vertical-align: middle;
+                 animation: spin 1s linear infinite; }
+      #track { position: relative; width: 300px; height: 6px; background: #eee;
+               margin-top: 8px; overflow: hidden; }
+      #bar { position: absolute; top: 0; left: 0; width: 100px; height: 6px; background: #0a7;
+             animation: slide 2.1s linear infinite; }
+      pre { background: #111; color: #ddd; padding: 12px; white-space: pre-wrap; }
+
+      @keyframes spin  { to { transform: rotate(360deg); } }
+      @keyframes slide { from { transform: translateX(-100px); } to { transform: translateX(300px); } }
+    </style>
+    </head>
+    <body>
+    <h2>Archive log search</h2>
+    <input id="q" placeholder="error code or text">
+    <button id="go">Search</button>
+    <div id="loading">
+      <span id="spinner"></span> Searching archive...
+      <div id="track"><div id="bar"></div></div>
+    </div>
+    <pre id="out"></pre>
+    <script>
+    var loading = document.getElementById('loading');
+    var out = document.getElementById('out');
+
+    document.getElementById('go').onclick = function () {
+      var q = document.getElementById('q').value;
+      loading.classList.add('is-loading');
+      fetch('/api/logs/search?q=' + encodeURIComponent(q))
+        .then(function (r) { return r.text(); })
+        .then(function (t) { out.textContent = t; })
+        .catch(function () { out.textContent = 'Search failed.'; })
+        .finally(function () { loading.classList.remove('is-loading'); });
+    };
+    </script>
+    </body>
+    </html>
+    ```
+
+    **Green Notes**
+    - **CSS keyframes instead of JS-driven animation** (reduces E): the browser runs `@keyframes` itself, so there is no JavaScript running 60 times a second. The old bar also moved with `left`, which forces layout work. `transform` does not. In Green Metrics Tool micro-benchmarks, a 20-second animation used about 161 J CPU energy with a JavaScript `requestAnimationFrame` loop and about 145 J with CSS `@keyframes` (about 10% less). Your page used `setInterval`, not `requestAnimationFrame`, but the idea is the same.
+    - **Nothing runs when idle** (reduces E): an element with `display: none` does not animate. When the search ends, the animations stop with it, and they start fresh on the next search.
+
+    The look is the same: the spinner turns once per second, and the bar crosses the track in about 2 seconds. I also fixed two bugs. The timers are gone, so they can no longer pile up. And if the request fails, the loading box now closes and shows "Search failed." Before, it stayed open forever.
+verify:
+  static_only: HTML page with browser fetch and CSS animations; needs a browser and a backend endpoint, no stdlib or numpy
+    test possible

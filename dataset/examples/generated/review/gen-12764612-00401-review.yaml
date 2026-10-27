@@ -1,0 +1,80 @@
+id: gen-12764612-00401-review
+category: review
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    review pls, cron every minute on the landing page box
+
+    ```bash
+    #!/usr/bin/env bash
+    # refresh live counters for the landing page
+    OUT=/var/www/landing/api
+    BASE=http://127.0.0.1:8080/internal
+
+    cd $OUT
+    curl -s $BASE/stats > stats.json
+    curl -s $BASE/signups > signups.json
+
+    for f in stats.json signups.json; do
+        brotli -q 11 -f -k "$f" -o "$f.br"
+        gzip -9 -k -f "$f"
+    done
+
+    echo "updated $(date)" >> /var/log/landing-refresh.log
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (cron script, runs every minute)
+
+    #### [Bug] Failed fetch overwrites the live files
+    - **Where:** the two `curl -s ... > file` lines
+    - **Issue:** `-s` without `-f` writes an error page or an empty body into `stats.json` if the backend fails. The script then compresses it and nginx serves it. The files are also written in place, so a visitor can read a half-written file. `cd $OUT` and the unquoted `$BASE` also break on unexpected values.
+    - **Fix:** use `curl -sf` into a temp file, and only `mv` it into place when curl succeeded.
+
+    #### [High] Maximum-effort brotli on content that changes every minute
+    - **Where:** `brotli -q 11 -f -k "$f" -o "$f.br"`
+    - **Issue:** quality 11 is built for static assets that are compressed once and served many times. Here the data is new every minute, so you pay the most expensive codec 1,440 times a day per file. In Green Metrics Tool micro-benchmarks, brotli at its default quality 11 used about 45× the CPU energy of gzip when compressing 100 MB of text. Brotli gives smaller files, but those benchmarks compare energy only, and for a small JSON file the byte difference is small.
+    - **Fix:** drop the `.br` file and keep one `.gz` at gzip's default level. nginx serves it with `gzip_static on;`. If you want brotli, create it for the truly static files (JS, CSS) at deploy time.
+    - **Impact:** reduces E on the server on every run. Visitors still get compressed responses.
+
+    #### [Low] Compress level 9 for tiny files
+    - **Where:** `gzip -9`
+    - **Issue:** the extra effort buys little on files this small. The default level is enough.
+
+    ```bash
+    #!/usr/bin/env bash
+    set -u
+    OUT='/var/www/landing/api'
+    BASE='http://127.0.0.1:8080/internal'
+
+    refresh() {
+        local name=$1 tmp
+        tmp=$(mktemp -p "$OUT" "$name.XXXXXX") || return 1
+        if curl -sf "$BASE/$name" -o "$tmp" && gzip -c "$tmp" > "$tmp.gz"; then
+            chmod 644 "$tmp" "$tmp.gz"
+            mv "$tmp.gz" "$OUT/$name.json.gz"
+            mv "$tmp" "$OUT/$name.json"
+        else
+            rm -f "$tmp" "$tmp.gz"
+            echo "refresh failed: $name" >&2
+        fi
+    }
+
+    refresh stats
+    refresh signups
+
+    echo "updated $(date)" >> /var/log/landing-refresh.log
+    ```
+
+    Failed fetches now keep the last good file. The `.br` files are gone, so remove `brotli_static` from the nginx config if you had it on.
+
+    **Already good:** the data is compressed once per minute, not once per request.
+verify:
+  static_only: needs a running backend on localhost, curl, and nginx-served output; compression CLI behavior is not reproducible
+    in the test harness

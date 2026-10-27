@@ -1,0 +1,65 @@
+id: gen-6593849-00165-no-change
+category: no-change
+language: python
+patterns:
+- none
+- context-tradeoff
+facts:
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    We have a small Flask backend behind our marketing landing page. Marketing publishes announcement banners from an admin form, maybe 3-4 times a week. The page shows the newest banner first and keeps at most 5 banners. Our new dev says `list.insert(0, ...)` is an energy problem and wants me to switch to `collections.deque` everywhere. Requirements: newest first, max 5 kept, no behavior change. Do I need to change this?
+
+    ```python
+    from datetime import datetime, timezone
+
+    MAX_BANNERS = 5
+    _banners = []
+
+
+    def publish_banner(text, link):
+        banner = {
+            "text": text.strip(),
+            "link": link,
+            "published_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _banners.insert(0, banner)
+        del _banners[MAX_BANNERS:]
+        return banner
+
+
+    def current_banners():
+        return list(_banners)
+    ```
+- role: assistant
+  content: |
+    No, leave it as it is.
+
+    `insert(0, x)` is slow only because it shifts every element in the list. That cost grows with the list length. In Green Metrics Tool micro-benchmarks, 1,000,000 front inserts into a growing list used about 1515 J, against about 1.2 J for 1,000,000 `append` calls. Your list never has more than 6 items, and `publish_banner` runs a few times a week. Shifting 5 pointers a few times a week is not measurable, so a deque would not save anything here.
+
+    Your code is also correct for your requirements:
+    - `del _banners[MAX_BANNERS:]` keeps the list bounded, so it can never grow into the slow case.
+    - `current_banners()` returns a copy, so callers cannot change the shared list.
+
+    A deque makes sense when the list grows large or is written on a hot path, such as thousands of events per second. If you ever change this into a long history, the bounded version looks like this:
+
+    ```python
+    from collections import deque
+
+    MAX_BANNERS = 5
+    _banners = deque(maxlen=MAX_BANNERS)
+
+    _banners.appendleft({"text": "Spring sale", "link": "/sale"})
+    ```
+
+    It drops the oldest item automatically. For 5 items, keep the plain list: it is easier to read and slicing works without extra code.
+verify:
+  test: |-
+    from collections import deque
+    d = deque(maxlen=MAX_BANNERS)
+    for i in range(7):
+        d.appendleft({"text": str(i), "link": "/"})
+    assert len(d) == 5
+    assert d[0]["text"] == "6"
+    assert d[-1]["text"] == "2"

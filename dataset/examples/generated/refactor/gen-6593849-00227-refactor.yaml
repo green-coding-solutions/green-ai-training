@@ -1,0 +1,124 @@
+id: gen-6593849-00227-refactor
+category: refactor
+language: python
+patterns:
+- regex-precompile
+- memoize
+facts:
+- F-REGEX
+- F-LRU
+messages:
+- role: user
+  content: |
+    nginx access log summarizer, runs on ~20M lines per day. diff only, no lecture.
+
+    ```python
+    import re
+    from collections import Counter
+
+    LINE_RE = r'^(\S+) \S+ \S+ \[([^\]]+)\] "(\S+) (\S+) [^"]*" (\d{3}) (\d+|-) "[^"]*" "([^"]*)"$'
+
+
+    def browser_family(ua):
+        if re.search(r"bot|crawler|spider|curl|python-requests", ua, re.I):
+            return "bot"
+        m = re.search(r"(Edg|Firefox|Chrome|Safari)/(\d+)", ua)
+        if not m:
+            return "other"
+        name = {"Edg": "Edge"}.get(m.group(1), m.group(1))
+        return f"{name} {m.group(2)}"
+
+
+    def summarize(lines):
+        by_family = Counter()
+        by_class = Counter()
+        total_bytes = 0
+        for line in lines:
+            m = re.match(LINE_RE, line)
+            if not m:
+                continue
+            ip, ts, method, path, status, size, ua = m.groups()
+            by_class[status[0] + "xx"] += 1
+            if size != "-":
+                total_bytes += int(size)
+            by_family[browser_family(ua)] += 1
+        return by_family, by_class, total_bytes
+    ```
+- role: assistant
+  content: |
+    ```python
+    import re
+    from collections import Counter
+    from functools import lru_cache
+
+    LINE_RE = re.compile(r'^(\S+) \S+ \S+ \[([^\]]+)\] "(\S+) (\S+) [^"]*" (\d{3}) (\d+|-) "[^"]*" "([^"]*)"$')
+    BOT_RE = re.compile(r"bot|crawler|spider|curl|python-requests", re.I)
+    BROWSER_RE = re.compile(r"(Edg|Firefox|Chrome|Safari)/(\d+)")
+
+
+    @lru_cache(maxsize=4096)
+    def browser_family(ua):
+        if BOT_RE.search(ua):
+            return "bot"
+        m = BROWSER_RE.search(ua)
+        if not m:
+            return "other"
+        name = {"Edg": "Edge"}.get(m.group(1), m.group(1))
+        return f"{name} {m.group(2)}"
+
+
+    def summarize(lines):
+        by_family = Counter()
+        by_class = Counter()
+        total_bytes = 0
+        for line in lines:
+            m = LINE_RE.match(line)
+            if not m:
+                continue
+            ip, ts, method, path, status, size, ua = m.groups()
+            by_class[status[0] + "xx"] += 1
+            if size != "-":
+                total_bytes += int(size)
+            by_family[browser_family(ua)] += 1
+        return by_family, by_class, total_bytes
+    ```
+
+    **Green Notes**
+    - **Compile regex once** (reduces E): the three patterns are now module-level. Expect a small gain, because Python's `re` already caches compiled patterns. In Green Metrics Tool micro-benchmarks, a precompiled pattern used about 18% less CPU energy than inline `re.match` over 1,000,000 matches. It also makes sure the patterns can never be recompiled by a cache eviction.
+    - **Memoize `browser_family`** (reduces E): the function is pure, and a day of traffic has only a few thousand distinct user-agent strings across 20M lines. In Green Metrics Tool micro-benchmarks, `lru_cache` used about 9× less CPU energy for 1,000,000 repeated computations drawn from 200 distinct inputs. Your hit rate should be high, but check `browser_family.cache_info()` once on real data. If most user agents turn out to be unique, the cache only adds overhead, so remove it.
+    - The line regex is not memoized, since every log line is different.
+
+    Output is identical. The cache is bounded at 4096 entries, so memory stays flat.
+verify:
+  equivalence:
+    driver: |-
+      import random
+      random.seed(11)
+      uas = [
+          "Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 Chrome/118.0.0.0 Safari/537.36",
+          "Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 Chrome/118.0.0.0 Safari/537.36 Edg/118.0.2088.46",
+          "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/119.0",
+          "Mozilla/5.0 (Macintosh) AppleWebKit/605.1.15 Version/17.0 Safari/605.1.15",
+          "Googlebot/2.1 (+http://www.google.com/bot.html)",
+          "curl/8.1.2",
+          "python-requests/2.31.0",
+          "SomethingElse/1.0",
+          "",
+      ]
+      paths = ["/", "/api/items", "/static/app.js", "/login"]
+      statuses = ["200", "200", "200", "304", "404", "500", "301"]
+      lines = []
+      for i in range(500):
+          size = random.choice(["-", str(random.randint(0, 99999))])
+          lines.append(
+              f'10.0.0.{i % 250} - - [01/Nov/2026:10:{i % 60:02d}:00 +0000] '
+              f'"GET {random.choice(paths)} HTTP/1.1" {random.choice(statuses)} {size} "-" "{random.choice(uas)}"'
+          )
+      lines.append("garbage line")
+      lines.append("")
+      by_family, by_class, total = summarize(lines)
+      for k in sorted(by_family):
+          print(k, by_family[k])
+      for k in sorted(by_class):
+          print(k, by_class[k])
+      print(total)

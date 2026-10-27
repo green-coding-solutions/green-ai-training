@@ -1,0 +1,70 @@
+id: gen-9483221-00018-review
+category: review
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    Review this. Only tell me what to change, I don't need a rewrite. It's the hand-off between our extract stage and the loader box. Cron runs it every couple of minutes, each ndjson batch is roughly 100 MB of JSON text.
+
+    ```bash
+    #!/bin/bash
+    # ship ndjson batches from the extract stage to the loader host
+    set -e
+
+    SPOOL=/var/spool/etl/extract
+    DONE=/var/spool/etl/shipped
+    LOADER=etl@loader-02.internal
+    INCOMING=/srv/loader/incoming
+
+    mkdir -p $DONE
+
+    for f in $SPOOL/*.ndjson; do
+      [ -e "$f" ] || continue
+      name=$(basename "$f")
+      bzip2 -9 -c "$f" | ssh -o StrictHostKeyChecking=no $LOADER \
+        "bunzip2 > $INCOMING/$name.part && mv $INCOMING/$name.part $INCOMING/$name"
+      mv "$f" $DONE/
+    done
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline
+
+    #### [Bug] Overlapping cron runs ship the same file twice
+    - **Where:** the whole script, no lock
+    - **Issue:** if one run takes longer than the cron interval, the next run starts while the first is still sending. Both see the same `$f` and write the same `.part` file on the loader. That can corrupt the batch or double-load it.
+    - **Fix:** take a lock at the top.
+
+    #### [Security] Host key checking is off
+    - **Where:** `ssh -o StrictHostKeyChecking=no`
+    - **Issue:** anyone who can intercept the connection can receive your data and feed the loader fake batches.
+    - **Fix:** add the loader's key to `known_hosts` once (`ssh-keyscan loader-02.internal`, then verify the fingerprint) and use `StrictHostKeyChecking=yes`.
+
+    #### [High] bzip2 -9 on every batch
+    - **Where:** `bzip2 -9 -c "$f"` and `bunzip2` on the loader
+    - **Issue:** this data is compressed again on every run, and the loader has to decompress it every time. bzip2 is one of the most expensive codecs on both sides.
+    - **Fix:** use `zstd` at its default level on both ends.
+    - **Impact:** reduces E on both hosts, per batch. In Green Metrics Tool micro-benchmarks on 100 MB of English text with default settings, compressing used about 106 J with bzip2 and about 16 J with zstd. Decompressing used about 52 J with bzip2 and about 5.3 J with zstd. Those figures measure energy, not output size. bzip2 usually gives a somewhat smaller file. That only matters if the link is the bottleneck, and between two hosts in the same network it usually isn't.
+
+    ```bash
+    exec 9>/var/lock/etl-ship.lock
+    flock -n 9 || exit 0
+
+    for f in "$SPOOL"/*.ndjson; do
+      [ -e "$f" ] || continue
+      name=$(basename "$f")
+      zstd -q -c "$f" | ssh -o StrictHostKeyChecking=yes "$LOADER" \
+        "zstd -d -q > '$INCOMING/$name.part' && mv '$INCOMING/$name.part' '$INCOMING/$name'"
+      mv "$f" "$DONE"/
+    done
+    ```
+
+    Install `zstd` on both hosts first. Deploy both ends in the same change, because the loader must not run `bunzip2` on zstd data.
+
+    **Already good:** the `.part` then `mv` pattern means the loader never sees half-written files. Compressing in the pipe avoids a temp file on disk.
+verify:
+  static_only: needs ssh, a remote loader host and zstd; not runnable in the sandbox

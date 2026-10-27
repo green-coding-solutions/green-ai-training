@@ -1,0 +1,78 @@
+id: gen-12764612-00437-review
+category: review
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    Hello, can you look on my backup script pls? I wrote it for our small office, it run every night from cron and make backup of the mailboxes (maildir, around 30 GB) to the NAS. We keep 14 days. Its working but sometimes I am not sure it is write good.
+
+    ```bash
+    #!/bin/bash
+    # nightly backup of mail folders
+    SRC=/srv/mail
+    DEST=/mnt/nas/mailbackup
+    DATE=`date +%Y-%m-%d`
+
+    cd $SRC
+    7z a -t7z -mx=9 -mhe=on -p$BACKUP_PASS $DEST/mail-$DATE.7z . > /dev/null
+
+    # delete old
+    find $DEST -name "mail-*.7z" -mtime +14 -exec rm {} \;
+
+    echo "backup done $DATE" | mail -s "backup" admin@firma.example
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (nightly backup job)
+
+    #### [Bug] Failed backup is not noticed, and old backups are still deleted
+    - **Where:** the lines after `7z a ...`
+    - **Issue:** the script never checks if `7z` worked. If the NAS is full or not mounted, it still deletes the old backups and sends "backup done". After 14 days of failures you could have no backup at all.
+    - **Fix:** use `set -euo pipefail` and write to a `.part` file. Rename it only when the whole pipeline worked. Prune and send the mail only after that.
+
+    #### [Bug] `cd $SRC` has no check
+    - **Where:** `cd $SRC`
+    - **Issue:** if the `cd` fails, `7z` packs the current directory, not the mail. Variables without quotes also break on spaces.
+    - **Fix:** use `tar -C "$SRC"` and quote the variables.
+
+    #### [Security] Password visible in the process list
+    - **Where:** `-p$BACKUP_PASS`
+    - **Issue:** every user on the machine can read it with `ps` while the backup runs.
+    - **Fix:** put the passphrase in a root-only file (`chmod 600`) and give gpg the file.
+
+    #### [High] Very expensive codec for data that is compressed every night
+    - **Where:** `7z a -t7z -mx=9`
+    - **Issue:** the full 30 GB mail store is compressed with 7-Zip at a high level, every night. In Green Metrics Tool micro-benchmarks, compressing 100 MB of text at default settings used ~16 J with zstd and ~724 J with 7-Zip. `-mx=9` is above the default, so it costs more. Compression is worth it for data you keep for 14 days, but a fast codec gives most of the benefit.
+    - **Fix:** use `tar | zstd | gpg`. Compress first, then encrypt, because encrypted data does not compress.
+    - **Impact:** E on the backup server, every night. These measurements compare energy, not file size. 7-Zip makes smaller files. If NAS space is tight, check the real size difference on your mail before you decide.
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    SRC=/srv/mail
+    DEST=/mnt/nas/mailbackup
+    PASSFILE=/etc/mailbackup.pass   # chmod 600, owner root
+    DATE=$(date +%F)
+    OUT="$DEST/mail-$DATE.tar.zst.gpg"
+
+    tar -C "$SRC" -cf - . \
+      | zstd -q \
+      | gpg --batch --yes --pinentry-mode loopback \
+            --passphrase-file "$PASSFILE" --symmetric -o "$OUT.part"
+    mv "$OUT.part" "$OUT"
+
+    # only reached when the backup worked
+    find "$DEST" -name 'mail-*.tar.zst.gpg' -mtime +14 -delete
+    echo "backup done $DATE" | mail -s 'backup' admin@firma.example
+    ```
+
+    The old `mail-*.7z` files are not matched by the new `find`. Keep your old `find` line for some days until they are gone.
+
+    To restore: `gpg -d --batch --pinentry-mode loopback --passphrase-file /etc/mailbackup.pass mail-DATE.tar.zst.gpg | zstd -d | tar -x -C /restore/dir`. Test this once now, before you need it.
+verify:
+  static_only: needs 7z, zstd, gpg, a mail store and a NAS mount; script is only syntax checked

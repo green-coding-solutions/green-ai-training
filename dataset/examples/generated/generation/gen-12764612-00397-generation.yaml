@@ -1,0 +1,120 @@
+id: gen-12764612-00397-generation
+category: generation
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    I need a FastAPI service for our real-estate platform. It checks if the asking price of a listing looks off.
+
+    Requirements:
+    - POST /v1/price-check takes a list of listings (1 to 64 per request). Each has `asking_price` (float, > 0) and `features` (exactly 8 floats, already normalized by our frontend).
+    - Model is a small PyTorch regression net: 8 -> 32 -> 16 -> 1 with ReLU. The weights are a plain state_dict in `models/price_net.pt`. CPU only, no GPU on these pods.
+    - Load the model once at startup, not per request.
+    - Response: for each listing `predicted_price`, `deviation` (asking minus predicted, divided by predicted) and `flagged` (true if abs(deviation) > 0.3).
+    - Return 422 for bad input, and 503 if the model file is missing.
+    - Keep it simple, we will add auth later.
+- role: assistant
+  content: |
+    ```python
+    from contextlib import asynccontextmanager
+    from pathlib import Path
+
+    import torch
+    from fastapi import FastAPI, HTTPException, Request
+    from pydantic import BaseModel, Field
+    from torch import nn
+
+    MODEL_PATH = Path("models/price_net.pt")
+    N_FEATURES = 8
+    MAX_ITEMS = 64
+    FLAG_THRESHOLD = 0.3
+
+
+    class PriceNet(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(N_FEATURES, 32),
+                nn.ReLU(),
+                nn.Linear(32, 16),
+                nn.ReLU(),
+                nn.Linear(16, 1),
+            )
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.net(x).squeeze(-1)
+
+
+    class Listing(BaseModel):
+        asking_price: float = Field(gt=0)
+        features: list[float] = Field(min_length=N_FEATURES, max_length=N_FEATURES)
+
+
+    class PriceCheckRequest(BaseModel):
+        listings: list[Listing] = Field(min_length=1, max_length=MAX_ITEMS)
+
+
+    class PriceCheckResult(BaseModel):
+        predicted_price: float
+        deviation: float
+        flagged: bool
+
+
+    class PriceCheckResponse(BaseModel):
+        results: list[PriceCheckResult]
+
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        app.state.model = None
+        if MODEL_PATH.is_file():
+            model = PriceNet()
+            state = torch.load(MODEL_PATH, map_location="cpu", weights_only=True)
+            model.load_state_dict(state)
+            model.eval()
+            app.state.model = model
+        yield
+
+
+    app = FastAPI(lifespan=lifespan)
+
+
+    @app.post("/v1/price-check", response_model=PriceCheckResponse)
+    def price_check(body: PriceCheckRequest, request: Request) -> PriceCheckResponse:
+        model = request.app.state.model
+        if model is None:
+            raise HTTPException(status_code=503, detail="Model not available")
+
+        x = torch.tensor([l.features for l in body.listings], dtype=torch.float32)
+        asking = torch.tensor([l.asking_price for l in body.listings], dtype=torch.float32)
+
+        with torch.no_grad():
+            predicted = model(x)
+
+        # Guard against zero or negative predictions before dividing.
+        deviation = (asking - predicted) / predicted.clamp(min=1.0)
+        flagged = deviation.abs() > FLAG_THRESHOLD
+
+        return PriceCheckResponse(
+            results=[
+                PriceCheckResult(
+                    predicted_price=p,
+                    deviation=d,
+                    flagged=f,
+                )
+                for p, d, f in zip(predicted.tolist(), deviation.tolist(), flagged.tolist())
+            ]
+        )
+    ```
+
+    The endpoint is a plain `def`, so FastAPI runs it in its thread pool and the CPU-bound forward pass does not block the event loop. Pydantic returns 422 for bad input. The `clamp` keeps a predicted price of zero or below from causing a division by zero or a sign flip.
+
+    **Green Notes**
+    - **`torch.no_grad()` for inference** (reduces E): the forward pass runs inside `no_grad`, so PyTorch does not build an autograd graph for every request. You never call `backward()` here, so that work is wasted. In Green Metrics Tool micro-benchmarks of 100,000 CPU inferences, a run without `no_grad` used ~157 J and one with it ~135 J, about 14% less. The saving is per request, so it adds up on a busy endpoint. Your net is small, so expect the same direction but measure it on your own traffic.
+    - `model.eval()` is also set at load time. It does not save energy by itself, but it is the right mode for inference if you add dropout or batch norm layers later.
+verify:
+  static_only: needs torch, fastapi and pydantic

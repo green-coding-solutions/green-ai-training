@@ -1,0 +1,47 @@
+id: gen-6593849-00138-generation
+category: generation
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    py func: list of ~50 image urls -> labels from our model server POST /predict, keep order
+- role: assistant
+  content: |
+    ```python
+    import asyncio
+
+    import httpx
+
+
+    async def predict_labels(urls, endpoint, max_concurrency=8):
+        """Return one label per url, in the same order as `urls`."""
+        sem = asyncio.Semaphore(max_concurrency)
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+
+            async def predict_one(url):
+                async with sem:
+                    resp = await client.post(endpoint, json={"image_url": url})
+                    resp.raise_for_status()
+                    return resp.json()["label"]
+
+            return await asyncio.gather(*(predict_one(u) for u in urls))
+
+
+    # labels = asyncio.run(predict_labels(urls, "http://models.internal:8080/predict"))
+    ```
+
+    If one request fails, `gather` raises that error. Wrap `predict_one` in `try/except` if you want partial results instead.
+
+    **Green Notes**
+    - **Concurrent requests** (reduces E, idle wait): the 50 calls overlap instead of waiting one after another, so the process spends far less time blocked on the network. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. With few requests the gain is mostly wall time.
+    - **One shared client** (reduces E, network): connections are reused, so there is no new TCP/TLS handshake per image.
+    - **Bounded with a semaphore**: the model server sees at most 8 requests at once, so it is not flooded and you avoid retries from timeouts.
+
+    *Not applied:* async for a single call. With one request, plain `httpx.post` is simpler and saves nothing.
+verify:
+  static_only: needs httpx and a running model server

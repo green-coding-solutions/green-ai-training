@@ -1,0 +1,133 @@
+id: gen-6593849-00267-refactor
+category: refactor
+language: python
+patterns:
+- memoize
+- avoid-exception-flow
+facts:
+- F-LRU
+- F-EXC
+messages:
+- role: user
+  content: |
+    Our nightly ETL cleans the order-line export from the warehouse system. It is a CSV with about 2 million rows, and the `unit` column has only a few hundred different values (things like "PCS", "pcs.", "Kgs", "box", "  m "). The profiler says `normalize_unit` is one of the top functions.
+
+    Requirements:
+    - Output must stay exactly the same, the downstream loader compares files byte by byte.
+    - No new dependencies, stdlib only.
+    - Memory must stay bounded, the job runs in a 512 MB container.
+    - Keep it readable, other people maintain this.
+
+    Can you optimize it?
+
+    ```python
+    import csv
+
+    UNIT_ALIASES = {
+        "pcs": "piece",
+        "pc": "piece",
+        "kgs": "kg",
+        "ltr": "l",
+        "lt": "l",
+        "mtr": "m",
+    }
+
+
+    def normalize_unit(raw):
+        cleaned = " ".join(raw.strip().lower().rstrip(".").split())
+        try:
+            return UNIT_ALIASES[cleaned]
+        except KeyError:
+            return cleaned
+
+
+    def clean_rows(rows):
+        out = []
+        for row in rows:
+            out.append({
+                "sku": row["sku"].strip(),
+                "qty": int(row["qty"]),
+                "unit": normalize_unit(row["unit"]),
+            })
+        return out
+
+
+    def clean_file(path):
+        with open(path, newline="") as f:
+            return clean_rows(csv.DictReader(f))
+    ```
+- role: assistant
+  content: |
+    ```python
+    import csv
+    from functools import lru_cache
+
+    UNIT_ALIASES = {
+        "pcs": "piece",
+        "pc": "piece",
+        "kgs": "kg",
+        "ltr": "l",
+        "lt": "l",
+        "mtr": "m",
+    }
+
+
+    @lru_cache(maxsize=4096)
+    def normalize_unit(raw):
+        cleaned = " ".join(raw.strip().lower().rstrip(".").split())
+        return UNIT_ALIASES.get(cleaned, cleaned)
+
+
+    def clean_rows(rows):
+        return [
+            {
+                "sku": row["sku"].strip(),
+                "qty": int(row["qty"]),
+                "unit": normalize_unit(row["unit"]),
+            }
+            for row in rows
+        ]
+
+
+    def clean_file(path):
+        with open(path, newline="") as f:
+            return clean_rows(csv.DictReader(f))
+    ```
+
+    **Green Notes**
+    - **Memoize a pure function** (reduces E): `normalize_unit` depends only on its input, and a few hundred raw values repeat across 2 million rows. With the cache, each distinct value is cleaned once and every repeat is a dictionary hit. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations drawn from 200 distinct values used about 9× less CPU energy with `lru_cache`. The cache is bounded by `maxsize=4096`, so memory stays small. It returns plain strings, so callers cannot change a cached value by accident.
+    - **No exception for a common case** (reduces E): most units are not aliases, so `UNIT_ALIASES[cleaned]` raised and caught a `KeyError` for most values. `dict.get(cleaned, cleaned)` does the same without raising. In Green Metrics Tool micro-benchmarks, with about half of the keys missing, `dict.get` used about 12% less CPU energy than `try/except KeyError`. Raising is the expensive part, so `try/except` is fine when misses are rare.
+
+    The output is identical. I also turned the append loop in `clean_rows` into a list comprehension. That is only a readability change. The cache only helps while the number of distinct raw values stays small. If the column held mostly unique text, it would add overhead and you should remove it.
+verify:
+  test: |
+    assert normalize_unit(" PCS. ") == "piece"
+    assert normalize_unit("Box") == "box"
+    assert normalize_unit("  m ") == "m"
+    assert normalize_unit("Kgs") == "kg"
+    rows = [
+        {"sku": " A1 ", "qty": "3", "unit": "PCS"},
+        {"sku": "B2", "qty": "10", "unit": "pcs."},
+        {"sku": "C3", "qty": "1", "unit": "box"},
+    ]
+    assert clean_rows(rows) == [
+        {"sku": "A1", "qty": 3, "unit": "piece"},
+        {"sku": "B2", "qty": 10, "unit": "piece"},
+        {"sku": "C3", "qty": 1, "unit": "box"},
+    ]
+    assert clean_rows([]) == []
+    assert normalize_unit.cache_info().maxsize == 4096
+  equivalence:
+    driver: |-
+      rows = [
+          {"sku": " A1 ", "qty": "3", "unit": "PCS"},
+          {"sku": "B2", "qty": "10", "unit": "pcs."},
+          {"sku": "C3", "qty": "1", "unit": "box"},
+          {"sku": "D4", "qty": "7", "unit": "  Kgs  "},
+          {"sku": "E5", "qty": "2", "unit": "M"},
+          {"sku": "F6", "qty": "5", "unit": "LTR."},
+          {"sku": "G7", "qty": "4", "unit": "box"},
+          {"sku": "H8", "qty": "9", "unit": "two   words"},
+      ] * 3
+      for r in clean_rows(rows):
+          print(r["sku"], r["qty"], r["unit"])

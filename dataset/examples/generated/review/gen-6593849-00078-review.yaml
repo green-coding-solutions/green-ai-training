@@ -1,0 +1,99 @@
+id: gen-6593849-00078-review
+category: review
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    hello, can you check this function pls. we use it in our CI to find build jobs who are suddenly slow. it read the duration of every job run (we have few million rows per night) and mark the run if it is much slower than normal for this job. it work but I am not sure is it written good, maybe something wrong?
+
+    ```python
+    import math
+
+    def flag_slow_builds(rows, history={}, z_limit=3.0):
+        flagged = []
+        for job, secs in rows:
+            st = history.get(job)
+            if st is None:
+                history[job] = [1, secs, 0.0]
+                continue
+            n, mean, m2 = st
+            if n >= 5:
+                std = math.sqrt(m2 / (n - 1))
+                z = (secs - mean) / std
+                if z > z_limit:
+                    flagged.append((job, secs, round(z, 2)))
+            n += 1
+            delta = secs - mean
+            mean += delta / n
+            m2 += delta * (secs - mean)
+            st[0], st[1], st[2] = n, mean, m2
+        return flagged
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly CI statistics)
+
+    #### [Bug] Shared `history` between calls
+    - **Where:** `def flag_slow_builds(rows, history={}, ...)`
+    - **Issue:** a default `{}` is created once and reused by every call. If the function runs twice in one process (a retry, a test, a second file), the second run starts with the statistics of the first one. The flagged runs then depend on what ran before.
+    - **Fix:** use `history=None` and create the dict inside the function.
+
+    #### [Bug] Crash when a job always has the same duration
+    - **Where:** `z = (secs - mean) / std`
+    - **Issue:** if the first runs of a job all have the same duration, `std` is `0.0` and this raises `ZeroDivisionError`. This can stop the whole nightly run for one stable job.
+    - **Fix:** only compute `z` when `std > 0`. The version below skips such runs. If you want any increase over a zero-variance history to be flagged, that is a policy choice you have to make.
+
+    #### [Low] `math.sqrt` looked up on every row
+    - **Where:** `math.sqrt(...)` inside the loop
+    - **Issue:** Python looks up `math`, then `sqrt`, for every row. With millions of rows this is a small but constant cost. In Green Metrics Tool micro-benchmarks, binding `math.sqrt` to a local name before a 10,000,000-iteration loop saved about 4-5%. So it is a minor gain, only worth it because this loop is hot.
+    - **Fix:** `sqrt = math.sqrt` before the loop.
+    - **Impact:** E, a few percent at most. The behavior does not change.
+
+    ```python
+    import math
+
+    def flag_slow_builds(rows, history=None, z_limit=3.0):
+        if history is None:
+            history = {}
+        sqrt = math.sqrt
+        flagged = []
+        for job, secs in rows:
+            st = history.get(job)
+            if st is None:
+                history[job] = [1, secs, 0.0]
+                continue
+            n, mean, m2 = st
+            if n >= 5:
+                std = sqrt(m2 / (n - 1))
+                if std > 0:
+                    z = (secs - mean) / std
+                    if z > z_limit:
+                        flagged.append((job, secs, round(z, 2)))
+            n += 1
+            delta = secs - mean
+            mean += delta / n
+            m2 += delta * (secs - mean)
+            st[0], st[1], st[2] = n, mean, m2
+        return flagged
+    ```
+
+    **Already good:** the running mean and variance (one pass, no list of all durations in memory) is the right approach for this data size. The loop does no extra work per row.
+verify:
+  equivalence:
+    driver: |
+      rows = []
+      x = 12345
+      for i in range(2000):
+          x = (x * 1103515245 + 12345) % 2147483648
+          rows.append(("job%d" % (i % 7), 60.0 + (x % 1000) / 10.0 + (300.0 if i % 97 == 0 else 0.0)))
+      print(flag_slow_builds(rows, {}))
+  test: |-
+    assert flag_slow_builds([("a", 10.0)] * 8) == []
+    data = [("a", 10.0 + i % 3) for i in range(30)] + [("a", 90.0)]
+    r1 = flag_slow_builds(data)
+    r2 = flag_slow_builds(data)
+    assert r1 == r2 and len(r1) == 1

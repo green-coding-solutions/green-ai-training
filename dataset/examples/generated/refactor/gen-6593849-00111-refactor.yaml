@@ -1,0 +1,67 @@
+id: gen-6593849-00111-refactor
+category: refactor
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    Hello, I work in a bioinformatics lab and I write small python tools for our sequencing data. This one make reverse complement of DNA reads and write them as FASTA text. It work ok but when I run it on big genome files (some contigs have many millions of bases) it is very slow and use alot of CPU. Can you optimize it please? My english is not so good, sorry.
+
+    ```python
+    COMPLEMENT = {"A": "T", "T": "A", "G": "C", "C": "G", "N": "N"}
+
+    def reverse_complement(seq):
+        result = ""
+        for base in reversed(seq.upper()):
+            result += COMPLEMENT.get(base, "N")
+        return result
+
+    def to_fasta(records, width=60):
+        out = ""
+        for name, seq in records:
+            out += ">" + name + "\n"
+            rc = reverse_complement(seq)
+            for i in range(0, len(rc), width):
+                out += rc[i:i + width] + "\n"
+        return out
+    ```
+- role: assistant
+  content: |
+    ```python
+    COMPLEMENT = {"A": "T", "T": "A", "G": "C", "C": "G", "N": "N"}
+
+    def reverse_complement(seq):
+        return "".join([COMPLEMENT.get(base, "N") for base in reversed(seq.upper())])
+
+    def to_fasta(records, width=60):
+        parts = []
+        for name, seq in records:
+            parts.append(f">{name}\n")
+            rc = reverse_complement(seq)
+            for i in range(0, len(rc), width):
+                parts.append(rc[i:i + width] + "\n")
+        return "".join(parts)
+    ```
+
+    **Green Notes**
+    - **Join instead of `+=`** (reduces E): both functions built a string one small piece at a time, once per base and once per output line. With millions of bases, that is millions of appends. Now the pieces go into a list, and one `join` builds the string at the end. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces with `+=` used roughly 260× more CPU energy than `"".join()`. The same benchmark showed that f-string concatenation in a loop behaves like `+=`, so the loop has to collect the pieces in a list.
+    - CPython can sometimes extend a string in place, so on your machine the gap may be smaller. `join` is fast on every Python version and does not depend on that optimization.
+    - The output is exactly the same text, including for empty sequences and unknown letters (they still become `N`).
+    - If you write the result to a file, you can also call `f.write(...)` for each part instead of building the whole string. That saves memory on very large genomes.
+verify:
+  equivalence:
+    driver: |-
+      import random
+      random.seed(11)
+      records = []
+      for i in range(6):
+          n = random.choice([0, 1, 59, 60, 61, 500, 4000])
+          seq = "".join(random.choice("ACGTNacgtnXR") for _ in range(n))
+          records.append((f"contig_{i}", seq))
+      records.append(("empty", ""))
+      print(to_fasta(records), end="")
+      print(to_fasta(records, width=10), end="")
+      print(reverse_complement("AACGTTxN"))

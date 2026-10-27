@@ -1,0 +1,45 @@
+id: gen-6593849-00196-refactor
+category: refactor
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```dockerfile
+    FROM python:3.12
+    RUN apt-get update && apt-get install -y build-essential git curl vim htop
+    WORKDIR /app
+    COPY . .
+    RUN pip install -r requirements.txt
+    RUN pip install pytest black flake8 ipython
+    ENTRYPOINT ["python", "-m", "invoicer"]
+    ```
+- role: assistant
+  content: |
+    ```dockerfile
+    FROM python:3.12-slim
+
+    WORKDIR /app
+
+    # dependencies first: this layer is reused until requirements.txt changes
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY . .
+
+    ENTRYPOINT ["python", "-m", "invoicer"]
+    ```
+
+    **Green Notes**
+    - **Slim base, runtime dependencies only** (reduces E, storage, network): the compilers, `git`, `curl`, `vim`, `htop` and the dev tools (pytest, black, flake8, ipython) are gone from the image. In Green Metrics Tool measurements of a similar change for a small Flask app, the image build used ~124 J instead of ~885 J, about 7× less. Running the app afterwards cost the same. The saving is in every build, pull and stored copy, so it repeats each time the tool is built or fetched.
+    - **Dependency layer before the source** (reduces E): `COPY . .` came before `pip install`, so every code change reinstalled all packages. Now only a change to `requirements.txt` does.
+    - **`--no-cache-dir`** (reduces storage): pip's download cache no longer ends up in the image.
+
+    Run pytest, black and flake8 in CI or in a separate dev image, not in the one you ship. If a package in `requirements.txt` has no wheel and needs a compiler, or is installed from a `git+` URL, build it in a separate build stage and copy the result over. Don't go back to the full image.
+verify:
+  static_only: Dockerfile

@@ -1,0 +1,47 @@
+id: gen-9483221-00006-no-change
+category: no-change
+language: python
+patterns:
+- set-membership
+- context-tradeoff
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    make this faster
+
+    ```python
+    from fastapi import Depends, HTTPException
+
+    from app.auth import current_user
+    from app.audit import log_denied
+
+
+    def require_scope(needed: str):
+        def checker(user=Depends(current_user)):
+            scopes = [s.name for s in user.scopes]
+            if needed not in scopes:
+                log_denied(user.id, needed)
+                raise HTTPException(status_code=403, detail="missing scope")
+            return user
+
+        return checker
+
+
+    @router.delete("/invoices/{invoice_id}")
+    def delete_invoice(invoice_id: int, user=Depends(require_scope("invoices:delete"))):
+        invoices.delete(invoice_id, deleted_by=user.id)
+        return {"ok": True}
+    ```
+- role: assistant
+  content: |
+    I wouldn't change it. The membership check is already the cheap form for this case.
+
+    - **One lookup per list.** The scope list is built for each request and checked once. Turning it into a set means one more pass over the same items, and then a single lookup. A set only pays off when you look up many times in the same collection.
+    - **Measured:** in Green Metrics Tool micro-benchmarks, one membership test on a 10,000,000-element list used about 6.9 J. Converting it to a set first and testing once used about 10.5 J, about 50% more. Your lists are far smaller, but the effect points the same way: a set can't win with a single lookup.
+    - **Nothing else is hot.** The check is a plain `in` on a handful of scope names. Any real time in this endpoint will be the database delete and the auth lookup.
+
+    If a request ever checks many scopes against the same user, a set built once for those checks would then make sense. For one check, leave it as is. If the endpoint feels slow, profile it first. I'd expect the time to be in `invoices.delete` or `current_user`, not in this check.
+verify:
+  static_only: answer contains no code; FastAPI app imports are not available

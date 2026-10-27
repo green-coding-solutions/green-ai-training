@@ -1,0 +1,131 @@
+id: gen-9483221-00023-review
+category: review
+language: python
+patterns:
+- async-concurrent-io
+- deque-or-append
+facts:
+- F-HTTP
+- F-LISTINS
+messages:
+- role: user
+  content: |
+    Review for our scoring service. Just the diff-level changes please, no essay.
+
+    ```python
+    import numpy as np
+    import requests
+    from fastapi import FastAPI, HTTPException
+
+    app = FastAPI()
+    model = load_model("/models/churn-v7.joblib")
+
+    FEATURE_HOSTS = {
+        "profile": "http://profile-svc.internal/v1/users",
+        "activity": "http://activity-svc.internal/v1/users",
+        "embedding": "http://embed-svc.internal/v1/users",
+    }
+    WINDOW = 500
+    recent_scores = []
+
+
+    def fetch(name, user_id):
+        r = requests.get(f"{FEATURE_HOSTS[name]}/{user_id}", timeout=2)
+        r.raise_for_status()
+        return r.json()
+
+
+    @app.post("/score")
+    async def score(user_id: str):
+        try:
+            profile = fetch("profile", user_id)
+            activity = fetch("activity", user_id)
+            embedding = fetch("embedding", user_id)
+        except requests.RequestException:
+            raise HTTPException(status_code=502, detail="feature service failed")
+
+        x = np.array(
+            [profile["tenure_days"], activity["sessions_30d"]] + embedding["vector"]
+        ).reshape(1, -1)
+        s = float(model.predict_proba(x)[0, 1])
+
+        recent_scores.insert(0, s)
+        if len(recent_scores) > WINDOW:
+            recent_scores.pop()
+        return {"user_id": user_id, "score": s}
+
+
+    @app.get("/drift")
+    async def drift():
+        last = recent_scores[:50]
+        return {"mean_last_50": sum(last) / len(last) if last else None}
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (ML inference, per request)
+
+    #### [Bug] Blocking `requests` calls inside `async def`
+    - **Where:** `fetch`, called from `score`
+    - **Issue:** `requests.get` blocks the event loop. While one request waits for a feature service, the whole worker serves nothing else, including `/drift`.
+    - **Fix:** use `httpx.AsyncClient` and `await` it. This is combined with the next finding.
+
+    #### [High] Three feature calls run one after another
+    - **Where:** `score`, the three `fetch(...)` lines
+    - **Issue:** the calls are independent, but each waits for the previous one. Latency is the sum of all three, and the worker holds the request open for that whole time.
+    - **Fix:** `asyncio.gather` with a shared async client.
+    - **Impact:** reduces idle wall time per request, and the CPU gain is modest. In Green Metrics Tool micro-benchmarks, 10 requests with async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. The gain is mostly wall time. You also remove the event-loop stall from the bug above.
+
+    #### [Medium] Front insertion into a list on every request
+    - **Where:** `recent_scores.insert(0, s)` and the `pop()`
+    - **Issue:** `insert(0, ...)` shifts all 500 stored scores on every call. In Green Metrics Tool micro-benchmarks, 1,000,000 front inserts into a list used over 1000× more CPU energy than 1,000,000 appends. At 500 items the shift is smaller, but it is still O(window) work on a hot path.
+    - **Fix:** `deque(maxlen=WINDOW)` with `appendleft`. It drops the oldest item by itself.
+    - **Impact:** reduces E per request to constant work.
+
+    ```python
+    import asyncio
+    from collections import deque
+    from itertools import islice
+
+    import httpx
+
+    client = httpx.AsyncClient(timeout=2)
+    recent_scores = deque(maxlen=WINDOW)
+
+
+    async def fetch(name, user_id):
+        r = await client.get(f"{FEATURE_HOSTS[name]}/{user_id}")
+        r.raise_for_status()
+        return r.json()
+
+
+    @app.post("/score")
+    async def score(user_id: str):
+        try:
+            profile, activity, embedding = await asyncio.gather(
+                fetch("profile", user_id),
+                fetch("activity", user_id),
+                fetch("embedding", user_id),
+            )
+        except httpx.HTTPError:
+            raise HTTPException(status_code=502, detail="feature service failed")
+        # ... build x and compute s as before ...
+        recent_scores.appendleft(s)
+        return {"user_id": user_id, "score": s}
+
+
+    @app.get("/drift")
+    async def drift():
+        last = list(islice(recent_scores, 50))
+        return {"mean_last_50": sum(last) / len(last) if last else None}
+    ```
+
+    Behavior notes:
+    - `gather` raises the first error, so the 502 path still works.
+    - The exception type changes from `requests.RequestException` to `httpx.HTTPError`.
+    - Close the client on shutdown with `await client.aclose()`.
+    - Scores are still newest first, and the window is still 500.
+
+    **Already good:** the 2 s timeout on every call, and the bounded score window.
+verify:
+  static_only: needs fastapi, httpx, requests, a model file and live feature services, which are not in the stdlib + numpy
+    sandbox

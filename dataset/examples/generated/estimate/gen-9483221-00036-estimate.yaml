@@ -1,0 +1,45 @@
+id: gen-9483221-00036-estimate
+category: estimate
+language: python
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    hourly job loads one rotated app log (~1000 lines) into postgres, one execute per line, commit at the end. energy saving if we use COPY?
+
+    ```python
+    def load(path, conn):
+        with open(path) as f, conn.cursor() as cur:
+            for line in f:
+                ts, level, msg = parse(line)
+                cur.execute(
+                    "INSERT INTO app_logs (ts, level, message) VALUES (%s, %s, %s)",
+                    (ts, level, msg),
+                )
+        conn.commit()
+    ```
+- role: assistant
+  content: |
+    Less, and clearly so at your batch size. In Green Metrics Tool micro-benchmarks with PostgreSQL 16 (psycopg 3, one commit per batch), `COPY` used about 5× less CPU energy than one `execute()` per row with batches of 1,000 rows. With batches of 5,000 rows the gap was about 22×. With batches of only 100 rows the differences were small, because the per-batch overhead dominated.
+
+    Your files sit in the range where it pays off. The loop sends 1,000 statements per file, `COPY` sends one stream.
+
+    ```python
+    def load(path, conn):
+        with open(path) as f, conn.cursor() as cur:
+            with cur.copy("COPY app_logs (ts, level, message) FROM STDIN") as copy:
+                for line in f:
+                    copy.write_row(parse(line))
+        conn.commit()
+    ```
+
+    Things to know:
+    - The file is still loaded in one transaction, as before. If one line fails, the whole file is rolled back.
+    - `COPY` has no `ON CONFLICT`. If the same lines can be loaded twice, `COPY` into a staging table first, then insert from it.
+
+    Don't scale the 5× to your yearly total. The real saving depends on your row width, indexes and hardware. To measure it, run both versions on the same file in a Green Metrics Tool usage scenario. For a quick CPU-time proxy, use `perf stat` or `time` on 20 or so files.
+verify:
+  static_only: needs a running PostgreSQL server and psycopg

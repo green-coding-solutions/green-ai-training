@@ -1,0 +1,115 @@
+id: gen-12764612-00418-multi-turn
+category: multi-turn
+language: python
+patterns:
+- async-concurrent-io
+- context-tradeoff
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    hello, i make landing page for our open source tool with FastAPI. in the hero part we show 3 numbers: github stars, npm downloads last week and how many people online in our discord. every number come from own public json api. can you write function get_social_numbers() what return dict with the 3 numbers? i use httpx. if one api is down the page must still work
+- role: assistant
+  content: |
+    The three calls don't depend on each other, so they run together with one shared client.
+
+    ```python
+    import asyncio
+    import httpx
+
+    SOURCES = {
+        "github_stars": (
+            "https://api.github.com/repos/acme/acme-app",
+            lambda d: d["stargazers_count"],
+        ),
+        "npm_downloads": (
+            "https://api.npmjs.org/downloads/point/last-week/acme-app",
+            lambda d: d["downloads"],
+        ),
+        "discord_online": (
+            "https://discord.com/api/guilds/123456789/widget.json",
+            lambda d: d["presence_count"],
+        ),
+    }
+
+
+    async def _fetch(client, name, url, pick):
+        try:
+            r = await client.get(url)
+            r.raise_for_status()
+            return name, pick(r.json())
+        except (httpx.HTTPError, KeyError, ValueError):
+            return name, None
+
+
+    async def get_social_numbers():
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            results = await asyncio.gather(
+                *(_fetch(client, n, u, p) for n, (u, p) in SOURCES.items())
+            )
+        return dict(results)
+    ```
+
+    A failed source gives `None` for that number. Your template can then hide it. Call it from an `async def` route with `await get_social_numbers()`.
+
+    **Green Notes**
+    - **Concurrent network calls** (reduces E): the page waits for the slowest call, not the sum of all three. In Green Metrics Tool micro-benchmarks with 10 requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sequential `urllib`. With only 3 calls the gain is mostly wall time.
+    - **One shared client with a 3 s timeout:** connections are reused, and a slow API can't hold the page open.
+- role: user
+  content: |
+    thanks. but my friend say async is too hard for maintain, he want normal def with requests. is it ok? we are only 2 people
+- role: assistant
+  content: |
+    Yes, that is fine here. With 3 calls the async gain is mostly wall time, and a small landing page does not need more. Simple code that you both understand is the better choice.
+
+    ```python
+    import requests
+
+    # SOURCES stays the same as before
+
+
+    def get_social_numbers():
+        numbers = {}
+        with requests.Session() as session:
+            for name, (url, pick) in SOURCES.items():
+                try:
+                    r = session.get(url, timeout=3.0)
+                    r.raise_for_status()
+                    numbers[name] = pick(r.json())
+                except (requests.RequestException, KeyError, ValueError):
+                    numbers[name] = None
+        return numbers
+    ```
+
+    One thing to keep: declare the FastAPI route with plain `def`, not `async def`. FastAPI then runs it in a worker thread. A blocking `requests` call inside `async def` would freeze the whole server while it waits.
+
+    The page now waits for the sum of the three calls. The timeout limits the worst case to about 9 s.
+- role: user
+  content: |
+    ok we use this. now boss say hero only need github stars, he remove the other two. please update
+- role: assistant
+  content: |
+    With one request there is nothing to run in parallel, so plain `requests` is the right choice. The `SOURCES` dict is no longer needed.
+
+    ```python
+    import requests
+
+
+    def get_github_stars():
+        try:
+            r = requests.get(
+                "https://api.github.com/repos/acme/acme-app", timeout=3.0
+            )
+            r.raise_for_status()
+            return r.json()["stargazers_count"]
+        except (requests.RequestException, KeyError, ValueError):
+            return None
+    ```
+
+    It returns `None` if the API fails, so the template can hide the number like before. Keep the route as plain `def`.
+
+    **Green Notes**
+    - *Not applied:* async I/O. It only helps when several calls overlap, and this page makes a single request.
+verify:
+  static_only: calls external HTTP APIs and needs httpx/requests and network access

@@ -1,0 +1,101 @@
+id: gen-6593849-00123-refactor
+category: refactor
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    Diff only. Our log pipeline previews come from this ApplicationSet. Every PR gets a full stack, and I keep finding `logpipe-pr-*` namespaces for PRs that were closed weeks ago. Make it cheaper.
+
+    ```yaml
+    apiVersion: argoproj.io/v1alpha1
+    kind: ApplicationSet
+    metadata:
+      name: logpipe-previews
+      namespace: argocd
+    spec:
+      generators:
+        - pullRequest:
+            github:
+              owner: acme
+              repo: logpipe
+              tokenRef:
+                secretName: github-token
+                key: token
+            requeueAfterSeconds: 120
+      template:
+        metadata:
+          name: 'logpipe-pr-{{number}}'
+        spec:
+          project: previews
+          source:
+            repoURL: https://github.com/acme/logpipe.git
+            targetRevision: '{{head_sha}}'
+            path: deploy/chart
+            helm:
+              values: |
+                vector:
+                  replicas: 3
+                kafka:
+                  brokers: 3
+                clickhouse:
+                  replicas: 2
+                grafana:
+                  enabled: true
+                ingress:
+                  host: pr-{{number}}.logpipe-preview.acme.dev
+          destination:
+            server: https://kubernetes.default.svc
+            namespace: 'logpipe-pr-{{number}}'
+          syncPolicy:
+            automated:
+              selfHeal: true
+            syncOptions:
+              - CreateNamespace=true
+    ```
+- role: assistant
+  content: |
+    These are the changed keys only. Merge them into your ApplicationSet.
+
+    ```yaml
+    spec:
+      generators:
+        - pullRequest:
+            github:
+              labels:                 # new
+                - preview
+      template:
+        metadata:
+          finalizers:                 # new
+            - resources-finalizer.argocd.argoproj.io
+        spec:
+          source:
+            helm:
+              values: |
+                vector:
+                  replicas: 1
+                kafka:
+                  brokers: 1
+                clickhouse:
+                  replicas: 1
+                grafana:
+                  enabled: true
+                ingress:
+                  host: pr-{{number}}.logpipe-preview.acme.dev
+          syncPolicy:
+            automated:
+              selfHeal: true
+              prune: true             # new
+    ```
+
+    **Green Notes**
+    - **Tear down on close** (reduces E, M): your template has no finalizer. When a PR closes, the Application is removed, but its namespace and workloads stay behind. That is why the old `logpipe-pr-*` namespaces are still there. The finalizer makes Argo CD delete the resources together with the Application. Clean up the existing leftovers once by hand.
+    - **Only labelled PRs get an environment** (reduces E, M): most PRs never need a running stack. Adding the `preview` label creates one. Removing the label or closing the PR deletes it. This removes whole environments and all the hours they would run.
+    - **One replica of each service** (reduces E, M): this saves less than you might expect. In Green Metrics Tool micro-benchmarks of a preview stack idling for 60 seconds, 3 app replicas plus Postgres, Redis and a worker used ~269 J CPU energy. One app replica plus Postgres used ~262 J, about 3% less. That was a different stack, so treat it only as a rough guide. Fewer replicas mainly save reserved memory and node capacity.
+
+    Set the Kafka topic replication factor to 1 in the chart's preview values. Otherwise topics will not be created with a single broker. Previews no longer test replica or failover behavior, so keep that in staging.
+verify:
+  static_only: YAML for an Argo CD ApplicationSet. Needs a Kubernetes cluster.

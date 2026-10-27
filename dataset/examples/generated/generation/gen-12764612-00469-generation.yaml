@@ -1,0 +1,47 @@
+id: gen-12764612-00469-generation
+category: generation
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    Elevation tile endpoint in our map service. Each request has a 512x512 float32 height grid, NaN where there's no data. Need `to_levels(heights, lo, hi, nodata_idx=255)` that returns a uint8 array of the same shape: linear 0..254 between lo and hi, clamped, NaN -> nodata_idx. The client maps the indices to a palette. numba is already in requirements.txt. Just the code, no explanation needed.
+- role: assistant
+  content: |
+    ```python
+    import numpy as np
+    from numba import njit
+
+
+    @njit(cache=True)
+    def _fill_levels(flat, lo, scale, out, nodata_idx):
+        for i in range(flat.shape[0]):
+            v = flat[i]
+            if v != v:  # NaN
+                out[i] = nodata_idx
+            else:
+                t = (v - lo) * scale
+                if t < 0.0:
+                    t = 0.0
+                elif t > 254.0:
+                    t = 254.0
+                out[i] = int(t + 0.5)
+
+
+    def to_levels(heights, lo, hi, nodata_idx=255):
+        if not hi > lo:
+            raise ValueError("hi must be greater than lo")
+        flat = np.ascontiguousarray(heights, dtype=np.float32).ravel()
+        out = np.empty(flat.shape[0], dtype=np.uint8)
+        _fill_levels(flat, float(lo), 254.0 / (hi - lo), out, nodata_idx)
+        return out.reshape(np.shape(heights))
+    ```
+
+    **Green Notes**
+    - **JIT for the hot numeric loop** (reduces E): this loop runs once per cell on every tile request, so it is CPU-bound work that Numba compiles well. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples used ~40 J in a pure Python loop and ~9.5 J with `@njit`, about 4× less.
+    - The first call compiles the function. `cache=True` stores the result on disk, so workers don't recompile after a restart. Call the function once with a tiny array at startup to keep that cost out of the first request.
+verify:
+  static_only: needs numba, which is not in stdlib + numpy

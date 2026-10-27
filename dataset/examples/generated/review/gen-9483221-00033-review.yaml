@@ -1,0 +1,84 @@
+id: gen-9483221-00033-review
+category: review
+language: python
+patterns:
+- vectorize-or-jit
+- keep-star-imports
+facts:
+- F-NUMBA
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    hi, im not sure whats wrong with my code. its the step before our vibration classifier (runs on a CPU server, one request = one recording of about 2 million float32 samples from a motor sensor). it works and the results are good but each request feels slow and the model itself is fast. can you review it?
+
+    ```python
+    from numpy import *
+
+    WINDOW = 256
+
+    def smooth(samples, alpha=0.1, max_jump=5.0):
+        # remove spikes and smooth the signal
+        out = zeros(len(samples), dtype=float32)
+        level = samples[0]
+        for i in range(len(samples)):
+            x = samples[i]
+            if abs(x - level) > max_jump:
+                x = level
+            level = level + alpha * (x - level)
+            out[i] = level
+        return out
+
+    def features(samples):
+        s = smooth(samples)
+        n = len(s) // WINDOW * WINDOW
+        windows = s[:n].reshape(-1, WINDOW)
+        return stack([windows.mean(axis=1), windows.std(axis=1)], axis=1).astype(float32)
+
+    def classify(model, samples):
+        feats = features(samples)
+        return model.predict(feats)
+    ```
+- role: assistant
+  content: |
+    **Workload:** AI/ML (inference pre-processing, per request)
+
+    #### [Bug] Short or empty recordings
+    - **Where:** `samples[0]` in `smooth`, and the reshape in `features`
+    - **Issue:** an empty recording raises `IndexError`. A recording shorter than 256 samples gives zero windows, so the model gets an empty array and `mean`/`std` may warn.
+    - **Fix:** reject it early in `classify`:
+      ```python
+      if len(samples) < WINDOW:
+          raise ValueError("recording shorter than one window")
+      ```
+
+    #### [High] Pure Python loop over 2 million samples
+    - **Where:** the `for i in range(len(samples))` loop in `smooth`
+    - **Issue:** this is where your time goes, not the model. Each step reads one element, compares, updates and writes, all in the interpreter, about 2 million times per request. Every sample depends on the previous `level`, so you can't turn it into one numpy expression. This is the case for a JIT. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples in a pure Python loop used ~40 J and the same loop with Numba `@njit` ~9.5 J, about 4× less. That is a different loop, so treat it as the kind of gain, not a promise for yours.
+    - **Fix:** keep the code, add `@njit`. `cache=True` stores the compiled version on disk, so a restarted worker doesn't compile again:
+      ```python
+      from numpy import *
+      from numba import njit
+
+      WINDOW = 256
+
+      @njit(cache=True)
+      def smooth(samples, alpha=0.1, max_jump=5.0):
+          out = zeros(len(samples), dtype=float32)
+          level = samples[0]
+          for i in range(len(samples)):
+              x = samples[i]
+              if abs(x - level) > max_jump:
+                  x = level
+              level = level + alpha * (x - level)
+              out[i] = level
+          return out
+      ```
+    - **Impact:** E, per request. The first call compiles (about a second), so call `smooth` once on a small array at startup. Pass a numpy array, not a Python list. The output can differ from the old version in the last float32 digit, because the arithmetic is done in float64 before it is stored.
+
+    **Already good:**
+    - The window features use numpy `mean` and `std` on a reshaped array, no loop needed.
+    - `from numpy import *` is fine. In Green Metrics Tool micro-benchmarks, star imports and normal imports showed no measurable energy difference, so I left it as it is.
+verify:
+  static_only: needs numba, which is not in the stdlib + numpy test environment; the JIT-decorated function body is the same
+    plain Python/numpy code as the original

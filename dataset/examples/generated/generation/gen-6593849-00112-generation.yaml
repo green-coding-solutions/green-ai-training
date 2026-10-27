@@ -1,0 +1,126 @@
+id: gen-6593849-00112-generation
+category: generation
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    ```python
+    import os
+    from dataclasses import dataclass
+
+    ICONS = {"success": "✅", "failure": "❌", "cancelled": "⚪", "skipped": "⏭️"}
+
+
+    @dataclass
+    class JobResult:
+        name: str
+        status: str  # success | failure | cancelled | skipped
+        duration_s: float
+        log_tail: list[str]  # last lines of the job log
+
+
+    def render_summary(results: list[JobResult]) -> str:
+        """Markdown for $GITHUB_STEP_SUMMARY.
+        Table of all jobs, then a <details> block with the log tail for every failed job.
+        """
+        # TODO
+        raise NotImplementedError
+
+
+    def write_summary(results: list[JobResult]) -> None:
+        path = os.environ.get("GITHUB_STEP_SUMMARY")
+        if path:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(render_summary(results))
+    ```
+
+    ?
+- role: assistant
+  content: |
+    This fills in `render_summary`. `write_summary` can stay as it is.
+
+    ```python
+    import os
+    from dataclasses import dataclass
+
+    ICONS = {"success": "✅", "failure": "❌", "cancelled": "⚪", "skipped": "⏭️"}
+
+
+    @dataclass
+    class JobResult:
+        name: str
+        status: str  # success | failure | cancelled | skipped
+        duration_s: float
+        log_tail: list[str]  # last lines of the job log
+
+
+    def render_summary(results: list[JobResult]) -> str:
+        """Markdown for $GITHUB_STEP_SUMMARY.
+        Table of all jobs, then a <details> block with the log tail for every failed job.
+        """
+        parts = [
+            "## Pipeline results",
+            "",
+            "| Job | Status | Duration |",
+            "| --- | --- | --- |",
+        ]
+        for r in results:
+            icon = ICONS.get(r.status, "❔")
+            name = r.name.replace("|", "\\|")
+            parts.append(f"| {name} | {icon} {r.status} | {r.duration_s:.1f}s |")
+
+        for r in results:
+            if r.status != "failure":
+                continue
+            parts.append("")
+            parts.append(f"<details><summary>{r.name}: last {len(r.log_tail)} log lines</summary>")
+            parts.append("")
+            parts.append("```text")
+            parts.extend(line.rstrip("\n") for line in r.log_tail)
+            parts.append("```")
+            parts.append("")
+            parts.append("</details>")
+
+        return "\n".join(parts) + "\n"
+
+
+    def write_summary(results: list[JobResult]) -> None:
+        path = os.environ.get("GITHUB_STEP_SUMMARY")
+        if path:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(render_summary(results))
+    ```
+
+    **Green Notes**
+    - **Collect lines, then `"".join()` once** (reduces E): the summary is built as a list of lines and joined at the end. Growing one string with `+=` (or with f-strings in a loop) copies the text again and again as it gets longer. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces used about 469 J with `+=` and about 1.8 J with `join`, roughly 260× less CPU energy. Your log tails can be long, so the same effect applies here, only smaller.
+    - **One write to the summary file:** `write_summary` still opens the file once and writes the full text in one call.
+
+    Two small fixes: `|` in a job name is escaped so it can't break the table, and trailing newlines are stripped from log lines so the code block has no blank gaps.
+verify:
+  module: true
+  test: |-
+    r = [
+        JobResult("build", "success", 12.34, []),
+        JobResult("test|unit", "failure", 5.0, ["a\n", "b"]),
+        JobResult("deploy", "skipped", 0.0, []),
+    ]
+    out = render_summary(r)
+    lines = out.split("\n")
+    assert lines[0] == "## Pipeline results"
+    assert "| build | ✅ success | 12.3s |" in lines
+    assert "| test\\|unit | ❌ failure | 5.0s |" in lines
+    assert "| deploy | ⏭️ skipped | 0.0s |" in lines
+    assert "<details><summary>test|unit: last 2 log lines</summary>" in lines
+    i = lines.index("```text")
+    assert lines[i + 1 : i + 4] == ["a", "b", "```"]
+    assert out.endswith("</details>\n")
+    assert "<details>" not in render_summary([r[0]])
+    import os, tempfile
+    p = os.path.join(tempfile.mkdtemp(), "s.md")
+    os.environ["GITHUB_STEP_SUMMARY"] = p
+    write_summary(r)
+    assert open(p, encoding="utf-8").read() == out

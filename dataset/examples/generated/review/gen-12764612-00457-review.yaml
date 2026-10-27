@@ -1,0 +1,94 @@
+id: gen-12764612-00457-review
+category: review
+language: bash
+patterns:
+- bash-quoting
+- compress-stored
+facts:
+- F-BASH-QUOTES
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    ?
+
+    ```bash
+    #!/usr/bin/env bash
+    LOG_DIR="/var/log/myapp"
+    ARCHIVE_DIR="/var/archive/myapp"
+    LOG_FILE="/var/log/archive-logs.log"
+
+    mkdir -p "$ARCHIVE_DIR"
+    echo "Archive run started" >> "$LOG_FILE"
+
+    for f in "$LOG_DIR"/*.log; do
+        name=$(basename "$f")
+        if lsof "$f" > /dev/null 2>&1; then
+            echo "Skipping $name, still open" >> "$LOG_FILE"
+            continue
+        fi
+        xz -9e -c "$f" > "$ARCHIVE_DIR/$name.xz"
+        echo "Archived $name" >> "$LOG_FILE"
+        rm "$f"
+    done
+
+    echo "Archive run finished" >> "$LOG_FILE"
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (log archiving, runs repeatedly)
+
+    #### [Bug] Original log is deleted even if compression fails
+    - **Where:** `xz ... > "$ARCHIVE_DIR/$name.xz"` followed by `rm "$f"`
+    - **Issue:** `rm` runs whatever `xz` returned. If the disk is full or `xz` is killed, you lose the log and keep a truncated archive. The "Archived" line is also written in that case.
+    - **Fix:** only delete after a successful compression, and remove the partial output otherwise (see the script below).
+
+    #### [Bug] Empty directory runs the loop on a literal pattern
+    - **Where:** `for f in "$LOG_DIR"/*.log`
+    - **Issue:** with no `.log` files, `$f` is the text `/var/log/myapp/*.log`. The script then tries to archive a file that does not exist.
+    - **Fix:** `shopt -s nullglob`.
+
+    #### [Medium] Slow, expensive codec for data you compress every run
+    - **Where:** `xz -9e`
+    - **Issue:** you compress new logs on every run. In Green Metrics Tool micro-benchmarks on 100 MB of text, with default levels, zstd used about 4× less CPU energy than gzip, and xz about 29× more than zstd. `-9e` is even more costly than the default level that was measured. These figures compare energy, not file size. xz usually gives smaller files, so keep it only if archive size is your top concern, for example very long retention or a slow link.
+    - **Fix:** `zstd` at its default level. Decompression stays cheap for both.
+    - **Impact:** E, per run and per log file. The saving repeats with every archive run.
+
+    #### [Low] Double quotes for fixed text
+    - **Where:** `"/var/log/myapp"`, `"/var/archive/myapp"`, `"/var/log/archive-logs.log"`, `"Archive run started"`, `"Archive run finished"`
+    - **Issue:** nothing is expanded in these strings. Bash scans double-quoted text for `$`, backticks and backslashes. In Green Metrics Tool micro-benchmarks, single quotes used about 24% less CPU energy for that work, with a long literal in a large loop. Your strings are short and run once per run, so the absolute gain is tiny.
+    - **Fix:** single quotes for literals. Keep double quotes around `"$f"`, `"$name"` and the other variables.
+
+    ```bash
+    #!/usr/bin/env bash
+    LOG_DIR='/var/log/myapp'
+    ARCHIVE_DIR='/var/archive/myapp'
+    LOG_FILE='/var/log/archive-logs.log'
+
+    mkdir -p "$ARCHIVE_DIR"
+    echo 'Archive run started' >> "$LOG_FILE"
+
+    shopt -s nullglob
+    for f in "$LOG_DIR"/*.log; do
+        name=$(basename "$f")
+        if lsof "$f" > /dev/null 2>&1; then
+            echo "Skipping $name, still open" >> "$LOG_FILE"
+            continue
+        fi
+        if zstd -q -o "$ARCHIVE_DIR/$name.zst" "$f"; then
+            echo "Archived $name" >> "$LOG_FILE"
+            rm -- "$f"
+        else
+            echo "Compression failed for $name, original kept" >> "$LOG_FILE"
+            rm -f -- "$ARCHIVE_DIR/$name.zst"
+        fi
+    done
+
+    echo 'Archive run finished' >> "$LOG_FILE"
+    ```
+
+    New archives end in `.zst`. Existing `.xz` files stay readable and need no change. `zstd` keeps the source file by default, so the `rm` only happens after success.
+
+    **Already good:** the `lsof` check stops you from archiving a log that is still being written, and variables are quoted.
+verify:
+  static_only: needs zstd, xz and lsof and writes under /var/log and /var/archive

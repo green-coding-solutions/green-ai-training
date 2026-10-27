@@ -1,0 +1,58 @@
+id: gen-12764612-00454-generation
+category: generation
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    func: list of USGS earthquake event ids -> {id: magnitude}, ~300 ids per run
+- role: assistant
+  content: |
+    ```python
+    import asyncio
+
+    import httpx
+
+    USGS_URL = "https://earthquake.usgs.gov/fdsnws/event/1/query"
+
+
+    async def _fetch_magnitude(client, sem, event_id):
+        async with sem:
+            resp = await client.get(
+                USGS_URL, params={"eventid": event_id, "format": "geojson"}
+            )
+        if resp.status_code in (204, 404):  # unknown event id
+            return event_id, None
+        resp.raise_for_status()
+        return event_id, resp.json()["properties"]["mag"]
+
+
+    async def _fetch_all(event_ids, max_concurrent):
+        sem = asyncio.Semaphore(max_concurrent)
+        async with httpx.AsyncClient(timeout=15) as client:
+            results = await asyncio.gather(
+                *(_fetch_magnitude(client, sem, e) for e in event_ids)
+            )
+        return dict(results)
+
+
+    def get_event_magnitudes(event_ids, max_concurrent=10):
+        """Return {event_id: magnitude}. Unknown ids map to None."""
+        unique_ids = list(dict.fromkeys(event_ids))  # drop duplicates, keep order
+        return asyncio.run(_fetch_all(unique_ids, max_concurrent))
+    ```
+
+    Call it from normal code: `mags = get_event_magnitudes(ids)`. Inside Jupyter, use `await _fetch_all(ids, 10)` instead, because `asyncio.run` fails in a running loop.
+
+    **Green Notes**
+    - **Concurrent requests** (reduces E, shortens run time): with ~300 ids, a sequential loop waits for each response before sending the next. Here up to 10 requests are in flight at once, so the CPU and machine are not held idle for the whole run. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. The gain is mostly wall time, and it grows with the number of requests.
+    - **One shared client** (reduces network, E): connections are reused instead of opening a new TLS connection per id.
+    - **Semaphore limit** keeps the load on the USGS server polite and avoids rate-limit errors.
+    - **Duplicate ids are removed** before fetching, so no id is requested twice.
+
+    *Not applied:* async for a handful of ids. For 1-3 requests, a plain loop is simpler and the difference is negligible.
+verify:
+  static_only: needs network access to the USGS API and the httpx package

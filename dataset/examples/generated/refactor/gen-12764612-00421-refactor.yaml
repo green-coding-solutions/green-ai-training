@@ -1,0 +1,155 @@
+id: gen-12764612-00421-refactor
+category: refactor
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    Hi, I have a small CLI that we use in our bookshop back office. It reads the order export (CSV on stdin), normalizes every ISBN to ISBN-13 and prints the units sold per book. The export has about 400k rows per month, but the same bestsellers appear again and again, so there are only a few thousand different ISBNs.
+
+    Can you optimize and clean up the code? Requirements:
+    - Python 3.8, standard library only (it runs on the old office server)
+    - same stdout output as now, same messages on stderr for bad rows
+    - bad ISBNs must still be skipped and counted, not crash the run
+
+    ```python
+    #!/usr/bin/env python3
+    """Count units per ISBN from a bookshop order export (CSV on stdin)."""
+    import csv
+    import sys
+    from collections import Counter
+
+
+    def to_isbn13(raw):
+        s = raw.replace("-", "").replace(" ", "").upper()
+        if len(s) == 10:
+            if not s[:9].isdigit() or s[9] not in "0123456789X":
+                raise ValueError(f"bad ISBN-10: {raw!r}")
+            total = sum((10 - i) * (10 if c == "X" else int(c)) for i, c in enumerate(s))
+            if total % 11 != 0:
+                raise ValueError(f"bad ISBN-10 checksum: {raw!r}")
+            s = "978" + s[:9]
+            total = sum(int(c) * (1 if i % 2 == 0 else 3) for i, c in enumerate(s))
+            return s + str((10 - total % 10) % 10)
+        if len(s) == 13 and s.isdigit():
+            total = sum(int(c) * (1 if i % 2 == 0 else 3) for i, c in enumerate(s))
+            if total % 10 != 0:
+                raise ValueError(f"bad ISBN-13 checksum: {raw!r}")
+            return s
+        raise ValueError(f"bad ISBN length: {raw!r}")
+
+
+    def main():
+        counts = Counter()
+        bad = 0
+        reader = csv.DictReader(sys.stdin)
+        for row in reader:
+            try:
+                isbn = to_isbn13(row["isbn"])
+            except ValueError as exc:
+                bad += 1
+                print(f"skip: {exc}", file=sys.stderr)
+                continue
+            counts[isbn] += int(row["qty"])
+        for isbn, qty in counts.most_common():
+            print(f"{isbn}\t{qty}")
+        print(f"bad rows: {bad}", file=sys.stderr)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    The main cost is `to_isbn13`. It is a pure function, and it runs the full checksum work for every row, although the same few thousand ISBN strings repeat. Caching its result fixes this, and the rest of the script can stay as it is.
+
+    ```python
+    #!/usr/bin/env python3
+    """Count units per ISBN from a bookshop order export (CSV on stdin)."""
+    import csv
+    import sys
+    from collections import Counter
+    from functools import lru_cache
+
+
+    @lru_cache(maxsize=4096)
+    def to_isbn13(raw):
+        s = raw.replace("-", "").replace(" ", "").upper()
+        if len(s) == 10:
+            if not s[:9].isdigit() or s[9] not in "0123456789X":
+                raise ValueError(f"bad ISBN-10: {raw!r}")
+            total = sum((10 - i) * (10 if c == "X" else int(c)) for i, c in enumerate(s))
+            if total % 11 != 0:
+                raise ValueError(f"bad ISBN-10 checksum: {raw!r}")
+            s = "978" + s[:9]
+            total = sum(int(c) * (1 if i % 2 == 0 else 3) for i, c in enumerate(s))
+            return s + str((10 - total % 10) % 10)
+        if len(s) == 13 and s.isdigit():
+            total = sum(int(c) * (1 if i % 2 == 0 else 3) for i, c in enumerate(s))
+            if total % 10 != 0:
+                raise ValueError(f"bad ISBN-13 checksum: {raw!r}")
+            return s
+        raise ValueError(f"bad ISBN length: {raw!r}")
+
+
+    def main():
+        counts = Counter()
+        bad = 0
+        reader = csv.DictReader(sys.stdin)
+        for row in reader:
+            try:
+                isbn = to_isbn13(row["isbn"])
+            except ValueError as exc:
+                bad += 1
+                print(f"skip: {exc}", file=sys.stderr)
+                continue
+            counts[isbn] += int(row["qty"])
+        for isbn, qty in counts.most_common():
+            print(f"{isbn}\t{qty}")
+        print(f"bad rows: {bad}", file=sys.stderr)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    Output and stderr messages are the same as before. `lru_cache` works on Python 3.8 and is in the standard library.
+
+    **Green Notes**
+    - **Memoize a pure function** (reduces E): each distinct ISBN string is now checked once, and every repeat is a dictionary lookup. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over 200 distinct inputs used about 9× less CPU energy with `lru_cache`. Your gain depends on how often ISBNs repeat in the export.
+    - **Bounded cache** (reduces M): `maxsize=4096` keeps memory fixed. Your few thousand distinct ISBNs fit, and the least recently used entries are dropped if the feed ever grows.
+    - **Safe for your requirements:** the function returns a plain string, so callers cannot change a cached value. Exceptions are not cached. A bad ISBN raises `ValueError` every time, so each bad row is still skipped, counted and reported on stderr.
+    - *Not applied:* no other changes. If a future export has mostly unique ISBNs, the cache adds overhead and gains nothing. Check `to_isbn13.cache_info()` on a real file to see the hit rate.
+verify:
+  module: true
+  test: |
+    assert to_isbn13("0-306-40615-2") == "9780306406157"
+    assert to_isbn13("978-0-306-40615-7") == "9780306406157"
+    assert to_isbn13("978-0-306-40615-7") == "9780306406157"
+    assert to_isbn13.cache_info().hits >= 1
+    for bad in ["123", "978-0-306-40615-8", "0306406153"]:
+        try:
+            to_isbn13(bad)
+            assert False, bad
+        except ValueError:
+            pass
+  equivalence:
+    driver: |-
+      import io
+      import sys
+      data = (
+          "isbn,qty\n"
+          "0-306-40615-2,3\n"
+          "978-0-306-40615-7,2\n"
+          "080442957X,5\n"
+          "123,1\n"
+          "978-0-306-40615-7,4\n"
+          "0-8044-2957-X,1\n"
+          "9780306406158,2\n"
+          "0-306-40615-2,1\n"
+      )
+      sys.stdin = io.StringIO(data)
+      main()

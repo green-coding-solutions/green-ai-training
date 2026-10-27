@@ -1,0 +1,86 @@
+id: gen-12764612-00476-review
+category: review
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    ?
+
+    ```nginx
+    server {
+        listen 80;
+        server_name spectra.lab.example.org;
+        root /srv/spectra/public;
+        index index.html;
+
+        gzip on;
+        gzip_comp_level 9;
+        gzip_min_length 0;
+        gzip_types *;
+        gzip_proxied any;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location /plots {
+            alias /srv/spectra/plots/;
+            autoindex on;
+        }
+
+        location /api/ {
+            proxy_pass http://127.0.0.1:8010;
+            proxy_set_header Host $host;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (static files plus a proxied API)
+
+    #### [Security] Path traversal through `alias`
+    - **Where:** `location /plots { alias /srv/spectra/plots/; }`
+    - **Issue:** the location has no trailing slash, but the alias has one. A request like `/plots../secrets.txt` maps to `/srv/spectra/plots/../secrets.txt` and leaves the plots folder. `autoindex on` also lists every file there.
+    - **Fix:** make both sides match, and turn off the listing if nobody needs it:
+      ```nginx
+      location /plots/ {
+          alias /srv/spectra/plots/;
+      }
+      ```
+
+    #### [High] Static files are gzipped again on every request
+    - **Where:** `gzip on; gzip_comp_level 9;` with `root` and `alias` locations
+    - **Issue:** the HTML, JS, CSS and JSON files do not change between requests, but nginx compresses them each time, and level 9 is the most expensive level. In Green Metrics Tool micro-benchmarks (nginx serving 2,000 text requests), gzip level 5 per request used about 4× the CPU energy of serving precompressed files. Both sent about 10× fewer bytes than no compression.
+    - **Fix:** compress once when you publish, and let nginx serve the `.gz` files:
+      ```bash
+      find /srv/spectra/public -type f \( -name '*.html' -o -name '*.js' -o -name '*.css' -o -name '*.json' -o -name '*.svg' \) -exec gzip -9 -k -f {} +
+      ```
+      ```nginx
+      gzip_static on;
+      gzip_vary on;
+      ```
+      A high level is fine here, because it runs once per publish and not once per request.
+    - **Impact:** E (server CPU), per request. Bytes on the network stay the same.
+
+    #### [Medium] `gzip_types *` compresses files that are already compressed
+    - **Where:** `gzip_types *;` and `gzip_min_length 0;`
+    - **Issue:** PNG plots, `.nc.gz` or ZIP downloads, and tiny responses cost CPU and gain nothing. Compressing already-compressed data does not make it smaller.
+    - **Fix:** list the text types only, and skip tiny bodies:
+      ```nginx
+      gzip_types text/plain text/css application/javascript application/json image/svg+xml;
+      gzip_min_length 256;
+      ```
+    - **Impact:** E, per request.
+
+    #### [Low] Level 9 for the proxied API
+    - **Where:** `location /api/` inherits `gzip_comp_level 9`
+    - **Issue:** API responses are different each time, so they must be compressed per request. Keep compression on for real networks, but use a moderate level such as 4 or 5. The extra effort of level 9 is paid on every response.
+    - **Fix:** set `gzip_comp_level 5;` in the server block. The static files use the precompressed copies, so the level only affects the API.
+
+    **Already good:** `try_files ... =404` returns a clean 404, and `gzip_proxied any` is useful if a CDN or proxy sits in front.
+verify:
+  static_only: nginx config

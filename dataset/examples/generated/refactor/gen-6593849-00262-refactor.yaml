@@ -1,0 +1,63 @@
+id: gen-6593849-00262-refactor
+category: refactor
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    ?
+
+    ```bash
+    #!/bin/bash
+    # ship finished event batches to the loader host
+    SPOOL=/var/spool/etl/events
+    DONE=/var/spool/etl/shipped
+    HOST=loader01.internal
+
+    mkdir -p $DONE
+    for f in $SPOOL/*.ndjson; do
+      [ -e "$f" ] || continue
+      echo "shipping $f"
+      xz -9e -c $f | ssh $HOST 'xz -dc | /opt/etl/bin/load --table events'
+      if [ $? -eq 0 ]; then
+        mv $f $DONE/
+      else
+        echo "failed: $f" >&2
+      fi
+    done
+    ```
+- role: assistant
+  content: |
+    ```bash
+    #!/bin/bash
+    # ship finished event batches to the loader host
+    set -o pipefail
+
+    SPOOL=/var/spool/etl/events
+    DONE=/var/spool/etl/shipped
+    HOST=loader01.internal
+
+    mkdir -p "$DONE"
+    for f in "$SPOOL"/*.ndjson; do
+      [ -e "$f" ] || continue
+      echo "shipping $f"
+      if zstd -q -c "$f" | ssh "$HOST" 'zstd -dc | /opt/etl/bin/load --table events'; then
+        mv "$f" "$DONE"/
+      else
+        echo "failed: $f" >&2
+      fi
+    done
+    ```
+
+    **Green Notes**
+    - **Fast codec for data compressed often** (reduces E): `xz -9e` is the most expensive setting for a job that compresses every batch. In Green Metrics Tool micro-benchmarks on 100 MB of text, xz used about 29× the compression energy of zstd at its default level. Decompression on the loader host also dropped, from about 11.7 J to about 5.3 J per 100 MB.
+    - **Energy, not size:** those figures compare energy only. xz usually makes smaller files. If the link to the loader is slow and the bytes matter more than CPU, say so and we can pick a higher zstd level instead of going back to xz.
+    - **Bug fix:** without `pipefail`, `$?` only held the status of `ssh`. A failed compress step could still move the batch to `shipped`. The check now covers the whole pipe.
+    - **Quoting:** the variables are now quoted, so paths with spaces don't break the loop.
+
+    The loader host needs `zstd` installed. The stream is decompressed in the same command, so nothing else on that side changes.
+verify:
+  static_only: needs ssh, a remote loader host and the xz and zstd binaries

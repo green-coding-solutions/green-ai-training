@@ -1,0 +1,99 @@
+id: gen-9483221-00003-review
+category: review
+language: bash
+patterns:
+- bash-quoting
+facts:
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    Hello, can you review my script please? It clean the meter readings every night, before we load them to the warehouse. The raw file have around 500000 lines. I dont know if it is good, I am not expert in bash.
+
+    ```bash
+    #!/bin/bash
+    # clean_readings.sh - nightly ETL step: raw meter readings -> clean tsv + rejects
+    # usage: clean_readings.sh raw.csv clean.tsv rejects.txt
+
+    in=$1
+    out=$2
+    rejects=$3
+
+    if [ -f $in ]; then
+      mkdir -p $(dirname $out)
+    else
+      echo "input file not found" >&2
+      exit 1
+    fi
+
+    exec 3> "$rejects"
+    ok=0
+    bad=0
+
+    while IFS=, read -r meter kwh ts site; do
+      hint="Rejected: reading must be a plain decimal number in kWh with a dot as separator, meter_id must be 8 digits, timestamp must be ISO 8601 in UTC (for example 2026-01-31T23:45:00Z). Rows from decommissioned meters are dropped by the data contract."
+      if [[ ! $meter =~ ^[0-9]{8}$ ]] || [[ ! $kwh =~ ^[0-9]+(\.[0-9]+)?$ ]] || [[ ! $ts =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$ ]]; then
+        printf "%s\t%s\n" "$meter,$kwh,$ts" "$hint" >&3
+        bad=$((bad + 1))
+        continue
+      fi
+      printf "%s\t%s\t%s\t%s\n" "$meter" "$kwh" "$ts" "${site:-unknown}"
+      ok=$((ok + 1))
+    done < "$in" > "$out"
+
+    exec 3>&-
+    echo "done: $ok ok, $bad rejected"
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly batch, one loop pass per input row)
+
+    #### [Bug] Unquoted path variables
+    - **Where:** `[ -f $in ]` and `mkdir -p $(dirname $out)`
+    - **Issue:** a path with a space is split into several words. If `$in` is empty, `[ -f ]` is true, so the script goes on and fails later at `< "$in"`.
+    - **Fix:** quote variables: `[ -f "$in" ]` and `mkdir -p "$(dirname "$out")"`. Keep double quotes around every variable.
+
+    #### [Medium] Long double-quoted literal assigned for every row
+    - **Where:** `hint="Rejected: ..."` inside the `while` loop, and the `printf "..."` formats
+    - **Issue:** the text has no `$`, backtick or variable in it, so double quotes only make bash scan it for expansions on each of the 500000 iterations. Single quotes are taken as is.
+    - **Fix:** use single quotes for every literal that needs no expansion. In `printf` formats, `\t` and `\n` still work, because `printf` reads them, not bash. The `done:` message keeps its double quotes, because it expands `$ok` and `$bad`.
+    - **Impact:** reduces E in the loop. In Green Metrics Tool micro-benchmarks, assigning a 6,200-character literal in a loop used about 24% less CPU energy with single quotes, for 100,000 to 1,000,000 iterations. Your literal is much shorter, so expect a smaller absolute saving. Measure it on a sample file with `time` or `perf stat`.
+
+    ```bash
+    #!/bin/bash
+    # clean_readings.sh - nightly ETL step: raw meter readings -> clean tsv + rejects
+    # usage: clean_readings.sh raw.csv clean.tsv rejects.txt
+
+    in=$1
+    out=$2
+    rejects=$3
+
+    if [ -f "$in" ]; then
+      mkdir -p "$(dirname "$out")"
+    else
+      echo 'input file not found' >&2
+      exit 1
+    fi
+
+    exec 3> "$rejects"
+    ok=0
+    bad=0
+
+    while IFS=, read -r meter kwh ts site; do
+      hint='Rejected: reading must be a plain decimal number in kWh with a dot as separator, meter_id must be 8 digits, timestamp must be ISO 8601 in UTC (for example 2026-01-31T23:45:00Z). Rows from decommissioned meters are dropped by the data contract.'
+      if [[ ! $meter =~ ^[0-9]{8}$ ]] || [[ ! $kwh =~ ^[0-9]+(\.[0-9]+)?$ ]] || [[ ! $ts =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$ ]]; then
+        printf '%s\t%s\n' "$meter,$kwh,$ts" "$hint" >&3
+        bad=$((bad + 1))
+        continue
+      fi
+      printf '%s\t%s\t%s\t%s\n' "$meter" "$kwh" "$ts" "${site:-unknown}"
+      ok=$((ok + 1))
+    done < "$in" > "$out"
+
+    exec 3>&-
+    echo "done: $ok ok, $bad rejected"
+    ```
+
+    **Already good:** the loop uses `read -r` with `IFS`, `[[ =~ ]]` and `$(( ))`. It starts no process per line, which is what usually dominates shell loops. Output goes through one redirect on the loop, and variables inside the loop are quoted.
+verify:
+  static_only: bash script that reads and writes files given as arguments

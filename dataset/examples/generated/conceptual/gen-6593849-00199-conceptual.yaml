@@ -1,0 +1,35 @@
+id: gen-6593849-00199-conceptual
+category: conceptual
+language: text
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    ETL job, 40M rows a night. Two per-row pure functions: `normalize_country(raw)` (~250 distinct raw values in the feed) and `parse_order_ref(ref)` (every row has a unique ref). Should both get lru_cache? Just the diff.
+- role: assistant
+  content: |
+    Only `normalize_country`. Cache pays when inputs repeat. It costs a hash lookup and memory on every call, and it never pays back when inputs don't repeat.
+
+    ```python
+    from functools import lru_cache
+
+    @lru_cache(maxsize=1024)
+    def normalize_country(raw):
+        ...
+
+    def parse_order_ref(ref):  # unchanged, no cache
+        ...
+    ```
+
+    - **`normalize_country`:** ~250 distinct values over 40M rows means almost every call is a hit. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations drawn from 200 distinct values used ~43 J uncached and ~4.7 J with `@functools.lru_cache`, about 9× less. That is a similar shape to yours, but the benchmark function is not yours, so measure the real one.
+    - **`parse_order_ref`:** with unique refs, every call is a miss. You pay the lookup, the insert and the eviction, and you get nothing back. The cache would also hold 1024 refs that are never read again.
+
+    Two checks before merging:
+
+    - The function must be pure. If the result depends on config or a lookup table that changes mid-run, the cache will return stale values.
+    - Keep `maxsize` bounded. With a messy feed, new raw spellings can appear without end, and `maxsize=None` would grow forever.
+verify:
+  static_only: conceptual answer

@@ -1,0 +1,102 @@
+id: gen-6593849-00006-refactor
+category: refactor
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    Review apps for orders-api in GitLab. Diff only, I don't need an essay. They pile up on the cluster and nobody cleans them.
+
+    ```yaml
+    stages: [test, build, deploy]
+
+    variables:
+      IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+
+    test:
+      stage: test
+      image: python:3.12-slim
+      script:
+        - pip install -r requirements.txt
+        - pytest -q
+
+    build:
+      stage: build
+      image: docker:27
+      services: [docker:27-dind]
+      script:
+        - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+        - docker build -t $IMAGE .
+        - docker push $IMAGE
+
+    deploy_review:
+      stage: deploy
+      image: alpine/helm:3.15
+      script:
+        - >
+          helm upgrade --install orders-api-$CI_COMMIT_REF_SLUG ./chart
+          --namespace review-$CI_COMMIT_REF_SLUG --create-namespace
+          --set image.tag=$CI_COMMIT_SHORT_SHA
+          --set replicaCount=3
+          --set postgres.enabled=true
+          --set redis.enabled=true
+          --set worker.enabled=true
+      environment:
+        name: review/$CI_COMMIT_REF_SLUG
+        url: https://$CI_COMMIT_REF_SLUG.review.example.com
+      except:
+        - main
+    ```
+- role: assistant
+  content: |
+    Only `deploy_review` changes, plus a new `stop_review` job:
+
+    ```yaml
+    deploy_review:
+      stage: deploy
+      image: alpine/helm:3.15
+      script:
+        - >
+          helm upgrade --install orders-api-$CI_COMMIT_REF_SLUG ./chart
+          --namespace review-$CI_COMMIT_REF_SLUG --create-namespace
+          --set image.tag=$CI_COMMIT_SHORT_SHA
+          --set replicaCount=1
+          --set postgres.enabled=true
+          --set redis.enabled=false
+          --set worker.enabled=false
+      environment:
+        name: review/$CI_COMMIT_REF_SLUG
+        url: https://$CI_COMMIT_REF_SLUG.review.example.com
+        on_stop: stop_review
+        auto_stop_in: 2 days
+      rules:
+        - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+    stop_review:
+      stage: deploy
+      image: alpine/k8s:1.29.4
+      variables:
+        GIT_STRATEGY: none
+      script:
+        - helm uninstall orders-api-$CI_COMMIT_REF_SLUG --namespace review-$CI_COMMIT_REF_SLUG
+        - kubectl delete namespace review-$CI_COMMIT_REF_SLUG --ignore-not-found
+      environment:
+        name: review/$CI_COMMIT_REF_SLUG
+        action: stop
+      rules:
+        - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+          when: manual
+          allow_failure: true
+    ```
+
+    **Green Notes**
+    - **Minimize environments** (reduces E, M): `on_stop` runs `stop_review` when the MR is merged or the branch is deleted. `auto_stop_in` removes forgotten ones after 2 days, and each new deploy resets the timer. The namespace delete also frees the Postgres volume. In Green Metrics Tool micro-benchmarks, a preview environment idling for 60 seconds used about 3% less CPU energy with 1 app replica and Postgres (~262 J) than with 3 replicas, Postgres, Redis and a polling worker (~269 J). Machine energy differed by less than 1%. Idle services cost little per minute, so the real saving is the hours an environment no longer exists.
+    - **Smaller footprint** (reduces M): 1 replica and no Redis or worker reserve less memory on the cluster. Turn Redis and the worker back on only for MRs that touch them.
+    - **MR pipelines only** (reduces E, M): branch pushes without an MR no longer get an environment.
+
+    Behavior changes: reviewers now get a preview only once an MR exists. After 2 days without a push the environment is stopped, and re-running `deploy_review` brings it back. If the API needs Redis at startup, set `redis.enabled=true` again.
+verify:
+  static_only: GitLab CI config needing a cluster and registry

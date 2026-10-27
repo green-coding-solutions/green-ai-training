@@ -1,0 +1,64 @@
+id: gen-6593849-00101-no-change
+category: no-change
+language: python
+patterns:
+- vectorize-or-jit
+- context-tradeoff
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    hi, im not sure whats wrong with my script. its a step in our github actions pipeline, it reads the test report json and checks how many tests are slow. the whole step takes a few seconds in the log and i think the for loop is the reason. someone said i should use numba to make it faster. is that right? we have around 400 tests per run
+
+    ```python
+    import json
+    import sys
+
+    SLOW_LIMIT = 2.0
+    MAX_SLOW = 10
+
+
+    def load_durations(path):
+        with open(path) as f:
+            report = json.load(f)
+        return [t["duration"] for t in report["tests"]]
+
+
+    def summarize(durations, limit):
+        total = 0.0
+        slow = 0
+        longest = 0.0
+        for d in durations:
+            total += d
+            if d > limit:
+                slow += 1
+            if d > longest:
+                longest = d
+        return total, slow, longest
+
+
+    if __name__ == "__main__":
+        durations = load_durations(sys.argv[1])
+        total, slow, longest = summarize(durations, SLOW_LIMIT)
+        print(f"tests: {len(durations)}")
+        print(f"total: {total:.1f}s")
+        print(f"slow (> {SLOW_LIMIT}s): {slow}")
+        print(f"longest: {longest:.1f}s")
+        if slow > MAX_SLOW:
+            print("too many slow tests")
+            sys.exit(1)
+    ```
+- role: assistant
+  content: |
+    No, don't add numba. Your script is already fine, and numba would make this step worse.
+
+    - **The loop is tiny.** It runs 400 iterations once per pipeline run. That is far too little work to notice. The few seconds in your log most likely come from starting the runner step, starting Python and reading the file.
+    - **Numba only pays off for hot numeric loops.** In Green Metrics Tool micro-benchmarks, a pure Python loop over 10,000,000 samples used ~40 J, and the same loop with Numba `@njit` used ~9.5 J (about 4× less). Your loop is about 25,000 times smaller than that.
+    - **Numba has a fixed cost.** It is a large dependency to install on every CI run. It also compiles the function again in every new process. With 400 values, that cost is much bigger than any time saved.
+
+    The code is simple, it reads well, and `json.load` is the only real work. I would leave it as it is.
+
+    If the step feels slow, look at the time before your script starts, such as checkout and dependency install. Caching the dependencies there is a better place to look than this loop.
+verify:
+  static_only: answer contains no code, only advice not to change the script

@@ -1,0 +1,47 @@
+id: gen-9483221-00045-generation
+category: generation
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    bash script: from the gateway's sensors.csv (device,ts,battery_mv,rssi) list devices whose battery went below 3000 mV, with their avg rssi
+- role: assistant
+  content: |
+    The threshold is an optional second argument. The file has a header line, which the script skips.
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    file=${1:?usage: low-battery.sh sensors.csv [threshold_mv]}
+    limit=${2:-3000}
+
+    # Columns: device,ts,battery_mv,rssi
+    awk -F, -v limit="$limit" '
+      NR == 1 { next }
+      {
+        dev = $1
+        mv = $3 + 0
+        n[dev]++
+        rssi_sum[dev] += $4
+        if (!(dev in min_mv) || mv < min_mv[dev]) min_mv[dev] = mv
+      }
+      END {
+        for (dev in n)
+          if (min_mv[dev] < limit)
+            printf "%s\t%d\t%.1f\t%d\n", dev, min_mv[dev], rssi_sum[dev] / n[dev], n[dev]
+      }
+    ' "$file" | sort
+    ```
+
+    Output is tab-separated and sorted by device: `device`, lowest battery in mV, average rssi, number of readings.
+
+    **Green Notes**
+    - **Single-pass tool instead of a shell loop** (reduces E): one `awk` process reads the whole file, so there is no `echo | cut` or `expr` process per line. In Green Metrics Tool micro-benchmarks on a 20,000-line log, a `while read` loop that ran `$(echo | cut)` and `$(expr)` per field used ~1302 J. One `awk` pass with identical output used ~1.0 J, over 1000× less. Process starts dominate shell scripts. A gateway that runs this on a timer repeats that cost on every run.
+    - **Single quotes for the awk program and the format strings** (reduces E): they contain no shell expansion, so bash takes them as they are. The threshold is passed with `-v`, so the program text stays a plain literal.
+verify:
+  static_only: bash script reading a CSV file with awk and sort, no network or packages beyond coreutils

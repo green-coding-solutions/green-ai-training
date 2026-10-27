@@ -1,0 +1,91 @@
+id: gen-6593849-00160-estimate
+category: estimate
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    We have a nightly job that reads the previous day's access log from our load balancer and builds a latency histogram per service. Then it writes a summary for the dashboard. It runs in a fresh container from cron, and the log is usually several million lines. The profiler says almost all the time is in this bucketing function:
+
+    ```python
+    import math
+
+    LO_MS = 0.1
+    HI_MS = 60000.0
+    N_BUCKETS = 64
+    _LOG_LO = math.log(LO_MS)
+    _STEP = (math.log(HI_MS) - _LOG_LO) / N_BUCKETS
+
+
+    def bucket_counts(latencies_ms):
+        counts = [0] * N_BUCKETS
+        for x in latencies_ms:
+            if x < LO_MS:
+                x = LO_MS
+            elif x > HI_MS:
+                x = HI_MS
+            idx = int((math.log(x) - _LOG_LO) / _STEP)
+            if idx >= N_BUCKETS:
+                idx = N_BUCKETS - 1
+            counts[idx] += 1
+        return counts
+    ```
+
+    Requirements: results must stay identical, we can add numba to the image, and the container's work dir is writable. My question: how much energy would we save if we put numba on this? I need something I can put in the ticket.
+- role: assistant
+  content: |
+    Directionally, a clear saving. This is the kind of loop numba is good at: pure numeric work, one pass, no Python objects inside the loop.
+
+    The closest measurement I have is in Green Metrics Tool micro-benchmarks. Quantizing 10,000,000 samples in a pure Python loop used ~40 J of CPU energy. With Numba `@njit` it used ~9.5 J, about 4× less. Your function has the same shape: a per-sample clamp, a log and an index.
+
+    Here is the change:
+
+    ```python
+    import math
+
+    import numpy as np
+    from numba import njit
+
+    LO_MS = 0.1
+    HI_MS = 60000.0
+    N_BUCKETS = 64
+    _LOG_LO = math.log(LO_MS)
+    _STEP = (math.log(HI_MS) - _LOG_LO) / N_BUCKETS
+
+
+    @njit(cache=True)
+    def _bucket_counts(latencies_ms, lo, hi, log_lo, step, n_buckets):
+        counts = np.zeros(n_buckets, dtype=np.int64)
+        for i in range(latencies_ms.shape[0]):
+            x = latencies_ms[i]
+            if x < lo:
+                x = lo
+            elif x > hi:
+                x = hi
+            idx = int((math.log(x) - log_lo) / step)
+            if idx >= n_buckets:
+                idx = n_buckets - 1
+            counts[idx] += 1
+        return counts
+
+
+    def bucket_counts(latencies_ms):
+        arr = np.asarray(latencies_ms, dtype=np.float64)
+        return _bucket_counts(arr, LO_MS, HI_MS, _LOG_LO, _STEP, N_BUCKETS).tolist()
+    ```
+
+    The result is the same list of counts. The wrapper keeps your old signature.
+
+    What to keep in mind for the ticket:
+
+    - **Don't scale my figure to your job.** It comes from one machine and one loop. Your saving depends on how many lines you really process and how much time the loop takes in the whole job.
+    - **Only the loop gets cheaper.** Reading and parsing the log, and writing the summary, cost the same as before. If parsing is a big part of the run, the total saving is smaller than the loop saving.
+    - **Compile cost.** Your job starts a fresh process every night, so numba compiles on each run. `cache=True` stores the compiled code in `__pycache__` next to the module. Bake that cache into the image, or make sure the directory is writable, as you said it is. Without it, a small log can end up costing more with numba than without.
+    - **Extra dependency.** Numba adds weight to the image. That is fine for a loop that runs on millions of lines every night. For a job on a few thousand lines it would not be worth it.
+
+    To measure it, run both versions on the same real log file. Use a Green Metrics Tool usage scenario if you have one. Otherwise use `perf stat` or `time` for a CPU-time proxy. Run the numba version twice, once with a cold cache and once with a warm one, because the first run includes compilation.
+verify:
+  static_only: needs numba, which is not in stdlib + numpy

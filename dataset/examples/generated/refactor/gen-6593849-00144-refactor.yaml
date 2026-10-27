@@ -1,0 +1,50 @@
+id: gen-6593849-00144-refactor
+category: refactor
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    Log shipper image, builds on every push in GitLab CI. Diff only, please.
+
+    ```dockerfile
+    FROM python:3.12
+    RUN apt-get update && apt-get install -y build-essential git curl vim less
+    WORKDIR /app
+    COPY . /app
+    RUN pip install -r requirements.txt
+    RUN pip install pytest black mypy ipython
+    ENV PYTHONUNBUFFERED=1
+    CMD ["python", "-m", "logshipper.main", "--config", "/etc/logshipper/config.yaml"]
+    ```
+
+    requirements.txt is pyyaml, orjson, requests and python-dateutil.
+- role: assistant
+  content: |
+    ```diff
+    -FROM python:3.12
+    -RUN apt-get update && apt-get install -y build-essential git curl vim less
+    +FROM python:3.12-slim
+    +ENV PYTHONUNBUFFERED=1
+     WORKDIR /app
+    -COPY . /app
+    -RUN pip install -r requirements.txt
+    -RUN pip install pytest black mypy ipython
+    -ENV PYTHONUNBUFFERED=1
+    +COPY requirements.txt .
+    +RUN pip install --no-cache-dir -r requirements.txt
+    +COPY . .
+     CMD ["python", "-m", "logshipper.main", "--config", "/etc/logshipper/config.yaml"]
+    ```
+
+    Add a `.dockerignore` with `.git`, `.venv`, `__pycache__` and any sample log files, so they stay out of `COPY . .`. Run pytest, black and mypy in a separate CI job, not in the shipped image.
+
+    **Green Notes**
+    - **Slim base, runtime dependencies only** (reduces E, storage, network): the compiler toolchain, `git`, `curl`, `vim` and the dev tools are gone. All four packages in your requirements have wheels for Linux, so nothing needs `build-essential`. If you add one that does, compile it in a build stage and copy only the installed packages. In Green Metrics Tool measurements of a similar change for a small Flask app, the image build used about 7× less energy, while serving requests cost the same. The saving repeats with every CI build, pull and stored copy.
+    - **Dependency layer before the source** (reduces E): a push that only changes code reuses the cached `pip install` layer. Before, every code change invalidated it.
+    - **No pip cache** (reduces storage): `--no-cache-dir` keeps downloaded wheels out of the image.
+verify:
+  static_only: Dockerfile

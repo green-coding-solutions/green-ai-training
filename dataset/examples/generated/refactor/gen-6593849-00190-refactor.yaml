@@ -1,0 +1,107 @@
+id: gen-6593849-00190-refactor
+category: refactor
+language: python
+patterns:
+- regex-precompile
+- async-concurrent-io
+facts:
+- F-REGEX
+- F-HTTP
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import re
+    import requests
+
+    BASE_URL = "https://shop.example.com/p/"
+
+
+    def check_prices(skus):
+        """Fetch competitor product pages, return {sku: (cents, stock)}."""
+        results = {}
+        for sku in skus:
+            url = BASE_URL + sku
+            try:
+                resp = requests.get(url, timeout=10)
+                resp.raise_for_status()
+            except requests.RequestException as e:
+                print(f"skip {sku}: {e}")
+                continue
+            html = resp.text
+            price_m = re.search(r'<span class="price"[^>]*>\s*([\d.,]+)\s*&euro;', html)
+            stock_m = re.search(r'data-stock="(\d+)"', html)
+            if not price_m:
+                print(f"no price for {sku}")
+                continue
+            price = price_m.group(1).replace(".", "").replace(",", ".")
+            cents = round(float(price) * 100)
+            stock = int(stock_m.group(1)) if stock_m else 0
+            results[sku] = (cents, stock)
+        return results
+    ```
+- role: assistant
+  content: |
+    ```python
+    import asyncio
+    import re
+
+    import httpx
+
+    BASE_URL = "https://shop.example.com/p/"
+    MAX_PARALLEL = 10
+
+    PRICE_RE = re.compile(r'<span class="price"[^>]*>\s*([\d.,]+)\s*&euro;')
+    STOCK_RE = re.compile(r'data-stock="(\d+)"')
+
+
+    async def _fetch(client, sem, sku):
+        async with sem:
+            try:
+                resp = await client.get(BASE_URL + sku)
+                resp.raise_for_status()
+            except httpx.HTTPError as e:
+                print(f"skip {sku}: {e}")
+                return sku, None
+        return sku, resp.text
+
+
+    async def _check_prices(skus):
+        sem = asyncio.Semaphore(MAX_PARALLEL)
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            pages = await asyncio.gather(*(_fetch(client, sem, sku) for sku in skus))
+
+        results = {}
+        for sku, html in pages:
+            if html is None:
+                continue
+            price_m = PRICE_RE.search(html)
+            if not price_m:
+                print(f"no price for {sku}")
+                continue
+            stock_m = STOCK_RE.search(html)
+            price = price_m.group(1).replace(".", "").replace(",", ".")
+            cents = round(float(price) * 100)
+            stock = int(stock_m.group(1)) if stock_m else 0
+            results[sku] = (cents, stock)
+        return results
+
+
+    def check_prices(skus):
+        """Fetch competitor product pages, return {sku: (cents, stock)}."""
+        return asyncio.run(_check_prices(skus))
+    ```
+
+    **Green Notes**
+    - **Concurrent requests with `httpx`** (reduces E and idle time): the old loop waited for each page before starting the next one. Now up to 10 requests run at once, so the job waits for the slowest page instead of the sum of all pages. In Green Metrics Tool micro-benchmarks, 10 HTTP requests took ~9.1 J and 3.1 s with sync `urllib` and ~8.4 J and 2.6 s with async `httpx`. That is about 7% less CPU energy and about 17% less wall time. The CPU saving is modest, and most of the gain is wall time. The semaphore keeps the load on the competitor site polite.
+    - **Regexes compiled once at module level** (reduces E): the patterns are fixed, so they no longer go through the `re` lookup on every page. The win is small, because Python's `re` caches compiled patterns. In Green Metrics Tool micro-benchmarks, 1,000,000 matches took ~21 J inline and ~18 J precompiled, about 18% less. It also keeps the patterns in one place.
+
+    Behavior differences:
+    - `check_prices(skus)` has the same signature and returns the same dict, in the same order as `skus`.
+    - The "skip" and "no price" messages may now print in a different order.
+    - `httpx` does not follow redirects by default, so `follow_redirects=True` keeps the old `requests` behavior.
+    - `asyncio.run` can't be called from inside a running event loop. In that case, call `_check_prices` with `await`.
+verify:
+  static_only: needs network access and the httpx package

@@ -1,0 +1,106 @@
+id: gen-6593849-00293-multi-turn
+category: multi-turn
+language: python
+patterns:
+- torch-no-grad
+- context-tradeoff
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    diff only. CLI that scores a folder of .npy feature files with our torch model, CPU. what do you change?
+
+    ```python
+    import argparse
+    import sys
+    from pathlib import Path
+
+    import numpy as np
+    import torch
+
+
+    def load_model(path):
+        model = torch.jit.load(path)
+        model.eval()
+        return model
+
+
+    def score_file(model, path):
+        x = torch.from_numpy(np.load(path)).float()
+        out = model(x)
+        return out.softmax(dim=-1).argmax(dim=-1).tolist()
+
+
+    def main():
+        ap = argparse.ArgumentParser()
+        ap.add_argument("model")
+        ap.add_argument("folder")
+        args = ap.parse_args()
+        model = load_model(args.model)
+        for p in sorted(Path(args.folder).glob("*.npy")):
+            labels = score_file(model, p)
+            print(f"{p.name}\t{labels}")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+- role: assistant
+  content: |
+    ```diff
+     def score_file(model, path):
+         x = torch.from_numpy(np.load(path)).float()
+    -    out = model(x)
+    +    with torch.inference_mode():
+    +        out = model(x)
+         return out.softmax(dim=-1).argmax(dim=-1).tolist()
+    ```
+
+    **Green Notes**
+    - **No autograd during inference** (reduces E): without it, torch tracks the graph for every forward pass although you never call `backward()`. In Green Metrics Tool micro-benchmarks, 100,000 CPU inferences used about 14% less energy with `torch.no_grad()`. `inference_mode()` is the stricter form of the same idea.
+    - The labels are the same. The output tensor is only read after the block, and `softmax` and `argmax` on it work as before.
+- role: user
+  content: |
+    we still support torch 1.8 on one box. is inference_mode there? also don't want to touch more lines than needed
+- role: assistant
+  content: |
+    `inference_mode()` came in torch 1.9, so 1.8 doesn't have it. Use `no_grad()`. It exists in all versions and gives the same saving here.
+
+    ```diff
+     def score_file(model, path):
+         x = torch.from_numpy(np.load(path)).float()
+    -    out = model(x)
+    +    with torch.no_grad():
+    +        out = model(x)
+         return out.softmax(dim=-1).argmax(dim=-1).tolist()
+    ```
+
+    Same three lines, nothing else touched. The measured figure above was for `no_grad()`, so it applies as is.
+- role: user
+  content: |
+    ok. can we wrap the whole main loop in it instead, one with block, so I can drop the one in score_file?
+- role: assistant
+  content: |
+    You can, but I'd keep it in `score_file`. Both give the same results and the same saving. The difference is scope.
+
+    With the block in `main`, any code you later add to `score_file` or the loop runs without autograd too. That's fine today. It becomes a problem if someone reuses `score_file` from another module, where the block is missing and gradients are tracked again without any sign of it.
+
+    If you still prefer one block in `main`:
+
+    ```diff
+    -    out = model(x)
+    +    out = model(x)
+    ...
+         for p in sorted(Path(args.folder).glob("*.npy")):
+    -        labels = score_file(model, p)
+    -        print(f"{p.name}\t{labels}")
+    +        with torch.no_grad():
+    +            labels = score_file(model, p)
+    +        print(f"{p.name}\t{labels}")
+    ```
+
+    Enter the block once per file here. If you want a single block around the whole loop, move the `for` loop under one `with torch.no_grad():`. Either way, remove the block from `score_file`.
+verify:
+  static_only: needs torch, which is beyond stdlib + numpy

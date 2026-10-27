@@ -1,0 +1,56 @@
+id: gen-6593849-00235-generation
+category: generation
+language: python
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    flask endpoint POST /api/events/bulk, client sends json list of up to ~5000 events (user_id, kind, payload json, created_at), save to postgres w/ psycopg 3. table is `events`
+- role: assistant
+  content: |
+    ```python
+    import json
+
+    from flask import Blueprint, current_app, jsonify, request
+
+    bp = Blueprint("events", __name__)
+
+    REQUIRED = ("user_id", "kind", "payload", "created_at")
+
+
+    @bp.post("/api/events/bulk")
+    def bulk_events():
+        items = request.get_json(silent=True)
+        if not isinstance(items, list) or not items:
+            return jsonify(error="expected a non-empty JSON list"), 400
+        if not all(isinstance(e, dict) and all(k in e for k in REQUIRED) for e in items):
+            return jsonify(error="each event needs " + ", ".join(REQUIRED)), 400
+
+        rows = [
+            (e["user_id"], e["kind"], json.dumps(e["payload"]), e["created_at"])
+            for e in items
+        ]
+
+        with current_app.db_pool.connection() as conn:
+            with conn.cursor() as cur:
+                with cur.copy(
+                    "COPY events (user_id, kind, payload, created_at) FROM STDIN"
+                ) as copy:
+                    for row in rows:
+                        copy.write_row(row)
+            # the connection context manager commits on exit
+
+        return jsonify(inserted=len(rows)), 201
+    ```
+
+    **Green Notes**
+    - **Batch write with `COPY`** (reduces E): one `COPY ... FROM STDIN` streams all rows in a single statement and one commit, instead of up to 5,000 `INSERT` round trips. In Green Metrics Tool micro-benchmarks on PostgreSQL 16, with 5,000-row batches, `COPY` used about 22× less CPU energy than one `execute()` per row and about 8× less than `executemany()`.
+    - **One transaction per request**: the whole batch commits together, so a bad row doesn't leave half the events saved.
+    *Not applied:* `COPY` for small requests. With batches around 100 rows the differences were small in the same benchmark, so for tiny payloads a plain `executemany()` is just as fine.
+
+    `payload` is sent as JSON text, so it works for a `jsonb` or `json` column. `COPY` has no `ON CONFLICT`. If clients can resend events, load into a temp table first and insert from there.
+verify:
+  static_only: needs a running Flask app and PostgreSQL

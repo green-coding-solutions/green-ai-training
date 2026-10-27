@@ -1,0 +1,49 @@
+id: gen-9483221-00032-generation
+category: generation
+language: sql
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+sql_dialect: postgres
+messages:
+- role: user
+  content: |
+    Hello, my image classifier evaluation make a file eval_preds.csv after every run, about 1.2 million lines. Columns: sample_id, true_label, pred_label, confidence, latency_ms. First line is the header. I want to look at the results with SQL (wrong predictions by class, slow samples). I use postgres and psql. Can you write the sql script to create the table and put the file inside? Sorry for my english.
+- role: assistant
+  content: |
+    ```sql
+    -- load_eval_preds.sql
+    -- run: psql -d mydb -f load_eval_preds.sql
+    BEGIN;
+
+    CREATE TABLE IF NOT EXISTS eval_preds (
+        sample_id   bigint PRIMARY KEY,
+        true_label  text   NOT NULL,
+        pred_label  text   NOT NULL,
+        confidence  real   NOT NULL,
+        latency_ms  real   NOT NULL
+    );
+
+    \copy eval_preds (sample_id, true_label, pred_label, confidence, latency_ms) FROM 'eval_preds.csv' WITH (FORMAT csv, HEADER true)
+
+    COMMIT;
+
+    -- quick check: wrong predictions per true class
+    SELECT true_label,
+           count(*) FILTER (WHERE true_label <> pred_label) AS wrong,
+           count(*)                                         AS total
+    FROM eval_preds
+    GROUP BY true_label
+    ORDER BY wrong DESC;
+    ```
+
+    Notes for use:
+    - `\copy` is a psql command. It reads the file on your computer, so the file does not need to be on the database server.
+    - If you load a new run into the same table, `sample_id` must be unique, or the load fails and the transaction rolls back. Use `TRUNCATE eval_preds;` before the load, or add a `run_id` column to the table.
+
+    **Green Notes**
+    - **Batch database writes** (reduces E): `COPY` sends all 1.2 million rows in one stream, so there is no statement and no round trip per row. A file full of `INSERT` lines would run 1.2 million statements. In Green Metrics Tool micro-benchmarks on PostgreSQL 16, loading 500,000 rows in batches of 5,000 used about 22× less CPU energy with `COPY` than with one `INSERT` per row.
+    - **One transaction** for the table and the load: one commit instead of many, and no half-loaded table if the file has a bad line.
+ve­rify:
+  static_only: needs PostgreSQL and the psql \copy command, which SQLite does not have

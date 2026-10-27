@@ -1,0 +1,125 @@
+id: gen-12764612-00433-refactor
+category: refactor
+language: python
+patterns:
+- regex-precompile
+- vectorize-or-jit
+facts:
+- F-REGEX
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    Hello, this is endpoint from our weather station backend. Stations upload big batches (some have 200k readings) and the server CPU is very high when this run. Can you make it more fast and clean? Sorry for my english
+
+    ```python
+    import re
+    from flask import Flask, request, jsonify
+
+    app = Flask(__name__)
+
+    LO, HI = -50.0, 150.0
+    WINDOW = 12
+
+
+    def bad_ids(readings):
+        bad = []
+        for r in readings:
+            if not re.match(r"^WS-\d{4}$", r["sensor_id"]):
+                bad.append(r["sensor_id"])
+        return bad
+
+
+    def smooth(values, window, lo, hi):
+        out = []
+        acc = 0.0
+        for i in range(len(values)):
+            acc += values[i]
+            if i >= window:
+                acc -= values[i - window]
+            n = min(i + 1, window)
+            v = acc / n
+            if v < lo:
+                v = lo
+            elif v > hi:
+                v = hi
+            out.append(v)
+        return out
+
+
+    @app.route("/api/v1/batch", methods=["POST"])
+    def upload_batch():
+        data = request.get_json()
+        readings = data["readings"]
+        bad = bad_ids(readings)
+        if bad:
+            return jsonify({"error": "bad sensor ids", "ids": sorted(set(bad))[:10]}), 400
+        values = [r["raw"] * 0.1 - 40.0 for r in readings]
+        smoothed = smooth(values, WINDOW, LO, HI)
+        return jsonify({
+            "count": len(smoothed),
+            "last": smoothed[-1] if smoothed else None,
+            "max": max(smoothed) if smoothed else None,
+        })
+    ```
+- role: assistant
+  content: |
+    ```python
+    import re
+
+    import numpy as np
+    from flask import Flask, request, jsonify
+    from numba import njit
+
+    app = Flask(__name__)
+
+    LO, HI = -50.0, 150.0
+    WINDOW = 12
+
+    SENSOR_ID = re.compile(r"^WS-\d{4}$")
+
+
+    def bad_ids(readings):
+        return [r["sensor_id"] for r in readings if not SENSOR_ID.match(r["sensor_id"])]
+
+
+    @njit(cache=True)
+    def smooth(values, window, lo, hi):
+        out = np.empty(values.shape[0])
+        acc = 0.0
+        for i in range(values.shape[0]):
+            acc += values[i]
+            if i >= window:
+                acc -= values[i - window]
+            n = min(i + 1, window)
+            v = acc / n
+            if v < lo:
+                v = lo
+            elif v > hi:
+                v = hi
+            out[i] = v
+        return out
+
+
+    @app.route("/api/v1/batch", methods=["POST"])
+    def upload_batch():
+        data = request.get_json()
+        readings = data["readings"]
+        bad = bad_ids(readings)
+        if bad:
+            return jsonify({"error": "bad sensor ids", "ids": sorted(set(bad))[:10]}), 400
+        values = np.array([r["raw"] * 0.1 - 40.0 for r in readings], dtype=np.float64)
+        smoothed = smooth(values, WINDOW, LO, HI)
+        return jsonify({
+            "count": int(smoothed.shape[0]),
+            "last": float(smoothed[-1]) if smoothed.size else None,
+            "max": float(smoothed.max()) if smoothed.size else None,
+        })
+    ```
+
+    **Green Notes**
+    - **Compile the regex once** (reduces E): the pattern is now built at import time and reused for every reading. Python's `re` already caches patterns, so the win is small. In Green Metrics Tool micro-benchmarks, 1,000,000 matches with a precompiled pattern used about 18% less CPU energy than inline `re.match`. The pattern is the same as before, so the check gives the same result, including the `$` that also accepts a trailing newline.
+    - **Numba `@njit` on the smoothing loop** (reduces E): this is a plain numeric loop over every reading, and it is the CPU-bound part for big batches. In Green Metrics Tool micro-benchmarks, a pure Python loop over 10,000,000 samples used about 4× more CPU energy than the same loop with Numba. The output is the same numbers as before.
+    - *Not applied:* nothing else changed. Numba only pays off because your batches are large. For small batches it would add a dependency and a compile step on the first call, without a real gain. `cache=True` keeps the compiled code between restarts, so make sure the app can write to its `__pycache__` folder.
+verify:
+  static_only: needs Flask and Numba, which are not in stdlib + numpy

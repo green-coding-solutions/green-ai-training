@@ -1,0 +1,98 @@
+id: gen-6593849-00094-review
+category: review
+language: python
+patterns:
+- batch-db-writes
+- avoid-exception-flow
+facts:
+- F-PG-INSERT
+- F-EXC
+messages:
+- role: user
+  content: |
+    hello, can you look at my code pls. its for our gateway, it collect the sensor readings from many devices and every 5 minutes it send them to postgres. around 3000 readings each time. sometimes it crash and I dont understand why. also is it slow? sorry for my english
+
+    ```python
+    import psycopg
+
+    DSN = "host=10.0.0.5 dbname=iot user=gateway password=gw2024"
+
+    def flush(readings):
+        conn = psycopg.connect(DSN)
+        cur = conn.cursor()
+        for r in readings:
+            try:
+                battery = r["payload"]["battery"]
+            except KeyError:
+                battery = None
+            try:
+                rssi = r["payload"]["rssi"]
+            except KeyError:
+                rssi = None
+            cur.execute(
+                f"INSERT INTO readings (device_id, ts, temp_c, battery, rssi) "
+                f"VALUES ('{r['device_id']}', '{r['ts']}', {r['temp_c']}, {battery}, {rssi})"
+            )
+            conn.commit()
+        conn.close()
+    ```
+
+    Most of the small devices dont send battery or rssi, only the big ones.
+- role: assistant
+  content: |
+    **Workload:** data pipeline (IoT gateway, periodic bulk write)
+
+    #### [Bug] `None` is pasted into the SQL text
+    - **Where:** the f-string in `cur.execute(...)`
+    - **Issue:** when `battery` or `rssi` is missing, the f-string writes the word `None` into the statement. Postgres does not know it and the insert fails with a syntax error. This is probably your crash. A failure also leaves the connection open, and a flush stops half way.
+    - **Fix:** pass values as parameters. The driver turns Python `None` into `NULL`.
+
+    #### [Security] SQL built with an f-string, password in the code
+    - **Where:** `cur.execute(f"...")` and `DSN`
+    - **Issue:** `device_id` comes from devices on the network. A bad value with a quote in it can change your SQL. The database password is also in the source file.
+    - **Fix:** use parameters or `COPY`, and read the DSN from an environment variable.
+
+    #### [High] One statement and one commit per reading
+    - **Where:** the `for r in readings` loop
+    - **Issue:** 3000 readings means 3000 round trips and 3000 commits for every flush. Each commit waits for a disk flush on the server.
+    - **Fix:** build all rows first and write them in one `COPY`. Use `executemany()` if you want something simpler.
+    - **Impact:** reduces E on the gateway and the database. In Green Metrics Tool micro-benchmarks with 5,000-row batches, `COPY` used about 22× less CPU energy than one `execute()` per row. With batches of only about 100 rows the difference was small, but your 3000 rows are in the range where it pays off.
+
+    #### [Low] `try/except KeyError` for a normal case
+    - **Where:** the `battery` and `rssi` lookups
+    - **Issue:** you say most devices don't send these fields, so the exception is the usual path, not the rare one. Raising is the expensive part.
+    - **Fix:** use `dict.get`.
+    - **Impact:** reduces E per reading a little. In Green Metrics Tool micro-benchmarks with about half of the keys missing, `dict.get` used about 12% less energy than `try/except KeyError`. If misses were rare, `try/except` would be fine.
+
+    ```python
+    import os
+    import psycopg
+
+    DSN = os.environ["IOT_DSN"]
+
+    def flush(readings):
+        rows = []
+        for r in readings:
+            payload = r["payload"]
+            rows.append((
+                r["device_id"],
+                r["ts"],
+                r["temp_c"],
+                payload.get("battery"),
+                payload.get("rssi"),
+            ))
+
+        with psycopg.connect(DSN) as conn:
+            with conn.cursor() as cur:
+                with cur.copy(
+                    "COPY readings (device_id, ts, temp_c, battery, rssi) FROM STDIN"
+                ) as copy:
+                    for row in rows:
+                        copy.write_row(row)
+    ```
+
+    The `with` block commits once at the end, or rolls back if something fails. So a flush is now all or nothing. If you need to keep the good rows when one row is bad, tell me and we can change this.
+
+    **Already good:** you already collect readings and write them in groups, not one by one as they arrive.
+verify:
+  static_only: needs a running PostgreSQL server and the psycopg package

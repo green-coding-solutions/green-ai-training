@@ -1,0 +1,56 @@
+id: gen-6593849-00107-generation
+category: generation
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    dbt docs site for our warehouse, internal, ~30 analysts. CI runs `dbt docs generate` on every merge to main (a few times a day) and rsyncs `target/` to /srv/dbt-docs. Big files are manifest.json (~25 MB), catalog.json (~8 MB), plus index.html. Current vhost:
+
+    ```nginx
+    server {
+        listen 80;
+        server_name dbt-docs.internal.example;
+
+        root /srv/dbt-docs;
+        index index.html;
+
+        location / {
+            try_files $uri =404;
+            add_header Cache-Control "no-cache";
+        }
+    }
+    ```
+
+    Add compression. Diff only, no explanation of what gzip is.
+- role: assistant
+  content: |
+    Add to the `location /` block:
+
+    ```nginx
+        location / {
+            try_files $uri =404;
+            add_header Cache-Control "no-cache";
+    +       gzip_static on;
+    +       gzip_vary on;
+        }
+    ```
+
+    Add to the CI job, after `dbt docs generate` and before the rsync:
+
+    ```bash
+    find target -type f \( -name '*.html' -o -name '*.json' -o -name '*.js' -o -name '*.css' \) \
+      -exec gzip -9 -k -f {} +
+    ```
+
+    **Green Notes**
+    - **Precompress static assets at build time** (reduces network and E): the files change a few times a day and are read many times, so compress once in CI and let nginx serve the `.gz` files. In Green Metrics Tool micro-benchmarks with text assets, compression sent about 10× fewer bytes. Compressing on every request cost about 4× the CPU energy of serving precompressed files. Precompressed files still cost about 2× no compression there, because the client has to decompress them. That test ran on a local network, so it shows only the CPU side. On a real network the byte saving is what counts.
+    - **`gzip -9` is fine here:** the cost is paid once per build, not per request.
+    - *Not applied:* `gzip on` for these paths. It would compress per request when a `.gz` file is missing.
+
+    Keep the uncompressed originals next to the `.gz` files. Clients without gzip support get them. Always run the compress step after every generate. nginx does not check whether a `.gz` file is stale, so a missed run serves old content.
+verify:
+  static_only: nginx config and shell snippet, no runnable Python or JavaScript

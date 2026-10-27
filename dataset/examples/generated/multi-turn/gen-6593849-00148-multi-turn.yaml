@@ -1,0 +1,78 @@
+id: gen-6593849-00148-multi-turn
+category: multi-turn
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    I need a function for our REST API (FastAPI) that picks the response language from the `Accept-Language` header.
+
+    Requirements:
+    - `pick_locale(accept_language: str) -> str`
+    - supported: `en`, `de`, `fr`, `pt-br`. Default is `en`.
+    - respect q-values (`de;q=0.9,en;q=0.8`), `q=0` means "not acceptable"
+    - a region tag like `de-AT` should fall back to `de` if only the base language is supported
+    - it is called on every request, in a middleware. In our access logs there are only a few hundred different header values, because most browsers send the same string again and again
+- role: assistant
+  content: |
+    ```python
+    from functools import lru_cache
+
+    SUPPORTED = ("en", "de", "fr", "pt-br")
+    DEFAULT = "en"
+
+
+    @lru_cache(maxsize=1024)
+    def pick_locale(accept_language: str) -> str:
+        weighted = []
+        for part in accept_language.split(","):
+            tag, _, params = part.strip().partition(";")
+            tag = tag.strip().lower()
+            if not tag:
+                continue
+            q = 1.0
+            params = params.strip()
+            if params.startswith("q="):
+                try:
+                    q = float(params[2:])
+                except ValueError:
+                    continue
+            weighted.append((q, tag))
+
+        weighted.sort(key=lambda item: -item[0])  # stable: header order breaks ties
+        for q, tag in weighted:
+            if q <= 0:
+                continue
+            if tag in SUPPORTED:
+                return tag
+            base = tag.split("-")[0]
+            if base in SUPPORTED:
+                return base
+        return DEFAULT
+    ```
+
+    **Green Notes**
+    - **Memoize repeated pure computations** (reduces E): the result depends only on the header string, and your logs show a few hundred distinct values, so almost every request is a cache hit instead of a re-parse. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over 200 distinct inputs used about 9× less CPU energy with `lru_cache`. With mostly unique inputs, a cache only adds overhead.
+    - **Bounded cache** (reduces M): `maxsize=1024` caps memory, because clients control this header and could send endless variations.
+- role: user
+  content: |
+    Thanks. My tech lead says `maxsize=None` is simpler, no eviction to think about. He also wants the same `@lru_cache` on `get_user_plan(user_id)`, which reads the plan from Postgres, so we save DB calls. Can you tell me what to answer him?
+- role: assistant
+  content: |
+    Keep the bound on `pick_locale`, and don't cache `get_user_plan` this way.
+
+    **`maxsize=None` on the header function**
+    - It works for your normal traffic. The risk is the unusual traffic: the header comes from the client, so a bot or scanner can send a new string on every request. Each one stays in memory forever.
+    - With `maxsize=1024` your few hundred real values all fit, so you lose nothing. Eviction only matters for junk values.
+
+    **`@lru_cache` on `get_user_plan`**
+    - The function is not pure. Its result changes when a user upgrades or cancels, and `lru_cache` has no expiry. Users would see their old plan until the process restarts.
+    - Each process would also keep its own copy, so workers can disagree.
+    - Memoizing pays off when the same input comes back many times. Here the input is the user id, so you have many distinct keys and fewer repeats per key. That is the case where the benefit is small and the cache mostly adds overhead.
+
+    If you still want to reduce DB reads for plans, that needs its own design with an expiry and invalidation on plan changes. Don't solve it with a decorator. For the locale function, the decorator is the right tool.
+verify:
+  static_only: final answer contains no code; the code of the first turn is a simple stdlib function

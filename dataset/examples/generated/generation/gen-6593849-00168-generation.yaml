@@ -1,0 +1,77 @@
+id: gen-6593849-00168-generation
+category: generation
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    Current vhost below. Need compression on it: JSON from /v1/ and the OpenAPI docs (openapi.json is ~600 KB, plus redoc bundle and css). Just the diff please.
+
+    ```nginx
+    server {
+        listen 443 ssl http2;
+        server_name api.acme-logistics.example;
+
+        ssl_certificate     /etc/ssl/acme/fullchain.pem;
+        ssl_certificate_key /etc/ssl/acme/privkey.pem;
+
+        location /docs/ {
+            alias /srv/api-docs/;
+            expires 1h;
+        }
+
+        location /v1/ {
+            proxy_pass http://127.0.0.1:8080;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+    }
+    ```
+- role: assistant
+  content: |
+    ```nginx
+    server {
+        listen 443 ssl http2;
+        server_name api.acme-logistics.example;
+
+        ssl_certificate     /etc/ssl/acme/fullchain.pem;
+        ssl_certificate_key /etc/ssl/acme/privkey.pem;
+
+    +   gzip            on;
+    +   gzip_comp_level 4;
+    +   gzip_min_length 512;
+    +   gzip_vary       on;
+    +   gzip_proxied    any;
+    +   gzip_types      application/json application/javascript text/css image/svg+xml;
+
+        location /docs/ {
+            alias /srv/api-docs/;
+            expires 1h;
+    +       gzip_static on;
+        }
+
+        location /v1/ {
+            proxy_pass http://127.0.0.1:8080;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+    }
+    ```
+
+    Precompress the docs once, in the step that publishes them:
+
+    ```bash
+    find /srv/api-docs -type f \( -name '*.json' -o -name '*.js' -o -name '*.css' -o -name '*.svg' \) \
+      -exec gzip -9 -k -f {} +
+    ```
+
+    **Green Notes**
+    - **Precompressed static files** (reduces E): `gzip_static on` serves the `.gz` files made at publish time, so `/docs/` is never compressed per request. In Green Metrics Tool micro-benchmarks with nginx serving text assets, per-request gzip level 5 used about 4× the CPU energy of precompressed files. Both sent about 10× fewer bytes than uncompressed.
+    - **Level 4 for `/v1/`** (reduces E, network): API JSON is dynamic, so it must be compressed per request. A moderate level keeps CPU cost low and still shrinks JSON a lot. `gzip_min_length 512` skips tiny responses where compression gains nothing.
+    - Keep `gzip -9` and other expensive settings for the precompress step only. They run once per publish, not once per request.
+    - `gzip_vary on` keeps caches correct for clients with and without `Accept-Encoding: gzip`.
+verify:
+  static_only: nginx configuration, no runnable Python or JavaScript

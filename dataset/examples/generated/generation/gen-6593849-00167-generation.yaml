@@ -1,0 +1,47 @@
+id: gen-6593849-00167-generation
+category: generation
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    diff only please. need `forward_known(messages, provisioned)` for our LoRa/MQTT gateway. `provisioned` is the list of ~6k device ids from /etc/gw/provisioned.txt, read once at boot. `messages` is a batch of dicts like `{"dev": "a1b2c3", "ts": 1718000000, "val": 21.5}`, we get about 2k per second. Return only messages from provisioned devices, same order. Also give me the loader.
+- role: assistant
+  content: |
+    ```python
+    def load_provisioned(path="/etc/gw/provisioned.txt"):
+        with open(path) as f:
+            return frozenset(line.strip() for line in f if line.strip())
+
+
+    def forward_known(messages, provisioned):
+        return [m for m in messages if m["dev"] in provisioned]
+    ```
+
+    Call `load_provisioned()` once at boot and pass the result to every batch call.
+
+    **Green Notes**
+    - **Set for membership** (reduces E): the ids are loaded into a `frozenset` once, so each message check is O(1) instead of a scan over ~6k ids. At about 2k messages per second, that is the repeated-lookup case where a set pays off.
+    - *Not applied:* converting inside `forward_known`. Rebuilding the set per batch would repeat the O(n) build every time. In Green Metrics Tool micro-benchmarks, one lookup on a 10,000,000-element list was cheaper than building a set first and testing once. A set only wins when many lookups share one build.
+  verify:
+    test: |-
+      import os, tempfile
+      d = tempfile.mkdtemp()
+      p = os.path.join(d, "prov.txt")
+      with open(p, "w") as f:
+          f.write("a1\nb2\n\n c3 \n")
+      prov = load_provisioned(p)
+      assert prov == frozenset({"a1", "b2", "c3"})
+      msgs = [
+          {"dev": "b2", "ts": 1, "val": 1.0},
+          {"dev": "zz", "ts": 2, "val": 2.0},
+          {"dev": "a1", "ts": 3, "val": 3.0},
+          {"dev": "c3", "ts": 4, "val": 4.0},
+          {"dev": "yy", "ts": 5, "val": 5.0},
+      ]
+      out = forward_known(msgs, prov)
+      assert [m["ts"] for m in out] == [1, 3, 4]
+      assert forward_known([], prov) == []

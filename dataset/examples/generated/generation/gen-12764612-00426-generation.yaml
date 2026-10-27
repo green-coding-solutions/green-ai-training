@@ -1,0 +1,74 @@
+id: gen-12764612-00426-generation
+category: generation
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    Need `shipping_zone(country, postcode)` for the checkout API. Returns a zone letter.
+
+    - DE: first two digits 00-31 → A, 32-63 → B, 64-99 → C
+    - AT: first two digits 10-29 → A, 30-99 → B
+    - NL, BE, LU, CH → D
+    - FR, IT, ES, PL, CZ, DK, SE → E
+    - everything else → F
+
+    Input is raw user text (" 10115", "1011 ab", lowercase country). It runs for every cart line on every request. Just the code.
+- role: assistant
+  content: |
+    ```python
+    from functools import lru_cache
+
+    _RANGES = {
+        "DE": ((0, 31, "A"), (32, 63, "B"), (64, 99, "C")),
+        "AT": ((10, 29, "A"), (30, 99, "B")),
+    }
+    _ZONE_D = frozenset({"NL", "BE", "LU", "CH"})
+    _ZONE_E = frozenset({"FR", "IT", "ES", "PL", "CZ", "DK", "SE"})
+
+
+    def shipping_zone(country: str, postcode: str) -> str:
+        digits = "".join(ch for ch in postcode if ch.isdigit())
+        return _zone(country.strip().upper(), digits[:2])
+
+
+    @lru_cache(maxsize=1024)
+    def _zone(country: str, prefix: str) -> str:
+        ranges = _RANGES.get(country)
+        if ranges is not None:
+            if len(prefix) < 2:
+                return "F"
+            n = int(prefix)
+            for lo, hi, zone in ranges:
+                if lo <= n <= hi:
+                    return zone
+            return "F"
+        if country in _ZONE_D:
+            return "D"
+        if country in _ZONE_E:
+            return "E"
+        return "F"
+    ```
+
+    **Green Notes**
+    - **Memoize the zone lookup** (reduces E): the result depends only on the country and a two-digit prefix. That is at most a few hundred distinct inputs, while the calls repeat for every cart line. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over 200 distinct inputs used about 9× less CPU energy with `lru_cache`.
+    - **Normalize before the cache:** the cache key is `(country, 2-digit prefix)`, not the raw postcode. " 10115" and "10117" share one entry. Caching on the raw string would fill the cache with near-unique keys and add overhead for no gain.
+    - **Bounded cache:** `maxsize=1024` caps memory. The function is pure and returns a string, so there is no stale data or shared mutable state.
+  verify:
+    test: |-
+      assert shipping_zone("de", " 10115") == "A"
+      assert shipping_zone("DE", "80331") == "C"
+      assert shipping_zone("DE", "40210") == "B"
+      assert shipping_zone("at", "1010") == "A"
+      assert shipping_zone("AT", "5020") == "B"
+      assert shipping_zone("NL", "1011 ab") == "D"
+      assert shipping_zone("se", "11122") == "E"
+      assert shipping_zone("US", "10001") == "F"
+      assert shipping_zone("DE", "") == "F"
+      _zone.cache_clear()
+      shipping_zone("DE", "10115")
+      shipping_zone("DE", "10999")
+      assert _zone.cache_info().hits >= 1

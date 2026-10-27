@@ -1,0 +1,63 @@
+id: gen-6593849-00157-generation
+category: generation
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    func: list of (lat, lon) -> mean daily solar irradiance 2024 from NASA POWER, ~80 points per run
+- role: assistant
+  content: |
+    The 80 requests are independent and mostly wait on the network, so I send them concurrently over one shared client, with a cap on parallel calls:
+
+    ```python
+    import asyncio
+    import httpx
+
+    URL = "https://power.larc.nasa.gov/api/temporal/daily/point"
+    PARAM = "ALLSKY_SFC_SW_DWN"
+    FILL = -999  # NASA POWER marks missing days with -999
+
+
+    async def _fetch_mean(client, sem, lat, lon):
+        async with sem:
+            resp = await client.get(URL, params={
+                "parameters": PARAM,
+                "community": "RE",
+                "latitude": lat,
+                "longitude": lon,
+                "start": "20240101",
+                "end": "20241231",
+                "format": "JSON",
+            })
+        resp.raise_for_status()
+        days = resp.json()["properties"]["parameter"][PARAM].values()
+        valid = [v for v in days if v != FILL]
+        return (lat, lon), (sum(valid) / len(valid) if valid else None)
+
+
+    async def mean_irradiance_async(points, max_concurrency=8):
+        sem = asyncio.Semaphore(max_concurrency)
+        async with httpx.AsyncClient(timeout=30) as client:
+            results = await asyncio.gather(
+                *(_fetch_mean(client, sem, lat, lon) for lat, lon in points)
+            )
+        return dict(results)
+
+
+    def mean_irradiance(points, max_concurrency=8):
+        return asyncio.run(mean_irradiance_async(points, max_concurrency))
+    ```
+
+    Returns `{(lat, lon): mean_kWh_per_m2_per_day or None}`. Duplicate points collapse into one key. Inside Jupyter, call `await mean_irradiance_async(points)` instead.
+
+    **Green Notes**
+    - **Concurrent I/O** (reduces E and wall time): 80 sequential calls would hold the process open for 80 round trips in a row. Now the waits overlap. In Green Metrics Tool micro-benchmarks, 10 requests with async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. For small request counts the gain is mostly wall time, so it grows with the number of calls.
+    - **One shared `AsyncClient`** reuses connections instead of opening a new one per point.
+    - **`Semaphore(8)`** keeps the load on the public API polite and avoids rate-limit retries, which would waste the saving.
+    - *Not applied:* for a single point, a plain sync call is simpler and just as cheap.
+verify:
+  static_only: needs network access and httpx

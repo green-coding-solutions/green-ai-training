@@ -1,0 +1,109 @@
+id: gen-6593849-00261-refactor
+category: refactor
+language: python
+patterns:
+- simple-conditions
+- string-join
+facts:
+- F-COND
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    Please refactor this helper from our load balancer log tool. Requirements:
+    - Keep the function names, the arguments and the return value exactly the same (the counts dict and the report text).
+    - Output must stay identical, including line order.
+    - It reads JSON-lines files of 1-3 million entries every night, and it has become slow. Please make it as lean as you reasonably can without making it hard to read.
+
+    ```python
+    import json
+
+    def classify(status):
+        if status >= 200 and status < 300:
+            return "ok"
+        elif status >= 300 and status < 400:
+            return "redirect"
+        elif status == 429:
+            return "throttled"
+        elif status >= 400 and status < 500:
+            return "client_error"
+        elif status >= 500 and status < 600:
+            return "server_error"
+        elif status >= 100 and status < 200:
+            return "info"
+        return "other"
+
+    def summarize(path):
+        counts = {}
+        report = ""
+        with open(path) as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                entry = json.loads(raw)
+                label = classify(entry["status"])
+                counts[label] = counts.get(label, 0) + 1
+                report += entry["ts"] + " " + str(entry["status"]) + " " + label + " " + entry["path"] + "\n"
+        return counts, report
+    ```
+- role: assistant
+  content: |
+    ```python
+    import json
+
+    def classify(status):
+        if status == 429:
+            return "throttled"
+        group = status // 100
+        if group == 2:
+            return "ok"
+        elif group == 3:
+            return "redirect"
+        elif group == 4:
+            return "client_error"
+        elif group == 5:
+            return "server_error"
+        elif group == 1:
+            return "info"
+        return "other"
+
+    def summarize(path):
+        counts = {}
+        lines = []
+        with open(path) as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                entry = json.loads(raw)
+                label = classify(entry["status"])
+                counts[label] = counts.get(label, 0) + 1
+                lines.append(f'{entry["ts"]} {entry["status"]} {label} {entry["path"]}\n')
+        return counts, "".join(lines)
+    ```
+
+    **Green Notes**
+    - **Join instead of `+=`** (reduces E): the report used to grow by one piece for every log entry. Now each line goes into a list, and the list is joined once at the end. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces used about 469 J with `+=` and about 1.8 J with `"".join()`. That is roughly 260× less CPU energy. An f-string is fine for building one line. The problem was only the `+=` that kept growing the report.
+    - **Simple equality checks** (reduces E): `classify` runs once per entry. It now takes the hundreds digit of the status (`status // 100`) and compares it with plain `==`. The old code needed two comparisons for each range. In Green Metrics Tool micro-benchmarks, simple equality branches used about 16% less CPU energy than complex range and modulo conditions (10,000,000 classifications). Expect a smaller gain here, because your conditions were only range checks.
+    - **Behavior is unchanged:** `429` is still checked first, so it never ends up as `client_error`. The counts dict keeps the same insertion order, and the report has the same lines in the same order. Statuses outside 100-599 still return `"other"`.
+    - Parsing JSON is probably the largest cost per line, and this refactor does not change it. Time a real nightly file before and after (`time` or `perf stat`) to see what you gain on your data.
+verify:
+  module: true
+  equivalence:
+    driver: |-
+      import json, os, tempfile
+      statuses = [100, 101, 199, 200, 204, 299, 300, 301, 399, 400, 404, 428, 429, 430, 499,
+                  500, 502, 599, 600, 99, 0, 700, -100]
+      d = tempfile.mkdtemp()
+      p = os.path.join(d, "lb.jsonl")
+      with open(p, "w") as f:
+          for i in range(300):
+              s = statuses[(i * 7) % len(statuses)]
+              f.write(json.dumps({"ts": "2026-10-26T00:%02d:%02d" % (i // 60, i % 60), "status": s, "path": "/p/%d" % (i % 13)}) + "\n")
+              if i % 50 == 0:
+                  f.write("\n")
+      counts, report = summarize(p)
+      print(counts)
+      print(report, end="")
+      print([classify(s) for s in statuses])

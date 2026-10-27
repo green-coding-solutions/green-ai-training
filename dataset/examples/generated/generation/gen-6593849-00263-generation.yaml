@@ -1,0 +1,55 @@
+id: gen-6593849-00263-generation
+category: generation
+language: bash
+patterns:
+- bash-builtins
+facts:
+- F-BASH-SUBPROC
+messages:
+- role: user
+  content: |
+    hi, im new to bash and not sure what i do wrong. i have a file servers.csv about 12000 lines, columns are name,ip,env,owner (first line is the header). i want 2 things: how many servers in each env (prod, stage, dev), and a file with only the ip of the prod servers. my first try takes many minutes and i dont understand why, it was a while loop that calls cut for every column. can you write the script? it gets the csv and the output file as arguments
+- role: assistant
+  content: |
+    The loop is slow because every `cut` call starts a new process. With 12,000 lines and several columns, that is tens of thousands of process starts. One `awk` call reads the whole file once and does both jobs.
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    if [ "$#" -ne 2 ]; then
+        echo "usage: $0 servers.csv prod_ips.txt" >&2
+        exit 1
+    fi
+
+    csv=$1
+    out=$2
+
+    : > "$out"
+
+    awk -F',' -v out="$out" -v want='prod' '
+    NR > 1 {
+        count[$3]++
+        if ($3 == want) print $2 > out
+    }
+    END {
+        for (env in count) print env, count[env]
+    }
+    ' "$csv" | sort
+    ```
+
+    Run it like this:
+
+    ```bash
+    ./count_servers.sh servers.csv prod_ips.txt
+    ```
+
+    It prints one line per env, for example `prod 41`, sorted by name. The prod IPs go to `prod_ips.txt`, one per line. The line `: > "$out"` creates the file empty first, so it exists even if there are no prod servers.
+
+    This assumes plain CSV with no quoted fields that contain commas.
+
+    **Green Notes**
+    - **One `awk` pass instead of subprocesses in a loop** (reduces E): `$(echo "$line" | cut ...)` starts several processes for every line, and process starts dominate shell scripts. In Green Metrics Tool micro-benchmarks that summarized a 20,000-line log, a loop with a subprocess per field used over 1000× the energy of one `awk` pass. A loop with only builtins (`read -r`, `$(( ))`, `case`) was about 300× cheaper than the subprocess loop, and `awk` was still about 4× cheaper than that.
+    - **Header skipped with `NR > 1`**, so the header line is not counted as an env.
+verify:
+  static_only: bash script, no python or javascript to execute

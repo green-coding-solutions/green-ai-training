@@ -1,0 +1,91 @@
+id: gen-6593849-00250-review
+category: review
+language: python
+patterns:
+- string-join
+facts:
+- F-STRCAT
+messages:
+- role: user
+  content: |
+    Please review this module before we ship it. It builds the product feed that we upload to a marketplace every night. We have about 300k active SKUs, and the file is a tab-separated text file with a header line. Requirements: the output format must not change, because the marketplace parser is strict. The job runs on a small worker, and it must stay readable for the junior devs on the team. Please tell me what you find, ordered by importance.
+
+    ```python
+    BASE_URL = "https://shop.example.com"
+
+
+    def build_feed(products, currency="EUR"):
+        out = "id\ttitle\tprice\tavailability\tlink\n"
+        for p in products:
+            price = "%.2f %s" % (p["price_cents"] / 100, currency)
+            if p["stock"] > 0:
+                avail = "in stock"
+            else:
+                avail = "out of stock"
+            link = f'{BASE_URL}/p/{p["slug"]}'
+            out += f'{p["sku"]}\t{p["title"]}\t{price}\t{avail}\t{link}\n'
+        return out
+
+
+    def export_feed(products, path):
+        text = build_feed(products)
+        with open(path, "w") as f:
+            f.write(text)
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (nightly export)
+
+    #### [Bug] Titles with tabs or line breaks corrupt the feed
+    - **Where:** `build_feed`, the `{p["title"]}` field, and `open(path, "w")` in `export_feed`
+    - **Issue:** a product title that contains a tab or a newline adds an extra column or a extra row. A strict parser will reject the file or read wrong data. Also, `open` without `encoding` uses the machine's default, so titles with accents or symbols can fail or be written in the wrong encoding on a different worker.
+    - **Fix:** collapse the whitespace in the title and set the encoding and newline explicitly. Titles with normal single spaces stay the same.
+      ```python
+      title = " ".join(p["title"].split())
+      ```
+      ```python
+      with open(path, "w", encoding="utf-8", newline="\n") as f:
+      ```
+
+    #### [High] Feed built with `+=` in a loop over all products
+    - **Where:** `out += f'...'` in `build_feed`
+    - **Issue:** this makes one string operation per product, and with 300k SKUs the string gets very large. In Green Metrics Tool micro-benchmarks, building a string from 1,000,000 pieces with `+=` used ~469 J of CPU energy, and `"".join()` ~1.8 J, roughly 260× less. An f-string appended in a loop behaved like `+=` (~455 J). The figures are for that test, not for your job, but the direction is the same.
+    - **Fix:** collect the lines in a list and join once. The output is byte for byte the same.
+      ```python
+      BASE_URL = "https://shop.example.com"
+
+
+      def build_feed(products, currency="EUR"):
+          lines = ["id\ttitle\tprice\tavailability\tlink"]
+          for p in products:
+              title = " ".join(p["title"].split())
+              price = "%.2f %s" % (p["price_cents"] / 100, currency)
+              avail = "in stock" if p["stock"] > 0 else "out of stock"
+              link = f'{BASE_URL}/p/{p["slug"]}'
+              lines.append(f'{p["sku"]}\t{title}\t{price}\t{avail}\t{link}')
+          return "\n".join(lines) + "\n"
+
+
+      def export_feed(products, path):
+          text = build_feed(products)
+          with open(path, "w", encoding="utf-8", newline="\n") as f:
+              f.write(text)
+      ```
+    - **Impact:** E on the worker, on every nightly run. It scales with the number of SKUs. The code stays as easy to read as before.
+
+    **Already good:** the format is built in one place, `build_feed` is separate from file writing, and the price is formatted with a fixed two decimals.
+verify:
+  equivalence:
+    driver: |
+      products = [
+          {"sku": "A-1", "title": "Blue Mug 300 ml", "price_cents": 1299, "stock": 5, "slug": "blue-mug"},
+          {"sku": "A-2", "title": "Red Plate", "price_cents": 850, "stock": 0, "slug": "red-plate"},
+          {"sku": "B-7", "title": "Wooden Spoon Set", "price_cents": 5, "stock": 12, "slug": "spoon-set"},
+      ]
+      print(build_feed(products), end="")
+      print(build_feed([], "USD"), end="")
+      print(build_feed(products, "USD"), end="")
+  test: |-
+    out = build_feed([{"sku": "X", "title": "Bad\tTitle\nHere", "price_cents": 100, "stock": 1, "slug": "x"}])
+    assert out.count("\n") == 2
+    assert out.splitlines()[1].split("\t")[1] == "Bad Title Here"

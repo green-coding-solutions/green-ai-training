@@ -1,0 +1,123 @@
+id: gen-9483221-00037-refactor
+category: refactor
+language: javascript
+patterns:
+- css-animations
+facts:
+- F-ANIM
+messages:
+- role: user
+  content: |
+    ```js
+    const scanBar = document.getElementById('scan-bar');
+    const cursor = document.getElementById('tail-cursor');
+    const statusEl = document.getElementById('scan-status');
+    const results = document.getElementById('scan-results');
+
+    let rafId = null;
+    let scanning = false;
+
+    function animateScan(ts) {
+      const phase = (ts % 1600) / 1600;
+      scanBar.style.transform = 'translateX(' + (-100 + phase * 400) + '%)';
+      rafId = requestAnimationFrame(animateScan);
+    }
+
+    function startScan() {
+      if (scanning) return;
+      scanning = true;
+      scanBar.hidden = false;
+      statusEl.textContent = 'Scanning archive...';
+      rafId = requestAnimationFrame(animateScan);
+    }
+
+    function stopScan(message) {
+      scanning = false;
+      cancelAnimationFrame(rafId);
+      scanBar.hidden = true;
+      statusEl.textContent = message;
+    }
+
+    setInterval(function () {
+      cursor.style.opacity = cursor.style.opacity === '0' ? '1' : '0';
+    }, 500);
+
+    async function scanArchive(url, pattern) {
+      startScan();
+      try {
+        const res = await fetch(url + '?q=' + encodeURIComponent(pattern));
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        results.textContent = data.lines.join('\n');
+        stopScan(data.lines.length + ' matching lines');
+      } catch (err) {
+        stopScan('Scan failed: ' + err.message);
+      }
+    }
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```css
+    #scan-bar {
+      animation: scan-sweep 1.6s linear infinite;
+    }
+    #scan-bar[hidden] {
+      display: none;
+    }
+    @keyframes scan-sweep {
+      from { transform: translateX(-100%); }
+      to   { transform: translateX(300%); }
+    }
+
+    #tail-cursor {
+      animation: cursor-blink 1s steps(1, end) infinite;
+    }
+    @keyframes cursor-blink {
+      0%   { opacity: 1; }
+      50%  { opacity: 0; }
+    }
+    ```
+
+    ```js
+    const scanBar = document.getElementById('scan-bar');
+    const statusEl = document.getElementById('scan-status');
+    const results = document.getElementById('scan-results');
+
+    let scanning = false;
+
+    function startScan() {
+      if (scanning) return;
+      scanning = true;
+      scanBar.hidden = false;
+      statusEl.textContent = 'Scanning archive...';
+    }
+
+    function stopScan(message) {
+      scanning = false;
+      scanBar.hidden = true;
+      statusEl.textContent = message;
+    }
+
+    async function scanArchive(url, pattern) {
+      startScan();
+      try {
+        const res = await fetch(url + '?q=' + encodeURIComponent(pattern));
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        results.textContent = data.lines.join('\n');
+        stopScan(data.lines.length + ' matching lines');
+      } catch (err) {
+        stopScan('Scan failed: ' + err.message);
+      }
+    }
+    ```
+
+    **Green Notes**
+    - **CSS keyframes instead of a `requestAnimationFrame` loop** (reduces E on the client): the sweep ran a JS callback on every frame and wrote an inline style each time. Now the browser runs the animation itself, and `startScan` / `stopScan` only toggle `hidden`. In Green Metrics Tool micro-benchmarks of a 20-second browser animation, a `requestAnimationFrame` version used ~161 J and CSS `@keyframes` used ~145 J, about 10% less. This page may stay open during long scans, so the saving repeats.
+    - **Cursor blink moved to CSS** (reduces E): the `setInterval` toggle ran forever, even while the tab was idle. `steps(1, end)` keeps the hard on/off blink.
+    - `[hidden]` gets `display: none`, so the animation stops when the bar is hidden and no work is left running between scans. Since `cancelAnimationFrame` and `rafId` are gone, the `rafId` variable and the cursor element lookup are removed too.
+    - Behavior is the same: the bar travels from -100% to 300% of its own width every 1.6 s. The 10% figure is from one benchmark setup, so measure your own page if you need exact numbers.
+verify:
+  static_only: Needs a browser DOM, requestAnimationFrame and CSS animation; cannot run in Node stdlib

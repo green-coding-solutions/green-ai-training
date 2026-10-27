@@ -1,0 +1,118 @@
+id: gen-6593849-00198-review
+category: review
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    review pls
+
+    ```yaml
+    stages: [build, deploy]
+
+    variables:
+      IMAGE: $CI_REGISTRY_IMAGE/shop:$CI_COMMIT_REF_SLUG
+      POSTGRES_PASSWORD: review123
+
+    build:
+      stage: build
+      image: docker:26
+      services: [docker:26-dind]
+      script:
+        - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+        - docker build -t $IMAGE .
+        - docker push $IMAGE
+
+    deploy_review:
+      stage: deploy
+      image: alpine/helm:3.15
+      script:
+        - helm upgrade --install shop-$CI_COMMIT_REF_NAME ./chart
+            --namespace review-$CI_COMMIT_REF_NAME --create-namespace
+            --set image=$IMAGE
+            --set replicaCount=3
+            --set postgres.enabled=true
+            --set postgres.password=$POSTGRES_PASSWORD
+            --set redis.enabled=true
+            --set worker.enabled=true
+      environment:
+        name: review/$CI_COMMIT_REF_NAME
+        url: https://$CI_COMMIT_REF_SLUG.review.example.com
+      rules:
+        - if: $CI_COMMIT_BRANCH
+    ```
+- role: assistant
+  content: |
+    **Workload:** cloud backend (CI/CD, review environments)
+
+    #### [Bug] Branch names break the Helm release and namespace
+    - **Where:** `shop-$CI_COMMIT_REF_NAME`, `review-$CI_COMMIT_REF_NAME`
+    - **Issue:** branch names like `feature/cart` contain `/`, capitals or `_`. Helm release names and Kubernetes namespaces do not allow them, so the deploy fails for those branches. Long names also hit the length limit.
+    - **Fix:** use `$CI_COMMIT_REF_SLUG`. It is lowercase, DNS-safe and shortened.
+
+    #### [Security] Hardcoded database password
+    - **Where:** `POSTGRES_PASSWORD: review123`
+    - **Issue:** the password is in the repo and is passed with `--set`, so it shows up in the job log and the Helm release data.
+    - **Fix:** use a masked, protected CI/CD variable, or generate a random password per environment in the chart.
+
+    #### [High] Environments are never removed
+    - **Where:** `deploy_review` has no `on_stop` and no `auto_stop_in`
+    - **Issue:** every pushed branch gets an environment, and `rules: if: $CI_COMMIT_BRANCH` also deploys `main`. Nothing deletes them, so they stay up long after the merge. In Green Metrics Tool micro-benchmarks, an idle preview environment with 3 app replicas, Postgres, Redis and a polling worker used about 269 J of CPU energy in 60 seconds. With 1 replica and Postgres it was about 262 J, about 3% less. Idle services cost little per minute. The cost comes from the hours and from how many environments exist.
+    - **Fix:** deploy only for merge requests, stop the environment when the MR is merged or closed, and add a time limit as a safety net.
+    - **Impact:** E and M on the cluster. Removing environments that should not exist saves far more than trimming their services.
+
+    #### [Medium] Full stack for every review
+    - **Where:** `replicaCount=3`, `redis.enabled`, `worker.enabled`
+    - **Issue:** a review environment serves one reviewer. Three replicas add reserved memory and scheduling load, and they cost more when many MRs are open at once.
+    - **Fix:** use 1 replica. Enable Redis and the worker only if the change needs them, or point reviews at one shared Redis.
+
+    Fixed job:
+
+    ```yaml
+    deploy_review:
+      stage: deploy
+      image: alpine/helm:3.15
+      script:
+        - helm upgrade --install shop-$CI_COMMIT_REF_SLUG ./chart
+            --namespace review-$CI_COMMIT_REF_SLUG --create-namespace
+            --set image=$IMAGE
+            --set replicaCount=1
+            --set postgres.enabled=true
+            --set postgres.password=$REVIEW_DB_PASSWORD
+      environment:
+        name: review/$CI_COMMIT_REF_SLUG
+        url: https://$CI_COMMIT_REF_SLUG.review.example.com
+        on_stop: stop_review
+        auto_stop_in: 3 days
+      rules:
+        - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+    stop_review:
+      stage: deploy
+      image: alpine/helm:3.15
+      variables:
+        GIT_STRATEGY: none
+      script:
+        - helm uninstall shop-$CI_COMMIT_REF_SLUG --namespace review-$CI_COMMIT_REF_SLUG
+        - kubectl delete namespace review-$CI_COMMIT_REF_SLUG --ignore-not-found
+      environment:
+        name: review/$CI_COMMIT_REF_SLUG
+        action: stop
+      rules:
+        - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+          when: manual
+    ```
+
+    Use an image that has both `helm` and `kubectl` for the stop job, or delete only the namespace. Deleting the namespace also removes the release's resources.
+
+    #### [Low] Registry password on the command line
+    - **Where:** `docker login -u ... -p ...`
+    - **Issue:** `-p` puts the password in the process list and Docker warns about it.
+    - **Fix:** `echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"`
+
+    **Already good:** the image tag uses the branch slug, and the environment has a URL, so GitLab can track it.
+verify:
+  static_only: GitLab CI YAML with Helm and a registry, needs a cluster

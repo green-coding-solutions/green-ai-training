@@ -1,0 +1,162 @@
+id: gen-6593849-00046-refactor
+category: refactor
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    Please optimize this function of our log tool. It counts ERROR lines per owning team from our app logs. The files have a few million lines per day. Requirements:
+
+    - the output must stay exactly the same (same counts, same sort order)
+    - first matching rule wins, rule order in rules.txt is important
+    - only the standard library, no new dependencies
+    - it runs in a small container with 256 MB RAM, so no unbounded memory growth
+    - `summarize(lines, rules)` is imported by two other scripts, so keep its signature
+
+    ```python
+    import fnmatch
+    import sys
+    from collections import Counter
+
+
+    def load_rules(path):
+        rules = []
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                pattern, team = line.split()
+                rules.append((pattern, team))
+        return rules
+
+
+    def owner_for_host(host, rules):
+        host = host.lower().rstrip(".")
+        for pattern, team in rules:
+            if fnmatch.fnmatchcase(host, pattern):
+                return team
+        return "unassigned"
+
+
+    def summarize(lines, rules):
+        per_team = Counter()
+        for line in lines:
+            parts = line.split(None, 3)
+            if len(parts) < 4:
+                continue
+            ts, host, level, msg = parts
+            if level != "ERROR":
+                continue
+            per_team[owner_for_host(host, rules)] += 1
+        return per_team
+
+
+    def main():
+        rules = load_rules(sys.argv[1])
+        per_team = summarize(sys.stdin, rules)
+        for team, n in sorted(per_team.items(), key=lambda kv: (-kv[1], kv[0])):
+            print(f"{team}\t{n}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    ```python
+    import fnmatch
+    import sys
+    from collections import Counter
+    from functools import lru_cache
+
+
+    def load_rules(path):
+        rules = []
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                pattern, team = line.split()
+                rules.append((pattern, team))
+        return rules
+
+
+    def make_owner_resolver(rules):
+        rules = tuple(rules)
+
+        @lru_cache(maxsize=4096)
+        def owner_for_host(host):
+            host = host.lower().rstrip(".")
+            for pattern, team in rules:
+                if fnmatch.fnmatchcase(host, pattern):
+                    return team
+            return "unassigned"
+
+        return owner_for_host
+
+
+    def summarize(lines, rules):
+        owner_for_host = make_owner_resolver(rules)
+        per_team = Counter()
+        for line in lines:
+            parts = line.split(None, 3)
+            if len(parts) < 4:
+                continue
+            ts, host, level, msg = parts
+            if level != "ERROR":
+                continue
+            per_team[owner_for_host(host)] += 1
+        return per_team
+
+
+    def main():
+        rules = load_rules(sys.argv[1])
+        per_team = summarize(sys.stdin, rules)
+        for team, n in sorted(per_team.items(), key=lambda kv: (-kv[1], kv[0])):
+            print(f"{team}\t{n}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **Memoize the host lookup** (reduces E per log line): your fleet has a limited number of hosts, but the same hosts repeat millions of times. Before, every ERROR line ran the whole rule list with `fnmatch`. Now each distinct host is matched once and later lines are a dictionary hit. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over 200 distinct inputs used about 4.7 J with `lru_cache` instead of about 43 J without, about 9× less. Your saving depends on your rule count and host mix, so measure it on a real log file with `time` or `perf stat`.
+    - **Bounded cache:** `maxsize=4096` keeps memory small for your 256 MB limit. The cache pays off only because hosts repeat. If most hostnames are unique (for example, short-lived pod names), the cache would only add overhead.
+    - **Behavior:** the output and the rule order are the same. The cache is created inside `summarize`, so each call starts empty and nothing is shared between calls. `make_owner_resolver` copies the rules into a tuple, so later changes to your `rules` list are not seen by an existing resolver. `summarize(lines, rules)` keeps its signature. `owner_for_host(host, rules)` is now internal and takes only `host`.
+verify:
+  module: true
+  test: |
+    r = make_owner_resolver([("a-*", "x"), ("*.example.com", "y")])
+    assert r("A-1.") == "x"
+    assert r("db.example.com") == "y"
+    assert r("other.net") == "unassigned"
+    r("a-1")
+    r("a-1")
+    assert r.cache_info().hits == 1
+    c = summarize(["t h-1 ERROR boom", "t a-2 INFO ok", "short"], [("h-*", "t1")])
+    assert dict(c) == {"t1": 1}
+  equivalence:
+    driver: |-
+      rules = [
+          ("db-*.prod.example.com", "data-platform"),
+          ("web-*.prod.example.com", "web"),
+          ("pay-*.prod.example.com", "payments"),
+          ("*.staging.example.com", "qa"),
+          ("*.example.com", "misc"),
+      ]
+      hosts = ["db-1.prod.example.com", "WEB-2.prod.example.com.", "pay-9.prod.example.com",
+               "app.staging.example.com", "x.example.com", "unknown.net", "web-3.prod.example.com"]
+      levels = ["ERROR", "INFO", "ERROR", "WARN", "ERROR"]
+      lines = []
+      for i in range(3000):
+          lines.append(f"2026-10-24T03:{i % 60:02d}:00Z {hosts[i % len(hosts)]} {levels[i % len(levels)]} msg {i}\n")
+      lines.append("broken line\n")
+      per_team = summarize(lines, rules)
+      for team, n in sorted(per_team.items(), key=lambda kv: (-kv[1], kv[0])):
+          print(f"{team}\t{n}")

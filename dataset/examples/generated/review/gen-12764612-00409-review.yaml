@@ -1,0 +1,137 @@
+id: gen-12764612-00409-review
+category: review
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    Review this please. Diff only, no essay. It's a small CLI we run over our monorepos in CI (lots of json, lockfiles, images, docs next to the source).
+
+    ```python
+    #!/usr/bin/env python3
+    """langstat: count files and lines per language in a source tree."""
+    import os
+    import sys
+    from collections import defaultdict
+
+    LANG_BY_EXT = {
+        ".py": "Python", ".js": "JavaScript", ".ts": "TypeScript",
+        ".go": "Go", ".rs": "Rust", ".java": "Java", ".c": "C",
+        ".h": "C", ".cpp": "C++", ".sh": "Shell", ".sql": "SQL",
+        ".html": "HTML", ".css": "CSS",
+    }
+
+    SKIP_DIRS = {".git", "node_modules", ".venv", "__pycache__"}
+
+
+    def scan(root):
+        files = defaultdict(int)
+        lines = defaultdict(int)
+        skipped = 0
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            for name in filenames:
+                ext = os.path.splitext(name)[1].lower()
+                try:
+                    lang = LANG_BY_EXT[ext]
+                except KeyError:
+                    skipped += 1
+                    continue
+                path = os.path.join(dirpath, name)
+                with open(path) as fh:
+                    n = sum(1 for _ in fh)
+                files[lang] += 1
+                lines[lang] += n
+        return files, lines, skipped
+
+
+    def main():
+        root = sys.argv[1] if len(sys.argv) > 1 else "."
+        files, lines, skipped = scan(root)
+        for lang in sorted(lines, key=lines.get, reverse=True):
+            print(f"{lang:<12}{files[lang]:>6}{lines[lang]:>9}")
+        print(f"skipped: {skipped}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (CI, run over large trees)
+
+    #### [Bug] Crash on files that are not valid text
+    - **Where:** `open(path)` in `scan`
+    - **Issue:** the default encoding depends on the locale, and strict decoding raises `UnicodeDecodeError` on the first source file with a stray Latin-1 byte. One bad file kills the whole run.
+    - **Fix:** `open(path, encoding="utf-8", errors="replace")`. Line counts stay the same.
+
+    #### [Low] Exception used for the common "unknown extension" case
+    - **Where:** `try: LANG_BY_EXT[ext] ... except KeyError`
+    - **Issue:** in your trees, most files (json, lockfiles, images, docs) are not in the table, so a `KeyError` is raised and caught for most files. In Green Metrics Tool micro-benchmarks with about half of the keys missing, `dict.get` used about 12% less CPU energy than `try/except KeyError`, because the cost is in raising. Here file I/O dominates the run, so the real saving is small. It is still a cleaner lookup. If misses were rare, `try/except` would be fine.
+    - **Fix:** `.get()` and a `None` check.
+    - **Impact:** E, small. One avoided exception per skipped file.
+
+    Both changes in `scan`. Nothing else changes, and the output is identical:
+
+    ```python
+    def scan(root):
+        files = defaultdict(int)
+        lines = defaultdict(int)
+        skipped = 0
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            for name in filenames:
+                lang = LANG_BY_EXT.get(os.path.splitext(name)[1].lower())
+                if lang is None:
+                    skipped += 1
+                    continue
+                path = os.path.join(dirpath, name)
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    n = sum(1 for _ in fh)
+                files[lang] += 1
+                lines[lang] += n
+        return files, lines, skipped
+    ```
+
+    **Already good:** pruning `SKIP_DIRS` in place so `os.walk` never enters them, and streaming lines instead of reading whole files.
+verify:
+  module: true
+  equivalence:
+    driver: |-
+      import os
+      import tempfile
+      from collections import defaultdict
+      globals().setdefault("LANG_BY_EXT", {
+          ".py": "Python", ".js": "JavaScript", ".ts": "TypeScript",
+          ".go": "Go", ".rs": "Rust", ".java": "Java", ".c": "C",
+          ".h": "C", ".cpp": "C++", ".sh": "Shell", ".sql": "SQL",
+          ".html": "HTML", ".css": "CSS",
+      })
+      globals().setdefault("SKIP_DIRS", {".git", "node_modules", ".venv", "__pycache__"})
+
+      with tempfile.TemporaryDirectory() as root:
+          layout = {
+              "a.py": "x = 1\ny = 2\nz = 3\n",
+              "b.PY": "print(1)\n",
+              "c.json": "{}\n",
+              "d.png": "notreallyapng\n",
+              "README.md": "# hi\n",
+              "Makefile": "all:\n",
+              "package-lock.json": "{}\n{}\n",
+              "sub/e.js": "a\nb\n",
+              "sub/deep/f.sh": "echo hi\n",
+              "node_modules/x.js": "skipped\n",
+              ".git/config": "skipped\n",
+          }
+          for rel, text in layout.items():
+              path = os.path.join(root, rel)
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              with open(path, "w", encoding="utf-8") as fh:
+                  fh.write(text)
+          files, lines, skipped = scan(root)
+          for lang in sorted(lines):
+              print(lang, files[lang], lines[lang])
+          print("skipped", skipped)

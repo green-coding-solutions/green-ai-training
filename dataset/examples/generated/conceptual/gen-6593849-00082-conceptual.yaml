@@ -1,0 +1,59 @@
+id: gen-6593849-00082-conceptual
+category: conceptual
+language: text
+patterns:
+- hoist-invariants
+- context-tradeoff
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    ```python
+    import math
+    from fastapi import APIRouter, Depends
+    from app.config import settings
+    from app.db import get_db
+
+    router = APIRouter()
+
+
+    @router.get("/v1/orders/summary")
+    def order_summary(page: int = 1, db=Depends(get_db)):
+        rows = db.fetch_orders(page=page, page_size=settings.PAGE_SIZE)
+        items = []
+        for r in rows:
+            gross = r.net_cents * (1 + settings.VAT_RATE)
+            items.append({
+                "id": r.id,
+                "total": math.ceil(gross) / 100,
+                "currency": settings.CURRENCY,
+            })
+        return {"items": items}
+    ```
+
+    ?
+- role: assistant
+  content: |
+    I assume you are asking whether to hoist `settings.VAT_RATE`, `settings.CURRENCY` and `math.ceil` out of the loop. Not here.
+
+    - **The gain is tiny even in a hot loop.** In Green Metrics Tool micro-benchmarks, binding `math.sqrt` to a local before a 10,000,000-iteration loop saved only about 4-5%.
+    - **Your loop is short.** It runs once per row of a single page. The database call and JSON serialization cost far more than a few attribute lookups, so the saving would be lost in the noise.
+    - **Readability matters more.** Extra local variables make a short handler harder to read for no visible gain.
+
+    If this same loop later moves into a bulk export over millions of rows, binding the values once is fine:
+
+    ```python
+    ceil = math.ceil
+    vat = 1 + settings.VAT_RATE
+    currency = settings.CURRENCY
+
+    items = [
+        {"id": r.id, "total": ceil(r.net_cents * vat) / 100, "currency": currency}
+        for r in rows
+    ]
+    ```
+
+    Even then, treat it as a minor cleanup. Measure first with `perf stat` or `time` on a realistic row count.
+verify:
+  static_only: conceptual answer, needs fastapi and app modules

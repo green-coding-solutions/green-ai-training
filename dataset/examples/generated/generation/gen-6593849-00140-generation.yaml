@@ -1,0 +1,40 @@
+id: gen-6593849-00140-generation
+category: generation
+language: bash
+patterns:
+- compress-transmitted
+- bash-quoting
+facts:
+- F-COMPRESS-CODECS
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    Need a bash script to refresh our staging DB from prod. Tables orders, order_items, customers from the `shop` db, target db is `shop_staging` on $STAGING_HOST. Prod and staging are in different regions, so it goes over the WAN via ssh. Pipe it, no temp files. Code only, I'll read it.
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    : "${STAGING_HOST:?set STAGING_HOST}"
+
+    args=()
+    for t in orders order_items customers; do
+      args+=(--table="$t")
+    done
+
+    pg_dump --no-owner "${args[@]}" shop \
+      | zstd -q -3 \
+      | ssh -o Compression=no "$STAGING_HOST" \
+          'zstd -d -q | psql -q -v ON_ERROR_STOP=1 shop_staging'
+    ```
+
+    **Green Notes**
+    - **Compress the stream with zstd** (reduces network and E): SQL text compresses well, so far fewer bytes cross the WAN. In Green Metrics Tool measurements compressing 100 MB of text, zstd used about 4× less energy than gzip, and xz used about 29× more than zstd. The comparison covers energy only, not compression ratio. If the link is very slow, a stronger codec can still be worth it.
+    - **`-o Compression=no`** stops ssh from running its own zlib pass over data that is already compressed.
+    - **Single quotes** for the remote command, which needs no local expansion. Variables stay in double quotes.
+
+    The staging host needs `zstd` installed. `pipefail` makes the script fail if the dump or the compression step fails.
+verify:
+  static_only: needs postgres, ssh and zstd

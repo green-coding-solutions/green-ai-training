@@ -1,0 +1,72 @@
+id: gen-12764612-00400-estimate
+category: estimate
+language: python
+patterns:
+- select-columns
+facts:
+- F-PG-SELECT
+- F-PG-COLUMNS
+messages:
+- role: user
+  content: |
+    Build dashboard backend, Postgres 16, psycopg 3. `builds` has ~40 cols, incl. `log_tail` (TEXT), `junit_xml` (TEXT), `env_dump` (JSONB). The grid only shows id, branch, status, duration_s, started_at. About 300k calls/day. What would we save by trimming? Diff only, and no essay.
+
+    ```python
+    def list_builds(conn, project_id, limit=100):
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM builds "
+                "WHERE project_id = %s "
+                "ORDER BY started_at DESC LIMIT %s",
+                (project_id, limit),
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                "id": r["id"],
+                "branch": r["branch"],
+                "status": r["status"],
+                "duration_s": r["duration_s"],
+                "started_at": r["started_at"].isoformat(),
+            }
+            for r in rows
+        ]
+    ```
+- role: assistant
+  content: |
+    Likely a clear saving. The query reads the large text and JSONB columns for every row and the code drops them.
+
+    ```python
+    def list_builds(conn, project_id, limit=100):
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT id, branch, status, duration_s, started_at "
+                "FROM builds "
+                "WHERE project_id = %s "
+                "ORDER BY started_at DESC LIMIT %s",
+                (project_id, limit),
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                "id": r["id"],
+                "branch": r["branch"],
+                "status": r["status"],
+                "duration_s": r["duration_s"],
+                "started_at": r["started_at"].isoformat(),
+            }
+            for r in rows
+        ]
+    ```
+
+    **Measured reference:** in Green Metrics Tool micro-benchmarks on PostgreSQL 16 with a 52-column products table with large text columns, reading 2,500 rows 1,000 times used ~470 J with `SELECT *` and ~64 J with 10 named columns, about 7× less. A column sweep on the same table showed that cost follows the data each column carries.
+
+    **What I can't give you:** a number for your system. Your factor depends on how large `log_tail`, `junit_xml` and `env_dump` really are, and on how many rows you return. Don't scale the figure above to 300k calls.
+
+    **How to measure:**
+    - Compare `EXPLAIN (ANALYZE, VERBOSE, BUFFERS)` output and the bytes returned per call for both queries.
+    - Run both versions in a loop against a copy of your data as a Green Metrics Tool usage scenario. Multiply the per-call difference by your daily calls.
+
+    Large TEXT and JSONB values are stored out of line (TOAST). If you don't select them, PostgreSQL doesn't have to fetch them at all.
+verify:
+  static_only: needs a PostgreSQL database and psycopg

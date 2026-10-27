@@ -1,0 +1,79 @@
+id: gen-12764612-00456-generation
+category: generation
+language: python
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    Hi, I am quite new with Python and databases. I have a table `reviews` (id, body) in Postgres with about 300k product reviews. I want to run a sentiment model from huggingface on all of them and save the result (label and score) in a new table `review_sentiment`. My first try took forever and I dont know what is wrong, maybe the model is just slow? Can you write the script for me? I use psycopg 3.
+- role: assistant
+  content: |
+    The model is probably not the only slow part. If your first try ran one `INSERT` (and maybe one commit) per review, that is 300k round trips to the database. This script scores the reviews in chunks and writes each chunk with one `COPY`.
+
+    Create the table once. The primary key also lets you re-run the script after a crash, because it skips reviews that are already scored:
+
+    ```sql
+    CREATE TABLE IF NOT EXISTS review_sentiment (
+        review_id bigint PRIMARY KEY REFERENCES reviews(id),
+        label     text NOT NULL,
+        score     real NOT NULL,
+        model     text NOT NULL
+    );
+    ```
+
+    ```python
+    import psycopg
+    from transformers import pipeline
+
+    DSN = "postgresql://localhost/shop"
+    MODEL = "distilbert-base-uncased-finetuned-sst-2-english"
+    CHUNK = 5000
+
+    SELECT_TODO = """
+        SELECT r.id, r.body
+        FROM reviews r
+        WHERE NOT EXISTS (
+            SELECT 1 FROM review_sentiment s WHERE s.review_id = r.id
+        )
+        ORDER BY r.id
+    """
+
+    COPY_SQL = "COPY review_sentiment (review_id, label, score, model) FROM STDIN"
+
+
+    def main():
+        clf = pipeline("sentiment-analysis", model=MODEL)
+
+        with psycopg.connect(DSN) as read_conn, psycopg.connect(DSN) as write_conn:
+            with read_conn.cursor(name="todo_reviews") as read_cur:
+                read_cur.execute(SELECT_TODO)
+                done = 0
+                while rows := read_cur.fetchmany(CHUNK):
+                    ids = [r[0] for r in rows]
+                    texts = [r[1] or "" for r in rows]
+                    preds = clf(texts, batch_size=32, truncation=True)
+
+                    with write_conn.cursor() as write_cur:
+                        with write_cur.copy(COPY_SQL) as copy:
+                            for review_id, p in zip(ids, preds):
+                                copy.write_row((review_id, p["label"], p["score"], MODEL))
+                    write_conn.commit()
+
+                    done += len(rows)
+                    print(f"{done} reviews scored")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **Batch database writes** (reduces E): one `COPY` and one commit per 5,000 reviews instead of one `INSERT` per review, so 300k statements become about 60. In Green Metrics Tool micro-benchmarks, inserting 500,000 rows in batches of 5,000 used ~384 J with one `execute()` per row and ~17 J with `COPY`, about 22× less CPU energy.
+    - The saving is smaller with small batches. In the same benchmarks, batches of only 100 rows differed little, so don't go below a few thousand rows per chunk for a job like this.
+
+    The model itself is still the main cost of the script, and batching the writes only removes the database overhead around it. If the script stops in the middle, the chunk being written is rolled back, and the next run continues from the first unscored review.
+verify:
+  static_only: needs a Postgres server, huggingface transformers and a downloaded model

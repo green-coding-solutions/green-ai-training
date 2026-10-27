@@ -58,34 +58,35 @@ messages:
     - **Where:** `re.sub(pattern, repl, line, re.I)` in `scrub_line`
     - **Issue:** the fourth positional argument of `re.sub` is `count`, not `flags`. `re.I` equals 2, so each rule replaces at most two matches per line and is still case-sensitive. The ignore-case intent never worked.
     - **Fix:** pass the flag when compiling the rule (see the diff below).
-    - **Impact:** correctness. Output changes: rules now match case-insensitively and replace every match on a line. If you wanted case-sensitive rules, drop `re.I` and the count limit is gone either way.
+    - **Impact:** correctness. Output changes: rules now match case-insensitively and replace every match on a line. If you wanted case-sensitive rules, drop `re.I`. The count limit goes away either way.
 
     #### [High] ~900 distinct patterns go through the `re` module cache on every line
     - **Where:** `scrub_line`, `load_rules`
-    - **Issue:** `re.sub(pattern, ...)` looks the pattern up in an internal cache that holds up to 512 compiled patterns. With more than 512 rules, each line cycles through all of them and evicts the entries it needs next, so rules get recompiled again and again. In Green Metrics Tool micro-benchmarks, a precompiled pattern used about 18% less CPU energy than inline `re.match` over 1,000,000 matches, where the cache works. Forcing a recompile on every call cost about 200× more per match. Your rule set is on the bad side of that line.
-    - **Fix:** compile once in `load_rules`, apply compiled patterns in the loop.
-      ```python
-      import re
-
-
-      def load_rules(path):
-          rules = []
-          with open(path, encoding="utf-8") as fh:
-              for raw in fh:
-                  raw = raw.rstrip("\n")
-                  if not raw or raw.startswith("#"):
-                      continue
-                  pattern, repl = raw.split("\t", 1)
-                  rules.append((re.compile(pattern, re.I), repl))
-          return rules
-
-
-      def scrub_line(line, rules):
-          for rx, repl in rules:
-              line = rx.sub(repl, line)
-          return line
-      ```
+    - **Issue:** `re.sub(pattern, ...)` looks the pattern up in an internal cache that holds up to 512 compiled patterns. With more than 512 rules, each line cycles through all of them and evicts the entries it needs next, so rules get recompiled again and again. In Green Metrics Tool micro-benchmarks over 1,000,000 matches, where the cache works, a precompiled pattern used about 18% less CPU energy than inline `re.match`. Forcing a recompile on every call cost about 200× more per match. Your rule set is on the bad side of that line.
+    - **Fix:** compile once in `load_rules` and apply the compiled patterns in the loop (diff below).
     - **Impact:** E per line and per rule, on every run. Rules compile once per process. A malformed pattern in the rules file now fails at startup, not halfway through the output.
+
+    ```python
+    import re
+
+
+    def load_rules(path):
+        rules = []
+        with open(path, encoding="utf-8") as fh:
+            for raw in fh:
+                raw = raw.rstrip("\n")
+                if not raw or raw.startswith("#"):
+                    continue
+                pattern, repl = raw.split("\t", 1)
+                rules.append((re.compile(pattern, re.I), repl))
+        return rules
+
+
+    def scrub_line(line, rules):
+        for rx, repl in rules:
+            line = rx.sub(repl, line)
+        return line
+    ```
 
     **Already good:** input is streamed line by line, files are closed with `with`, and the usage error goes to stderr with a non-zero exit code.
 verify:

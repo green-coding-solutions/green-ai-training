@@ -1,0 +1,101 @@
+id: gen-12764612-00468-review
+category: review
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import numpy as np
+    import requests
+
+    EMBED_URL = "https://inference.internal.example/v1/embed"
+    API_KEY = "sk-live-51f9c0d2b7e84a36"
+
+
+    def embed_batch(texts):
+        vectors = []
+        for text in texts:
+            try:
+                resp = requests.post(
+                    EMBED_URL,
+                    json={"model": "bge-small", "input": text},
+                    headers={"Authorization": f"Bearer {API_KEY}"},
+                )
+                vectors.append(resp.json()["embedding"])
+            except Exception:
+                vectors.append(None)
+        return vectors
+
+
+    def rank_documents(query, docs, top_k=5):
+        vecs = embed_batch([query] + docs)
+        q = np.array(vecs[0])
+        scores = []
+        for doc, v in zip(docs, vecs[1:]):
+            d = np.array(v)
+            scores.append((float(q @ d / (np.linalg.norm(q) * np.linalg.norm(d))), doc))
+        scores.sort(reverse=True)
+        return scores[:top_k]
+    ```
+- role: assistant
+  content: |
+    **Workload:** AI/ML (client for a remote embedding service)
+
+    #### [Security] API key in source code
+    - **Where:** `API_KEY = "sk-live-..."`
+    - **Issue:** the key is committed with the code, so anyone with repo access can use it. Rotate it, because it is already exposed.
+    - **Fix:** read it from the environment: `API_KEY = os.environ["EMBED_API_KEY"]`.
+
+    #### [Bug] Failed requests become `None` and crash later
+    - **Where:** `except Exception: vectors.append(None)` in `embed_batch`, then `np.array(v)` in `rank_documents`
+    - **Issue:** a timeout, a 500 or an error JSON is hidden. The failed vector is `None`, and `rank_documents` fails later with a confusing numpy error. If the query itself fails, the whole ranking is wrong. There is also no `timeout`, so one hung call blocks the whole loop forever.
+    - **Fix:** set a timeout, call `raise_for_status()`, and let the error reach the caller (see the code below).
+
+    #### [High] One blocking request after another
+    - **Where:** the `for text in texts` loop in `embed_batch`
+    - **Issue:** every document waits for the previous response, so total time is the sum of all round trips. The CPU is idle during this wait, but the process and the caller are held open the whole time. Requests that do not depend on each other can run concurrently. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, sync `urllib` used ~9.1 J and async `httpx` ~8.4 J. That is about 7% less CPU energy and about 17% less wall time. So the gain is mostly wall time, and it grows with the number of documents per call.
+    - **Fix:** async client, bounded concurrency, results in input order:
+      ```python
+      import asyncio
+      import os
+
+      import httpx
+      import numpy as np
+
+      EMBED_URL = "https://inference.internal.example/v1/embed"
+      API_KEY = os.environ["EMBED_API_KEY"]
+
+
+      async def _embed_one(client, sem, text):
+          async with sem:
+              resp = await client.post(
+                  EMBED_URL, json={"model": "bge-small", "input": text}
+              )
+              resp.raise_for_status()
+              return resp.json()["embedding"]
+
+
+      async def embed_batch_async(texts, max_concurrency=8):
+          sem = asyncio.Semaphore(max_concurrency)
+          headers = {"Authorization": f"Bearer {API_KEY}"}
+          async with httpx.AsyncClient(headers=headers, timeout=10.0) as client:
+              return await asyncio.gather(
+                  *(_embed_one(client, sem, t) for t in texts)
+              )
+
+
+      def embed_batch(texts):
+          return asyncio.run(embed_batch_async(texts))
+      ```
+      `rank_documents` stays as it is. `gather` keeps the input order, so `vecs[0]` is still the query. The semaphore keeps the inference server from being flooded. If you call this from inside an async web handler, `await embed_batch_async(...)` directly, because `asyncio.run` fails inside a running loop.
+    - **Impact:** mostly wall time and resource holding time. CPU energy drops only a little. If a call usually has just one or two texts, keep the simple sync version.
+
+    **Already good:** `rank_documents` embeds the query and all documents in one pass and sorts once.
+verify:
+  static_only: needs a remote embedding endpoint, httpx and network access

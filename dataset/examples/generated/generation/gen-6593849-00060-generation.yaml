@@ -1,0 +1,57 @@
+id: gen-6593849-00060-generation
+category: generation
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    Hello, I need a python function for our CI runner report. We have cpu load samples from the runners (one per second, percent 0-100, numpy array, about 5M samples every night). I want to smooth it so one spike not make the graph crazy. The rule: every new sample can only move max `max_jump` away from the last smoothed value, and then I do exponential smoothing with `alpha`. Name `smooth_runner_load(samples, alpha=0.1, max_jump=20.0)`, return numpy array same length. Numba is already in our requirements. Thank you!
+- role: assistant
+  content: |
+    Each smoothed value depends on the one before it, so this can't be written as one numpy expression. A plain Python loop over 5M samples would be slow, so the loop is compiled with Numba.
+
+    ```python
+    import numpy as np
+    from numba import njit
+
+
+    @njit(cache=True)
+    def _smooth(x, alpha, max_jump, out):
+        prev = x[0]
+        out[0] = prev
+        for i in range(1, x.shape[0]):
+            v = x[i]
+            lo = prev - max_jump
+            hi = prev + max_jump
+            if v < lo:
+                v = lo
+            elif v > hi:
+                v = hi
+            prev = prev + alpha * (v - prev)
+            out[i] = prev
+
+
+    def smooth_runner_load(samples, alpha=0.1, max_jump=20.0):
+        if not 0.0 < alpha <= 1.0:
+            raise ValueError("alpha must be in (0, 1]")
+        if max_jump < 0:
+            raise ValueError("max_jump must not be negative")
+        x = np.ascontiguousarray(samples, dtype=np.float64)
+        out = np.empty_like(x)
+        if x.size:
+            _smooth(x, alpha, float(max_jump), out)
+        return out
+    ```
+
+    The first sample is used as the start value. The clip uses the last smoothed value, not the last raw sample, as in your rule. Empty input returns an empty array.
+
+    **Green Notes**
+    - **JIT for a hot numeric loop** (reduces E): the loop runs over millions of plain floats, which is the case Numba is made for. In Green Metrics Tool micro-benchmarks, quantizing 10,000,000 samples in a pure Python loop used about 4× more CPU energy than the same loop with `@njit`.
+    - **`cache=True`**: the compiled code is saved in `__pycache__`. If your nightly job starts on a fresh runner, the cache is lost and the compile (about a second) happens on every run. That is small for 5M samples.
+
+    *Not applied:* Numba for small inputs. For a few thousand samples, the compile time is more than the loop, so a plain Python loop is better there.
+verify:
+  static_only: needs numba, which is not in the standard library or numpy

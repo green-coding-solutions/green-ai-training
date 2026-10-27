@@ -1,0 +1,83 @@
+id: gen-6593849-00173-multi-turn
+category: multi-turn
+language: bash
+patterns:
+- compress-stored
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS-BREAKEVEN
+messages:
+- role: user
+  content: |
+    hello, i need small bash script for our iot gateway (raspberry pi, debian). the mqtt bridge write one log file every day, /var/log/gw/mqtt-YYYY-MM-DD.log. i want the script run at night from cron, put yesterday file in /srv/archive/gw and delete archives older than 90 days. we need keep the data for audits
+- role: assistant
+  content: |
+    ```bash
+    #!/bin/bash
+    set -euo pipefail
+
+    LOG_DIR='/var/log/gw'
+    ARCHIVE_DIR='/srv/archive/gw'
+    KEEP_DAYS=90
+
+    day=$(date -d 'yesterday' +%F)
+    src="$LOG_DIR/mqtt-$day.log"
+    dest="$ARCHIVE_DIR/mqtt-$day.log.zst"
+
+    mkdir -p "$ARCHIVE_DIR"
+
+    if [ -f "$src" ]; then
+      zstd -q -T1 -o "$dest.tmp" -- "$src"
+      mv -- "$dest.tmp" "$dest"
+      rm -- "$src"
+    fi
+
+    find "$ARCHIVE_DIR" -name 'mqtt-*.log.zst' -mtime +"$KEEP_DAYS" -delete
+    ```
+
+    Cron entry, for example: `30 2 * * * /usr/local/bin/archive-gw-logs.sh`
+
+    **Green Notes**
+    - **Compress stored data with a fast codec** (reduces E and storage): the logs are kept for 90 days, so compressing them pays off. zstd at its default level is cheap. In Green Metrics Tool micro-benchmarks on 100 MB of text, zstd used ~16 J and gzip ~67 J.
+    - **Original is deleted only after the archive is complete:** the file is written under a temporary name and renamed, so a power loss on the gateway doesn't leave a broken archive.
+- role: user
+  content: |
+    thanks. but our sd card is only 16GB and boss want the files more small. i think xz is the smallest, can you use xz
+
+    ```text
+    ```
+- role: assistant
+  content: |
+    Yes, xz usually gives smaller files than zstd. Here is the script with xz.
+
+    ```bash
+    #!/bin/bash
+    set -euo pipefail
+
+    LOG_DIR='/var/log/gw'
+    ARCHIVE_DIR='/srv/archive/gw'
+    KEEP_DAYS=90
+
+    day=$(date -d 'yesterday' +%F)
+    src="$LOG_DIR/mqtt-$day.log"
+    dest="$ARCHIVE_DIR/mqtt-$day.log.xz"
+
+    mkdir -p "$ARCHIVE_DIR"
+
+    if [ -f "$src" ]; then
+      nice -n 19 xz -6 -T1 -c -- "$src" > "$dest.tmp"
+      mv -- "$dest.tmp" "$dest"
+      rm -- "$src"
+    fi
+
+    find "$ARCHIVE_DIR" \( -name 'mqtt-*.log.xz' -o -name 'mqtt-*.log.zst' \) -mtime +"$KEEP_DAYS" -delete
+    ```
+
+    **Green Notes**
+    - **Slower, stronger codec is fine here:** xz costs much more energy to compress. In Green Metrics Tool micro-benchmarks on 100 MB of text, xz used ~458 J and zstd ~16 J, about 29× more. Those figures compare energy only, not file size. Your logs are written once, compressed once per day and kept 90 days, and a published estimate puts the break-even for xz at about 7 days of storage. So the extra work pays off for your SD card.
+    - **`xz -6` instead of `-9`:** `-6` is the default and the level that was measured. `-9` needs a lot more RAM while compressing, which is a risk on a small Raspberry Pi.
+    - **`nice -n 19`:** the job runs at night, but this keeps the MQTT bridge responsive if it overlaps.
+
+    The `find` line also cleans up any old `.zst` archives, in case you ran the first version.
+verify:
+  static_only: bash script using zstd/xz, cron and GNU date/find; not executed in sandbox

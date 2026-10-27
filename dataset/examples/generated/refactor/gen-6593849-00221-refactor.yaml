@@ -1,0 +1,151 @@
+id: gen-6593849-00221-refactor
+category: refactor
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    hello, I have script in our CI for calculate the cost of runner jobs. we export the jobs as csv from our CI every week, around 400k rows, and it run very slow. can you make it more fast and clean? thanks
+
+    ```python
+    import csv
+    import re
+    import sys
+    from collections import defaultdict
+
+    FAMILY_RATE = {  # USD per vCPU hour
+        "t3": 0.0208,
+        "m5": 0.048,
+        "m6i": 0.048,
+        "c5": 0.0425,
+        "c6i": 0.0425,
+        "r5": 0.063,
+    }
+    SIZE_VCPU = {"medium": 1, "large": 2, "xlarge": 4}
+
+
+    def instance_specs(instance_type):
+        m = re.match(r"^([a-z]+\d+[a-z]*)\.(\d*)(medium|large|xlarge)$", instance_type.strip().lower())
+        if not m:
+            raise ValueError(f"bad instance type: {instance_type!r}")
+        family, count, size = m.groups()
+        if family not in FAMILY_RATE:
+            raise ValueError(f"unknown family: {family}")
+        vcpus = SIZE_VCPU[size] * (int(count) if count else 1)
+        return vcpus, FAMILY_RATE[family]
+
+
+    def main(path):
+        cost_by_team = defaultdict(float)
+        skipped = 0
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                try:
+                    vcpus, rate = instance_specs(row["instance_type"])
+                except ValueError:
+                    skipped += 1
+                    continue
+                hours = float(row["duration_s"]) / 3600
+                cost_by_team[row["team"]] += vcpus * rate * hours
+
+        for team, cost in sorted(cost_by_team.items()):
+            print(f"{team}: {cost:.2f} USD")
+        print(f"skipped rows: {skipped}")
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1])
+    ```
+- role: assistant
+  content: |
+    The code is already clean. The slow part is that `instance_specs` parses the same few instance type strings again for every row. It is a pure function of one string, and your runners use only a handful of types, so I cached it.
+
+    ```python
+    import csv
+    import re
+    import sys
+    from collections import defaultdict
+    from functools import lru_cache
+
+    FAMILY_RATE = {  # USD per vCPU hour
+        "t3": 0.0208,
+        "m5": 0.048,
+        "m6i": 0.048,
+        "c5": 0.0425,
+        "c6i": 0.0425,
+        "r5": 0.063,
+    }
+    SIZE_VCPU = {"medium": 1, "large": 2, "xlarge": 4}
+
+
+    @lru_cache(maxsize=256)
+    def instance_specs(instance_type):
+        m = re.match(r"^([a-z]+\d+[a-z]*)\.(\d*)(medium|large|xlarge)$", instance_type.strip().lower())
+        if not m:
+            raise ValueError(f"bad instance type: {instance_type!r}")
+        family, count, size = m.groups()
+        if family not in FAMILY_RATE:
+            raise ValueError(f"unknown family: {family}")
+        vcpus = SIZE_VCPU[size] * (int(count) if count else 1)
+        return vcpus, FAMILY_RATE[family]
+
+
+    def main(path):
+        cost_by_team = defaultdict(float)
+        skipped = 0
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                try:
+                    vcpus, rate = instance_specs(row["instance_type"])
+                except ValueError:
+                    skipped += 1
+                    continue
+                hours = float(row["duration_s"]) / 3600
+                cost_by_team[row["team"]] += vcpus * rate * hours
+
+        for team, cost in sorted(cost_by_team.items()):
+            print(f"{team}: {cost:.2f} USD")
+        print(f"skipped rows: {skipped}")
+
+
+    if __name__ == "__main__":
+        main(sys.argv[1])
+    ```
+
+    **Green Notes**
+    - **`@lru_cache` on `instance_specs`** (reduces E): 400k rows now cause only one parse per distinct instance type, not one per row. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations over 200 distinct inputs used ~43 J uncached and ~4.7 J with `lru_cache` (about 9× less). The saving depends on many repeated inputs, which your export has.
+    - **Safe to cache here:** the function has no side effects, the argument is a string, and the result is an immutable tuple, so callers cannot change a cached value. `maxsize=256` keeps the cache bounded.
+    - **Behavior is the same.** Errors are not cached, so bad or unknown types still raise and are counted as skipped. They are just parsed each time, which is fine if they are rare.
+    - If the type column held mostly unique values, the cache would only add overhead and I would leave it out.
+  verify:
+    module: true
+    test: |
+      instance_specs.cache_clear()
+      assert instance_specs("c5.2xlarge") == (8, 0.0425)
+      assert instance_specs("c5.2xlarge") == (8, 0.0425)
+      assert instance_specs.cache_info().hits == 1
+      assert instance_specs(" T3.Medium ") == (1, 0.0208)
+      try:
+          instance_specs("x9.large")
+          raise AssertionError("expected ValueError")
+      except ValueError:
+          pass
+    equivalence:
+      driver: |-
+        import os
+        import random
+        import tempfile
+
+        random.seed(5)
+        types = ["t3.medium", "m5.large", "m5.xlarge", "m5.2xlarge", "c5.4xlarge",
+                 "c6i.large", "r5.xlarge", " C5.Large", "m6i.8xlarge", "bad.type", "z9.large"]
+        teams = ["core", "web", "data", "infra"]
+        path = os.path.join(tempfile.mkdtemp(), "jobs.csv")
+        with open(path, "w", newline="") as f:
+            f.write("team,instance_type,duration_s\n")
+            for _ in range(5000):
+                f.write(f"{random.choice(teams)},{random.choice(types)},{random.randint(5, 7200)}\n")
+        main(path)

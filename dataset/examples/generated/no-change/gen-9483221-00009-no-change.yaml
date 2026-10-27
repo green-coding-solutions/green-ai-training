@@ -1,0 +1,57 @@
+id: gen-9483221-00009-no-change
+category: no-change
+language: python
+patterns:
+- regex-precompile
+- context-tradeoff
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    diff only. should these re.sub calls be re.compile'd? build step for our landing pages, runs in CI on deploy
+
+    ```python
+    import re
+    import sys
+    from datetime import date
+    from pathlib import Path
+
+    DIST = Path(sys.argv[1] if len(sys.argv) > 1 else "dist")
+
+
+    def render(html: str, year: int) -> str:
+        html = re.sub(r"<!--(?!\[if).*?-->", "", html, flags=re.S)
+        html = re.sub(r"\{\{\s*year\s*\}\}", str(year), html)
+        html = re.sub(r"\n\s*\n+", "\n", html)
+        return html
+
+
+    def main():
+        year = date.today().year
+        for page in sorted(DIST.glob("*.html")):
+            page.write_text(render(page.read_text(encoding="utf-8"), year), encoding="utf-8")
+            print("built", page.name)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    No diff. Leave it as is.
+
+    - Python's `re` module caches compiled patterns (up to 512), so these three literals are compiled once and reused for every page.
+    - Even in a tight loop the gain is small. In Green Metrics Tool micro-benchmarks with 1,000,000 matches, a precompiled pattern used ~18 J and inline `re.match` ~21 J, about 18% less.
+    - Here it is 3 patterns over a handful of HTML files, once per deploy. The difference is too small to matter, and module-level constants would only add lines.
+
+    Precompiling starts to matter if a pattern is built dynamically (for example from user input or a per-page string), or if you have more than 512 distinct patterns. Then the cache thrashes and each call recompiles.
+verify:
+  module: true
+  test: |-
+    out = render("<!-- note --><p>{{ year }}</p>\n\n\n<p>a</p>", 2026)
+    assert "note" not in out
+    assert "2026" in out
+    assert "\n\n" not in out
+    kept = render("<!--[if IE]><p>x</p><![endif]-->", 2026)
+    assert "[if IE]" in kept

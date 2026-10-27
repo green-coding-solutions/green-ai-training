@@ -1,0 +1,82 @@
+id: gen-6593849-00147-generation
+category: generation
+language: python
+patterns:
+- torch-no-grad
+facts:
+- F-NOGRAD
+messages:
+- role: user
+  content: |
+    hi, i am a hydrology student and not good with pytorch. i trained a small model that predicts the river level for the next hour from gauge data. now i want a python function that reads a csv with a whole year of 10 minute data (around 50000 rows) and writes the predictions to a new csv. when i tried it myself the memory went up and up and the results were a bit different every time i run it, i dont know what i do wrong
+
+    this is my model, weights are saved with torch.save(model.state_dict(), "flood_net.pt"):
+
+    ```python
+    import torch
+    import torch.nn as nn
+
+    class FloodNet(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(6, 32), nn.ReLU(), nn.Dropout(0.2),
+                nn.Linear(32, 16), nn.ReLU(),
+                nn.Linear(16, 1),
+            )
+
+        def forward(self, x):
+            return self.net(x)
+    ```
+
+    the csv has a header and 6 columns: rain_1h, rain_6h, rain_24h, level_now, level_delta, soil_moisture. i did not scale the inputs when training. we have no gpu, only my laptop
+- role: assistant
+  content: |
+    Two things caused your problems. The model was still in training mode, so dropout switched random values off on every run. That is why the results changed. And PyTorch kept the data for training (the autograd graph) while predicting, which is why the memory grew.
+
+    ```python
+    import numpy as np
+    import torch
+    import torch.nn as nn
+
+    class FloodNet(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(6, 32), nn.ReLU(), nn.Dropout(0.2),
+                nn.Linear(32, 16), nn.ReLU(),
+                nn.Linear(16, 1),
+            )
+
+        def forward(self, x):
+            return self.net(x)
+
+    def predict_levels(csv_path, out_path, weights_path="flood_net.pt", batch_size=2048):
+        model = FloodNet()
+        model.load_state_dict(torch.load(weights_path, map_location="cpu", weights_only=True))
+        model.eval()  # turns dropout off, so results are the same on every run
+
+        features = np.loadtxt(csv_path, delimiter=",", skiprows=1, ndmin=2, dtype=np.float32)
+        x = torch.from_numpy(features)
+
+        parts = []
+        with torch.no_grad():  # no training bookkeeping while predicting
+            for start in range(0, len(x), batch_size):
+                parts.append(model(x[start:start + batch_size]).squeeze(1).numpy())
+
+        preds = np.concatenate(parts) if parts else np.empty(0, dtype=np.float32)
+        np.savetxt(out_path, preds, delimiter=",", header="predicted_level_m",
+                   comments="", fmt="%.4f")
+        return preds
+
+    if __name__ == "__main__":
+        predict_levels("gauge_2025.csv", "predictions_2025.csv")
+    ```
+
+    The output has one row per input row, in the same order, under the header `predicted_level_m`. The inputs are used as they are, with no scaling, like in your training.
+
+    **Green Notes**
+    - **`torch.no_grad()` for inference** (reduces E, M): predicting needs no gradients, so PyTorch does not record the graph. That fixes your growing memory. In Green Metrics Tool micro-benchmarks of 100,000 CPU inferences, running without gradient tracking used about 14% less CPU energy.
+    - **`model.eval()`**: this is about correct results, not energy. It makes the predictions repeatable.
+verify:
+  static_only: needs PyTorch, which is not available in the test environment

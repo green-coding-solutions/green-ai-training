@@ -1,0 +1,107 @@
+id: gen-6593849-00113-review
+category: review
+language: python
+patterns:
+- keep-star-imports
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    from decimal import *
+    from datetime import *
+    import sqlite3
+
+    TAX_RATES = {"DE": "0.19", "FR": "0.20", "NL": "0.21", "US": "0.00"}
+
+
+    def order_total(subtotal, country):
+        rate = Decimal(TAX_RATES[country])
+        gross = Decimal(subtotal) * (1 + rate)
+        return gross.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+    def customer_report(db, customer_id, since=None):
+        sql = ("SELECT id, country, subtotal FROM orders "
+               f"WHERE customer_id = '{customer_id}'")
+        if since:
+            sql += f" AND created_at >= '{since}'"
+        rows = db.execute(sql).fetchall()
+
+        total = Decimal("0")
+        lines = []
+        for order_id, country, subtotal in rows:
+            t = order_total(subtotal, country)
+            total += t
+            lines.append(f"{order_id}: {t}")
+        lines.append(f"Total as of {date.today().isoformat()}: {total}")
+        return "\n".join(lines)
+
+
+    if __name__ == "__main__":
+        db = sqlite3.connect("shop.db")
+        print(customer_report(db, "C-1042"))
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (e-commerce reporting, per customer request)
+
+    #### [Security] SQL injection
+    - **Where:** `customer_report`, the f-string SQL
+    - **Issue:** `customer_id` and `since` go straight into the query. A value like `x' OR '1'='1` returns every customer's orders.
+    - **Fix:** use placeholders, shown below.
+
+    #### [Bug] Float subtotals give wrong cents
+    - **Where:** `Decimal(subtotal)`
+    - **Issue:** if `subtotal` is a REAL column, it arrives as a float. `Decimal(19.99)` keeps the binary error (`19.989999...`), so a total that should end on a half cent can round the wrong way.
+    - **Fix:** `Decimal(str(subtotal))`. Better, store money as integer cents or TEXT.
+
+    #### [Bug] Unknown country aborts the whole report
+    - **Where:** `TAX_RATES[country]`
+    - **Issue:** one order with a country not in the table raises a bare `KeyError` and the customer gets no report.
+    - **Fix:** raise a clear error that names the order, or skip and flag it. The version below raises `ValueError` with the order id.
+
+    Fixed version:
+
+    ```python
+    from decimal import *
+    from datetime import *
+    import sqlite3
+
+    TAX_RATES = {"DE": "0.19", "FR": "0.20", "NL": "0.21", "US": "0.00"}
+
+
+    def order_total(subtotal, country):
+        rate = Decimal(TAX_RATES[country])
+        gross = Decimal(str(subtotal)) * (1 + rate)
+        return gross.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+    def customer_report(db, customer_id, since=None):
+        sql = "SELECT id, country, subtotal FROM orders WHERE customer_id = ?"
+        params = [customer_id]
+        if since:
+            sql += " AND created_at >= ?"
+            params.append(since)
+        rows = db.execute(sql, params).fetchall()
+
+        total = Decimal("0")
+        lines = []
+        for order_id, country, subtotal in rows:
+            if country not in TAX_RATES:
+                raise ValueError(f"order {order_id}: no tax rate for {country!r}")
+            t = order_total(subtotal, country)
+            total += t
+            lines.append(f"{order_id}: {t}")
+        lines.append(f"Total as of {date.today().isoformat()}: {total}")
+        return "\n".join(lines)
+    ```
+
+    **Star imports:** `from decimal import *` and `from datetime import *` are fine to keep. In Green Metrics Tool micro-benchmarks, star imports and `import x` showed no measurable energy difference, so changing them would only be churn. If you want to change them for readability, that is a style choice, not an energy one.
+
+    **Already good:** `Decimal` with `ROUND_HALF_UP` for money, one query per report, and a single `"\n".join` to build the output.
+verify:
+  static_only: needs a shop.db SQLite database with an orders table; the fixed code was checked by reading only

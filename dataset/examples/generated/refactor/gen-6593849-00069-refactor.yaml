@@ -1,0 +1,177 @@
+id: gen-6593849-00069-refactor
+category: refactor
+language: html
+patterns:
+- dom-size
+- lazy-load-images
+facts:
+- F-DOM-SIZE
+- F-LAZY-IMG
+messages:
+- role: user
+  content: |
+    Our warehouse team uses this stock overview page on old tablets and it takes a long time to open and then scrolls badly. We have around 4,800 SKUs. Can you refactor it?
+
+    Requirements:
+    - keep the live search by SKU or name
+    - keep the red highlight for items at or below reorder level
+    - keep the thumbnails and the sticky header
+    - no frameworks or build step, it is one file served from our intranet
+    - must work in the Firefox ESR on the tablets
+
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <title>Stock overview</title>
+    <style>
+      body { font: 14px system-ui, sans-serif; margin: 16px; }
+      .head, .row { display: flex; align-items: center; border-bottom: 1px solid #ddd; }
+      .head { position: sticky; top: 0; background: #f3f3f3; font-weight: bold; }
+      .cell { flex: 1; padding: 4px 6px; }
+      .cell.photo { flex: 0 0 60px; }
+      .low { background: #fff1f0; }
+      .thumb img { width: 48px; height: 48px; object-fit: cover; }
+    </style>
+    </head>
+    <body>
+    <h1>Stock overview</h1>
+    <input id="q" placeholder="Search SKU or name">
+    <div class="head">
+      <div class="cell photo">Photo</div><div class="cell">SKU</div><div class="cell">Name</div>
+      <div class="cell">Bin</div><div class="cell">Qty</div><div class="cell">Reorder at</div>
+    </div>
+    <div id="stock"></div>
+    <script>
+    const stock = document.getElementById('stock');
+    fetch('/api/stock.json').then(r => r.json()).then(items => {
+      items.forEach(it => {
+        const row = document.createElement('div');
+        row.className = 'row' + (it.qty <= it.reorder ? ' low' : '');
+        row.dataset.search = (it.sku + ' ' + it.name).toLowerCase();
+        row.innerHTML =
+          '<div class="cell photo"><div class="thumb"><img src="' + it.thumb + '"></div></div>' +
+          '<div class="cell"><span>' + it.sku + '</span></div>' +
+          '<div class="cell"><span>' + it.name + '</span></div>' +
+          '<div class="cell"><span>' + it.bin + '</span></div>' +
+          '<div class="cell"><span>' + it.qty + '</span></div>' +
+          '<div class="cell"><span>' + it.reorder + '</span></div>';
+        stock.appendChild(row);
+      });
+    });
+    document.getElementById('q').addEventListener('input', e => {
+      const t = e.target.value.toLowerCase();
+      document.querySelectorAll('#stock .row').forEach(r => {
+        r.style.display = r.dataset.search.includes(t) ? '' : 'none';
+      });
+    });
+    </script>
+    </body>
+    </html>
+    ```
+- role: assistant
+  content: |
+    ```html
+    <!doctype html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <title>Stock overview</title>
+    <style>
+      body { font: 14px system-ui, sans-serif; margin: 16px; }
+      table { border-collapse: collapse; width: 100%; }
+      thead th { position: sticky; top: 0; background: #f3f3f3; text-align: left; padding: 6px; }
+      td { padding: 4px 6px; border-bottom: 1px solid #ddd; }
+      tr.low td { background: #fff1f0; }
+      img { display: block; width: 48px; height: 48px; object-fit: cover; }
+      nav { margin: 8px 0; display: flex; gap: 8px; align-items: center; }
+    </style>
+    </head>
+    <body>
+    <h1>Stock overview</h1>
+    <input id="q" type="search" placeholder="Search SKU or name">
+    <nav>
+      <button id="prev">Previous</button>
+      <span id="info"></span>
+      <button id="next">Next</button>
+    </nav>
+    <table>
+      <thead>
+        <tr><th>Photo</th><th>SKU</th><th>Name</th><th>Bin</th><th>Qty</th><th>Reorder at</th></tr>
+      </thead>
+      <tbody id="stock"></tbody>
+    </table>
+    <script>
+    const PAGE_SIZE = 100;
+    const EAGER_ROWS = 8; // thumbnails visible without scrolling load right away
+
+    const body = document.getElementById('stock');
+    const info = document.getElementById('info');
+    const prev = document.getElementById('prev');
+    const next = document.getElementById('next');
+
+    let items = [];
+    let view = [];
+    let page = 0;
+
+    function cell(text) {
+      const td = document.createElement('td');
+      td.textContent = text;
+      return td;
+    }
+
+    function render() {
+      const start = page * PAGE_SIZE;
+      const frag = document.createDocumentFragment();
+      view.slice(start, start + PAGE_SIZE).forEach((it, i) => {
+        const tr = document.createElement('tr');
+        if (it.qty <= it.reorder) tr.className = 'low';
+        const img = document.createElement('img');
+        img.src = it.thumb;
+        img.alt = '';
+        img.width = 48;
+        img.height = 48;
+        img.loading = i < EAGER_ROWS ? 'eager' : 'lazy';
+        const photo = document.createElement('td');
+        photo.appendChild(img);
+        tr.append(photo, cell(it.sku), cell(it.name), cell(it.bin), cell(it.qty), cell(it.reorder));
+        frag.appendChild(tr);
+      });
+      body.replaceChildren(frag);
+
+      const pages = Math.max(1, Math.ceil(view.length / PAGE_SIZE));
+      info.textContent = view.length + ' items, page ' + (page + 1) + ' of ' + pages;
+      prev.disabled = page === 0;
+      next.disabled = page >= pages - 1;
+    }
+
+    fetch('/api/stock.json').then(r => r.json()).then(data => {
+      items = data.map(it => ({ ...it, search: (it.sku + ' ' + it.name).toLowerCase() }));
+      view = items;
+      render();
+    });
+
+    document.getElementById('q').addEventListener('input', e => {
+      const t = e.target.value.toLowerCase();
+      view = items.filter(it => it.search.includes(t));
+      page = 0;
+      render();
+    });
+    prev.addEventListener('click', () => { page--; render(); });
+    next.addEventListener('click', () => { page++; render(); });
+    </script>
+    </body>
+    </html>
+    ```
+
+    **Green Notes**
+    - **Smaller DOM, paginated** (reduces E on the client): the page built every SKU at once, with a wrapper element around each cell and each row appended to the live DOM one by one. Now it shows 100 rows per page as a plain `<table>`, built in a `DocumentFragment` and inserted once. In Green Metrics Tool micro-benchmarks, 30 page loads of a 10,000-row table with 14 elements per row used ~1036 J. The same data paginated to 100 rows per page as a plain table in a `DocumentFragment` used ~457 J, about 56% less. Your page has a similar structure, and old tablets feel this cost most.
+    - **Lazy thumbnails below the first screen** (reduces network, some E): the first 8 rows load their images right away and the rest use `loading="lazy"`. The width and height are set, so the rows do not jump when images arrive. In Green Metrics Tool tests of an article with 15 photos, loading it 20 times without scrolling used about 12% less, and there was no difference when the visitor scrolled to the end. Here only 100 thumbnails exist per page, so expect a smaller gain for staff who scroll through every page.
+
+    Behavior changes to know about:
+    - Search now filters the full list, not just what is rendered, and resets to page 1. The browser's own Ctrl+F only finds rows on the current page.
+    - **Security fix:** the old code put `it.name`, `it.sku` and `it.thumb` into `innerHTML`. A product name like `<img src=x onerror=...>` would run script on every tablet. The new code uses `textContent` and DOM properties, so values are shown as plain text.
+    - The lowercased search text is computed once per item at load, not on every keystroke.
+verify:
+  static_only: HTML page with a browser-only script that needs a DOM and a stock API endpoint

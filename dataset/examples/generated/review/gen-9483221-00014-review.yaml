@@ -1,0 +1,143 @@
+id: gen-9483221-00014-review
+category: review
+language: python
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    Please review our nightly model evaluation job. It scores a held-out validation set (about 300k samples) with a PyTorch classifier and stores every prediction in Postgres 16, so the dashboard team can slice errors later. At the end it writes one summary row.
+
+    Requirements: we use psycopg 3 and can't add new dependencies. The tables `eval_predictions` and `eval_runs` must stay as they are. The returned accuracy must not change. The job runs on one CPU node after the training pipeline.
+
+    ```python
+    import numpy as np
+    import psycopg
+    import torch
+
+    DSN = "postgresql://eval:eval@db.internal/mlops"
+
+
+    def load_validation_set(path):
+        data = np.load(path)
+        return data["ids"], data["x"].astype(np.float32), data["y"]
+
+
+    def evaluate(model, model_version, val_path, batch_size=512):
+        ids, x, y = load_validation_set(val_path)
+        conn = psycopg.connect(DSN)
+        cur = conn.cursor()
+        model.eval()
+        correct = 0
+
+        with torch.no_grad():
+            for start in range(0, len(x), batch_size):
+                xb = torch.from_numpy(x[start:start + batch_size])
+                probs = torch.softmax(model(xb), dim=1)
+                conf, pred = probs.max(dim=1)
+
+                for i in range(len(pred)):
+                    sample_id = int(ids[start + i])
+                    label = int(y[start + i])
+                    cur.execute(
+                        f"INSERT INTO eval_predictions "
+                        f"(model_version, sample_id, label, pred, confidence) "
+                        f"VALUES ('{model_version}', %s, %s, %s, %s)",
+                        (sample_id, label, int(pred[i]), float(conf[i])),
+                    )
+                    conn.commit()
+                    if int(pred[i]) == label:
+                        correct += 1
+
+        accuracy = correct / len(x)
+        cur.execute(
+            "INSERT INTO eval_runs (model_version, accuracy) VALUES (%s, %s)",
+            (model_version, accuracy),
+        )
+        conn.commit()
+        return accuracy
+    ```
+- role: assistant
+  content: |
+    **Workload:** AI/ML (offline evaluation job writing to Postgres)
+
+    #### [Security] SQL built with an f-string
+    - **Where:** the `INSERT INTO eval_predictions` statement, `'{model_version}'`
+    - **Issue:** `model_version` is pasted into the SQL text. If it ever comes from a CLI argument, a registry tag or a file name, a quote in it breaks the query or lets someone inject SQL.
+    - **Fix:** pass it as a parameter. The code below does this.
+
+    #### [Bug] Partial results stay in the database, connection is never closed
+    - **Where:** `conn.commit()` inside the loop, and `psycopg.connect(DSN)` without a `with` block
+    - **Issue:** every row is committed on its own. If the job crashes at sample 200,000, those rows stay in `eval_predictions` with no row in `eval_runs`, and the dashboard shows an unfinished run. The connection is also left open on errors.
+    - **Fix:** write the whole run in one transaction, so it is all or nothing. `with psycopg.connect(DSN)` commits on success, rolls back on an exception and closes the connection.
+
+    #### [High] One INSERT and one commit per prediction
+    - **Where:** the inner `for i in range(len(pred))` loop
+    - **Issue:** 300k samples mean 300k statements, 300k round trips and 300k commits, each with its own WAL flush. The model itself runs in batches of 512, but the database work does not use that. In Green Metrics Tool micro-benchmarks inserting 500,000 rows into PostgreSQL 16 in batches of 5,000 rows (one commit per batch), one `execute()` per row used ~384 J, `executemany()` ~139 J (about 2.8× less) and `COPY ... FROM STDIN` ~17 J (about 22× less than the loop). Your job also commits after every row, which that benchmark did not, so expect the gap to be at least as large.
+    - **Fix:** collect rows in a list and send them with `COPY` in chunks of about 5,000 rows. With only about 100 rows per batch the same benchmark showed small differences, so don't shrink the chunk size much.
+    - **Impact:** E on the node and on the database server, plus a shorter run. Rows, schema and returned accuracy stay the same. Rows can arrive in `eval_predictions` in the same order as before.
+
+    ```python
+    import numpy as np
+    import psycopg
+    import torch
+
+    DSN = "postgresql://eval:eval@db.internal/mlops"
+    FLUSH_ROWS = 5000
+    COPY_SQL = (
+        "COPY eval_predictions (model_version, sample_id, label, pred, confidence) "
+        "FROM STDIN"
+    )
+
+
+    def load_validation_set(path):
+        data = np.load(path)
+        return data["ids"], data["x"].astype(np.float32), data["y"]
+
+
+    def flush(cur, rows):
+        if not rows:
+            return
+        with cur.copy(COPY_SQL) as copy:
+            for row in rows:
+                copy.write_row(row)
+        rows.clear()
+
+
+    def evaluate(model, model_version, val_path, batch_size=512):
+        ids, x, y = load_validation_set(val_path)
+        model.eval()
+        correct = 0
+        rows = []
+
+        with torch.no_grad(), psycopg.connect(DSN) as conn, conn.cursor() as cur:
+            for start in range(0, len(x), batch_size):
+                xb = torch.from_numpy(x[start:start + batch_size])
+                conf, pred = torch.softmax(model(xb), dim=1).max(dim=1)
+                batch_ids = ids[start:start + batch_size].tolist()
+                labels = y[start:start + batch_size].tolist()
+                preds = pred.tolist()
+
+                rows.extend(
+                    (model_version, sid, lab, p, c)
+                    for sid, lab, p, c in zip(batch_ids, labels, preds, conf.tolist())
+                )
+                correct += sum(p == lab for p, lab in zip(preds, labels))
+
+                if len(rows) >= FLUSH_ROWS:
+                    flush(cur, rows)
+
+            flush(cur, rows)
+            accuracy = correct / len(x)
+            cur.execute(
+                "INSERT INTO eval_runs (model_version, accuracy) VALUES (%s, %s)",
+                (model_version, accuracy),
+            )
+        return accuracy
+    ```
+
+    **Already good:** `model.eval()` and `torch.no_grad()` are in place, and the model runs on batches instead of single samples.
+verify:
+  static_only: needs torch, numpy, psycopg and a Postgres server

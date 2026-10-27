@@ -1,0 +1,66 @@
+id: gen-6593849-00134-review
+category: review
+language: python
+patterns:
+- keep-star-imports
+facts:
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    hello, this is small udp receiver on our sensor gateway (raspberry pi). sensors send 6 byte packet and we keep last value of every sensor in a json file. my colleague say the star imports on top are bad for energy and I must change them. can you review pls? is something wrong?
+
+    ```python
+    #!/usr/bin/env python3
+    from socket import *
+    from struct import *
+    from time import *
+    from json import *
+
+    PORT = 9750
+    FMT = "<HhH"   # sensor id, temp x100, battery mV
+    SIZE = calcsize(FMT)
+    OUT = "/var/lib/gw/last.json"
+    LAST = {}
+
+
+    def run():
+        s = socket(AF_INET, SOCK_DGRAM)
+        s.bind(("0.0.0.0", PORT))
+        while True:
+            data, addr = s.recvfrom(1024)
+            sid, t, bat = unpack(FMT, data)
+            LAST[sid] = {"temp": t / 100, "bat": bat, "ts": time()}
+            with open(OUT, "w") as f:
+                dump(LAST, f)
+
+
+    run()
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (long-running IoT gateway service)
+
+    #### [Bug] One bad packet stops the gateway
+    - **Where:** `unpack(FMT, data)` in `run()`
+    - **Issue:** `unpack` raises an error if the packet is not exactly 6 bytes. Any stray or broken UDP packet ends the loop, and all sensors go silent until someone restarts the service.
+    - **Fix:** skip packets with the wrong size:
+      ```python
+      data, addr = s.recvfrom(1024)
+      if len(data) != SIZE:
+          continue
+      sid, t, bat = unpack(FMT, data)
+      ```
+    - **Impact:** reliability. A crash and restart also wastes energy and loses data.
+
+    #### [Security] Port open on all interfaces, no sender check
+    - **Where:** `s.bind(("0.0.0.0", PORT))`
+    - **Issue:** anyone who can reach the gateway can send packets and write fake values for any sensor id.
+    - **Fix:** bind to the address of the sensor network (for example `("192.168.10.1", PORT)`) and add a firewall rule that allows only the sensor subnet.
+
+    #### Star imports: leave them
+    Your colleague is not right about energy here. In Green Metrics Tool micro-benchmarks of 1,000 Python process starts, `from sympy import *` used ~3103 J and `import sympy` ~3093 J. That is no measurable difference. The same was true for a small built-in module. What costs energy is loading a heavy module at all, and yours are small standard modules. Changing these imports will not save anything, so I would not touch them.
+
+    **Already good:** the file is only written when a packet arrives, and the loop blocks on `recvfrom`, so the gateway sleeps when no sensor sends.
+verify:
+  static_only: UDP server loop with an infinite while True, needs sockets and a writable /var/lib path

@@ -1,0 +1,109 @@
+id: gen-6593849-00212-review
+category: review
+language: python
+patterns:
+- set-membership
+- avoid-exception-flow
+facts:
+- F-MEMB
+- F-EXC
+messages:
+- role: user
+  content: |
+    Review this, findings + diff only please. It's the test planner step in our CI. Runs on every PR, roughly 20k tests, quarantine list has ~3k entries, owners map covers maybe half of the tests.
+
+    ```python
+    import os
+    import subprocess
+
+
+    def load_lines(path):
+        with open(path) as f:
+            return [line.strip() for line in f if line.strip()]
+
+
+    def changed_files(base):
+        out = subprocess.check_output(
+            f"git diff --name-only origin/{base}...HEAD", shell=True, text=True
+        )
+        return out.splitlines()
+
+
+    def build_plan(all_tests, quarantined, owners, base):
+        changed_dirs = [os.path.dirname(f) for f in changed_files(base)]
+        plan = []
+        for test in all_tests:
+            if test in quarantined:
+                continue
+            if os.path.dirname(test) not in changed_dirs:
+                continue
+            try:
+                owner = owners[test]
+            except KeyError:
+                owner = "unowned"
+            plan.append((test, owner))
+        return plan
+
+
+    if __name__ == "__main__":
+        tests = load_lines("all_tests.txt")
+        quarantined = load_lines("quarantine.txt")
+        owners = dict(line.split(",", 1) for line in load_lines("owners.csv"))
+        for test, owner in build_plan(tests, quarantined, owners, os.environ["BASE_BRANCH"]):
+            print(f"{test} {owner}")
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (CI step, runs on every PR)
+
+    #### [Security] Shell injection through the branch name
+    - **Where:** `changed_files`, `shell=True` with `base` from `BASE_BRANCH`
+    - **Issue:** the value is pasted into a shell command. A crafted branch name can run arbitrary commands on the runner.
+    - **Fix:** pass an argument list, no shell (see the diff below).
+
+    #### [High] List membership inside a 20k-iteration loop
+    - **Where:** `test in quarantined` and `... not in changed_dirs`
+    - **Issue:** both are lists, so each test scans up to ~3k quarantine entries, plus the whole `changed_dirs` list. That is O(tests × entries) work on every PR. A set makes each lookup O(1) on average, and building it once is O(n). The set only pays off because you look up thousands of times. For a single lookup, a plain list scan is cheaper than converting first. In Green Metrics Tool micro-benchmarks, one test on a 10,000,000-element list was cheaper than building a set and testing once.
+    - **Fix:** build `quarantined` and `changed_dirs` as sets once, before the loop. The output order does not change, because you still iterate `all_tests`.
+    - **Impact:** E on every PR, by the size of the lists.
+
+    #### [Medium] `try/except KeyError` for a common case
+    - **Where:** `owners[test]`
+    - **Issue:** about half of the tests have no owner, so you raise and catch an exception for half of the 20k tests. In Green Metrics Tool micro-benchmarks with about half of the keys missing, `dict.get(key, default)` used about 12% less CPU energy than `try/except KeyError`. If misses were rare, `try/except` would be fine.
+    - **Fix:** `owners.get(test, "unowned")`.
+    - **Impact:** E per run, modest. It is also shorter.
+
+    ```python
+    def changed_files(base):
+        out = subprocess.check_output(
+            ["git", "diff", "--name-only", f"origin/{base}...HEAD", "--"], text=True
+        )
+        return out.splitlines()
+
+
+    def build_plan(all_tests, quarantined, owners, base):
+        quarantined = set(quarantined)
+        changed_dirs = {os.path.dirname(f) for f in changed_files(base)}
+        plan = []
+        for test in all_tests:
+            if test in quarantined:
+                continue
+            if os.path.dirname(test) not in changed_dirs:
+                continue
+            plan.append((test, owners.get(test, "unowned")))
+        return plan
+    ```
+
+    **Already good:** `load_lines` streams the file once, and the plan keeps the order of `all_tests`.
+verify:
+  module: true
+  test: |-
+    import os
+    changed_files = lambda base: ["tests/api/test_a.py", "docs/x.md"]
+    plan = build_plan(
+        ["tests/api/t1.py", "tests/api/t2.py", "tests/ui/t3.py", "tests/api/t4.py"],
+        ["tests/api/t2.py"],
+        {"tests/api/t1.py": "ann"},
+        "main",
+    )
+    assert plan == [("tests/api/t1.py", "ann"), ("tests/api/t4.py", "unowned")], plan

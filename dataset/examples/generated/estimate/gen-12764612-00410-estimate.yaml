@@ -1,0 +1,61 @@
+id: gen-12764612-00410-estimate
+category: estimate
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    hi, i am not sure what is wrong with my Dockerfile. its for our small model api (pytorch, runs on cpu, flask). my boss asked me how much energy we would save if we make it smaller but I dont know what to tell him. we build it in github actions on every push
+
+    ```dockerfile
+    FROM python:3.12
+
+    RUN apt-get update && apt-get install -y build-essential git curl vim htop
+    RUN pip install pytest black mypy ipython
+
+    WORKDIR /app
+    COPY . /app
+    RUN pip install -r requirements.txt
+
+    EXPOSE 5000
+    CMD ["python", "serve.py"]
+    ```
+- role: assistant
+  content: |
+    Short answer for your boss: the saving is real, but it is in the build, not in the running service.
+
+    **What is wrong:**
+    - `python:3.12` is the full image. `python:3.12-slim` is enough for most apps.
+    - `build-essential`, `git`, `curl`, `vim`, `htop` and the dev tools (pytest, black, mypy, ipython) are not needed at runtime.
+    - `COPY . /app` comes before `pip install`. Every code change invalidates the dependency layer, so all packages install again on each push.
+
+    **Measured reference:** in Green Metrics Tool micro-benchmarks of a small Flask app, building the full `python:3.12` image with build tools and dev tools without a build cache used ~885 J and 157 s. A `python:3.12-slim` image with runtime dependencies only used ~124 J and 25 s, about 7× less. Serving 2,000 requests afterwards cost the same with both images, so the running service does not get cheaper.
+
+    I can't turn this into a number for your project. Your app has PyTorch, which is large and dominates the install. The share you save from the base image and tools will be smaller than in that small Flask app. The saving repeats with every build, pull and stored copy, so a CI that builds on every push adds it up.
+
+    **How to measure your own number:**
+    1. Build both versions with `docker build --no-cache` and compare `time` and image size from `docker images`.
+    2. For energy, run both builds as Green Metrics Tool usage scenarios, or use `perf stat` as a CPU proxy.
+    3. Multiply the per-build difference by your pushes per month.
+
+    Here is the slimmer version to test:
+
+    ```dockerfile
+    FROM python:3.12-slim
+
+    WORKDIR /app
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY . .
+
+    EXPOSE 5000
+    CMD ["python", "serve.py"]
+    ```
+
+    If a package in `requirements.txt` needs to compile and the build fails, add only the build tool it needs, not the whole set. Run tests in a separate CI step with their own dev dependencies.
+verify:
+  static_only: Dockerfile needs docker build, not runnable here

@@ -1,0 +1,73 @@
+id: gen-6593849-00061-refactor
+category: refactor
+language: python
+patterns:
+- torch-no-grad
+- regex-precompile
+facts:
+- F-NOGRAD
+- F-REGEX
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import os
+    import re
+    import numpy as np
+    import torch
+
+    model = torch.load("morph_cnn.pt", weights_only=False)
+    model.eval()
+
+    def classify_cutouts(cutout_dir):
+        results = []
+        for name in sorted(os.listdir(cutout_dir)):
+            m = re.match(r"^obj(\d+)_([griz])_(\d{8})\.npy$", name)
+            if not m:
+                continue
+            arr = np.load(os.path.join(cutout_dir, name))
+            x = torch.from_numpy(arr).float().unsqueeze(0).unsqueeze(0)
+            logits = model(x)
+            probs = torch.softmax(logits, dim=1)[0]
+            cls = int(probs.argmax())
+            results.append((int(m.group(1)), m.group(2), m.group(3), cls, float(probs[cls])))
+        return results
+    ```
+- role: assistant
+  content: |
+    ```python
+    import os
+    import re
+    import numpy as np
+    import torch
+
+    model = torch.load("morph_cnn.pt", weights_only=False)
+    model.eval()
+
+    CUTOUT_RE = re.compile(r"^obj(\d+)_([griz])_(\d{8})\.npy$")
+
+    def classify_cutouts(cutout_dir):
+        results = []
+        with torch.no_grad():
+            for name in sorted(os.listdir(cutout_dir)):
+                m = CUTOUT_RE.match(name)
+                if not m:
+                    continue
+                arr = np.load(os.path.join(cutout_dir, name))
+                x = torch.from_numpy(arr).float().unsqueeze(0).unsqueeze(0)
+                logits = model(x)
+                probs = torch.softmax(logits, dim=1)[0]
+                cls = int(probs.argmax())
+                results.append((int(m.group(1)), m.group(2), m.group(3), cls, float(probs[cls])))
+        return results
+    ```
+
+    **Green Notes**
+    - **`torch.no_grad()` for inference** (reduces E): `model.eval()` only switches layer behavior. It does not stop PyTorch from recording the autograd graph on every forward pass. In Green Metrics Tool micro-benchmarks of 100,000 CPU inferences, `no_grad` used about 14% less CPU energy. It also saves memory, because no intermediate tensors are kept for a backward pass. The results are the same.
+    - **Regex compiled once** (reduces E): the pattern is constant, so it now lives at module level. The gain is small, because Python's `re` module caches compiled patterns. In Green Metrics Tool micro-benchmarks of 1,000,000 matches, a precompiled pattern used about 18% less CPU energy than the inline call. Per file this is tiny next to the model forward pass, but it costs nothing and reads cleaner.
+
+    Behavior is unchanged: same files, same order, same output tuples.
+verify:
+  static_only: needs torch, numpy and a trained model file

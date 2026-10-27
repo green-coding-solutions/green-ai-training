@@ -64,7 +64,7 @@ messages:
     #### [Security] Fixed temp file in /tmp, written as root
     - **Where:** `TMP=/tmp/mailstats.tmp`, `> $TMP`, `>> $TMP`
     - **Issue:** any local user can create `/tmp/mailstats.tmp` as a symlink to a system file before logrotate runs. Root then truncates that file and appends to it.
-    - **Fix:** `tmp=$(mktemp) || exit 1` and `trap 'rm -f "$tmp"' EXIT`.
+    - **Fix:** `tmp=$(mktemp) || exit 1` and a `trap` that removes the temp files on exit.
 
     #### [High] About nine new processes for every log line
     - **Where:** the two `$(echo "$line" | grep | cut | tr ...)` substitutions and `$(expr ...)` inside the loop
@@ -83,9 +83,10 @@ messages:
     OUT=/var/lib/zabbix/mailstats.txt
 
     tmp=$(mktemp) || exit 1
-    trap 'rm -f "$tmp"' EXIT
+    tot=$(mktemp) || exit 1
+    trap 'rm -f "$tmp" "$tot"' EXIT
 
-    totals=$(awk -v out="$tmp" '
+    awk -v out="$tmp" -v tot="$tot" '
     /postfix\/smtp\[/ && / to=</ {
         if (!match($0, /status=[a-z]+/)) next
         status = substr($0, RSTART + 7, RLENGTH - 7)
@@ -103,13 +104,14 @@ messages:
             print kk[1], kk[2], count[k] > out
         }
         close(out)
-        printf "TOTAL sent=%d deferred=%d bounced=%d\n", ns, nd, nb
-    }' "$LOG")
+        printf "TOTAL sent=%d deferred=%d bounced=%d\n", ns, nd, nb > tot
+        close(tot)
+    }' "$LOG"
 
     {
-        echo "# mailstats $(date +%F)"
+        printf '# mailstats %s\n' "$(date +%F)"
         sort -k3,3nr "$tmp" | head -n 50
-        printf '%s\n' "$totals"
+        cat "$tot"
     } > "$OUT"
     ```
 

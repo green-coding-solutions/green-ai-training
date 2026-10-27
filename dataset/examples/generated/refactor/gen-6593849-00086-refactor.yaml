@@ -1,0 +1,64 @@
+id: gen-6593849-00086-refactor
+category: refactor
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```dockerfile
+    FROM python:3.11
+
+    RUN apt-get update && apt-get install -y build-essential gfortran git vim curl htop libopenblas-dev
+
+    WORKDIR /opt/sim
+    COPY . .
+
+    RUN pip install -r requirements.txt
+    RUN pip install jupyter pytest black flake8
+
+    ENV OMP_NUM_THREADS=4
+    CMD ["python", "run_sim.py", "--config", "configs/heat2d.yaml"]
+    ```
+- role: assistant
+  content: |
+    ```dockerfile
+    FROM python:3.11-slim
+
+    ENV PYTHONDONTWRITEBYTECODE=1 \
+        PYTHONUNBUFFERED=1 \
+        OMP_NUM_THREADS=4
+
+    WORKDIR /opt/sim
+
+    # dependencies first: this layer is reused until requirements.txt changes
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY . .
+
+    CMD ["python", "run_sim.py", "--config", "configs/heat2d.yaml"]
+    ```
+
+    Add a `.dockerignore` so results and local data stay out of the build context:
+
+    ```text
+    .git
+    .venv
+    __pycache__
+    results/
+    data/raw/
+    ```
+
+    **Green Notes**
+    - **Slim base, runtime dependencies only** (reduces E, storage, network): the compilers, `git`, `vim`, `htop`, Jupyter and the lint and test tools are gone from the run image. Run `pytest`, `black` and `flake8` in a CI job or a dev image instead. In Green Metrics Tool measurements of a similar change for a small Flask app, the image build used about 7× less energy, while serving requests cost the same. The saving repeats with every build, pull and stored copy.
+    - **Dependency layer before the source** (reduces E): a change to `run_sim.py` or a config reuses the cached `pip install` layer instead of reinstalling numpy and friends.
+    - **No pip cache** (reduces storage): `--no-cache-dir` keeps downloaded wheels out of the image.
+
+    I dropped `libopenblas-dev` and `gfortran` because the numpy and scipy wheels bring their own BLAS. If one of your packages has no wheel and needs a compiler, build it in a separate build stage and copy only the installed packages into the slim image.
+verify:
+  static_only: Dockerfile

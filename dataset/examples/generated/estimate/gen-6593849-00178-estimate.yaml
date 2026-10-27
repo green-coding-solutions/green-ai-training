@@ -1,0 +1,103 @@
+id: gen-6593849-00178-estimate
+category: estimate
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    ?
+
+    ```yaml
+    # preview env for sentiment-api, one per PR, namespace preview-pr-<n>
+    # how much energy would we save if we cut this down?
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: sentiment-api
+      namespace: preview-pr-482
+    spec:
+      replicas: 3
+      selector:
+        matchLabels: {app: sentiment-api}
+      template:
+        metadata:
+          labels: {app: sentiment-api}
+        spec:
+          containers:
+            - name: api
+              image: registry.example.com/sentiment-api:pr-482
+              ports: [{containerPort: 8000}]
+              env:
+                - {name: REDIS_URL, value: "redis://redis:6379"}
+                - {name: DATABASE_URL, value: "postgresql://app@postgres:5432/preview"}
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: redis
+      namespace: preview-pr-482
+    spec:
+      replicas: 1
+      selector:
+        matchLabels: {app: redis}
+      template:
+        metadata:
+          labels: {app: redis}
+        spec:
+          containers:
+            - {name: redis, image: "redis:7"}
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: batch-worker
+      namespace: preview-pr-482
+    spec:
+      replicas: 1
+      selector:
+        matchLabels: {app: batch-worker}
+      template:
+        metadata:
+          labels: {app: batch-worker}
+        spec:
+          containers:
+            - name: worker
+              image: registry.example.com/sentiment-api:pr-482
+              command: ["python", "-m", "worker", "--poll-interval", "2"]
+    ```
+- role: assistant
+  content: |
+    Less than you might hope for the services, a lot for the hours. I can't give you a number for your cluster without measuring it, but here is the direction.
+
+    **Cutting the services:** In Green Metrics Tool micro-benchmarks, a preview environment idling for 60 seconds with 3 app replicas, Postgres, Redis and a polling worker used ~269 J of CPU energy. With 1 app replica and Postgres it used ~262 J. That is about 3% less. Machine energy differed by less than 1%, because the idle machine baseline dominates. Idle extra services cost little per minute. That benchmark did not run a loaded model server, so a replica that holds a model in memory may reserve more RAM than the test did.
+
+    **Where the saving is:** an environment that no longer exists. Its whole baseline is gone for every hour it would have stayed up. So the first change is a teardown when the PR closes:
+
+    ```yaml
+    on:
+      pull_request:
+        types: [closed]
+
+    jobs:
+      teardown:
+        runs-on: ubuntu-latest
+        steps:
+          - run: kubectl delete namespace "preview-pr-${{ github.event.number }}" --ignore-not-found
+    ```
+
+    The second change is smaller. Previews do not need load balancing, so one API replica is enough:
+
+    ```yaml
+    spec:
+      replicas: 1
+    ```
+
+    **How to measure:**
+    1. Count the hours your preview namespaces exist per week, before and after the teardown. This is the number that drives the saving.
+    2. For energy, run the old and new stack idle for the same time in a Green Metrics Tool usage scenario on the same machine, and compare CPU and machine energy.
+    3. Multiply the per-hour difference by the hours you removed. Do not scale the 3% to your cluster.
+verify:
+  static_only: Kubernetes manifests and a GitHub Actions workflow, no runnable code

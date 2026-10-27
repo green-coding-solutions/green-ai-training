@@ -1,0 +1,67 @@
+id: gen-12764612-00417-generation
+category: generation
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    Need a small CLI: reads latency values in ms from stdin, one float per line, prints a log-scale histogram (10 buckets per decade). Blank lines skipped, values <= 0 counted separately. Inputs can be 10M+ lines. Just give me the code, no walkthrough.
+- role: assistant
+  content: |
+    ```python
+    #!/usr/bin/env python3
+    """Log-scale histogram of values read from stdin, one per line."""
+    import math
+    import sys
+
+    PER_DECADE = 10
+
+
+    def histogram(lines, per_decade=PER_DECADE):
+        log10 = math.log10
+        floor = math.floor
+        counts = {}
+        get = counts.get
+        nonpositive = 0
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            value = float(line)
+            if value <= 0:
+                nonpositive += 1
+                continue
+            bucket = floor(log10(value) * per_decade)
+            counts[bucket] = get(bucket, 0) + 1
+        return counts, nonpositive
+
+
+    def main():
+        counts, nonpositive = histogram(sys.stdin)
+        for bucket in sorted(counts):
+            low = 10 ** (bucket / PER_DECADE)
+            high = 10 ** ((bucket + 1) / PER_DECADE)
+            print(f"{low:12.4g} {high:12.4g} {counts[bucket]}")
+        if nonpositive:
+            print(f"{'<= 0':>25} {nonpositive}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    **Green Notes**
+    - **Hoist loop-invariant lookups** (reduces E): `math.log10`, `math.floor` and `counts.get` are bound to locals once, so the per-line loop skips repeated attribute lookups. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local before a 10,000,000-iteration loop saved about 4-5%. The gain is small and only worth it in a loop this hot.
+    - *Not applied:* anything beyond that. The loop body is dominated by parsing and `float()`, so more tuning would cost readability for little.
+verify:
+  module: true
+  test: |-
+    counts, nonpositive = histogram(["1.0\n", "10\n", "100.0\n", "1\n", "\n", "0\n", "-3\n", "  \n"])
+    assert counts == {0: 2, 10: 1, 20: 1}, counts
+    assert nonpositive == 2
+    counts, nonpositive = histogram(["0.5"])
+    assert counts == {-4: 1}, counts
+    assert nonpositive == 0

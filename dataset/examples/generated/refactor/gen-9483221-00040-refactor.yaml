@@ -1,0 +1,87 @@
+id: gen-9483221-00040-refactor
+category: refactor
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    This runs from cron every minute on our field gateways (small ARM boxes, LTE uplink, billed per MB). It bundles the buffered sensor files and uploads them to our ingest API. The CPU on these boxes is weak and they run on a limited power budget, so I would like it cleaned up.
+
+    Requirements:
+    - keep the schedule (every minute) and the at-least-once behavior: files are only deleted after a successful upload
+    - the ingest API accepts `Content-Encoding` gzip, zstd and xz
+    - `zstd` is installed on the gateways
+    - uploads must stay compressed, because we pay per MB
+
+    ```bash
+    #!/usr/bin/env bash
+    # ship buffered sensor readings to the ingest API (cron, every minute)
+    set -euo pipefail
+
+    SPOOL=/var/spool/gw/readings
+    OUT=/var/spool/gw/outbox
+    ENDPOINT='https://ingest.example.net/v1/readings'
+    TOKEN_FILE=/etc/gw/token
+
+    mkdir -p "$OUT"
+    shopt -s nullglob
+    files=("$SPOOL"/*.ndjson)
+    (( ${#files[@]} )) || exit 0
+
+    batch="$OUT/batch-$(date +%s).ndjson.xz"
+    cat "${files[@]}" | xz -9e -c > "$batch"
+
+    if curl -sS --fail --max-time 60 \
+         -H "Authorization: Bearer $(cat "$TOKEN_FILE")" \
+         -H 'Content-Type: application/x-ndjson' \
+         -H 'Content-Encoding: xz' \
+         --data-binary @"$batch" "$ENDPOINT"; then
+      rm -f "${files[@]}" "$batch"
+    else
+      echo "upload failed, keeping $batch" >&2
+    fi
+    ```
+- role: assistant
+  content: |
+    ```bash
+    #!/usr/bin/env bash
+    # ship buffered sensor readings to the ingest API (cron, every minute)
+    set -euo pipefail
+
+    SPOOL=/var/spool/gw/readings
+    OUT=/var/spool/gw/outbox
+    ENDPOINT='https://ingest.example.net/v1/readings'
+    TOKEN_FILE=/etc/gw/token
+
+    mkdir -p "$OUT"
+    shopt -s nullglob
+    files=("$SPOOL"/*.ndjson)
+    (( ${#files[@]} )) || exit 0
+
+    batch="$OUT/batch-$(date +%s).ndjson.zst"
+    trap 'rm -f "$batch"' EXIT
+    cat "${files[@]}" | zstd -q -c > "$batch"
+
+    if curl -sS --fail --max-time 60 \
+         -H "Authorization: Bearer $(cat "$TOKEN_FILE")" \
+         -H 'Content-Type: application/x-ndjson' \
+         -H 'Content-Encoding: zstd' \
+         --data-binary @"$batch" "$ENDPOINT"; then
+      rm -f "${files[@]}"
+    else
+      echo 'upload failed, will retry next run' >&2
+    fi
+    ```
+
+    **Green Notes**
+    - **Fast codec for data that is compressed often** (reduces E): this job compresses a new batch every minute, so the codec cost repeats all day on a weak CPU. In Green Metrics Tool micro-benchmarks on 100 MB of English text, zstd at its default level used ~16 J, while xz at its default level used ~458 J, about 29× more. Your `-9e` is an even more expensive setting. The upload stays compressed, so the LTE traffic is still reduced.
+    - *Trade-off:* those figures compare energy, not file size. xz usually produces smaller files, so check the batch size on real data. If bytes matter more than CPU, you can try a higher zstd level and compare size and CPU time on a gateway. I did not measure that.
+
+    Behavior changes:
+    - The header is now `Content-Encoding: zstd`, which your API accepts.
+    - The original left a `batch-*.xz` file in the outbox after every failed upload. The source files were kept too, so the next run bundled them again and the old batch was never used or removed. The `trap` now deletes the batch on every exit, and the next run rebuilds it. Files are still deleted only after a successful upload.
+verify:
+  static_only: needs curl, the zstd binary, a network endpoint and spool directories on a gateway

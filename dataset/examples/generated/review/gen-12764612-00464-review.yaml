@@ -1,0 +1,85 @@
+id: gen-12764612-00464-review
+category: review
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    #!/usr/bin/env python3
+    """dedupe-urls: remove duplicate URLs from a crawl list, keep first occurrence."""
+    import sys
+    import argparse
+
+
+    def load_urls(path):
+        urls = []
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    urls.append(line)
+        return urls
+
+
+    def dedupe(urls):
+        seen = []
+        result = []
+        for u in urls:
+            key = u.rstrip("/").lower()
+            if key not in seen:
+                seen.append(key)
+                result.append(u)
+        return result
+
+
+    def main():
+        p = argparse.ArgumentParser()
+        p.add_argument("infile")
+        p.add_argument("outfile")
+        args = p.parse_args()
+
+        urls = load_urls(args.infile)
+        unique = dedupe(urls)
+        with open(args.outfile, "w") as out:
+            for u in unique:
+                out.write(u + "\n")
+        print("kept %d of %d" % (len(unique), len(urls)))
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (CLI, runs on whole crawl lists)
+
+    #### [High] Linear scan of a growing list for every URL
+    - **Where:** `dedupe()`, `if key not in seen` with `seen = []`
+    - **Issue:** `seen` is a list that grows with every new URL, and each URL is checked against all of it. That is O(n²) comparisons. This is the case where a set pays off: many lookups against the same growing collection. In Green Metrics Tool micro-benchmarks a single lookup in a 10,000,000-element list was cheaper than building a set for it (~6.9 J vs ~10.5 J), so a set is not free. Here you do one lookup per URL, so the set cost is repaid quickly.
+    - **Fix:** make `seen` a set. Keep `result` as a list, so the output order stays the same (first occurrence wins).
+      ```python
+      def dedupe(urls):
+          seen = set()
+          result = []
+          for u in urls:
+              key = u.rstrip("/").lower()
+              if key not in seen:
+                  seen.add(key)
+                  result.append(u)
+          return result
+      ```
+    - **Impact:** E, from O(n²) to O(n) overall. The gap grows with list size and is small for a few hundred URLs. Output is identical.
+
+    **Already good:** the input is read line by line, both files are closed with `with`, and comments and blank lines are skipped. Nothing else needs changing.
+verify:
+  test: |-
+    assert dedupe(["http://a/x/", "http://A/x", "http://b", "http://b/"]) == ["http://a/x/", "http://b"]
+    assert dedupe([]) == []
+    big = ["http://h/%d" % (i % 500) for i in range(5000)]
+    assert dedupe(big) == ["http://h/%d" % i for i in range(500)]

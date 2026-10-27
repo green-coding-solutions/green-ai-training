@@ -1,0 +1,100 @@
+id: gen-6593849-00184-generation
+category: generation
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    I need a Python script for our release pipeline (GitHub Actions, runs on every release tag). Before we deploy, it must check that every image in our release manifest really exists in our private Docker registry, so we don't roll out a half-pushed release.
+
+    Requirements:
+    - Input: a text file path as the first argument, one `name:tag` per line (like `payments/api:1.14.2`). Skip empty lines and lines starting with `#`.
+    - Registry is Docker Registry HTTP API v2 at `REGISTRY_URL` (env var). Auth is a bearer token in `REGISTRY_TOKEN`.
+    - Use `HEAD /v2/<name>/manifests/<tag>`. 200 = exists, 404 = missing, anything else or a network error = error.
+    - Manifests usually have 25 to 40 images.
+    - Print one line per image in the same order as the input file: `OK`, `MISSING` or `ERROR (<reason>)`.
+    - Exit code 0 only if all images are OK, otherwise 1.
+    - httpx is already in our CI image. Timeout 10 seconds per request.
+- role: assistant
+  content: |-
+    ```python
+    #!/usr/bin/env python3
+    """Check that every image:tag in a release manifest exists in the registry."""
+    import asyncio
+    import os
+    import sys
+
+    import httpx
+
+    REGISTRY_URL = os.environ["REGISTRY_URL"].rstrip("/")
+    REGISTRY_TOKEN = os.environ["REGISTRY_TOKEN"]
+    MAX_CONCURRENCY = 10
+    TIMEOUT = 10.0
+
+    ACCEPT = ", ".join([
+        "application/vnd.docker.distribution.manifest.v2+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.oci.image.index.v1+json",
+    ])
+
+
+    def read_images(path):
+        with open(path, encoding="utf-8") as f:
+            lines = (line.strip() for line in f)
+            return [line for line in lines if line and not line.startswith("#")]
+
+
+    async def check_image(client, sem, image):
+        name, sep, tag = image.rpartition(":")
+        if not sep or not name or not tag or "/" in tag:
+            return "ERROR (expected name:tag)"
+        url = f"{REGISTRY_URL}/v2/{name}/manifests/{tag}"
+        async with sem:
+            try:
+                resp = await client.head(url)
+            except httpx.HTTPError as exc:
+                return f"ERROR ({type(exc).__name__})"
+        if resp.status_code == 200:
+            return "OK"
+        if resp.status_code == 404:
+            return "MISSING"
+        return f"ERROR (HTTP {resp.status_code})"
+
+
+    async def check_all(images):
+        sem = asyncio.Semaphore(MAX_CONCURRENCY)
+        headers = {
+            "Authorization": f"Bearer {REGISTRY_TOKEN}",
+            "Accept": ACCEPT,
+        }
+        async with httpx.AsyncClient(headers=headers, timeout=TIMEOUT) as client:
+            return await asyncio.gather(
+                *(check_image(client, sem, image) for image in images)
+            )
+
+
+    def main():
+        if len(sys.argv) != 2:
+            print(f"usage: {sys.argv[0]} MANIFEST_FILE", file=sys.stderr)
+            return 2
+        images = read_images(sys.argv[1])
+        results = asyncio.run(check_all(images))
+        for image, result in zip(images, results):
+            print(f"{image}: {result}")
+        return 0 if all(r == "OK" for r in results) else 1
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    ```
+
+    `asyncio.gather` returns results in input order, so the output order matches your file. A malformed line gives an `ERROR` line and does not stop the other checks.
+
+    **Green Notes**
+    - **Concurrent HTTP checks** (reduces idle wall time, a little E): the 25 to 40 `HEAD` requests are independent, so they run at the same time instead of one after another. The job runs for roughly the slowest few round trips instead of the sum of all. In Green Metrics Tool micro-benchmarks with 10 requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. The gain is mostly wall time, so the CI runner is held for less time.
+    - **`Semaphore(10)`** caps the open connections, so the registry is not hit with 40 requests at once.
+    - **`HEAD` instead of `GET`** transfers only headers, not the manifest body.

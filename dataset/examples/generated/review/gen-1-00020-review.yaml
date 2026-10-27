@@ -50,7 +50,7 @@ messages:
     #### [Bug] No timeout and no status check
     - **Where:** `fetch_rate`
     - **Issue:** `requests.get` has no timeout, so one hung connection blocks the whole cron run forever. There is no `raise_for_status()`, so a 429 or 500 body goes to `resp.json()` and fails later with a `KeyError`, or returns garbage. The broad `except Exception` in `refresh_rates` then logs only "rate failed" and hides the real cause.
-    - **Fix:** set a timeout, check the status, and log the exception type (see the code below).
+    - **Fix:** set a timeout, check the status, and log the exception (see the code below).
 
     #### [Bug] Partial table can replace the full one
     - **Where:** `refresh_rates` return value
@@ -59,41 +59,42 @@ messages:
 
     #### [Medium] 12 requests run one after another
     - **Where:** `refresh_rates` loop
-    - **Issue:** each request waits for the previous one, so the run takes about 12× one round trip, and the process idles most of that time. The requests are independent, so they can run concurrently.
-    - **Fix:** one `httpx.AsyncClient` (one connection pool) and `asyncio.gather`:
-      ```python
-      import asyncio
-
-      import httpx
-
-
-      async def fetch_rate(client, base, quote):
-          resp = await client.get(FX_URL, params={"base": base, "symbols": quote})
-          resp.raise_for_status()
-          return Decimal(str(resp.json()["rates"][quote]))
-
-
-      async def refresh_rates(base="USD"):
-          async with httpx.AsyncClient(timeout=5.0) as client:
-              results = await asyncio.gather(
-                  *(fetch_rate(client, base, q) for q in CURRENCIES),
-                  return_exceptions=True,
-              )
-          rates = {}
-          for quote, result in zip(CURRENCIES, results):
-              if isinstance(result, Exception):
-                  log.warning("rate failed for %s: %r", quote, result)
-              else:
-                  rates[quote] = result
-          return rates
-
-
-      if __name__ == "__main__":
-          table = asyncio.run(refresh_rates())
-          print(len(table), "rates")
-      ```
+    - **Issue:** each request waits for the previous one, so the run takes the sum of all round trips, and the process idles most of that time. The requests are independent, so they can run concurrently.
+    - **Fix:** one `httpx.AsyncClient` (one connection pool) and `asyncio.gather`, code below.
     - **Impact:** mostly wall time and idle holding time. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. With 12 requests every 15 minutes the absolute saving is small, so this is Medium, not High.
     - **Check:** if the rates API rate-limits you, wrap the call in an `asyncio.Semaphore(4)`. The result is the same, only the concurrency is capped.
+
+    ```python
+    import asyncio
+
+    import httpx
+
+
+    async def fetch_rate(client, base, quote):
+        resp = await client.get(FX_URL, params={"base": base, "symbols": quote})
+        resp.raise_for_status()
+        return Decimal(str(resp.json()["rates"][quote]))
+
+
+    async def refresh_rates(base="USD"):
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            results = await asyncio.gather(
+                *(fetch_rate(client, base, q) for q in CURRENCIES),
+                return_exceptions=True,
+            )
+        rates = {}
+        for quote, result in zip(CURRENCIES, results):
+            if isinstance(result, Exception):
+                log.warning("rate failed for %s: %r", quote, result)
+            else:
+                rates[quote] = result
+        return rates
+
+
+    if __name__ == "__main__":
+        table = asyncio.run(refresh_rates())
+        print(len(table), "rates")
+    ```
 
     **Already good:** `Decimal(str(...))` avoids float rounding in money values.
 verify:

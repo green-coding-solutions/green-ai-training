@@ -1,0 +1,89 @@
+id: gen-6593849-00009-generation
+category: generation
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    hello, i need small python script for command line. it read my requirements.txt (about 40 packages, some have == version, some not) and for every package ask the pypi json api what is the newest version. then print only packages where my pinned version is diffrent from newest. i use python 3.11 and httpx is already installed. thank you!
+- role: assistant
+  content: |
+    ```python
+    import argparse
+    import asyncio
+    import re
+
+    import httpx
+
+    NAME_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)")
+    PIN_RE = re.compile(r"==\s*([^\s;,#]+)")
+    MAX_PARALLEL = 10
+
+
+    def read_requirements(path: str) -> dict[str, str | None]:
+        """Return {package: pinned version or None}, in file order."""
+        packages: dict[str, str | None] = {}
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith(("#", "-")):
+                    continue
+                match = NAME_RE.match(line)
+                if not match:
+                    continue
+                pin = PIN_RE.search(line)
+                packages[match.group(1)] = pin.group(1) if pin else None
+        return packages
+
+
+    async def latest_version(client: httpx.AsyncClient, sem: asyncio.Semaphore, name: str) -> str | None:
+        async with sem:
+            try:
+                resp = await client.get(f"https://pypi.org/pypi/{name}/json")
+                resp.raise_for_status()
+                return resp.json()["info"]["version"]
+            except (httpx.HTTPError, KeyError, ValueError):
+                return None
+
+
+    async def check(packages: dict[str, str | None]) -> dict[str, str | None]:
+        sem = asyncio.Semaphore(MAX_PARALLEL)
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            results = await asyncio.gather(
+                *(latest_version(client, sem, name) for name in packages)
+            )
+        return dict(zip(packages, results))
+
+
+    def main() -> None:
+        parser = argparse.ArgumentParser(description="Show outdated pinned packages")
+        parser.add_argument("requirements", nargs="?", default="requirements.txt")
+        args = parser.parse_args()
+
+        packages = read_requirements(args.requirements)
+        latest = asyncio.run(check(packages))
+
+        for name, pinned in packages.items():
+            newest = latest[name]
+            if newest is None:
+                print(f"{name}: could not get version from PyPI")
+            elif pinned is not None and pinned != newest:
+                print(f"{name}: {pinned} -> {newest}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+    Run it with `python outdated.py requirements.txt`. Packages without `==` are not compared, because there is no pinned version to check. They only show up if PyPI cannot be reached for them.
+
+    **Green Notes**
+    - **Concurrent requests** (reduces E, idle wait time): the script waits for the network, not for the CPU. With `asyncio.gather` the 40 requests wait together instead of one after another. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, async `httpx` used about 7% less CPU energy and about 17% less wall time than sync `urllib`. For a small number of requests the gain is mostly wall time.
+    - **One shared client** (reduces E, network): `AsyncClient` reuses connections, so there are no repeated connection setups to the same host.
+    - **Semaphore limit of 10**: keeps PyPI load polite and stops too many sockets being open at once.
+    - *Not applied:* no cache or retry layer. For a script you run now and then, that is more code than it saves.
+verify:
+  static_only: needs network access (PyPI) and httpx

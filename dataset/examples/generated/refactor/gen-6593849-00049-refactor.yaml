@@ -1,0 +1,143 @@
+id: gen-6593849-00049-refactor
+category: refactor
+language: python
+patterns:
+- avoid-exception-flow
+facts:
+- F-EXC
+messages:
+- role: user
+  content: |
+    We have a product list endpoint (Python 3.11, stdlib only for this module). The parser below runs on every request to `GET /products`. Most clients send no filters at all, or only `page`. Requirements: keep the exact same results and the same `BadRequest` messages, no new dependencies, and keep it readable for the team. Can you clean it up and make it cheaper per request?
+
+    ```python
+    MAX_PAGE_SIZE = 100
+    SORT_FIELDS = {"created": "created_at", "name": "name", "price": "price_cents"}
+
+
+    class BadRequest(Exception):
+        pass
+
+
+    def parse_list_params(params):
+        try:
+            page = int(params["page"])
+        except KeyError:
+            page = 1
+        except ValueError:
+            raise BadRequest("page must be an integer")
+        if page < 1:
+            raise BadRequest("page must be >= 1")
+
+        try:
+            size = int(params["page_size"])
+        except KeyError:
+            size = 20
+        except ValueError:
+            raise BadRequest("page_size must be an integer")
+        size = min(max(size, 1), MAX_PAGE_SIZE)
+
+        try:
+            sort_key = SORT_FIELDS[params["sort"]]
+        except KeyError:
+            sort_key = "created_at"
+
+        try:
+            direction = params["dir"].lower()
+        except KeyError:
+            direction = "asc"
+        if direction not in ("asc", "desc"):
+            raise BadRequest("dir must be asc or desc")
+
+        try:
+            query = params["q"].strip()
+        except KeyError:
+            query = ""
+
+        try:
+            in_stock = params["in_stock"] == "1"
+        except KeyError:
+            in_stock = False
+
+        return {
+            "page": page,
+            "page_size": size,
+            "sort": sort_key,
+            "dir": direction,
+            "q": query,
+            "in_stock": in_stock,
+        }
+    ```
+- role: assistant
+  content: |
+    ```python
+    MAX_PAGE_SIZE = 100
+    SORT_FIELDS = {"created": "created_at", "name": "name", "price": "price_cents"}
+
+
+    class BadRequest(Exception):
+        pass
+
+
+    def _int_param(params, name, default):
+        try:
+            return int(params.get(name, default))
+        except ValueError:
+            raise BadRequest(f"{name} must be an integer")
+
+
+    def parse_list_params(params):
+        page = _int_param(params, "page", 1)
+        if page < 1:
+            raise BadRequest("page must be >= 1")
+
+        size = _int_param(params, "page_size", 20)
+        size = min(max(size, 1), MAX_PAGE_SIZE)
+
+        sort_key = SORT_FIELDS.get(params.get("sort"), "created_at")
+
+        direction = params.get("dir", "asc").lower()
+        if direction not in ("asc", "desc"):
+            raise BadRequest("dir must be asc or desc")
+
+        return {
+            "page": page,
+            "page_size": size,
+            "sort": sort_key,
+            "dir": direction,
+            "q": params.get("q", "").strip(),
+            "in_stock": params.get("in_stock") == "1",
+        }
+    ```
+
+    **Green Notes**
+    - **`dict.get(key, default)` instead of `try/except KeyError`** (reduces E): your clients mostly omit these parameters, so most requests hit the "missing key" path, and raising and catching an exception is the slow part. In Green Metrics Tool micro-benchmarks, 10,000,000 dict lookups with about half of the keys missing used about 12% less CPU energy with `dict.get` than with `try/except KeyError`. Here the miss rate is likely higher than that, but I have no measurement for your traffic, so profile it before you promise a number.
+    - **Unknown `sort` values:** the old code also fell back to `created_at` through `KeyError`. One `SORT_FIELDS.get(params.get("sort"), "created_at")` covers both cases with the same result.
+    - **`int()` keeps its `try/except ValueError`:** bad numbers are rare, and a `try` block that does not raise costs almost nothing. The cost is in raising, so there is no reason to change it. I moved it into `_int_param` to remove the duplicated blocks. The error messages are the same.
+
+    The results and `BadRequest` messages are identical for every input the old code handled.
+verify:
+  equivalence:
+    driver: |-
+      cases = [
+          {},
+          {"page": "3"},
+          {"page": "0"},
+          {"page": "abc"},
+          {"page": ""},
+          {"page_size": "500"},
+          {"page_size": "-4"},
+          {"page_size": "x"},
+          {"sort": "price", "dir": "DESC"},
+          {"sort": "unknown"},
+          {"dir": "up"},
+          {"q": "  shoes "},
+          {"in_stock": "1"},
+          {"in_stock": "0"},
+          {"page": "2", "page_size": "50", "sort": "name", "dir": "Asc", "q": "x", "in_stock": "1"},
+      ]
+      for c in cases:
+          try:
+              print(sorted(parse_list_params(c).items()))
+          except BadRequest as e:
+              print("BadRequest:", e)

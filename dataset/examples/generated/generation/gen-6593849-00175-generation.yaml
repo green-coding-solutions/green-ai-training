@@ -1,0 +1,62 @@
+id: gen-6593849-00175-generation
+category: generation
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    Please write a Dockerfile for `lightfit`, our astronomy group's tool that fits light curves from FITS files. Requirements:
+
+    - Python 3.12
+    - deps are in requirements.txt (numpy, scipy, astropy, matplotlib)
+    - the code is the package folder `lightfit/` in the repo root, started with `python -m lightfit`
+    - users mount their FITS files at /data and pass arguments like `lightfit --period 2.4 curve.fits`
+    - plots are saved to PNG, there is no display
+    - it should not run as root
+    - GitLab CI builds the image on every push to any branch
+
+    Thanks!
+- role: assistant
+  content: |
+    ```dockerfile
+    FROM python:3.12-slim
+
+    ENV PYTHONDONTWRITEBYTECODE=1 \
+        PYTHONUNBUFFERED=1 \
+        PYTHONPATH=/app \
+        MPLBACKEND=Agg
+
+    WORKDIR /app
+
+    # Dependency layer first: it is reused until requirements.txt changes
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY lightfit/ lightfit/
+
+    RUN useradd --create-home --uid 10001 lightfit
+    USER lightfit
+
+    WORKDIR /data
+    ENTRYPOINT ["python", "-m", "lightfit"]
+    ```
+
+    Run it like this:
+
+    ```bash
+    docker run --rm -v "$PWD":/data lightfit --period 2.4 curve.fits
+    ```
+
+    Add a `.dockerignore` with `.git`, `__pycache__`, `*.fits` and `build/`, so test data and history are not sent to the build and do not invalidate the `COPY` layer.
+
+    **Green Notes**
+    - **Small container image** (reduces E and M): the slim base has only what Python needs, and the image installs runtime packages only, with no compiler, git or editors. numpy, scipy, astropy and matplotlib ship prebuilt wheels, so no build tools are needed. In Green Metrics Tool micro-benchmarks, building a small Flask app image this way used about 7× less energy than a full `python:3.12` base with dev tools. Serving requests afterwards cost the same, so the saving is in every build, pull and stored copy. That adds up when CI builds on every push.
+    - **Dependency layer before the source** (reduces E): pushes that only change `lightfit/` reuse the cached install layer instead of reinstalling everything.
+    - **`--no-cache-dir`** (reduces M): the pip download cache is not kept in the image.
+
+    *Not applied:* multi-stage build. All your dependencies install from wheels, so there is nothing to compile. If you later add a package that builds from source, compile it in a builder stage and copy only the result.
+verify:
+  static_only: Dockerfile build needs Docker and network

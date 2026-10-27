@@ -1,0 +1,107 @@
+id: gen-6593849-00146-refactor
+category: refactor
+language: python
+patterns:
+- deque-or-append
+- keep-star-imports
+facts:
+- F-LISTINS
+- F-IMPORT
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```python
+    import re
+    from os.path import *
+
+    LEVELS = ('ERROR', 'CRITICAL')
+    LINE_RE = re.compile(r'^\d{4}-\d{2}-\d{2} ')
+
+
+    def load_errors(log_dir, names):
+        """names are rotated files, oldest first. returns errors, newest first"""
+        errors = []
+        for name in names:
+            path = join(log_dir, name)
+            if not isfile(path):
+                continue
+            with open(path) as f:
+                for line in f:
+                    if not LINE_RE.match(line):
+                        continue
+                    parts = line.rstrip('\n').split(' ', 3)
+                    if len(parts) < 4:
+                        continue
+                    date, time, level, msg = parts
+                    if level in LEVELS:
+                        errors.insert(0, (date + ' ' + time, level, msg))
+        return errors
+    ```
+- role: assistant
+  content: |
+    ```python
+    import re
+    from os.path import *
+
+    LEVELS = ('ERROR', 'CRITICAL')
+    LINE_RE = re.compile(r'^\d{4}-\d{2}-\d{2} ')
+
+
+    def load_errors(log_dir, names):
+        """names are rotated files, oldest first. returns errors, newest first"""
+        errors = []
+        for name in names:
+            path = join(log_dir, name)
+            if not isfile(path):
+                continue
+            with open(path) as f:
+                for line in f:
+                    if not LINE_RE.match(line):
+                        continue
+                    parts = line.rstrip('\n').split(' ', 3)
+                    if len(parts) < 4:
+                        continue
+                    date, time, level, msg = parts
+                    if level in LEVELS:
+                        errors.append((date + ' ' + time, level, msg))
+        errors.reverse()
+        return errors
+    ```
+
+    The result is identical: same entries, same newest-first order.
+
+    **Green Notes**
+    - **Avoid front insertion** (reduces E): `errors.insert(0, ...)` shifts the whole list on every error, so the work grows with the square of the error count. Appending and reversing once at the end is linear. In Green Metrics Tool micro-benchmarks, 1,000,000 front inserts used ~1515 J and 1,000,000 appends used ~1.2 J, over 1000× less. The gap only becomes large with big lists, so it matters most when the logs hold many errors.
+    - **Star import left as is:** `from os.path import *` is fine to keep. In Green Metrics Tool micro-benchmarks, star imports and `import x` showed no measurable energy difference, so changing it would only add churn.
+    - If you need to add items at the front while reading, `collections.deque` with `appendleft` is also O(1). Here you only need the final order, so `append` plus one `reverse()` is simpler.
+verify:
+  equivalence:
+    driver: |-
+      import os, tempfile
+      d = tempfile.mkdtemp()
+      files = {
+          'app.log.2': [
+              '2026-10-01 10:00:00 INFO started ok',
+              '2026-10-01 10:00:05 ERROR db timeout on shard 3',
+              'traceback line without date',
+              '2026-10-01 10:01:00 CRITICAL disk full',
+          ],
+          'app.log.1': [
+              '2026-10-02 08:00:00 WARNING slow query',
+              '2026-10-02 08:00:09 ERROR cache miss storm',
+              '2026-10-02 08:00:10 ERROR',
+          ],
+          'app.log': [
+              '2026-10-03 09:30:00 ERROR upstream 502',
+              '2026-10-03 09:31:00 INFO recovered',
+          ],
+      }
+      for name, lines in files.items():
+          with open(os.path.join(d, name), 'w') as f:
+              f.write('\n'.join(lines) + '\n')
+      names = ['app.log.2', 'app.log.1', 'missing.log', 'app.log']
+      for item in load_errors(d, names):
+          print(item)
+      print(load_errors(d, []))

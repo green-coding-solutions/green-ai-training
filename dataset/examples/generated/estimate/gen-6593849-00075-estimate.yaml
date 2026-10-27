@@ -1,0 +1,51 @@
+id: gen-6593849-00075-estimate
+category: estimate
+language: yaml
+patterns:
+- minimize-environments
+facts:
+- F-PREVIEW-ENV
+messages:
+- role: user
+  content: |
+    Hello, we are small ML team and for every new model candidate we make one "eval environment" on our cluster, so the product people can try the model. Now I want to make it cheaper and my manager ask me "how much energy and CO2 we will save". I dont know what to answer him.
+
+    This is the values we use for one environment now:
+
+    ```yaml
+    # values-eval.yaml
+    inference:
+      image: registry.example.com/ml/sentiment-api:candidate
+      replicas: 3
+      resources:
+        requests: {cpu: "2", memory: 4Gi}
+    redis:
+      enabled: true
+    postgres:
+      enabled: true
+    metricsExporter:
+      enabled: true
+    ttl: none
+    ```
+
+    Plan is: 1 replica, only Postgres, no redis and no exporter. Environments mostly stay for 3-4 weeks because people forget to delete them. How much we save with this plan? Sorry for my english.
+- role: assistant
+  content: |
+    Trimming the services saves little. Removing environments earlier saves much more.
+
+    - **Fewer services and replicas:** in Green Metrics Tool micro-benchmarks, a preview environment idling for 60 seconds with 3 app replicas, Postgres, Redis and a worker used about 3% more CPU energy than the same environment with 1 replica and Postgres. Machine energy differed by less than 1%, because the idle machine baseline dominates. Idle containers use little CPU. Your inference pods may load a model into memory, so the larger effect is reserved memory. Requests of 3 × 4Gi become 1 × 4Gi, so the cluster may need fewer nodes. That depends on your scheduler, not on this benchmark.
+    - **Lifetime is the main lever.** An environment that lives 3-4 weeks costs its idle power for every hour of it. If it is deleted when the candidate is rejected or merged, and scaled to zero at night and on weekends, most of those hours are gone. This saving is proportional to the hours you remove.
+
+    What I would do, in this order:
+    1. Set a TTL (`ttl: none` is the problem here) or delete the environment when the model candidate is closed.
+    2. Scale it to zero outside working hours. Weekends alone are 48 of the 168 hours in a week.
+    3. Then trim to 1 replica and drop Redis and the exporter, if the people testing the model don't need them.
+
+    For your manager, don't give one CO2 number from my figures. They come from one machine and one stack. Do this instead:
+    - Count environment-hours per week now, and with the new rules.
+    - Measure one idling eval environment, with your cluster's power metrics or the Green Metrics Tool. Use a usage scenario that keeps it idle for a fixed time, before and after the trim.
+    - Multiply the measured idle power of your own environment by the hours you removed.
+
+    The first two steps give a defensible estimate. The third step only needs the setup you already have.
+verify:
+  static_only: yaml helm values only, no executable code

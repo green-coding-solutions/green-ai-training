@@ -1,0 +1,130 @@
+id: gen-6593849-00066-review
+category: review
+language: python
+patterns:
+- async-concurrent-io
+facts:
+- F-HTTP
+messages:
+- role: user
+  content: |
+    ?
+
+    ```python
+    import logging
+    import time
+
+    import requests
+
+    log = logging.getLogger("gateway")
+
+    NODES = [f"http://10.20.0.{i}:8080" for i in range(11, 23)]
+    POLL_SECONDS = 30
+    BROKER_URL = "http://localhost:9000/ingest"
+
+
+    def read_node(base):
+        r = requests.get(base + "/api/reading")
+        r.raise_for_status()
+        data = r.json()
+        return {
+            "node": base,
+            "temp": data["temp_c"],
+            "hum": data["humidity"],
+            "ts": data["ts"],
+        }
+
+
+    def poll_all():
+        readings = []
+        for base in NODES:
+            try:
+                readings.append(read_node(base))
+            except Exception as e:
+                log.warning("node %s failed: %s", base, e)
+        return readings
+
+
+    def main():
+        while True:
+            readings = poll_all()
+            if readings:
+                requests.post(BROKER_URL, json=readings)
+            time.sleep(POLL_SECONDS)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+- role: assistant
+  content: |
+    **Workload:** script (long-running polling loop on a gateway)
+
+    #### [Bug] No timeout on any request
+    - **Where:** `read_node` and the `requests.post` in `main`
+    - **Issue:** `requests` waits forever by default. One node that accepts the connection but never answers blocks the loop, so no node is read and nothing is published until you restart the gateway. The `except Exception` can't help, because nothing is raised.
+    - **Fix:** set a timeout on every call (see the code below).
+
+    #### [Medium] Nodes are polled one after another
+    - **Where:** `poll_all`
+    - **Issue:** the 12 nodes are independent, but each request waits for the previous one. A cycle takes the sum of all node latencies, and every slow node delays all the others. The gateway spends most of that time idle, waiting on the network.
+    - **Fix:** poll all nodes concurrently with `asyncio.gather` and one shared `httpx.AsyncClient`. Order of readings and the per-node error handling stay the same.
+    - **Impact:** mostly wall time. A cycle takes about as long as the slowest node instead of the sum. The CPU gain is modest. In Green Metrics Tool micro-benchmarks with 10 HTTP requests, sync `urllib` used ~9.1 J and async `httpx` ~8.4 J, about 7% less CPU energy and about 17% less wall time.
+
+    ```python
+    import asyncio
+    import logging
+
+    import httpx
+
+    log = logging.getLogger("gateway")
+
+    NODES = [f"http://10.20.0.{i}:8080" for i in range(11, 23)]
+    POLL_SECONDS = 30
+    BROKER_URL = "http://localhost:9000/ingest"
+
+
+    async def read_node(client, base):
+        r = await client.get(base + "/api/reading")
+        r.raise_for_status()
+        data = r.json()
+        return {
+            "node": base,
+            "temp": data["temp_c"],
+            "hum": data["humidity"],
+            "ts": data["ts"],
+        }
+
+
+    async def poll_all(client):
+        results = await asyncio.gather(
+            *(read_node(client, base) for base in NODES),
+            return_exceptions=True,
+        )
+        readings = []
+        for base, res in zip(NODES, results):
+            if isinstance(res, BaseException):
+                log.warning("node %s failed: %s", base, res)
+            else:
+                readings.append(res)
+        return readings
+
+
+    async def main():
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            while True:
+                readings = await poll_all(client)
+                if readings:
+                    await client.post(BROKER_URL, json=readings)
+                await asyncio.sleep(POLL_SECONDS)
+
+
+    if __name__ == "__main__":
+        asyncio.run(main())
+    ```
+
+    Keep the loop sequential if the nodes sit behind one slow serial bridge or a link that can't take 12 parallel connections. The publish step is a single request, so it stays as it is.
+
+    **Already good:** a failing node is logged and skipped, so one bad reading doesn't drop the whole cycle.
+verify:
+  static_only: needs network access to sensor nodes and the third-party package httpx

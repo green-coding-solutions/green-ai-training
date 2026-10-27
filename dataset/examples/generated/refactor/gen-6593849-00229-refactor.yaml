@@ -1,0 +1,69 @@
+id: gen-6593849-00229-refactor
+category: refactor
+language: dockerfile
+patterns:
+- small-container-images
+facts:
+- F-CONTAINER-IMAGE
+messages:
+- role: user
+  content: |
+    fix this
+
+    ```dockerfile
+    FROM python:3.12
+
+    RUN apt-get update && apt-get install -y build-essential git curl vim gfortran libopenblas-dev liblapack-dev
+    RUN pip install jupyterlab ipython black mypy pytest
+
+    WORKDIR /opt/sim
+    COPY . /opt/sim
+
+    RUN pip install -r requirements.txt
+
+    ENV OMP_NUM_THREADS=4
+    ENTRYPOINT ["python", "run_ensemble.py"]
+    CMD ["--config", "configs/default.yaml"]
+    ```
+- role: assistant
+  content: |
+    ```dockerfile
+    FROM python:3.12-slim
+
+    ENV PYTHONDONTWRITEBYTECODE=1 \
+        PYTHONUNBUFFERED=1 \
+        OMP_NUM_THREADS=4
+
+    WORKDIR /opt/sim
+
+    # dependencies first: this layer is reused until requirements.txt changes
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+
+    COPY . .
+
+    ENTRYPOINT ["python", "run_ensemble.py"]
+    CMD ["--config", "configs/default.yaml"]
+    ```
+
+    Add a `.dockerignore` so results and large inputs don't get copied into the image:
+
+    ```text
+    .git
+    .venv
+    __pycache__
+    .ipynb_checkpoints
+    output/
+    data/
+    ```
+
+    Mount `data/` and `output/` as volumes when you run the container.
+
+    **Green Notes**
+    - **Slim base, runtime dependencies only** (reduces E, storage, network): JupyterLab, IPython, black, mypy, pytest, `git`, `curl`, `vim` and the compilers are gone from the runtime image. Run linting and tests in a separate CI job. In Green Metrics Tool measurements of a similar change for a small Flask app, the image build used about 7× less energy, while serving requests cost the same. The saving is in every build, pull and stored copy.
+    - **Dependency layer before the source** (reduces E): a push that only changes your code reuses the cached `pip install` layer instead of reinstalling everything.
+    - **No pip cache** (reduces storage): `--no-cache-dir` keeps downloaded wheels out of the image.
+
+    *Check before you build:* I removed `build-essential`, `gfortran` and the BLAS/LAPACK dev packages. This works if your `requirements.txt` installs only prebuilt wheels, which is normal for numpy and scipy on Linux. If a package must compile from source, use a multi-stage build: compile in a full image and copy only the installed packages into the slim one.
+verify:
+  static_only: Dockerfile

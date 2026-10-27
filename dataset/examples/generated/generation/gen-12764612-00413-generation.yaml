@@ -1,0 +1,61 @@
+id: gen-12764612-00413-generation
+category: generation
+language: python
+patterns:
+- hoist-invariants
+facts:
+- F-ATTR
+messages:
+- role: user
+  content: |
+    I need a function for our billing API's bulk export endpoint (`GET /v1/invoices/export`). It streams NDJSON to the client, and one export can have a few million line items.
+
+    Requirements:
+    - Input: an iterable of `(sku, qty, net_cents)` tuples, and a `cfg` object with `cfg.vat_bp` (VAT in basis points, e.g. 1900 = 19%), `cfg.currency` and `cfg.max_qty`.
+    - Skip items where `qty <= 0` or `qty > cfg.max_qty`.
+    - For each kept item, output one JSON line with `sku`, `qty`, `net_cents` (unit net price), `gross_cents` and `currency`.
+    - `gross_cents` = `net_cents * qty` plus VAT, rounded up to the next cent. Integer math only, no floats.
+    - It must be a generator, because the web framework streams it.
+    - Compact JSON (no spaces), each line ends with `\n`.
+- role: assistant
+  content: |
+    ```python
+    import json
+    from typing import Iterable, Iterator
+
+    def invoice_ndjson(items: Iterable[tuple[str, int, int]], cfg) -> Iterator[str]:
+        # Read config once. It does not change while the export streams.
+        vat_bp = cfg.vat_bp
+        currency = cfg.currency
+        max_qty = cfg.max_qty
+        dumps = json.dumps
+        factor = 10_000 + vat_bp
+
+        for sku, qty, net_cents in items:
+            if qty <= 0 or qty > max_qty:
+                continue
+            gross = (net_cents * qty * factor + 9_999) // 10_000  # ceil, integer only
+            yield dumps(
+                {
+                    "sku": sku,
+                    "qty": qty,
+                    "net_cents": net_cents,
+                    "gross_cents": gross,
+                    "currency": currency,
+                },
+                separators=(",", ":"),
+            ) + "\n"
+    ```
+
+    **Green Notes**
+    - **Hoist loop-invariant lookups** (reduces E): `cfg.vat_bp`, `cfg.currency`, `cfg.max_qty` and `json.dumps` are looked up once, not once per line item. The gain is small. In Green Metrics Tool micro-benchmarks, caching `math.sqrt` in a local before a 10,000,000-iteration loop saved about 4-5%. It is worth it here because the loop runs per line item on a hot path.
+    - **`factor` is computed once:** `10_000 + vat_bp` is the same for every item, so it is not recomputed per row.
+    - *Not applied:* anything beyond this. The per-item work (one multiplication, one `dumps`) dominates, and the rest of the loop is already simple.
+verify:
+  test: |-
+    from types import SimpleNamespace
+    cfg = SimpleNamespace(vat_bp=1900, currency="EUR", max_qty=100)
+    out = list(invoice_ndjson([("A", 2, 1000), ("B", 0, 5), ("C", 3, 333), ("D", 101, 10)], cfg))
+    assert len(out) == 2
+    assert out[0] == '{"sku":"A","qty":2,"net_cents":1000,"gross_cents":2380,"currency":"EUR"}\n'
+    assert json.loads(out[1])["gross_cents"] == 1189

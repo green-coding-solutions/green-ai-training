@@ -1,0 +1,95 @@
+id: gen-6593849-00234-refactor
+category: refactor
+language: python
+patterns:
+- hoist-invariants
+- batch-db-writes
+facts:
+- F-ATTR
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    ```python
+    import math
+    import psycopg
+
+
+    class ChurnScorer:
+        def __init__(self, dsn, weights, bias, threshold=0.5):
+            self.conn = psycopg.connect(dsn)
+            self.weights = weights
+            self.bias = bias
+            self.threshold = threshold
+            self.model_version = "churn-2024-11"
+
+        def score_all(self, rows):
+            """rows: iterable of (customer_id, features) with features a list of floats"""
+            cur = self.conn.cursor()
+            flagged = 0
+            for customer_id, features in rows:
+                z = self.bias
+                for i in range(len(features)):
+                    z += self.weights[i] * features[i]
+                p = 1.0 / (1.0 + math.exp(-z))
+                is_flagged = p >= self.threshold
+                if is_flagged:
+                    flagged += 1
+                cur.execute(
+                    "INSERT INTO predictions (customer_id, model_version, score, flagged) "
+                    "VALUES (%s, %s, %s, %s)",
+                    (customer_id, self.model_version, p, is_flagged),
+                )
+                self.conn.commit()
+            return flagged
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```python
+    import math
+    import psycopg
+
+
+    class ChurnScorer:
+        def __init__(self, dsn, weights, bias, threshold=0.5):
+            self.conn = psycopg.connect(dsn)
+            self.weights = weights
+            self.bias = bias
+            self.threshold = threshold
+            self.model_version = "churn-2024-11"
+
+        def score_all(self, rows):
+            """rows: iterable of (customer_id, features) with features a list of floats"""
+            weights = self.weights
+            bias = self.bias
+            threshold = self.threshold
+            model_version = self.model_version
+            exp = math.exp
+            flagged = 0
+
+            with self.conn.transaction():
+                with self.conn.cursor() as cur:
+                    with cur.copy(
+                        "COPY predictions (customer_id, model_version, score, flagged) FROM STDIN"
+                    ) as copy:
+                        for customer_id, features in rows:
+                            z = bias
+                            for i in range(len(features)):
+                                z += weights[i] * features[i]
+                            p = 1.0 / (1.0 + exp(-z))
+                            is_flagged = p >= threshold
+                            if is_flagged:
+                                flagged += 1
+                            copy.write_row((customer_id, model_version, p, is_flagged))
+            return flagged
+    ```
+
+    **Green Notes**
+    - **Batch the writes with COPY** (reduces E, network): the old code did one `INSERT` and one `commit()` per customer, so N rows meant N round trips and N commits. Now it is one `COPY` stream and one commit. In Green Metrics Tool micro-benchmarks with PostgreSQL 16 and 500,000 rows in batches of 5,000, one `execute()` per row used ~384 J and `COPY` ~17 J, about 22× less. With batches of only about 100 rows the gap was small, so for a handful of rows `executemany()` is enough.
+    - **Hoist loop-invariant lookups** (reduces E): `self.weights`, `self.bias`, `self.threshold`, `self.model_version` and `math.exp` are now locals. In Green Metrics Tool micro-benchmarks, caching one attribute outside a 10,000,000-iteration loop saved about 4-5%. This is small, and it is worth it here only because the inner feature loop runs per customer.
+
+    Behavior change: the whole call is now one transaction. If scoring fails halfway, nothing is written. Before, every row that had already been scored stayed in the table. If you need partial progress, call `score_all` on chunks of a few thousand rows. The return value and the stored rows are the same otherwise.
+verify:
+  static_only: needs a PostgreSQL server and psycopg

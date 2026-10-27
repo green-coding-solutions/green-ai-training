@@ -1,0 +1,89 @@
+id: gen-9483221-00015-generation
+category: generation
+language: python
+patterns:
+- regex-precompile
+facts:
+- F-REGEX
+messages:
+- role: user
+  content: |
+    I'm writing the receiving side of a cattle tracker gateway. It runs on a Raspberry Pi Zero 2 W and reads NMEA sentences from a u-blox GPS module over serial, about 20 lines per second once all collars report in. I only care about `$GPRMC` / `$GNRMC` sentences.
+
+    Requirements for `parse_rmc(line)`:
+    - input is one raw line as str, may end with `\r\n`
+    - verify the checksum (XOR of everything between `$` and `*`), reject the line if it is wrong
+    - reject sentences without a fix (status `V`)
+    - return a dict with `time` (timezone-aware UTC datetime), `lat` and `lon` as signed decimal degrees, `speed_knots` (float) and `course` (float or None)
+    - return None for anything malformed, never raise
+    - stdlib only, no pynmea2
+
+    Example: `$GPRMC,123519.00,A,4807.038,N,01131.000,E,022.4,084.4,230324,,*xx`
+- role: assistant
+  content: |-
+    ```python
+    import re
+    from datetime import datetime, timezone
+
+    _RMC = re.compile(
+        r"""^\$(?P<body>G[PN]RMC,
+            (?P<time>\d{6})(?:\.\d+)?,
+            (?P<status>[AV]),
+            (?P<lat>\d{4}\.\d+),(?P<ns>[NS]),
+            (?P<lon>\d{5}\.\d+),(?P<ew>[EW]),
+            (?P<speed>\d+(?:\.\d+)?),
+            (?P<course>\d*(?:\.\d+)?),
+            (?P<date>\d{6})
+            [^*]*)
+            \*(?P<sum>[0-9A-Fa-f]{2})\s*$""",
+        re.VERBOSE,
+    )
+
+
+    def _checksum(body):
+        value = 0
+        for ch in body:
+            value ^= ord(ch)
+        return value
+
+
+    def parse_rmc(line):
+        m = _RMC.match(line)
+        if m is None:
+            return None
+        if m["status"] != "A":
+            return None
+        if _checksum(m["body"]) != int(m["sum"], 16):
+            return None
+
+        lat = int(m["lat"][:2]) + float(m["lat"][2:]) / 60
+        lon = int(m["lon"][:3]) + float(m["lon"][3:]) / 60
+        if m["ns"] == "S":
+            lat = -lat
+        if m["ew"] == "W":
+            lon = -lon
+
+        t, d = m["time"], m["date"]
+        try:
+            stamp = datetime(
+                2000 + int(d[4:6]), int(d[2:4]), int(d[0:2]),
+                int(t[0:2]), int(t[2:4]), int(t[4:6]),
+                tzinfo=timezone.utc,
+            )
+        except ValueError:
+            return None
+
+        return {
+            "time": stamp,
+            "lat": lat,
+            "lon": lon,
+            "speed_knots": float(m["speed"]),
+            "course": float(m["course"]) if m["course"] else None,
+        }
+    ```
+
+    The checksum in your example is a placeholder, so compute it from the body before you test with it. Lines that fail the pattern, the checksum or the date check return `None`, so a noisy serial line cannot crash the reader loop.
+
+    **Green Notes**
+    - **Compile the regex once** (reduces E): the pattern is fixed, so it is compiled at import time and not on every one of the ~20 calls per second. In Green Metrics Tool micro-benchmarks with 1,000,000 matches, an inline `re.match(pattern, s)` used ~21 J and a precompiled pattern ~18 J, about 18% less. The gain is small because Python's `re` module caches compiled patterns. It grows when patterns are built dynamically per call or when there are more than 512 distinct patterns.
+    - **Checksum last** (reduces E): the cheap pattern and status checks run first, so noise lines and no-fix sentences never reach the per-character XOR loop.

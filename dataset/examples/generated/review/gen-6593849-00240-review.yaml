@@ -1,0 +1,73 @@
+id: gen-6593849-00240-review
+category: review
+language: bash
+patterns:
+- compress-transmitted
+facts:
+- F-COMPRESS
+- F-COMPRESS-CODECS
+messages:
+- role: user
+  content: |
+    review pls, diff only. runs at the end of every CFD job on the cluster (a few hundred a night). output dir is 5-20 GB, mostly ASCII VTK + CSV probes. archive node is on the same 10GbE fabric, data is deleted after postprocessing, ~2 weeks.
+
+    ```bash
+    #!/bin/bash
+    # archive_run.sh - push finished run to archive node
+    RUN=$1
+    SRC=/scratch/sim/$RUN
+
+    cd $SRC
+    echo "archiving $RUN"
+    tar cf - . | brotli -q 11 | ssh archive01 "cat > /data/sim-archive/$RUN.tar.br"
+    rm -rf $SRC
+    echo "done $RUN"
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (scientific computing, runs after every job)
+
+    #### [Bug] `rm -rf` runs even when the transfer failed
+    - **Where:** last `rm -rf $SRC`
+    - **Issue:** there is no `set -e` or `pipefail`. If `ssh`, `brotli` or `tar` fails, the script still deletes the only copy of the run. If `$1` is empty, `SRC` becomes `/scratch/sim/` and the whole scratch tree is deleted.
+    - **Fix:** `set -euo pipefail`, require the argument, quote the paths.
+
+    #### [Security] Unquoted `$RUN` and `$SRC`
+    - **Where:** `cd $SRC`, `rm -rf $SRC`, and the remote `cat > ...$RUN...`
+    - **Issue:** spaces or glob characters in `$1` split the path. `$RUN` is also expanded into a remote shell command.
+    - **Fix:** quote the paths and allow only `[A-Za-z0-9._-]` in the run id.
+
+    #### [High] brotli at quality 11 on data that is compressed on every job
+    - **Where:** `brotli -q 11`
+    - **Issue:** quality 11 is built for assets compressed once and served many times. Here every run is compressed once, kept about 2 weeks, then deleted. The fabric is fast, so the CPU time is not repaid by saved transfer time.
+    - **Fix:** use `zstd -3`, a fast codec that still compresses ASCII VTK and CSV well.
+    - **Impact:** reduces E on every job. In Green Metrics Tool micro-benchmarks on 100 MB of text, brotli at quality 11 used about 190× the compression energy of zstd at its default level. The facts compare energy only, not output size. zstd files will be somewhat larger. If archive space gets tight, try a higher zstd level before reaching for brotli or xz.
+
+    ```text
+    --- archive_run.sh
+    +++ archive_run.sh
+    @@
+     #!/bin/bash
+     # archive_run.sh - push finished run to archive node
+    -RUN=$1
+    -SRC=/scratch/sim/$RUN
+    +set -euo pipefail
+    +RUN=${1:?usage: archive_run.sh RUN_ID}
+    +case $RUN in *[!A-Za-z0-9._-]*|'') echo "bad run id" >&2; exit 1;; esac
+    +SRC="/scratch/sim/$RUN"
+
+    -cd $SRC
+    +cd "$SRC"
+     echo "archiving $RUN"
+    -tar cf - . | brotli -q 11 | ssh archive01 "cat > /data/sim-archive/$RUN.tar.br"
+    -rm -rf $SRC
+    +tar cf - . | zstd -3 | ssh archive01 "cat > /data/sim-archive/$RUN.tar.zst"
+    +rm -rf "$SRC"
+     echo "done $RUN"
+    ```
+
+    Postprocessing must now read `.tar.zst` (`zstd -dc | tar xf -`) instead of `.tar.br`.
+
+    **Already good:** streaming `tar` through the pipe avoids a temporary archive on scratch.
+verify:
+  static_only: bash script needs an ssh archive host, brotli and zstd binaries

@@ -1,0 +1,82 @@
+id: gen-6593849-00099-generation
+category: generation
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    hi, i need python function for our cluster check script in CI. it read the kubernetes pod specs (json, around 50 thousand pods) and must sum up the cpu and memory requests. the values are strings like "500m", "250m", "2Gi", "512Mi", "1". i need convert this to numbers (cpu in cores, memory in bytes). most pods have the same few values, only maybe 30 different strings. please give me the parse function and one small function for the sum
+- role: assistant
+  content: |
+    ```python
+    import re
+    from functools import lru_cache
+
+    _QUANTITY = re.compile(r"(\d+(?:\.\d+)?)([A-Za-z]*)")
+
+    _FACTORS = {
+        "": 1,
+        "m": 0.001,
+        "k": 1000,
+        "M": 1000**2,
+        "G": 1000**3,
+        "T": 1000**4,
+        "Ki": 1024,
+        "Mi": 1024**2,
+        "Gi": 1024**3,
+        "Ti": 1024**4,
+    }
+
+
+    @lru_cache(maxsize=1024)
+    def parse_quantity(text: str) -> float:
+        """Convert a Kubernetes quantity like '500m' or '2Gi' to a number.
+
+        CPU gives cores, memory gives bytes.
+        """
+        match = _QUANTITY.fullmatch(text.strip())
+        if match is None:
+            raise ValueError(f"bad quantity: {text!r}")
+        number, suffix = match.groups()
+        try:
+            factor = _FACTORS[suffix]
+        except KeyError:
+            raise ValueError(f"unknown suffix in quantity: {text!r}") from None
+        return float(number) * factor
+
+
+    def sum_quantities(values) -> float:
+        return sum(parse_quantity(v) for v in values)
+    ```
+
+    Example:
+
+    ```python
+    cpu = sum_quantities(["500m", "250m", "500m", "1"])   # 2.25 cores
+    mem = sum_quantities(["2Gi", "512Mi", "2Gi"])         # bytes
+    ```
+
+    **Green Notes**
+    - **Memoize repeated pure computations** (reduces E): the function is pure and your 50,000 pods share about 30 distinct strings, so almost every call is a cache hit. In Green Metrics Tool micro-benchmarks, 1,000,000 calls drawing from 200 distinct inputs used ~43 J uncached and ~4.7 J with `lru_cache`, about 9× less.
+    - **Bounded cache** (reduces M): `maxsize=1024` keeps memory fixed even if a few odd values appear. Bad values raise `ValueError` and are not cached.
+    - *Not applied:* caching `sum_quantities`. Its input is a new list each time, so it would almost never hit. If every pod had a unique string, the cache would only add overhead and should be removed.
+verify:
+  module: false
+  green_block: 0
+  test: |-
+    assert parse_quantity("500m") == 0.5
+    assert parse_quantity("1") == 1.0
+    assert parse_quantity("2Gi") == 2 * 1024**3
+    assert parse_quantity("512Mi") == 512 * 1024**2
+    assert abs(sum_quantities(["500m", "250m", "500m", "1"]) - 2.25) < 1e-9
+    assert parse_quantity.cache_info().hits >= 1
+    for bad in ["abc", "5Xi", ""]:
+        try:
+            parse_quantity(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(bad)

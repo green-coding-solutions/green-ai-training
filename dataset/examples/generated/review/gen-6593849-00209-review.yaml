@@ -1,0 +1,114 @@
+id: gen-6593849-00209-review
+category: review
+language: python
+patterns:
+- vectorize-or-jit
+facts:
+- F-NUMBA
+messages:
+- role: user
+  content: |
+    Hello, can you make a review of this code? Its the heatmap endpoint for our landing page analitics. Marketing team open the dashboard many times in a day and the page wait some seconds for this call. I dont understand why is so slow, numpy is fast no?
+
+    ```python
+    import numpy as np
+    from flask import Flask, request, Response
+
+    app = Flask(__name__)
+
+    GRID_W, GRID_H = 160, 90   # one cell = 8x8 px of the landing page
+    BLUR_RADIUS = 5
+
+
+    def blur_grid(grid, radius):
+        h, w = grid.shape
+        out = np.zeros((h, w), dtype=np.float32)
+        for y in range(h):
+            for x in range(w):
+                total = 0.0
+                count = 0
+                for dy in range(-radius, radius + 1):
+                    for dx in range(-radius, radius + 1):
+                        yy, xx = y + dy, x + dx
+                        if 0 <= yy < h and 0 <= xx < w:
+                            total += grid[yy, xx]
+                            count += 1
+                out[y, x] = total / count
+        return out
+
+
+    def heatmap_levels(clicks):
+        grid = np.zeros((GRID_H, GRID_W), dtype=np.float32)
+        for cx, cy in clicks:
+            gx, gy = int(cx) // 8, int(cy) // 8
+            if 0 <= gx < GRID_W and 0 <= gy < GRID_H:
+                grid[gy, gx] += 1.0
+        blurred = blur_grid(grid, BLUR_RADIUS)
+        return (blurred / blurred.max() * 255).astype(np.uint8)
+
+
+    @app.route("/api/heatmap/<page_id>")
+    def heatmap(page_id):
+        clicks = load_clicks(page_id)  # list of (x, y) pixel positions from the db
+        levels = heatmap_levels(clicks)
+        return Response(levels.tobytes(), mimetype="application/octet-stream")
+    ```
+- role: assistant
+  content: |
+    **Workload:** web (backend for an analytics dashboard)
+
+    #### [Bug] Empty click list gives NaN
+    - **Where:** `heatmap_levels`, the last line
+    - **Issue:** a page without clicks has `blurred.max() == 0`. Then `0 / 0` is NaN, and casting NaN to `uint8` gives undefined values. The dashboard can show random colors for new pages.
+    - **Fix:** check the peak first and return zeros when it is 0.
+
+    #### [High] Pure Python loop over every cell and every neighbor
+    - **Where:** `blur_grid`
+    - **Issue:** numpy is fast for whole-array operations, but here the array is used like a list. The loop does 14,400 cells × 121 neighbors, about 1.7 million inner steps per request, and each `grid[yy, xx]` is a slow single-element lookup. This is a CPU-bound numeric hot loop that runs on every dashboard call.
+    - **Fix:** compile the loop with Numba `@njit`. The logic stays the same, so the output is the same. I clamp the window once per cell instead of testing every neighbor. Use `cache=True` so the compile cost is paid once, not at every worker start.
+    - **Impact:** reduces E per request. In Green Metrics Tool micro-benchmarks, a pure Python quantization loop over 10,000,000 samples used about 4× less CPU energy with Numba `@njit`. That was a different loop, so don't expect the same factor here. Measure your endpoint before and after.
+
+    ```python
+    import numpy as np
+    from numba import njit
+
+    GRID_W, GRID_H = 160, 90   # one cell = 8x8 px of the landing page
+    BLUR_RADIUS = 5
+
+
+    @njit(cache=True)
+    def blur_grid(grid, radius):
+        h, w = grid.shape
+        out = np.empty((h, w), dtype=np.float32)
+        for y in range(h):
+            y0 = max(0, y - radius)
+            y1 = min(h, y + radius + 1)
+            for x in range(w):
+                x0 = max(0, x - radius)
+                x1 = min(w, x + radius + 1)
+                total = 0.0
+                for yy in range(y0, y1):
+                    for xx in range(x0, x1):
+                        total += grid[yy, xx]
+                out[y, x] = total / ((y1 - y0) * (x1 - x0))
+        return out
+
+
+    def heatmap_levels(clicks):
+        grid = np.zeros((GRID_H, GRID_W), dtype=np.float32)
+        for cx, cy in clicks:
+            gx, gy = int(cx) // 8, int(cy) // 8
+            if 0 <= gx < GRID_W and 0 <= gy < GRID_H:
+                grid[gy, gx] += 1.0
+        blurred = blur_grid(grid, BLUR_RADIUS)
+        peak = blurred.max()
+        if peak == 0:
+            return np.zeros((GRID_H, GRID_W), dtype=np.uint8)
+        return (blurred / peak * 255).astype(np.uint8)
+    ```
+
+    The first request after a fresh deploy still pays the compile time once. After that the compiled code is loaded from the cache.
+
+    **Already good:** the grid is 160×90 cells and not one cell per pixel, so the work per request is already small. Clicks outside the page are filtered before they touch the grid.
+verify:
+  static_only: needs numba and flask, which are beyond stdlib and numpy

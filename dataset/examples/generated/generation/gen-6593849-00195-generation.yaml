@@ -1,0 +1,52 @@
+id: gen-6593849-00195-generation
+category: generation
+language: python
+patterns:
+- memoize
+facts:
+- F-LRU
+messages:
+- role: user
+  content: |
+    hello, i need a python function for our mqtt gateway (small industrial box, no big cpu). sensors send messages with topic like `site/ber01/dev/th-0042/temperature` and I must split it to site, device and metric. If the topic is not in this format I want None. The gateway get many messages every second, but we have only few hundred devices so same topics come again and again. Thank you!
+- role: assistant
+  content: |
+    ```python
+    from functools import lru_cache
+    from typing import NamedTuple, Optional
+
+
+    class TopicInfo(NamedTuple):
+        site: str
+        device: str
+        metric: str
+
+
+    @lru_cache(maxsize=4096)
+    def parse_topic(topic: str) -> Optional[TopicInfo]:
+        parts = topic.split("/")
+        if len(parts) != 5 or parts[0] != "site" or parts[2] != "dev":
+            return None
+        return TopicInfo(parts[1], parts[3], parts[4])
+
+
+    def on_message(topic: str, payload: bytes) -> None:
+        info = parse_topic(topic)
+        if info is None:
+            return  # unknown topic, ignore
+        print(info.site, info.device, info.metric, payload.decode())
+    ```
+
+    **Green Notes**
+    - **Memoize a repeated pure function** (reduces E): the same few hundred topics arrive over and over, so after the first message of a topic the split and checks are skipped and the stored result is returned. In Green Metrics Tool micro-benchmarks, 1,000,000 repeated computations drawn from 200 distinct inputs used ~43 J without a cache and ~4.7 J with `functools.lru_cache` (about 9× less). Your parser is much cheaper than that benchmark's computation, so expect a smaller gain. It depends on how often topics repeat.
+    - **Bounded cache:** `maxsize` caps memory on the box. A faulty device that sends random topics can't make it grow. If most topics were unique, the cache would only add overhead, so remove it then.
+    - **Immutable result:** `NamedTuple` is safe to share between calls. A cached `list` or `dict` could be changed by the caller and corrupt later results.
+verify:
+  test: |-
+    info = parse_topic("site/ber01/dev/th-0042/temperature")
+    assert info == ("ber01", "th-0042", "temperature")
+    assert info.device == "th-0042"
+    assert parse_topic("site/ber01/dev/th-0042") is None
+    assert parse_topic("foo/ber01/dev/th-0042/temperature") is None
+    assert parse_topic("site/ber01/dev/th-0042/temperature") is info
+    assert parse_topic.cache_info().hits >= 1

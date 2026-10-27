@@ -1,0 +1,74 @@
+id: gen-6593849-00125-refactor
+category: refactor
+language: bash
+patterns:
+- compress-transmitted
+- bash-quoting
+facts:
+- F-COMPRESS-CODECS
+- F-COMPRESS
+- F-BASH-QUOTES
+messages:
+- role: user
+  content: |
+    hi, im new to backend work. this script runs from cron every 5 minutes on our small API server and the CPU is always busy when it runs. i dont know what is wrong with it, can you improve it?
+
+    ```bash
+    #!/bin/bash
+    # refresh compressed API snapshots for nginx
+    OUT="/var/www/api-snapshots"
+    BASE="http://127.0.0.1:8080"
+    ENDPOINTS="prices stock categories promotions shipping-rates"
+
+    for name in $ENDPOINTS; do
+        echo "fetching $name"
+        curl -s "$BASE/v1/$name" -o "/tmp/$name.json"
+        if [ -s "/tmp/$name.json" ]; then
+            brotli -q 11 -f "/tmp/$name.json" -o "/tmp/$name.json.br"
+            mv "/tmp/$name.json.br" "$OUT/$name.json.br"
+            echo "ok: $name"
+        else
+            echo "empty response for $name"
+        fi
+        rm -f "/tmp/$name.json"
+    done
+    echo "snapshot run finished"
+    ```
+- role: assistant
+  content: |
+    The CPU load comes from `brotli -q 11`. That is the slowest brotli level, and the script runs it for every endpoint, every 5 minutes. I switched to gzip at its default level.
+
+    ```bash
+    #!/bin/bash
+    # refresh compressed API snapshots for nginx
+    OUT='/var/www/api-snapshots'
+    BASE='http://127.0.0.1:8080'
+    ENDPOINTS='prices stock categories promotions shipping-rates'
+
+    raw=$(mktemp) || exit 1
+    trap 'rm -f "$raw"' EXIT
+
+    for name in $ENDPOINTS; do
+        echo "fetching $name"
+        tmp="$OUT/$name.json.gz.tmp"
+        if curl -sf "$BASE/v1/$name" -o "$raw" && [ -s "$raw" ] \
+            && gzip -6 -c "$raw" > "$tmp" \
+            && mv "$tmp" "$OUT/$name.json.gz"; then
+            echo "ok: $name"
+        else
+            rm -f "$tmp"
+            echo "failed or empty response for $name"
+        fi
+    done
+    echo 'snapshot run finished'
+    ```
+
+    nginx must now serve `.gz` files (`gzip_static on;`) instead of `.br` files. gzip works for every client.
+
+    **Green Notes**
+    - **Fast codec for data compressed often** (reduces E): these files are rebuilt every 5 minutes, so the compression cost repeats all day. In Green Metrics Tool micro-benchmarks on 100 MB of text, brotli at its default quality 11 used ~3019 J, gzip ~67 J and zstd ~16 J. That is about 190× more for brotli than for zstd. Brotli at max quality is meant for static assets compressed once and served many times. If all your clients accept zstd, it is cheaper still than gzip.
+    - **Trade-off:** these figures compare energy, not file size. Brotli makes smaller files, so you send slightly more bytes per response with gzip.
+    - **Single quotes for fixed text** (reduces E): `OUT`, `BASE`, the endpoint list and the final message need no expansion. In micro-benchmarks single quotes used about 24% less CPU for that work. For a short script like this the saving is tiny, but it is the right default. Strings with `$name` or `$BASE` stay double-quoted.
+    - **Bug fixes:** `curl -f` now fails on HTTP errors. Before, a 500 error page would have been compressed and published as if it were data. The file is written next to its final path and then moved, so nginx never serves a half-written file. `mktemp` replaces the fixed `/tmp` names.
+verify:
+  static_only: needs curl, a local HTTP service, nginx paths and /var/www; not runnable in a sandbox

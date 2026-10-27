@@ -1,0 +1,60 @@
+id: gen-6593849-00067-generation
+category: generation
+language: nginx
+patterns:
+- text-compression
+facts:
+- F-TEXT-COMPRESS
+messages:
+- role: user
+  content: |
+    hi, i am new with nginx and i dont know what is wrong. we have a small demo for our image classifier, you upload a photo and it show the top 5 labels. Files are in /srv/classifier-demo/public (index.html, app.js, style.css, labels.json with 1000 class names and a folder samples/ with some jpg). The model runs in a FastAPI app on 127.0.0.1:8000, the endpoint is POST /predict and it return small json. When we show it on the guest wifi in the lab it feel slow to open the page. Can you write the nginx config for it? server name is classifier.lab.example.org
+- role: assistant
+  content: |
+    Here is a config for the page and the API. A likely reason for the slow first load is that the text files (HTML, JS, CSS, `labels.json`) are sent uncompressed. This config sends them compressed.
+
+    ```nginx
+    server {
+        listen 80;
+        server_name classifier.lab.example.org;
+        root /srv/classifier-demo/public;
+
+        # use the .gz files made at deploy time, compress on the fly only if one is missing
+        gzip_static on;
+        gzip on;
+        gzip_comp_level 5;
+        gzip_min_length 1024;
+        gzip_types text/css application/javascript application/json image/svg+xml;
+        gzip_vary on;
+
+        client_max_body_size 10m;
+
+        location /predict {
+            proxy_pass http://127.0.0.1:8000;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_read_timeout 60s;
+        }
+
+        location / {
+            add_header Cache-Control "no-cache";
+            try_files $uri $uri/ =404;
+        }
+    }
+    ```
+
+    Create the `.gz` files after every deploy of the page, next to the originals:
+
+    ```bash
+    find /srv/classifier-demo/public -type f \( -name '*.html' -o -name '*.js' -o -name '*.css' -o -name '*.json' -o -name '*.svg' \) \
+        -exec gzip -k -f -9 {} +
+    ```
+
+    Run it every time you change a file. If the `.gz` is older than the original, visitors get the old content.
+
+    **Green Notes**
+    - **Precompressed text assets** (reduces E, network): each file is compressed once at deploy time instead of on every request. In Green Metrics Tool measurements of nginx serving text assets, compression sent about 10× fewer bytes, and compressing on every request cost about 4× the CPU energy of serving precompressed files. Level 9 is fine here because it runs only once per deploy.
+    - **Small `/predict` answers are not compressed** (reduces E): `gzip_min_length 1024` skips the top-5 JSON, so the server does not spend CPU on a few hundred bytes. A big JSON answer would still be compressed.
+    - **JPEGs are not in `gzip_types`:** they are already compressed, so gzip would cost CPU and gain nothing.
+verify:
+  static_only: nginx config

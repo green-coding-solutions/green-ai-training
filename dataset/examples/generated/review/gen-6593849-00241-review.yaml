@@ -1,0 +1,94 @@
+id: gen-6593849-00241-review
+category: review
+language: python
+patterns:
+- simple-conditions
+facts:
+- F-COND
+messages:
+- role: user
+  content: |
+    Review this, we run it on the nightly access log rollup. Just tell me what to change, diffs are fine.
+
+    ```python
+    from collections import Counter
+
+
+    def classify(status):
+        if 200 <= status < 300:
+            return "ok"
+        elif 300 <= status < 400:
+            return "redirect"
+        elif 400 <= status < 500:
+            return "client_error"
+        elif 500 <= status < 600:
+            return "server_error"
+        return "other"
+
+
+    def summarize(lines):
+        counts = Counter()
+        total_bytes = 0
+        for line in lines:
+            parts = line.split()
+            status = int(parts[8])
+            size = int(parts[9])
+            counts[classify(status)] += 1
+            total_bytes += size
+        return counts, total_bytes
+    ```
+- role: assistant
+  content: |
+    **Workload:** data pipeline (log rollup)
+
+    #### [Bug] Crashes on `-` byte counts and short lines
+    - **Where:** `summarize`, `int(parts[9])` and `parts[8]`
+    - **Issue:** the combined log format writes `-` when no body was sent (304s, some HEAD requests). `int("-")` raises `ValueError` and kills the whole run. A truncated line raises `IndexError`.
+    - **Fix:**
+      ```diff
+      -        status = int(parts[8])
+      -        size = int(parts[9])
+      +        if len(parts) < 10:
+      +            continue
+      +        status = int(parts[8])
+      +        size = 0 if parts[9] == "-" else int(parts[9])
+      ```
+    - **Impact:** correctness. Malformed lines are now skipped instead of aborting the job. Count them if you need to know how many were dropped.
+
+    #### [Medium] Range guards evaluated per line
+    - **Where:** `classify`
+    - **Issue:** each branch is a chained range comparison, and a 5xx line goes through all four before it matches. This runs once per log line. In Green Metrics Tool micro-benchmarks (10,000,000 classifications), simple equality branches used ~46 J and complex range and modulo conditions ~54 J, about 16% less. Your guards are milder than those, so expect a smaller gain. It is still free to take.
+    - **Fix:** compute the class once, then compare for equality:
+      ```diff
+      -    if 200 <= status < 300:
+      +    klass = status // 100
+      +    if klass == 2:
+               return "ok"
+      -    elif 300 <= status < 400:
+      +    elif klass == 3:
+               return "redirect"
+      -    elif 400 <= status < 500:
+      +    elif klass == 4:
+               return "client_error"
+      -    elif 500 <= status < 600:
+      +    elif klass == 5:
+               return "server_error"
+      ```
+    - **Impact:** E, per line. Results are identical for every status, including values below 100 or above 599, which still return `"other"`.
+
+    Do not switch the chain to `match`. It performs the same as `if/elif` in the same benchmarks.
+
+    **Already good:** single pass over `lines`, so it works with a file iterator without loading the whole log. `Counter` is the right tool for the tallies.
+verify:
+  equivalence:
+    driver: |-
+      lines = []
+      statuses = [200, 204, 301, 302, 304, 400, 401, 404, 418, 499, 500, 502, 503, 599, 600, 99, 100, 0, 250, 399]
+      for i in range(200):
+          st = statuses[i % len(statuses)]
+          lines.append('10.0.0.%d - - [10/Oct/2026:13:55:36 +0000] "GET /p/%d HTTP/1.1" %d %d "-" "curl/8"' % (i % 255, i, st, i * 7))
+      counts, total = summarize(lines)
+      print(sorted(counts.items()))
+      print(total)
+      for s in [-5, 0, 99, 100, 199, 200, 299, 300, 399, 400, 499, 500, 599, 600, 1000]:
+          print(s, classify(s))

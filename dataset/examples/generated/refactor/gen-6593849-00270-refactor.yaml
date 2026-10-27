@@ -1,0 +1,81 @@
+id: gen-6593849-00270-refactor
+category: refactor
+language: python
+patterns:
+- set-membership
+facts:
+- F-MEMB
+messages:
+- role: user
+  content: |
+    ```python
+    import numpy as np
+
+    def rank_candidates(user_vec, item_matrix, item_ids, seen_items, k=10):
+        """Return the top-k unseen items for one user.
+
+        item_matrix: (n_items, dim) float array
+        item_ids: list of n_items ids, same order as the matrix rows
+        seen_items: list of item ids the user already viewed or bought
+        """
+        scores = item_matrix @ user_vec
+        order = np.argsort(-scores)
+
+        results = []
+        for idx in order:
+            item_id = item_ids[idx]
+            if item_id in seen_items:
+                continue
+            results.append((item_id, float(scores[idx])))
+            if len(results) == k:
+                break
+        return results
+    ```
+
+    ?
+- role: assistant
+  content: |
+    ```python
+    import numpy as np
+
+    def rank_candidates(user_vec, item_matrix, item_ids, seen_items, k=10):
+        """Return the top-k unseen items for one user.
+
+        item_matrix: (n_items, dim) float array
+        item_ids: list of n_items ids, same order as the matrix rows
+        seen_items: list of item ids the user already viewed or bought
+        """
+        scores = item_matrix @ user_vec
+        order = np.argsort(-scores)
+        seen = set(seen_items)  # built once per call, then O(1) per lookup
+
+        results = []
+        for idx in order:
+            item_id = item_ids[idx]
+            if item_id in seen:
+                continue
+            results.append((item_id, float(scores[idx])))
+            if len(results) == k:
+                break
+        return results
+    ```
+
+    Output is the same: same order, same scores, same items skipped.
+
+    **Green Notes**
+    - **Set for repeated membership tests** (reduces E): `item_id in seen_items` scanned the whole list for every candidate. The loop can check many candidates, and a user with a long history can have thousands of seen ids. That is O(n) per check, so the total cost grows with candidates × history. One `set(seen_items)` per call makes each check O(1).
+    - **Why it fits here:** the set only pays off because you look up many times. In Green Metrics Tool micro-benchmarks, a single membership test on a 10,000,000-element list used about 6.9 J, while converting it to a set first and testing once used about 10.5 J. If a call only checked a handful of candidates against a short list, the original would be fine.
+    - **Ids must be hashable:** strings and ints are fine. If you ever use unhashable ids such as lists, the set will raise a `TypeError`.
+    - If the same user is ranked many times in a row, build the set once outside the function and pass it in. The function works with either a list or a set.
+verify:
+  equivalence:
+    driver: |-
+      import numpy as np
+      rng = np.random.default_rng(0)
+      item_matrix = rng.normal(size=(2000, 16))
+      item_ids = [f"i{n}" for n in range(2000)]
+      seen = [f"i{n}" for n in range(0, 2000, 3)]
+      user = rng.normal(size=16)
+      print(rank_candidates(user, item_matrix, item_ids, seen, k=10))
+      print(rank_candidates(user, item_matrix, item_ids, [], k=5))
+      print(rank_candidates(user, item_matrix, item_ids, item_ids[:1990], k=10))

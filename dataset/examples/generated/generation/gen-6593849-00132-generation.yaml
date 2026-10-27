@@ -1,0 +1,47 @@
+id: gen-6593849-00132-generation
+category: generation
+language: python
+patterns:
+- batch-db-writes
+facts:
+- F-PG-INSERT
+messages:
+- role: user
+  content: |
+    Hello, I have small gatway in a farm, it collect data from many soil sensors by LoRa. Internet is bad there, so gateway keep all readings in memory and when connection come back it send everything to our Postgres (server in the cloud). Can be 100k - 300k readings after a long outage. Each reading is a tuple `(device_id, read_at, value)` with `read_at` a datetime. Table is `sensor_readings` with same 3 columns. Please write python function `save_readings(dsn, readings)` with psycopg 3. I want that it is not too slow and not eat all memory of the gateway. Thank you!
+- role: assistant
+  content: |
+    ```python
+    from itertools import islice
+
+    import psycopg
+
+    BATCH_SIZE = 5000
+
+    COPY_SQL = "COPY sensor_readings (device_id, read_at, value) FROM STDIN"
+
+
+    def save_readings(dsn, readings):
+        """Write (device_id, read_at, value) tuples. Returns the number of rows saved."""
+        total = 0
+        rows = iter(readings)
+        with psycopg.connect(dsn) as conn:
+            while batch := list(islice(rows, BATCH_SIZE)):
+                with conn.cursor() as cur, cur.copy(COPY_SQL) as copy:
+                    for row in batch:
+                        copy.write_row(row)
+                conn.commit()
+                total += len(batch)
+        return total
+    ```
+
+    It takes any iterable, so a list or a generator both work. Only 5,000 rows are held in the extra batch list at a time.
+
+    If the connection drops in the middle, the batches already committed stay in the table. When you resend after a failure, skip them or add a unique key on `(device_id, read_at)`, or you will get duplicates.
+
+    **Green Notes**
+    - **Batch database writes** (reduces E and network): `COPY` sends 5,000 rows in one operation, not 5,000 separate INSERTs with a round trip each. In Green Metrics Tool micro-benchmarks with PostgreSQL 16 (500,000 rows, 5,000 rows per commit), `COPY` used about 22× less CPU energy than one `execute()` per row, and about 8× less than `executemany()`.
+    - **Chunked commits** (reduces M): memory stays small on the gateway, and one commit per 5,000 rows keeps transactions short.
+    - *Not applied:* `COPY` for tiny writes. With only about 100 rows per batch, the same benchmarks showed small differences, so for a live trickle of a few readings a plain `executemany()` is fine.
+verify:
+  static_only: needs a running PostgreSQL server and the psycopg package
