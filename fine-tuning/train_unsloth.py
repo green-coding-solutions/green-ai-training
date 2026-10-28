@@ -5,11 +5,16 @@ os.environ["UNSLOTH_DISABLE_STATISTICS"] = "1"   # skips a telemetry README fetc
 os.environ["UNSLOTH_DISABLE_UPDATE_CHECK"] = "1"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
-import argparse
-import math
+# Unsloth imports must come before any other third party ML lib.
+# Reason being is that some patches are applied to internals which speed up training
+# Importing transformers first prohibits this
 from unsloth import FastLanguageModel, is_bfloat16_supported
 from unsloth.chat_templates import train_on_responses_only
 from unsloth.device_type import is_mlx_available
+
+import argparse
+import math
+
 import torch
 from datasets import load_dataset
 from trl import SFTTrainer, SFTConfig
