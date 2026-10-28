@@ -31,7 +31,7 @@ class EvalAfterFirstStep(TrainerCallback):
 
 def train_model(model_name, target_modules, dataset_path, output_dir, split_and_evaluate,
                 eval_dataset_path=None, epochs=3, learning_rate=2e-4, rank=16, max_seq_length=2048, quantize_4bit=False,
-                batch_size=2, gradient_accumulation_steps=None):
+                batch_size=2, gradient_accumulation_steps=None, eval_steps=50):
 
     # Load the model
     model, tokenizer = FastLanguageModel.from_pretrained(
@@ -152,9 +152,9 @@ def train_model(model_name, target_modules, dataset_path, output_dir, split_and_
             optim="adamw_8bit",
             seed=3407,
             report_to="none",
-            # Evaluate every 50 optimizer steps to see where in an epoch the eval loss turns
+            # Evaluate every eval_steps optimizer steps to see where in an epoch the eval loss turns
             eval_strategy="steps" if eval_dataset is not None else "no",
-            eval_steps=50,
+            eval_steps=eval_steps,
             # Baseline val loss of the untrained model, to compare the later evals against.
             # MLXTrainingConfig rejects this kwarg, MLX uses EvalAfterFirstStep instead.
             **({"eval_on_start": eval_dataset is not None} if not use_mlx else {}),
@@ -187,6 +187,7 @@ def main():
     parser.add_argument("--rank", help="LoRA rank (lora_alpha is set to the same value)", type=int, default=16)
     parser.add_argument("--batch-size", help="Conversations per forward pass. Lower it to save memory", type=int, default=2)
     parser.add_argument("--gradient-accumulation-steps", help="Batches per optimizer step (default: 8 / batch size, so the effective batch stays 8)", type=int, default=None)
+    parser.add_argument("--eval-steps", help="Optimizer steps between evals (and checkpoints, if the eval loss improved)", type=int, default=50)
     parser.add_argument("--max-seq-length", help="Maximum tokens per conversation, longer ones are truncated", type=int, default=2048)
     # These layers should ONLY be the language layers. Not the vision layers (like vision_model.XXX or vision.q_proj etc.)
     parser.add_argument("--target-modules", help="Comma-separated LoRA language layer target modules (gate_proj,up_proj,down_proj are typically 'knowledge' and 'q_proj,k_proj,v_proj,o_proj 'behaviour and capabilities')", default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
@@ -202,7 +203,7 @@ def main():
 
     train_model(args.model, target_modules, args.dataset, args.output, args.split_and_evaluate,
                 args.eval_dataset, args.epochs, args.learning_rate, args.rank, args.max_seq_length, args.quantize_4bit,
-                args.batch_size, args.gradient_accumulation_steps)
+                args.batch_size, args.gradient_accumulation_steps, args.eval_steps)
 
 if __name__ == "__main__":
     main()
