@@ -112,6 +112,9 @@ def train_model(model_name, target_modules, dataset_path, output_dir, split_and_
     total_steps = math.ceil(len(train_dataset) / (batch_size * gradient_accumulation_steps)) * epochs
     warmup_steps = max(1, int(total_steps * 0.1))
 
+    if total_steps < 100:
+        raise RuntimeError(f"Total Steps is very small ({total_steps}). It should be at least a couple hundreds to a few thousands. Read the README on which params to tune.")
+
     use_mlx = is_mlx_available()
 
     trainer = SFTTrainer(
