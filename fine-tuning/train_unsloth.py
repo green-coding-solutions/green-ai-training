@@ -134,7 +134,11 @@ def train_model(model_name, target_modules, dataset_path, output_dir, split_and_
             warmup_steps=warmup_steps,
             weight_decay=0.01,
             logging_steps=1,
-            save_strategy="epoch",
+            # Save a checkpoint after an eval only if the eval loss improved. Without an eval
+            # dataset there is no loss to compare, so fall back to one checkpoint per epoch.
+            save_strategy="best" if eval_dataset is not None else "epoch",
+            metric_for_best_model="eval_loss" if eval_dataset is not None else None,
+            greater_is_better=False,
             save_total_limit=2,
             bf16=is_bfloat16_supported(),
             fp16=not is_bfloat16_supported(),
@@ -143,9 +147,10 @@ def train_model(model_name, target_modules, dataset_path, output_dir, split_and_
             optim="adamw_8bit",
             seed=3407,
             report_to="none",
-            # Small datasets have few steps per epoch, so evaluate once per epoch
-            eval_strategy="epoch" if eval_dataset is not None else "no",
-            # Baseline val loss of the untrained model, to compare the epoch evals against.
+            # Evaluate every 50 optimizer steps to see where in an epoch the eval loss turns
+            eval_strategy="steps" if eval_dataset is not None else "no",
+            eval_steps=50,
+            # Baseline val loss of the untrained model, to compare the later evals against.
             # MLXTrainingConfig rejects this kwarg, MLX uses EvalAfterFirstStep instead.
             **({"eval_on_start": eval_dataset is not None} if not use_mlx else {}),
         ),
