@@ -20,6 +20,24 @@ from datasets import load_dataset
 from trl import SFTTrainer, SFTConfig
 from transformers import TrainerCallback
 
+class EvalProgressCallback(TrainerCallback):
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        metrics = metrics or {}
+        loss = metrics.get("eval_loss")
+
+        if loss is None:
+            return control
+
+        perplexity = math.exp(loss) if loss < 709 else float("inf")
+
+        print(
+            f"\nEval {state.global_step}/{state.max_steps} "
+            f"| Epoch: {state.epoch:.2f} "
+            f"| Val Loss: {loss:.4f} "
+            f"| Perplexity: {perplexity:.2f}",
+            flush=True,
+        )
+        return control
 
 class EvalAfterFirstStep(TrainerCallback):
     # The MLX trainer has no eval_on_start. Step 1 runs at 1/warmup_steps of the learning rate,
@@ -166,7 +184,9 @@ def train_model(model_name, target_modules, dataset_path, output_dir, split_and_
     trainer = train_on_responses_only(trainer)
 
     if eval_dataset is not None and use_mlx:
-        trainer.add_callback(EvalAfterFirstStep())
+        trainer.add_callback(EvalProgressCallback())
+        if use_mlx:
+            trainer.add_callback(EvalAfterFirstStep())
 
     trainer.train()
 
