@@ -186,7 +186,7 @@ def train_model(model_name, target_modules, dataset_path, output_dir, split_and_
     # prompts and the system prompt. Instruction/response markers are detected from the chat template.
     trainer = train_on_responses_only(trainer)
 
-    if eval_dataset is not None and use_mlx:
+    if eval_dataset is not None:
         trainer.add_callback(EvalProgressCallback())
         if use_mlx:
             trainer.add_callback(EvalAfterFirstStep())
