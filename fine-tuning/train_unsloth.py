@@ -96,6 +96,13 @@ def train_model(model_name, target_modules, dataset_path, output_dir, split_and_
         train_dataset = dataset["train"]
         eval_dataset = dataset["test"]
 
+    # Multimodal models (e.g. Gemma 4) return a processor instead of a tokenizer, which has no
+    # get_chat_template(). The chat_template attribute exists on both and can also be a dict of templates.
+    chat_template = getattr(tokenizer, "chat_template", None) or ""
+    if isinstance(chat_template, dict):
+        chat_template = " ".join(chat_template.values())
+    template_kwargs = {"enable_thinking": False} if "enable_thinking" in chat_template else {}
+
     def format_example(example):
         # ../dataset/out/*.jsonl uses a "messages" list (multi-turn, optional system prompt)
         messages = example.get("messages") or [
@@ -108,10 +115,6 @@ def train_model(model_name, target_modules, dataset_path, output_dir, split_and_
                 "content": example["response"],
             },
         ]
-
-        template_kwargs = {}
-        if "enable_thinking" in tokenizer.get_chat_template():
-            template_kwargs["enable_thinking"] = False
 
         return {
             "text": tokenizer.apply_chat_template(
