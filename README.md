@@ -157,6 +157,10 @@ and a fixed output format for energy savings. It reads the figures from
 | Savings output | measured figures, not scaled to your code | measured figures **plus** a labeled estimate per run and per year |
 | Updating the facts | retrain | edit or re-copy one Markdown file |
 
+> **Using your own local model?** The [Ollama RAG chat](llm-tools/README.md) works with any Ollama model that
+> supports tool calling, with no fine-tuning and without the full skill. The model looks up the matching measurement
+> through a tool call and quotes the figures straight from it, so the numbers stay true to the measurements.
+
 ## How to use it
 
 Always keep `SKILL.md` and the `skill-references/` folder together. The skill reads the facts from there.
