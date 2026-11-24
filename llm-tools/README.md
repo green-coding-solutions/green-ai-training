@@ -19,6 +19,7 @@ Assistant: In Green Metrics Tool micro-benchmarks, building a string from 1,000,
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Usage](#usage)
+- [Live measurements and fallback](#live-measurements-and-fallback)
 - [Tools available to the model](#tools-available-to-the-model)
 - [How it works](#how-it-works)
 - [Choosing a model](#choosing-a-model)
@@ -36,7 +37,7 @@ The repository offers three ways to bring the measurements into an LLM:
 | Training needed | yes | no | no |
 | Context used | none | the whole skill and facts file with each task | only the facts that match the question |
 | Where the numbers come from | learned during training | the facts file in the context | returned by a tool call, word for word |
-| Updating the facts | retrain | re-copy one Markdown file | edit one Markdown file, restart the chat |
+| Updating the facts | retrain | re-copy one Markdown file | newest values are fetched live on every lookup |
 
 Use `ollama-rag.py` when you want to keep your own model, don't want to load the full skill into a small context
 window, and want the energy figures to come straight from the measurements. The model never has to remember a number.
@@ -47,8 +48,9 @@ It gets the fact, including its conditions and caveats, as the tool result and i
 - Python 3.10 or newer
 - [Ollama](https://ollama.com/download) running locally (`ollama serve`, or the Ollama desktop app)
 - A model that supports tool calling, pulled with `ollama pull <model>` (see [Choosing a model](#choosing-a-model))
-- The rest of this repository: the script reads the facts from `../dataset/spec/measured-facts.md`, so keep it inside
-  the `llm-tools/` folder of the repository
+- The rest of this repository: the script reads the stored facts from `../dataset/spec/measured-facts.md`, so keep it
+  inside the `llm-tools/` folder of the repository, together with `include/` and `fact-lookup.json`
+- Internet access to `api.green-coding.io` for the newest values (optional: without it the stored facts are used)
 
 ## Installation
 
@@ -91,6 +93,56 @@ measurement the answer is based on.
 - *Does lazy loading images save energy?*
 - *Review PR 1234 in green-coding-solutions/green-metrics-tool for energy problems.*
 
+## Live measurements and fallback
+
+The benchmarks behind the facts keep running on the Green Metrics Tool cluster, so their energy values move. The chat
+therefore looks up the newest values whenever a fact is found:
+
+1. **Static lookup:** [`fact-lookup.json`](fact-lookup.json) lists, for every fact in `measured-facts.md`, the keywords
+   that trigger it and the Green Metrics Tool tasks it was measured with (task ID, software ID and name):
+
+   ```json
+   "F-STRCAT": {
+     "keywords": ["string building", "string concatenation", "+=", "join", "f-string", ...],
+     "tasks": [
+       {"id": 248, "software_id": 48, "name": "String Concatenation - += (optimized)"},
+       ...
+     ]
+   }
+   ```
+
+2. **Live fetch:** for a matching fact, the script calls `https://api.green-coding.io/v1/software/<software_id>/tasks`
+   for the softwares of its tasks. The API returns the newest successful run of every task with its phase metrics, the
+   same selection `data/query.sql` uses for the export. Each software is fetched once per chat session.
+3. **Fresh value or stored fact:** every task with a fresh value is shown with CPU energy, machine energy (where the
+   machine has a power meter), duration, work units (iterations, rows, page loads, …) and the link to its run. If a
+   task has no fresh value, because the API is unreachable, returns an error or has no run with energy values, the
+   stored fact from `measured-facts.md` is added as well. If the network is down, the first failed request switches
+   the whole search to the stored facts, so you wait for at most one timeout.
+
+A result with live values:
+
+```
+[Web / browser] F-ANIM
+Newest measurements from the Green Metrics Tool API:
+On GUI Benchmarking - TX1330 M3 [PREMIUM]:
+- JS Animation - Clean (Run Only) (phase Run animation for 20 seconds): CPU energy 155 J, machine energy 780 J, duration 20.1 s; run of 2026-10-22: https://metrics.green-coding.io/stats.html?id=...
+- CSS Animation - Clean (Run Only) (phase Run animation for 20 seconds): CPU energy 144 J, machine energy 771 J, duration 20.1 s; run of 2026-10-22: https://metrics.green-coding.io/stats.html?id=...
+```
+
+The same lookup without network access:
+
+```
+[GMT API not reachable (...), using the stored facts]
+[Web / browser] F-ANIM
+Stored measurement from measured-facts.md:
+**F-ANIM**: A 20-second animation in a real browser: JavaScript `requestAnimationFrame` with style updates ~161 J ...
+```
+
+**Adding a fact:** write it in `measured-facts.md`, then add an entry with the same ID to `fact-lookup.json`. Task IDs
+and software IDs are in the Green Metrics Tool export
+([`data/green-coding-measurement-data.csv`](../data/green-coding-measurement-data.csv), columns 1 and 3).
+
 ## Tools available to the model
 
 ### `search_green_measurements(query)`
@@ -99,9 +151,9 @@ Searches the measured facts of this repository (Python, SQL/PostgreSQL, Bash, we
 
 - `query`: keywords such as `string concatenation join`, `bulk insert postgres`, `gzip zstd`, or a fact ID like
   `F-STRCAT`.
-- Returns up to 3 matching facts, each with its section, the measured figures, the conditions and the measurement and
-  benchmark links.
-- If nothing matches, it returns the list of all fact IDs, so the model can search again with an ID.
+- Returns up to 3 matching facts: the newest values from the Green Metrics Tool API with their run links, or the stored
+  fact with its figures, conditions and links (see [Live measurements and fallback](#live-measurements-and-fallback)).
+- If nothing matches, it returns the list of all fact IDs with their first keywords, so the model can search again.
 
 ### `get_pull_request(owner, repo, pr_number)`
 
@@ -123,27 +175,43 @@ This is *agentic RAG* (retrieval-augmented generation through a tool call) with 
 
 - **Agentic:** the model decides when to look something up. Most RAG setups retrieve on every question
   and always put the results into the prompt. Here, retrieval runs only when the model calls `search_green_measurements`.
-- **Keyword retrieval:** facts are found by matching words, not by embeddings in a vector database. Each fact is short and
-  covers one technique, so with a few dozen of them, matching words is enough and needs no embedding model or index.
-- **Whole facts, not chunks:** the unit of retrieval is one complete fact with its figures, conditions and links, never
-  a cut-off text fragment.
+- **Keyword retrieval:** facts are found through a hand-written keyword list per fact, not by embeddings in a vector
+  database. With a few dozen facts that cover one technique each, matching words is enough and needs no embedding model
+  or index.
+- **Live data:** the retrieved fact points to its Green Metrics Tool tasks, whose newest values are fetched at
+  question time. The stored fact text is the fallback.
 
 `get_pull_request` is plain tool use rather than RAG: it fetches data for the model to work on, not knowledge to base
 an answer on.
 
+Files:
+
+| File | Content |
+|---|---|
+| `ollama-rag.py` | The chat: command line options, system prompt, streaming, tool loop |
+| `include/green_search.py` | The `search_green_measurements` tool: keyword lookup, live fetch from the GMT API, fallback to the stored facts |
+| `include/github_pr.py` | The `get_pull_request` tool |
+| `fact-lookup.json` | Keywords and GMT tasks per fact |
+
+Every include defines its tool schema as `TOOL` and the function that runs it. To add a tool, put a new file into
+`include/` and register both in `ollama-rag.py` (`tools` and `available_functions`).
+
 Step by step:
 
-1. **Facts:** at startup the script reads [`dataset/spec/measured-facts.md`](../dataset/spec/measured-facts.md).
-   Every entry that starts with `- **F-<ID>**` becomes one fact, together with its indented lines and its section
-   heading. [`skill-references/measured-facts.md`](../skill-references/measured-facts.md) is only a copy of this file.
+1. **Startup:** the script reads the stored facts from
+   [`dataset/spec/measured-facts.md`](../dataset/spec/measured-facts.md) (every entry that starts with `- **F-<ID>**`,
+   with its indented lines and section heading) and the static lookup [`fact-lookup.json`](fact-lookup.json).
+   [`skill-references/measured-facts.md`](../skill-references/measured-facts.md) is only a copy of the facts file.
 2. **System prompt:** the model is told to call `search_green_measurements` for energy questions, to base its answer
    only on the returned figures, to name Green Metrics Tool as the source with the measurement link, and to say so when
    no measurement fits.
-3. **Retrieval:** the search is a keyword match, not a vector search. Query and facts are split into words, common
-   words (*energy*, *saving*, *how*, …) are dropped and simple plural and *-ing*/*-ed* endings removed. A query word
-   counts as a hit when it equals a fact word or one is the prefix of the other (*postgres* finds *PostgreSQL*).
-   The facts with the most hits are returned, as long as they match at least two thirds as many words as the best one.
-4. **Tool loop:** the script runs the tool calls, sends the results back to the model and repeats until the model
+3. **Retrieval:** query and keywords are split into words, common words (*energy*, *saving*, *how*, …) are dropped and
+   simple plural and *-ing*/*-ed* endings removed. A query word counts as a hit when it equals a keyword word or one is
+   the prefix of the other (*postgres* finds *postgresql*). The facts with the most hits are returned, as long as they
+   match at least two thirds as many words as the best one. A fact ID such as `F-STRCAT` finds its fact directly.
+4. **Live values:** for each fact found, the newest values of its tasks are fetched, or the stored fact is used (see
+   [Live measurements and fallback](#live-measurements-and-fallback)).
+5. **Tool loop:** the script runs the tool calls, sends the results back to the model and repeats until the model
    answers without a tool call.
 
 ## Choosing a model
@@ -158,9 +226,16 @@ before the tool result.
 
 ## Limitations
 
-- **Keyword search only:** there are no synonyms. *docker image* does not find the container image fact, because the
-  fact never says *docker*. Rephrase (*container image*) or let the model search with a fact ID. See
-  [Possible upgrade: BM25 ranking](#possible-upgrade-bm25-ranking) for how the search could grow with more facts.
+- **Keywords are maintained by hand:** a question only finds a fact if it shares a word with that fact's keywords.
+  Add missing terms to `fact-lookup.json`. See [Possible upgrade: BM25 ranking](#possible-upgrade-bm25-ranking) for how
+  the search could grow with more facts.
+- **Live values come without the caveats:** when all tasks of a fact have live values, the model gets the task names
+  and figures only, not the conditions and caveats written in the fact text (e.g. that caching only pays off with
+  repeated inputs). Ratios such as *about 260× less* have to be worked out from the figures.
+- **New benchmarks are not picked up:** only the tasks listed in `fact-lookup.json` are fetched. A new benchmark needs
+  a new fact in `measured-facts.md` and a lookup entry.
+- **Long tool results:** facts that link many tasks return a lot of text. The compression codec comparison
+  (F-COMPRESS-CODECS, 56 tasks) returns about 12,000 characters, which can fill the context window of small models.
 - **Figures are not scaled:** the facts are micro-benchmark results on dedicated lab machines. They show the order of
   magnitude and direction of a saving, not an exact figure for your code or hardware.
 - **Large pull requests:** diffs longer than 20,000 characters are truncated, and only the first 100 comments of each
@@ -168,22 +243,23 @@ before the tool result.
 
 ## Possible upgrade: BM25 ranking
 
-The current ranking counts how many query words a fact contains. That works for a few dozen facts, but gets weaker as
-`measured-facts.md` grows:
+The current ranking counts how many query words appear in a fact's keywords. That works for a few dozen facts, but
+gets weaker as `measured-facts.md` grows:
 
-- Every word counts the same. A word that appears in many facts (*Python*, *loop*, *rows*) weighs as much as a rare,
-  telling one (*lru_cache*, *COPY*).
-- Long facts match more words by chance and push short, more precise facts down.
+- Every word counts the same. A word that appears in many keyword lists (*postgresql*, *compression*, *gzip*) weighs as
+  much as a rare, telling one (*lru_cache*, *executemany*).
+- Long keyword lists match more words by chance and push short, more precise ones down.
 
 [BM25](https://en.wikipedia.org/wiki/Okapi_BM25), the standard ranking in classic search engines, fixes both: it gives
 rare words more weight than common ones and corrects for fact length. It is still keyword search, so it fits into
 `search_green_measurements` without embeddings or a vector database. Either implement it in about 30 lines of Python or
-use the [`rank_bm25`](https://pypi.org/project/rank-bm25/) package. Facts and tokenizer stay as they are, and the
-fact ID lookup and the list of IDs on no match can stay too.
+use the [`rank_bm25`](https://pypi.org/project/rank-bm25/) package. The lookup file, the tokenizer, the live fetch
+and the fallback stay as they are. With many more facts, indexing the fact text next to the keywords saves
+writing every term by hand.
 
-BM25 only matches exact words after tokenizing. The prefix matching (*postgres* finds *PostgreSQL*) would have to come
-from a proper stemmer or a small synonym table instead. BM25 doesn't solve synonyms (*docker* vs. *container*) either.
-If that ever matters more than ranking, embeddings or a hybrid of BM25 and embeddings are the next step.
+BM25 only matches exact words after tokenizing. The prefix matching (*postgres* finds *postgresql*) would have to come
+from a proper stemmer instead. Synonyms (*docker* vs. *container*) still need the keyword list. If that ever becomes
+too much to maintain, embeddings or a hybrid of BM25 and embeddings are the next step.
 
 ## Sample conversation
 
