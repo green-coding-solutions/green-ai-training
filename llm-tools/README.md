@@ -189,7 +189,7 @@ If that ever matters more than ranking, embeddings or a hybrid of BM25 and embed
 
 
 ```log
-(.venv) arne@mintbook:~/Sites/green-coding/green-ai-training/llm-tools (main*) $ python3 ollama-rag.py --model gemma4:12b-mlx
+$ python3 ollama-rag.py --model gemma4:12b-mlx
 Chat started with gemma4:12b-mlx
 Commands: /clear, /exit
 
