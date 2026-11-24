@@ -23,6 +23,7 @@ Assistant: In Green Metrics Tool micro-benchmarks, building a string from 1,000,
 - [How it works](#how-it-works)
 - [Choosing a model](#choosing-a-model)
 - [Limitations](#limitations)
+- [Possible upgrade: BM25 ranking](#possible-upgrade-bm25-ranking)
 - [Sample conversation](#sample-conversation)
 
 ## When to use it
@@ -118,6 +119,20 @@ python3 ollama-rag.py
 
 ## How it works
 
+This is *agentic RAG* (retrieval-augmented generation through a tool call) with keyword retrieval:
+
+- **Agentic:** the model decides when to look something up. Most RAG setups retrieve on every question
+  and always put the results into the prompt. Here, retrieval runs only when the model calls `search_green_measurements`.
+- **Keyword retrieval:** facts are found by matching words, not by embeddings in a vector database. Each fact is short and
+  covers one technique, so with a few dozen of them, matching words is enough and needs no embedding model or index.
+- **Whole facts, not chunks:** the unit of retrieval is one complete fact with its figures, conditions and links, never
+  a cut-off text fragment.
+
+`get_pull_request` is plain tool use rather than RAG: it fetches data for the model to work on, not knowledge to base
+an answer on.
+
+Step by step:
+
 1. **Facts:** at startup the script reads [`dataset/spec/measured-facts.md`](../dataset/spec/measured-facts.md).
    Every entry that starts with `- **F-<ID>**` becomes one fact, together with its indented lines and its section
    heading. [`skill-references/measured-facts.md`](../skill-references/measured-facts.md) is only a copy of this file.
@@ -144,11 +159,31 @@ before the tool result.
 ## Limitations
 
 - **Keyword search only:** there are no synonyms. *docker image* does not find the container image fact, because the
-  fact never says *docker*. Rephrase (*container image*) or let the model search with a fact ID.
+  fact never says *docker*. Rephrase (*container image*) or let the model search with a fact ID. See
+  [Possible upgrade: BM25 ranking](#possible-upgrade-bm25-ranking) for how the search could grow with more facts.
 - **Figures are not scaled:** the facts are micro-benchmark results on dedicated lab machines. They show the order of
   magnitude and direction of a saving, not an exact figure for your code or hardware.
 - **Large pull requests:** diffs longer than 20,000 characters are truncated, and only the first 100 comments of each
   kind are fetched.
+
+## Possible upgrade: BM25 ranking
+
+The current ranking counts how many query words a fact contains. That works for a few dozen facts, but gets weaker as
+`measured-facts.md` grows:
+
+- Every word counts the same. A word that appears in many facts (*Python*, *loop*, *rows*) weighs as much as a rare,
+  telling one (*lru_cache*, *COPY*).
+- Long facts match more words by chance and push short, more precise facts down.
+
+[BM25](https://en.wikipedia.org/wiki/Okapi_BM25), the standard ranking in classic search engines, fixes both: it gives
+rare words more weight than common ones and corrects for fact length. It is still keyword search, so it fits into
+`search_green_measurements` without embeddings or a vector database. Either implement it in about 30 lines of Python or
+use the [`rank_bm25`](https://pypi.org/project/rank-bm25/) package. Facts and tokenizer stay as they are, and the
+fact ID lookup and the list of IDs on no match can stay too.
+
+BM25 only matches exact words after tokenizing. The prefix matching (*postgres* finds *PostgreSQL*) would have to come
+from a proper stemmer or a small synonym table instead. BM25 doesn't solve synonyms (*docker* vs. *container*) either.
+If that ever matters more than ranking, embeddings or a hybrid of BM25 and embeddings are the next step.
 
 ## Sample conversation
 
