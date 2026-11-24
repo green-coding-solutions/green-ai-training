@@ -1,12 +1,13 @@
 
 import ollama
+import argparse
 import json
 import os
 import re
 import urllib.error
 import urllib.request
 
-MODEL = "gemma4:12b-mlx"
+DEFAULT_MODEL = "gemma4"
 
 GITHUB_API = "https://api.github.com"
 # Optional: set GITHUB_TOKEN for private repos and a higher rate limit
@@ -275,6 +276,11 @@ def execute_tool(tool_call):
     print(f"[Tool result: {result}]\n")
     return result
 
+
+parser = argparse.ArgumentParser(description="Chat with a local Ollama model that looks up measured green coding energy figures")
+parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama model to chat with (default: {DEFAULT_MODEL})")
+args = parser.parse_args()
+MODEL = args.model
 
 # Conversation state
 messages = [{"role": "system", "content": SYSTEM_PROMPT}]
